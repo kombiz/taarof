@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Taarof — please, take my terminal</title>
+  <meta name="description" content="Taarof is a Linux terminal workspace: tabs in a sidebar, split panes with or without tmux, session restore, live agent activity indicators, and a local control surface for scripts and agents.">
+  <link rel="canonical" href="https://taarof.dev/">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://taarof.dev/">
+  <meta property="og:title" content="Taarof — please, take my terminal">
+  <meta property="og:description" content="A Linux terminal workspace built for visible agent work. Tabs, split panes, session restore, tmux, SSH, and agents that blink politely.">
+  <meta property="og:image" content="https://taarof.dev/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Taarof — please, take my terminal">
+  <meta name="twitter:description" content="A Linux terminal workspace built for visible agent work.">
+  <meta name="twitter:image" content="https://taarof.dev/og.png">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap">
+  <style>
+    :root { --crust:#0b0906; --base:#14110c; --mantle:#100d09; --panel:#17120c; --raised:#241d13; --line:#2c2519; --line2:#34291a; --border:#463726; --text:#efe7d6; --bright:#f6f0e4; --sub:#c3b9a7; --muted:#8f826d; --dim:#7c715e; --amber:#e0a43a; --wheat:#d9b34a; --green:#7bbf7a; --teal:#6bb0b8; --rose:#d6796b; }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; }
+    body { margin:0; background:var(--crust); color:var(--text); font-family:"IBM Plex Mono",ui-monospace,"SFMono-Regular","Liberation Mono",monospace; font-size:16px; line-height:1.65; }
+    a { color:var(--amber); }
+    .grotesk { font-family:"Space Grotesk",system-ui,sans-serif; }
+    .wrap { width:min(1180px,calc(100% - 40px)); margin:auto; }
+    .eyebrow { font-family:"Space Grotesk",system-ui,sans-serif; color:var(--amber); text-transform:uppercase; letter-spacing:.16em; font-size:13px; font-weight:700; }
+    .btn { display:inline-flex; align-items:center; justify-content:center; min-height:48px; padding:0 24px; font-weight:700; font-size:15px; text-decoration:none; border-radius:8px; }
+    .btn-primary { background:var(--amber); color:#171007; }
+    .btn-ghost { background:var(--panel); color:var(--text); border:1px solid var(--border); font-weight:600; }
+    nav { display:flex; align-items:center; justify-content:space-between; padding:18px 0; border-bottom:1px solid var(--raised); }
+    .brand { display:flex; align-items:center; gap:10px; }
+    .brand span.name { font-family:"Space Grotesk",system-ui,sans-serif; font-weight:600; font-size:18px; color:var(--bright); }
+    .pill { background:rgba(224,164,58,.1); color:var(--wheat); border:1px solid rgba(224,164,58,.24); border-radius:999px; font-size:10px; font-weight:700; padding:2px 8px; }
+    .navlinks { display:flex; align-items:center; gap:24px; }
+    .navlinks a.plain { color:var(--sub); font-size:13px; text-decoration:none; padding:13px 4px; }
+    .navlinks .btn { min-height:44px; padding:0 18px; font-size:13px; }
+    .hero { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:48px; align-items:center; padding:84px 0 96px; }
+    .hero-copy { display:flex; flex-direction:column; align-items:flex-start; gap:22px; }
+    h1 { margin:0; font-family:"Space Grotesk",system-ui,sans-serif; font-size:clamp(34px,4.5vw,58px); line-height:1.04; letter-spacing:-.025em; font-weight:700; color:var(--bright); }
+    .dek { margin:0; max-width:560px; color:var(--sub); font-size:17px; }
+    .actions { display:flex; flex-wrap:wrap; gap:12px; margin-top:8px; }
+    .chips { display:flex; flex-wrap:wrap; gap:9px; margin-top:10px; }
+    .chip { padding:5px 11px; border:1px solid var(--line); border-radius:999px; background:#141008; color:var(--muted); font-size:12px; }
+    .mock { border:1px solid var(--line2); border-radius:12px; background:var(--base); box-shadow:0 36px 80px rgba(0,0,0,.55); overflow:hidden; }
+    .mock-bar { display:flex; align-items:center; justify-content:space-between; height:40px; padding:0 14px; border-bottom:1px solid var(--raised); color:var(--dim); font-size:12px; }
+    .dots { display:flex; gap:8px; } .dots span { width:10px; height:10px; border-radius:999px; background:var(--border); }
+    .mock-body { display:grid; grid-template-columns:196px 1fr; min-height:430px; }
+    .mock-side { display:flex; flex-direction:column; gap:2px; background:var(--mantle); border-right:1px solid var(--raised); padding:12px 8px; }
+    .side-brand { display:flex; align-items:center; gap:7px; padding:6px 10px 10px; color:var(--bright); font-size:13px; font-weight:500; }
+    .side-label { color:var(--dim); font-size:9px; font-weight:700; letter-spacing:1.6px; padding:6px 10px 4px; font-family:"Space Grotesk",system-ui,sans-serif; }
+    .tabrow { display:flex; align-items:center; gap:9px; min-height:30px; padding:3px 8px; border-left:2px solid transparent; color:var(--sub); font-size:12px; }
+    .tabrow.active { background:var(--raised); border-left-color:var(--amber); color:var(--text); }
+    .dot { width:8px; height:8px; border-radius:999px; flex:none; }
+    .dot.run { background:var(--amber); box-shadow:0 0 10px rgba(224,164,58,.7); }
+    .dot.done { background:var(--green); } .dot.wait { background:var(--wheat); } .dot.idle { background:var(--dim); }
+    .mock-grid { display:grid; grid-template-columns:1.1fr .9fr; grid-template-rows:repeat(2,minmax(0,1fr)); gap:1px; background:var(--raised); }
+    .pane { background:var(--crust); padding:14px; font-size:11px; line-height:1.7; display:flex; flex-direction:column; gap:2px; }
+    .pane.tall { grid-row:span 2; }
+    .p { color:var(--amber); } .g { color:var(--green); } .t { color:var(--teal); } .r { color:var(--rose); } .s { color:var(--sub); }
+    section { padding:84px 0; border-top:1px solid var(--raised); }
+    .section-head { display:flex; flex-direction:column; gap:12px; max-width:720px; }
+    h2 { margin:0; font-family:"Space Grotesk",system-ui,sans-serif; font-size:clamp(28px,3.4vw,40px); line-height:1.08; letter-spacing:-.02em; font-weight:700; color:var(--bright); }
+    .section-head p { margin:0; color:var(--sub); font-size:15px; }
+    .features { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; margin-top:32px; }
+    .feature { display:flex; flex-direction:column; gap:12px; padding:26px; border:1px solid var(--line); border-radius:16px; background:var(--panel); }
+    .feature h3 { margin:0; font-family:"Space Grotesk",system-ui,sans-serif; font-size:17px; font-weight:600; color:var(--bright); }
+    .feature p { margin:0; color:var(--sub); font-size:13.5px; }
+    .closer { display:flex; flex-direction:column; gap:56px; }
+    .spot { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:48px; align-items:center; }
+    .spot h3 { margin:0; font-family:"Space Grotesk",system-ui,sans-serif; font-size:24px; font-weight:600; color:var(--bright); }
+    .spot .copy { display:flex; flex-direction:column; gap:12px; }
+    .spot .copy p { margin:0; color:var(--sub); font-size:15px; line-height:1.7; }
+    .vis { display:flex; flex-direction:column; gap:4px; border:1px solid var(--line); border-radius:16px; background:var(--mantle); padding:20px; font-size:13px; line-height:1.8; }
+    .vis .tabrow { min-height:34px; padding:4px 10px; font-size:13px; }
+    .vis .end { color:var(--dim); margin-left:auto; }
+    .install { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:48px; align-items:start; }
+    .install-copy { display:flex; flex-direction:column; gap:18px; }
+    .install-copy p { margin:0; color:var(--sub); font-size:15px; }
+    .note { border-left:3px solid var(--amber); padding:8px 0 8px 16px; color:var(--sub); font-size:13.5px; line-height:1.55; }
+    .notes { display:flex; flex-direction:column; gap:12px; margin-top:6px; }
+    .code { border:1px solid var(--line); border-radius:16px; background:var(--mantle); padding:26px; box-shadow:0 24px 60px rgba(0,0,0,.45); display:flex; flex-direction:column; gap:4px; font-size:13.5px; line-height:1.8; overflow-x:auto; }
+    .code div { white-space:nowrap; }
+    footer { display:flex; align-items:center; justify-content:space-between; gap:24px; padding:34px 0 48px; border-top:1px solid var(--raised); color:var(--muted); font-size:13px; }
+    footer .links { display:flex; gap:24px; flex:none; }
+    footer a { color:var(--muted); font-size:13px; text-decoration:none; padding:13px 0; }
+    @media (max-width:980px) {
+      .hero, .spot, .install { grid-template-columns:1fr; }
+      .features { grid-template-columns:1fr 1fr; }
+      .spot.flip .vis { order:2; }
+      section { padding:56px 0; }
+      .hero { padding:48px 0 56px; }
+    }
+    @media (max-width:640px) {
+      .navlinks a.plain { display:none; }
+      .features { grid-template-columns:1fr; }
+      .mock-body { grid-template-columns:1fr; }
+      .mock-side { display:none; }
+      .mock-grid { grid-template-columns:1fr; }
+      .pane.tall { grid-row:span 1; }
+      .actions { flex-direction:column; align-self:stretch; }
+      .actions .btn { width:100%; }
+      .code { font-size:11px; padding:18px; }
+      footer { flex-direction:column; align-items:flex-start; gap:0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <nav>
+      <div class="brand">
+        <svg width="20" height="20" viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M20 10 L29 19.5 L20 29" stroke="#e0a43a" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"></path><path d="M8 35 H40" stroke="#e0a43a" stroke-width="3.2" stroke-linecap="round"></path></svg>
+        <span class="name">taarof</span>
+        <span class="pill">v0.1</span>
+      </div>
+      <div class="navlinks">
+        <a class="plain" href="#features">Features</a>
+        <a class="plain" href="#install">Install</a>
+        <a class="plain" href="https://github.com/kombiz/taarof">GitHub</a>
+        <a class="btn btn-primary" href="https://github.com/kombiz/taarof/releases">Download</a>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="hero-copy">
+        <div class="eyebrow">A Linux terminal workspace · no, after you</div>
+        <h1>Please, take my terminal. I&nbsp;insist.</h1>
+        <p class="dek">It's nothing, really — a GTK4 terminal with a tabbed sidebar that respects you. Split panes with or without tmux, session restore that keeps your place, and good manners around your SSH habits. Honestly, it wouldn't even exist without you. Linux only.</p>
+        <div class="actions">
+          <a class="btn btn-primary" href="https://github.com/kombiz/taarof/releases">Download for Linux</a>
+          <a class="btn btn-ghost" href="https://github.com/kombiz/taarof">Politely decline (source)</a>
+        </div>
+        <div class="chips">
+          <span class="chip">GTK4 · libadwaita · VTE</span>
+          <span class="chip">MIT / Apache-2.0</span>
+          <span class="chip">Loopback-only HTTP</span>
+        </div>
+      </div>
+
+      <div class="mock" aria-label="Taarof workspace preview">
+        <div class="mock-bar">
+          <span>taarof — majlis</span>
+          <div class="dots"><span></span><span></span><span></span></div>
+        </div>
+        <div class="mock-body">
+          <div class="mock-side">
+            <div class="side-brand">
+              <svg width="14" height="14" viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M20 10 L29 19.5 L20 29" stroke="#e0a43a" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"></path><path d="M8 35 H40" stroke="#e0a43a" stroke-width="4" stroke-linecap="round"></path></svg>
+              <span>taarof</span>
+              <span class="pill" style="font-size:8px;padding:1px 5px;">v0.1</span>
+            </div>
+            <div class="side-label">TABS</div>
+            <div class="tabrow active"><span class="dot run"></span><span>agents / claude</span></div>
+            <div class="tabrow"><span class="dot done"></span><span>tests / cargo</span></div>
+            <div class="tabrow"><span class="dot wait"></span><span>tmux / build</span></div>
+            <div class="tabrow"><span class="dot idle"></span><span>dashboard</span></div>
+          </div>
+          <div class="mock-grid">
+            <div class="pane tall">
+              <div><span class="p">$</span> taarof list-tabs --pretty</div>
+              <div class="g">{ "schema": "taarof.state.v1" }</div>
+              <div style="min-height:10px;"></div>
+              <div><span class="p">$</span> cargo test</div>
+              <div class="s">running 218 tests</div>
+              <div class="g">test result: ok</div>
+              <div style="min-height:10px;"></div>
+              <div class="t">agent: editing release notes</div>
+            </div>
+            <div class="pane">
+              <div><span class="p">$</span> tmux ls</div>
+              <div class="s">taarof-release: 2 windows</div>
+              <div class="g">detached session tracked</div>
+            </div>
+            <div class="pane">
+              <div><span class="p">$</span> taarof agent-status</div>
+              <div class="r">alerts: waiting-input</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <section id="features">
+      <div class="section-head">
+        <div class="eyebrow">Why taarof</div>
+        <h2>A terminal that respects you.</h2>
+        <p>Remember what they did to WordPerfect for DOS? Not again! The terminal is the source of truth. It even plays nice with agents — if you're into that sort of thing.</p>
+      </div>
+      <div class="features">
+        <div class="feature">
+          <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true"><rect x="2" y="3" width="18" height="16" rx="2" stroke="#e0a43a" stroke-width="1.6"></rect><path d="M11 3 V19 M11 11 H20" stroke="#e0a43a" stroke-width="1.6"></path></svg>
+          <h3>Tabs, in a sidebar</h3>
+          <p>A tabbed sidebar and split panes you can actually keep track of. Keyboard navigation, Ghostty theme import, VTE rendering.</p>
+        </div>
+        <div class="feature">
+          <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true"><path d="M2 12 H6 L9 5 L13 17 L16 12 H20" stroke="#e0a43a" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+          <h3>Agents that blink politely</h3>
+          <p>Live indicators show running, waiting, done, and alert. Your agents blink when they want your attention instead of shouting over your work.</p>
+        </div>
+        <div class="feature">
+          <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true"><path d="M3 5 L8 11 L3 17" stroke="#e0a43a" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path><path d="M11 17 H19" stroke="#e0a43a" stroke-width="1.6" stroke-linecap="round"></path></svg>
+          <h3>A socket for your robots</h3>
+          <p>Same-user socket actions let tools and agents create tabs, run commands, send keys, and capture what your agents are actually doing.</p>
+        </div>
+        <div class="feature">
+          <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true"><rect x="3" y="8" width="14" height="11" rx="2" stroke="#e0a43a" stroke-width="1.6"></rect><path d="M6 8 V6 A2 2 0 0 1 8 4 H17 A2 2 0 0 1 19 6 V14 A2 2 0 0 1 17 16" stroke="#e0a43a" stroke-width="1.6"></path></svg>
+          <h3>tmux, but only if you hate scrolling</h3>
+          <p>Panes come with or without tmux backing. Long jobs detach and reattach, and it plays nicely with your SSH habits instead of replacing them.</p>
+        </div>
+        <div class="feature">
+          <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="8" stroke="#e0a43a" stroke-width="1.6"></circle><ellipse cx="11" cy="11" rx="3.4" ry="8" stroke="#e0a43a" stroke-width="1.6"></ellipse><path d="M3 11 H19" stroke="#e0a43a" stroke-width="1.6"></path></svg>
+          <h3>A web view, if you must</h3>
+          <p>An optional loopback HTTP API and web client expose read-only state behind a bearer token. It stays on your machine unless you say otherwise.</p>
+        </div>
+        <div class="feature">
+          <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true"><path d="M4 11 A7 7 0 1 1 6 16" stroke="#e0a43a" stroke-width="1.6" stroke-linecap="round"></path><path d="M4 7 V11 H8" stroke="#e0a43a" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+          <h3>Remembers where you were</h3>
+          <p>Tabs, panes, working directories, saved views, and templates persist between launches. It wouldn't dream of losing your place.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="closer">
+        <div class="section-head">
+          <div class="eyebrow">A closer look</div>
+          <h2>Since you insist.</h2>
+        </div>
+
+        <div class="spot">
+          <div class="copy">
+            <h3>They blink when they need you.</h3>
+            <p>Agent panes carry live status — running, waiting, done, alert — in the sidebar and the dock. A notification can drop you straight into the pane that wants you. No tab-cycling to check on the robots; they'll ask, politely.</p>
+          </div>
+          <div class="vis" style="font-size:13px;">
+            <div class="tabrow active"><span class="dot run"></span><span>claude · running</span><span class="end">editing release notes</span></div>
+            <div class="tabrow"><span class="dot" style="background:var(--rose);"></span><span>codex · alert</span><span class="end">waiting for input</span></div>
+            <div class="tabrow"><span class="dot wait"></span><span>build · waiting</span><span class="end">queued behind tests</span></div>
+            <div class="tabrow"><span class="dot done"></span><span>tests · done</span><span class="end">cargo test: ok</span></div>
+          </div>
+        </div>
+
+        <div class="spot flip">
+          <div class="vis">
+            <div><span class="p">$</span> tmux ls</div>
+            <div class="s">taarof-release: 2 windows (detached)</div>
+            <div style="min-height:10px;"></div>
+            <div><span class="p">$</span> taarof list-tabs --pretty</div>
+            <div class="s">"tmux": true, "host": "builder"</div>
+            <div class="g">reattach whenever you like</div>
+          </div>
+          <div class="copy">
+            <h3>Your tmux, your SSH, undisturbed.</h3>
+            <p>Panes come plain or tmux-backed. Long jobs keep running when the window closes; detach and reattach whenever. SSH hosts keep their aliases, and your dotfiles keep their opinions.</p>
+          </div>
+        </div>
+
+        <div class="spot">
+          <div class="copy">
+            <h3>A steering wheel for agents. Brakes for you.</h3>
+            <p>The same-user socket creates tabs, runs commands, sends keys, and captures pane text. The web client observes from a browser — loopback-only, token-gated, read-only unless you flip the switch yourself.</p>
+          </div>
+          <div class="vis">
+            <div><span class="p">$</span> taarof send-keys --tab tests "cargo test"</div>
+            <div><span class="p">$</span> taarof query-state --pretty</div>
+            <div class="g">{ "schema": "taarof.state.v1" }</div>
+            <div style="min-height:10px;"></div>
+            <div class="t">web: observing on 127.0.0.1 · read-only</div>
+          </div>
+        </div>
+
+        <div class="spot flip">
+          <div class="vis">
+            <div style="color:var(--muted);">restoring workspace…</div>
+            <div class="s">~/code/kmux — 3 panes</div>
+            <div class="s">~/code/homelab — tmux-backed</div>
+            <div class="s">saved view: release-week</div>
+            <div class="g">everything where you left it</div>
+          </div>
+          <div class="copy">
+            <h3>It kept your seat.</h3>
+            <p>Quit guilt-free. Tabs, panes, working directories, saved views, and templates return on launch — restored lazily, so startup stays quick and nothing spins up until you actually look at it.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="install">
+      <div class="install">
+        <div class="install-copy">
+          <div class="eyebrow">Install</div>
+          <h2>It's nothing, really. Just a tarball.</h2>
+          <p>Version tags publish a Linux x86_64 tarball and checksum. The bundled installer adds the desktop app, CLI, launcher, icon, metadata, and web bundle under your local prefix. You really shouldn't have.</p>
+          <div class="notes">
+            <div class="note">Supported today: Linux with GTK4, libadwaita, and VTE. macOS and Windows are not current release targets.</div>
+            <div class="note">HTTP access defaults to loopback-only and token-protected.</div>
+            <div class="note">Written in Rust, regrettably — working with agents does that to a person. It could have been PHP wrapped in Electron. You deserved better.</div>
+          </div>
+        </div>
+        <div class="code">
+          <div><span class="p">$</span> sha256sum -c taarof-linux-x86_64.tar.gz.sha256</div>
+          <div><span class="p">$</span> tar -xzf taarof-linux-x86_64.tar.gz</div>
+          <div><span class="p">$</span> ./taarof-linux-x86_64/install.sh</div>
+          <div><span class="p">$</span> ~/.local/bin/taarof-app</div>
+          <div style="min-height:14px;"></div>
+          <div style="color:var(--muted);"># drive it from any shell or agent</div>
+          <div><span class="p">$</span> taarof list-tabs --pretty</div>
+          <div><span class="p">$</span> taarof agent-status --tab current \</div>
+          <div style="padding-left:26px;">--state running --text "building release"</div>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <span>Taarof is dual-licensed under MIT or Apache-2.0 — please, take both. Inspired by the beauty, ease and airy smoothness of Ghostty, and then because CMUX looked cool with side tabs — but who only makes stuff for a Mac.</span>
+      <div class="links">
+        <a href="https://github.com/kombiz/taarof">Source</a>
+        <a href="https://github.com/kombiz/taarof/releases">Releases</a>
+      </div>
+    </footer>
+  </div>
+</body>
+</html>
