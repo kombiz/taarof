@@ -1,0 +1,272 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+# Fork pull requests only need to read this repository. Keep the default token
+# deliberately narrow for every CI job.
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check taarof-app formatting
+        run: cargo fmt --manifest-path taarof-app/Cargo.toml --all --check
+
+      - name: Check wasm-sidebar formatting
+        run: cargo fmt --manifest-path wasm-sidebar/Cargo.toml --all --check
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: taarof-app
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Check Rust dependency policy
+        run: cargo deny --manifest-path taarof-app/Cargo.toml check
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: taarof-web/package-lock.json
+
+      - name: Audit frontend dependencies
+        run: npm audit --package-lock-only
+        working-directory: taarof-web
+
+  taarof-web:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: taarof-web
+
+      - name: Build taarof-web
+        run: npm run build
+        working-directory: taarof-web
+
+      - name: Run taarof-web tests
+        run: npm test
+        working-directory: taarof-web
+
+  taarof-app:
+    runs-on: ubuntu-latest
+    # Debian trixie ships vte 0.80+, satisfying the vte4-sys >= 0.78 requirement
+    # that Ubuntu 24.04 runners (vte 0.76) cannot meet.
+    container:
+      image: debian:trixie-slim
+    env:
+      CARGO_HOME: /tmp/taarof-cargo
+      RUSTUP_HOME: /tmp/taarof-rustup
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            git \
+            libadwaita-1-dev \
+            libgtk-4-dev \
+            libgtksourceview-5-dev \
+            libsqlite3-dev \
+            libvte-2.91-gtk4-dev \
+            pkg-config \
+            tmux
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: taarof-web/package-lock.json
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Integration tests in tests/runtime_smoke.rs rely on taarof-web/dist
+      # existing (fallback for the web-asset resolver when TAAROF_WEB_DIST_DIR
+      # points at an invalid path). Build it before running cargo test.
+      - name: Build taarof-web
+        run: npm ci && npm run build
+        working-directory: taarof-web
+
+      - name: Lint taarof-app
+        run: cargo clippy --manifest-path taarof-app/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run taarof-app tests
+        run: cargo test --manifest-path taarof-app/Cargo.toml
+
+      - name: Build taarof-app release binary
+        run: cargo build --release --manifest-path taarof-app/Cargo.toml
+
+      - name: Restore host workspace ownership
+        if: always()
+        run: chown -R 1000:1000 "$GITHUB_WORKSPACE"
+
+  package-linux:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    env:
+      CARGO_HOME: /tmp/taarof-cargo
+      RUSTUP_HOME: /tmp/taarof-rustup
+    needs:
+      - taarof-web
+      - taarof-app
+    steps:
+      - name: Install packaging dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            appstream \
+            build-essential \
+            ca-certificates \
+            curl \
+            desktop-file-utils \
+            git \
+            libadwaita-1-dev \
+            libgtk-4-dev \
+            libgtksourceview-5-dev \
+            libsqlite3-dev \
+            libvte-2.91-gtk4-dev \
+            pkg-config
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # This container step runs as root over a workspace owned by the runner
+      # user, so Git rejects the checkout as dubiously owned. actions/checkout
+      # only marks it safe under a temporary HOME, so without this declaration
+      # build.rs records a stamp with no source revision and the packaging
+      # validation fails closed on unknown provenance.
+      - name: Trust the checkout for build provenance
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: taarof-web/package-lock.json
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate Linux packaging
+        run: bash packaging/linux/validate-local-install.sh
+
+      - name: Restore host workspace ownership
+        if: always()
+        run: chown -R 1000:1000 "$GITHUB_WORKSPACE"
+
+  # Offline repo-contract suites. These live in mise.toml's `test` task too,
+  # but no CI job runs `mise run test`, so they are invoked explicitly here or
+  # they would never run on a pull request.
+  contracts:
+    runs-on: ubuntu-latest
+    # Pinned to Debian on purpose: the AUR checks that need Arch tooling
+    # (makepkg, vercmp) must report as skipped rather than fail, and a fixed
+    # non-Arch image is what makes that skip behaviour honest and repeatable.
+    container:
+      image: debian:trixie-slim
+    env:
+      # Don't leave root-owned __pycache__ dirs in the ephemeral container workspace.
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Install contract-check dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            bash \
+            ca-certificates \
+            git \
+            python3
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Arch-only cases skip; the PKGBUILD syntax, repo-identity, dependency
+      # and pkgver contracts all run for real on Debian.
+      - name: Validate AUR PKGBUILD contracts
+        run: python3 testing/test_aur_pkgbuilds.py -v
+
+      - name: Validate GitHub workflow contracts
+        run: python3 testing/test_github_workflows.py -v
+
+      - name: Validate local HTTP route and control contracts
+        run: python3 testing/test_http_contract_docs.py -v
+
+      - name: Validate current architecture documentation contracts
+        run: python3 testing/test_architecture_docs.py -v
+
+      - name: Restore host workspace ownership
+        if: always()
+        run: chown -R 1000:1000 "$GITHUB_WORKSPACE"
+
+  wasm-sidebar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build sidebar WASM artifact
+        run: cargo build --manifest-path wasm-sidebar/Cargo.toml --target wasm32-wasip1

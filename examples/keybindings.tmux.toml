@@ -1,0 +1,13 @@
+# Partial tmux-flavored keybinding preset for taarof.
+# Copy into ~/.config/taarof/keybindings.toml if you want leader mode with Ctrl+B.
+
+[shortcuts]
+leader-mode = "<Control>b"
+
+[chords.leader]
+c = "new-tab"
+p = "previous-tab"
+w = "command-palette"
+z = "toggle-pane-zoom"
+"%" = "split-vertical"
+"\"" = "split-horizontal"

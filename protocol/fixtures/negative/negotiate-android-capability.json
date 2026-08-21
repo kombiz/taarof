@@ -1,0 +1,6 @@
+{
+  "protocol_version": { "major": 1, "minor": 0 },
+  "capabilities": ["raw_pty", "android_biometric_prompt"],
+  "nonce": "99999999-9999-4999-8999-999999999999",
+  "deadline_ms": 4102444800000
+}

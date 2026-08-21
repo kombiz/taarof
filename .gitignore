@@ -1,0 +1,97 @@
+# OS and editor artifacts
+.DS_Store
+*.swp
+*.swo
+*.tmp
+*.bak
+*.orig
+*.rej
+*~
+
+# Local environment and language caches
+.env
+.env.local
+.env.*.local
+.direnv/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+.cache/
+
+# Build and analysis output
+target/
+graphify-out/
+
+# Captured runtime/debug logs may contain bearer tokens or session URLs — never track.
+logs.txt
+*.log
+logs/
+wasm-sidebar/target/
+.worktrees/
+
+# Tool-generated artifacts
+graphify-out/
+.claude-dev-helper/
+.plugin-config/
+.project-structure.md
+.complexity-log.md
+.todos-report.md
+.*-project-structure.md
+.superpowers/
+taarof-app/.taarof-app-project-structure.md
+taarof-app/.plugin-config/
+taarof-app/.project-structure.md
+node_modules/
+dist/
+taarof-web/node_modules/
+taarof-web/dist/
+taarof-web/.tmp/
+
+# Legacy kmux rename leftovers / local generated artifacts
+kmux-app/target/
+kmux-app/.claude-dev-helper/
+kmux-app/.codex
+kmux-app/.complexity-log.md
+kmux-app/.*-project-structure.md
+kmux-app/.pi/
+kmux-app/.plugin-config/
+kmux-app/.project-structure.md
+kmux-app/.todos-report.md
+kmux-app/.worktrees/
+kmux-web/node_modules/
+kmux-web/dist/
+
+# Local agent artifacts
+.codex
+.orchestrator/
+.pi/
+.sandcastle/
+.a5c/
+.beads/
+AGENT_PROMPT.md
+REPO_GUIDE.md
+
+# Local review artifacts
+reviews/
+release-docs/
+.playwright-cli/
+output/
+todos.db
+
+# Local Sandcastle tooling
+/package.json
+/package-lock.json
+
+# Added for taarof public release
+logs.txt
+todos.db
+output/
+**/node_modules/
+*.log

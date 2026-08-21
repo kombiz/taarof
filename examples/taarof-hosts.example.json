@@ -1,0 +1,32 @@
+{
+  "defaults": {
+    "user": "developer"
+  },
+  "hosts": {
+    "build": {
+      "host": "build.example.invalid",
+      "label": "build",
+      "remote_cwd": "/srv/example/project"
+    },
+    "test": {
+      "host": "test.example.invalid",
+      "label": "test",
+      "remote_cwd": "/srv/example/project"
+    },
+    "docs": {
+      "host": "docs.example.invalid",
+      "label": "docs",
+      "remote_cwd": "/srv/example/project"
+    },
+    "build-admin": {
+      "host": "build.example.invalid",
+      "user": "root",
+      "label": "build-root",
+      "remote_cwd": "/srv/example/project"
+    }
+  },
+  "presets": {
+    "project": ["build", "test", "docs"],
+    "project-admin": ["build-admin", "test", "docs"]
+  }
+}

@@ -1,0 +1,1672 @@
+{
+  "version": 1,
+  "fixtures": [
+    {
+      "name": "basic_shell",
+      "file": "terminal/basic-shell.bin",
+      "cols": 40,
+      "rows": 8,
+      "fixture_sha256": "sha256:b8daa361b8f73e8e9592797885ad89b6142484d3d1f2d8c6fd7c7eff591e8496",
+      "expected": {
+        "cols": 40,
+        "rows": 8,
+        "active_screen": "primary",
+        "cursor": {
+          "row": 2,
+          "col": 12,
+          "visible": true
+        },
+        "modes": {
+          "application_cursor": false,
+          "bracketed_paste": false,
+          "cursor_visible": true,
+          "mouse_reporting": false
+        },
+        "visible_text": [
+          "taarof$ echo ok",
+          "ok",
+          "taarof$ done",
+          "",
+          "",
+          "",
+          "",
+          ""
+        ],
+        "visible_cells": [
+          {
+            "row": 0,
+            "col": 0,
+            "text": "t"
+          },
+          {
+            "row": 0,
+            "col": 1,
+            "text": "a"
+          },
+          {
+            "row": 0,
+            "col": 2,
+            "text": "a"
+          },
+          {
+            "row": 0,
+            "col": 3,
+            "text": "r"
+          },
+          {
+            "row": 0,
+            "col": 4,
+            "text": "o"
+          },
+          {
+            "row": 0,
+            "col": 5,
+            "text": "f"
+          },
+          {
+            "row": 0,
+            "col": 6,
+            "text": "$"
+          },
+          {
+            "row": 0,
+            "col": 8,
+            "text": "e"
+          },
+          {
+            "row": 0,
+            "col": 9,
+            "text": "c"
+          },
+          {
+            "row": 0,
+            "col": 10,
+            "text": "h"
+          },
+          {
+            "row": 0,
+            "col": 11,
+            "text": "o"
+          },
+          {
+            "row": 0,
+            "col": 13,
+            "text": "o"
+          },
+          {
+            "row": 0,
+            "col": 14,
+            "text": "k"
+          },
+          {
+            "row": 1,
+            "col": 0,
+            "text": "o"
+          },
+          {
+            "row": 1,
+            "col": 1,
+            "text": "k"
+          },
+          {
+            "row": 2,
+            "col": 0,
+            "text": "t"
+          },
+          {
+            "row": 2,
+            "col": 1,
+            "text": "a"
+          },
+          {
+            "row": 2,
+            "col": 2,
+            "text": "a"
+          },
+          {
+            "row": 2,
+            "col": 3,
+            "text": "r"
+          },
+          {
+            "row": 2,
+            "col": 4,
+            "text": "o"
+          },
+          {
+            "row": 2,
+            "col": 5,
+            "text": "f"
+          },
+          {
+            "row": 2,
+            "col": 6,
+            "text": "$"
+          },
+          {
+            "row": 2,
+            "col": 8,
+            "text": "d"
+          },
+          {
+            "row": 2,
+            "col": 9,
+            "text": "o"
+          },
+          {
+            "row": 2,
+            "col": 10,
+            "text": "n"
+          },
+          {
+            "row": 2,
+            "col": 11,
+            "text": "e"
+          }
+        ],
+        "attributed_cells": [
+          {
+            "row": 2,
+            "col": 8,
+            "text": "d",
+            "attrs": {
+              "bold": false,
+              "reverse": false,
+              "fg": "green",
+              "bg": null
+            }
+          },
+          {
+            "row": 2,
+            "col": 9,
+            "text": "o",
+            "attrs": {
+              "bold": false,
+              "reverse": false,
+              "fg": "green",
+              "bg": null
+            }
+          },
+          {
+            "row": 2,
+            "col": 10,
+            "text": "n",
+            "attrs": {
+              "bold": false,
+              "reverse": false,
+              "fg": "green",
+              "bg": null
+            }
+          },
+          {
+            "row": 2,
+            "col": 11,
+            "text": "e",
+            "attrs": {
+              "bold": false,
+              "reverse": false,
+              "fg": "green",
+              "bg": null
+            }
+          }
+        ],
+        "state_hash": "sha256:ea3d6fca4b167996815bd8eabc0d14527834e05c481efb3fae17e6304ccd4a4c"
+      },
+      "checkpoint": {
+        "ansi_base64": "G2MbWzE7MUh0G1sxOzJIYRtbMTszSGEbWzE7NEhyG1sxOzVIbxtbMTs2SGYbWzE7N0gkG1sxOzlIZRtbMTsxMEhjG1sxOzExSGgbWzE7MTJIbxtbMTsxNEhvG1sxOzE1SGsbWzI7MUhvG1syOzJIaxtbMzsxSHQbWzM7MkhhG1szOzNIYRtbMzs0SHIbWzM7NUhvG1szOzZIZhtbMzs3SCQbWzM7OUgbWzBtG1szMm1kG1szOzEwSG8bWzM7MTFIbhtbMzsxMkhlG1swbRtbMzsxM0g=",
+        "byte_count": 212,
+        "sha256": "sha256:990463add6aa4ae849a82024985db74c62f12ea7da22a514e0ee0e7a7c43d639",
+        "state_hash": "sha256:ea3d6fca4b167996815bd8eabc0d14527834e05c481efb3fae17e6304ccd4a4c"
+      },
+      "replay": {
+        "chunk_byte_lengths": [
+          8,
+          7,
+          4,
+          9,
+          6,
+          8
+        ],
+        "success": {
+          "ack_output_seq": "2"
+        },
+        "gap": {
+          "retained_from_output_seq": "2",
+          "ack_output_seq": "0",
+          "expected_error": "replay_gap"
+        }
+      },
+      "resize": {
+        "cols": 34,
+        "rows": 7,
+        "expected": {
+          "cols": 34,
+          "rows": 7,
+          "active_screen": "primary",
+          "cursor": {
+            "row": 2,
+            "col": 12,
+            "visible": true
+          },
+          "modes": {
+            "application_cursor": false,
+            "bracketed_paste": false,
+            "cursor_visible": true,
+            "mouse_reporting": false
+          },
+          "visible_text": [
+            "taarof$ echo ok",
+            "ok",
+            "taarof$ done",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "visible_cells": [
+            {
+              "row": 0,
+              "col": 0,
+              "text": "t"
+            },
+            {
+              "row": 0,
+              "col": 1,
+              "text": "a"
+            },
+            {
+              "row": 0,
+              "col": 2,
+              "text": "a"
+            },
+            {
+              "row": 0,
+              "col": 3,
+              "text": "r"
+            },
+            {
+              "row": 0,
+              "col": 4,
+              "text": "o"
+            },
+            {
+              "row": 0,
+              "col": 5,
+              "text": "f"
+            },
+            {
+              "row": 0,
+              "col": 6,
+              "text": "$"
+            },
+            {
+              "row": 0,
+              "col": 8,
+              "text": "e"
+            },
+            {
+              "row": 0,
+              "col": 9,
+              "text": "c"
+            },
+            {
+              "row": 0,
+              "col": 10,
+              "text": "h"
+            },
+            {
+              "row": 0,
+              "col": 11,
+              "text": "o"
+            },
+            {
+              "row": 0,
+              "col": 13,
+              "text": "o"
+            },
+            {
+              "row": 0,
+              "col": 14,
+              "text": "k"
+            },
+            {
+              "row": 1,
+              "col": 0,
+              "text": "o"
+            },
+            {
+              "row": 1,
+              "col": 1,
+              "text": "k"
+            },
+            {
+              "row": 2,
+              "col": 0,
+              "text": "t"
+            },
+            {
+              "row": 2,
+              "col": 1,
+              "text": "a"
+            },
+            {
+              "row": 2,
+              "col": 2,
+              "text": "a"
+            },
+            {
+              "row": 2,
+              "col": 3,
+              "text": "r"
+            },
+            {
+              "row": 2,
+              "col": 4,
+              "text": "o"
+            },
+            {
+              "row": 2,
+              "col": 5,
+              "text": "f"
+            },
+            {
+              "row": 2,
+              "col": 6,
+              "text": "$"
+            },
+            {
+              "row": 2,
+              "col": 8,
+              "text": "d"
+            },
+            {
+              "row": 2,
+              "col": 9,
+              "text": "o"
+            },
+            {
+              "row": 2,
+              "col": 10,
+              "text": "n"
+            },
+            {
+              "row": 2,
+              "col": 11,
+              "text": "e"
+            }
+          ],
+          "attributed_cells": [
+            {
+              "row": 2,
+              "col": 8,
+              "text": "d",
+              "attrs": {
+                "bold": false,
+                "reverse": false,
+                "fg": "green",
+                "bg": null
+              }
+            },
+            {
+              "row": 2,
+              "col": 9,
+              "text": "o",
+              "attrs": {
+                "bold": false,
+                "reverse": false,
+                "fg": "green",
+                "bg": null
+              }
+            },
+            {
+              "row": 2,
+              "col": 10,
+              "text": "n",
+              "attrs": {
+                "bold": false,
+                "reverse": false,
+                "fg": "green",
+                "bg": null
+              }
+            },
+            {
+              "row": 2,
+              "col": 11,
+              "text": "e",
+              "attrs": {
+                "bold": false,
+                "reverse": false,
+                "fg": "green",
+                "bg": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "alternate_screen",
+      "file": "terminal/alternate-screen.bin",
+      "cols": 32,
+      "rows": 6,
+      "fixture_sha256": "sha256:8956dfa8e76087fbec45228f5d1ff9d2793fab39914d283386737fd1d5b6258e",
+      "expected": {
+        "cols": 32,
+        "rows": 6,
+        "active_screen": "primary",
+        "cursor": {
+          "row": 2,
+          "col": 9,
+          "visible": true
+        },
+        "modes": {
+          "application_cursor": false,
+          "bracketed_paste": false,
+          "cursor_visible": true,
+          "mouse_reporting": false
+        },
+        "visible_text": [
+          "main shell",
+          "before alt",
+          "after alt",
+          "",
+          "",
+          ""
+        ],
+        "visible_cells": [
+          {
+            "row": 0,
+            "col": 0,
+            "text": "m"
+          },
+          {
+            "row": 0,
+            "col": 1,
+            "text": "a"
+          },
+          {
+            "row": 0,
+            "col": 2,
+            "text": "i"
+          },
+          {
+            "row": 0,
+            "col": 3,
+            "text": "n"
+          },
+          {
+            "row": 0,
+            "col": 5,
+            "text": "s"
+          },
+          {
+            "row": 0,
+            "col": 6,
+            "text": "h"
+          },
+          {
+            "row": 0,
+            "col": 7,
+            "text": "e"
+          },
+          {
+            "row": 0,
+            "col": 8,
+            "text": "l"
+          },
+          {
+            "row": 0,
+            "col": 9,
+            "text": "l"
+          },
+          {
+            "row": 1,
+            "col": 0,
+            "text": "b"
+          },
+          {
+            "row": 1,
+            "col": 1,
+            "text": "e"
+          },
+          {
+            "row": 1,
+            "col": 2,
+            "text": "f"
+          },
+          {
+            "row": 1,
+            "col": 3,
+            "text": "o"
+          },
+          {
+            "row": 1,
+            "col": 4,
+            "text": "r"
+          },
+          {
+            "row": 1,
+            "col": 5,
+            "text": "e"
+          },
+          {
+            "row": 1,
+            "col": 7,
+            "text": "a"
+          },
+          {
+            "row": 1,
+            "col": 8,
+            "text": "l"
+          },
+          {
+            "row": 1,
+            "col": 9,
+            "text": "t"
+          },
+          {
+            "row": 2,
+            "col": 0,
+            "text": "a"
+          },
+          {
+            "row": 2,
+            "col": 1,
+            "text": "f"
+          },
+          {
+            "row": 2,
+            "col": 2,
+            "text": "t"
+          },
+          {
+            "row": 2,
+            "col": 3,
+            "text": "e"
+          },
+          {
+            "row": 2,
+            "col": 4,
+            "text": "r"
+          },
+          {
+            "row": 2,
+            "col": 6,
+            "text": "a"
+          },
+          {
+            "row": 2,
+            "col": 7,
+            "text": "l"
+          },
+          {
+            "row": 2,
+            "col": 8,
+            "text": "t"
+          }
+        ],
+        "attributed_cells": [],
+        "state_hash": "sha256:612e262f4edbae5011d66101f1220dffe45fe0d0ee1db203a35d600cf1fbff2f"
+      },
+      "checkpoint": {
+        "ansi_base64": "G2MbWzE7MUhtG1sxOzJIYRtbMTszSGkbWzE7NEhuG1sxOzZIcxtbMTs3SGgbWzE7OEhlG1sxOzlIbBtbMTsxMEhsG1syOzFIYhtbMjsySGUbWzI7M0hmG1syOzRIbxtbMjs1SHIbWzI7NkhlG1syOzhIYRtbMjs5SGwbWzI7MTBIdBtbMzsxSGEbWzM7MkhmG1szOzNIdBtbMzs0SGUbWzM7NUhyG1szOzdIYRtbMzs4SGwbWzM7OUh0G1swbRtbMzsxMEg=",
+        "byte_count": 197,
+        "sha256": "sha256:61d157b0766cd2067053728a7f21bf63d00942a6f31f10fe87ceac5f53b8f0cb",
+        "state_hash": "sha256:612e262f4edbae5011d66101f1220dffe45fe0d0ee1db203a35d600cf1fbff2f"
+      },
+      "replay": {
+        "chunk_byte_lengths": [
+          12,
+          12,
+          8,
+          12,
+          18,
+          15,
+          8,
+          9,
+          10
+        ],
+        "success": {
+          "ack_output_seq": "3"
+        },
+        "gap": {
+          "retained_from_output_seq": "3",
+          "ack_output_seq": "1",
+          "expected_error": "replay_gap"
+        }
+      },
+      "resize": {
+        "cols": 26,
+        "rows": 5,
+        "expected": {
+          "cols": 26,
+          "rows": 5,
+          "active_screen": "primary",
+          "cursor": {
+            "row": 2,
+            "col": 9,
+            "visible": true
+          },
+          "modes": {
+            "application_cursor": false,
+            "bracketed_paste": false,
+            "cursor_visible": true,
+            "mouse_reporting": false
+          },
+          "visible_text": [
+            "main shell",
+            "before alt",
+            "after alt",
+            "",
+            ""
+          ],
+          "visible_cells": [
+            {
+              "row": 0,
+              "col": 0,
+              "text": "m"
+            },
+            {
+              "row": 0,
+              "col": 1,
+              "text": "a"
+            },
+            {
+              "row": 0,
+              "col": 2,
+              "text": "i"
+            },
+            {
+              "row": 0,
+              "col": 3,
+              "text": "n"
+            },
+            {
+              "row": 0,
+              "col": 5,
+              "text": "s"
+            },
+            {
+              "row": 0,
+              "col": 6,
+              "text": "h"
+            },
+            {
+              "row": 0,
+              "col": 7,
+              "text": "e"
+            },
+            {
+              "row": 0,
+              "col": 8,
+              "text": "l"
+            },
+            {
+              "row": 0,
+              "col": 9,
+              "text": "l"
+            },
+            {
+              "row": 1,
+              "col": 0,
+              "text": "b"
+            },
+            {
+              "row": 1,
+              "col": 1,
+              "text": "e"
+            },
+            {
+              "row": 1,
+              "col": 2,
+              "text": "f"
+            },
+            {
+              "row": 1,
+              "col": 3,
+              "text": "o"
+            },
+            {
+              "row": 1,
+              "col": 4,
+              "text": "r"
+            },
+            {
+              "row": 1,
+              "col": 5,
+              "text": "e"
+            },
+            {
+              "row": 1,
+              "col": 7,
+              "text": "a"
+            },
+            {
+              "row": 1,
+              "col": 8,
+              "text": "l"
+            },
+            {
+              "row": 1,
+              "col": 9,
+              "text": "t"
+            },
+            {
+              "row": 2,
+              "col": 0,
+              "text": "a"
+            },
+            {
+              "row": 2,
+              "col": 1,
+              "text": "f"
+            },
+            {
+              "row": 2,
+              "col": 2,
+              "text": "t"
+            },
+            {
+              "row": 2,
+              "col": 3,
+              "text": "e"
+            },
+            {
+              "row": 2,
+              "col": 4,
+              "text": "r"
+            },
+            {
+              "row": 2,
+              "col": 6,
+              "text": "a"
+            },
+            {
+              "row": 2,
+              "col": 7,
+              "text": "l"
+            },
+            {
+              "row": 2,
+              "col": 8,
+              "text": "t"
+            }
+          ],
+          "attributed_cells": []
+        }
+      }
+    },
+    {
+      "name": "cursor_modes",
+      "file": "terminal/cursor-modes.bin",
+      "cols": 30,
+      "rows": 7,
+      "fixture_sha256": "sha256:a14dafd4a195bba01af1d7ef5ca11a95ddf1ece3f7330aa96b0530814f562aef",
+      "expected": {
+        "cols": 30,
+        "rows": 7,
+        "active_screen": "primary",
+        "cursor": {
+          "row": 5,
+          "col": 15,
+          "visible": false
+        },
+        "modes": {
+          "application_cursor": true,
+          "bracketed_paste": true,
+          "cursor_visible": false,
+          "mouse_reporting": true
+        },
+        "visible_text": [
+          "mode check",
+          "",
+          "    BOLD",
+          "    REV",
+          "",
+          "         cursor",
+          ""
+        ],
+        "visible_cells": [
+          {
+            "row": 0,
+            "col": 0,
+            "text": "m"
+          },
+          {
+            "row": 0,
+            "col": 1,
+            "text": "o"
+          },
+          {
+            "row": 0,
+            "col": 2,
+            "text": "d"
+          },
+          {
+            "row": 0,
+            "col": 3,
+            "text": "e"
+          },
+          {
+            "row": 0,
+            "col": 5,
+            "text": "c"
+          },
+          {
+            "row": 0,
+            "col": 6,
+            "text": "h"
+          },
+          {
+            "row": 0,
+            "col": 7,
+            "text": "e"
+          },
+          {
+            "row": 0,
+            "col": 8,
+            "text": "c"
+          },
+          {
+            "row": 0,
+            "col": 9,
+            "text": "k"
+          },
+          {
+            "row": 2,
+            "col": 4,
+            "text": "B"
+          },
+          {
+            "row": 2,
+            "col": 5,
+            "text": "O"
+          },
+          {
+            "row": 2,
+            "col": 6,
+            "text": "L"
+          },
+          {
+            "row": 2,
+            "col": 7,
+            "text": "D"
+          },
+          {
+            "row": 3,
+            "col": 4,
+            "text": "R"
+          },
+          {
+            "row": 3,
+            "col": 5,
+            "text": "E"
+          },
+          {
+            "row": 3,
+            "col": 6,
+            "text": "V"
+          },
+          {
+            "row": 5,
+            "col": 9,
+            "text": "c"
+          },
+          {
+            "row": 5,
+            "col": 10,
+            "text": "u"
+          },
+          {
+            "row": 5,
+            "col": 11,
+            "text": "r"
+          },
+          {
+            "row": 5,
+            "col": 12,
+            "text": "s"
+          },
+          {
+            "row": 5,
+            "col": 13,
+            "text": "o"
+          },
+          {
+            "row": 5,
+            "col": 14,
+            "text": "r"
+          }
+        ],
+        "attributed_cells": [
+          {
+            "row": 2,
+            "col": 4,
+            "text": "B",
+            "attrs": {
+              "bold": true,
+              "reverse": false,
+              "fg": "blue",
+              "bg": null
+            }
+          },
+          {
+            "row": 2,
+            "col": 5,
+            "text": "O",
+            "attrs": {
+              "bold": true,
+              "reverse": false,
+              "fg": "blue",
+              "bg": null
+            }
+          },
+          {
+            "row": 2,
+            "col": 6,
+            "text": "L",
+            "attrs": {
+              "bold": true,
+              "reverse": false,
+              "fg": "blue",
+              "bg": null
+            }
+          },
+          {
+            "row": 2,
+            "col": 7,
+            "text": "D",
+            "attrs": {
+              "bold": true,
+              "reverse": false,
+              "fg": "blue",
+              "bg": null
+            }
+          },
+          {
+            "row": 3,
+            "col": 4,
+            "text": "R",
+            "attrs": {
+              "bold": false,
+              "reverse": true,
+              "fg": null,
+              "bg": null
+            }
+          },
+          {
+            "row": 3,
+            "col": 5,
+            "text": "E",
+            "attrs": {
+              "bold": false,
+              "reverse": true,
+              "fg": null,
+              "bg": null
+            }
+          },
+          {
+            "row": 3,
+            "col": 6,
+            "text": "V",
+            "attrs": {
+              "bold": false,
+              "reverse": true,
+              "fg": null,
+              "bg": null
+            }
+          }
+        ],
+        "state_hash": "sha256:a94666c1a219444ce5d62f88d82be2d2f01b6492a517b6899eba6bedb279029f"
+      },
+      "checkpoint": {
+        "ansi_base64": "G2MbWzE7MUhtG1sxOzJIbxtbMTszSGQbWzE7NEhlG1sxOzZIYxtbMTs3SGgbWzE7OEhlG1sxOzlIYxtbMTsxMEhrG1szOzVIG1swbRtbMTszNG1CG1szOzZITxtbMzs3SEwbWzM7OEhEG1s0OzVIG1swbRtbN21SG1s0OzZIRRtbNDs3SFYbWzY7MTBIG1swbWMbWzY7MTFIdRtbNjsxMkhyG1s2OzEzSHMbWzY7MTRIbxtbNjsxNUhyG1swbRtbPzFoG1s/MTAwMGgbWz8yMDA0aBtbPzI1bBtbNjsxNkg=",
+        "byte_count": 224,
+        "sha256": "sha256:ced89fa137557719935adc7ec0a6f97591365047f56be65d3ce0bf0cd52cfb79",
+        "state_hash": "sha256:a94666c1a219444ce5d62f88d82be2d2f01b6492a517b6899eba6bedb279029f"
+      },
+      "replay": {
+        "chunk_byte_lengths": [
+          10,
+          10,
+          10,
+          9,
+          12,
+          10,
+          12,
+          15
+        ],
+        "success": {
+          "ack_output_seq": "3"
+        },
+        "gap": {
+          "retained_from_output_seq": "4",
+          "ack_output_seq": "2",
+          "expected_error": "replay_gap"
+        }
+      },
+      "resize": {
+        "cols": 24,
+        "rows": 6,
+        "expected": {
+          "cols": 24,
+          "rows": 6,
+          "active_screen": "primary",
+          "cursor": {
+            "row": 5,
+            "col": 15,
+            "visible": false
+          },
+          "modes": {
+            "application_cursor": true,
+            "bracketed_paste": true,
+            "cursor_visible": false,
+            "mouse_reporting": true
+          },
+          "visible_text": [
+            "mode check",
+            "",
+            "    BOLD",
+            "    REV",
+            "",
+            "         cursor"
+          ],
+          "visible_cells": [
+            {
+              "row": 0,
+              "col": 0,
+              "text": "m"
+            },
+            {
+              "row": 0,
+              "col": 1,
+              "text": "o"
+            },
+            {
+              "row": 0,
+              "col": 2,
+              "text": "d"
+            },
+            {
+              "row": 0,
+              "col": 3,
+              "text": "e"
+            },
+            {
+              "row": 0,
+              "col": 5,
+              "text": "c"
+            },
+            {
+              "row": 0,
+              "col": 6,
+              "text": "h"
+            },
+            {
+              "row": 0,
+              "col": 7,
+              "text": "e"
+            },
+            {
+              "row": 0,
+              "col": 8,
+              "text": "c"
+            },
+            {
+              "row": 0,
+              "col": 9,
+              "text": "k"
+            },
+            {
+              "row": 2,
+              "col": 4,
+              "text": "B"
+            },
+            {
+              "row": 2,
+              "col": 5,
+              "text": "O"
+            },
+            {
+              "row": 2,
+              "col": 6,
+              "text": "L"
+            },
+            {
+              "row": 2,
+              "col": 7,
+              "text": "D"
+            },
+            {
+              "row": 3,
+              "col": 4,
+              "text": "R"
+            },
+            {
+              "row": 3,
+              "col": 5,
+              "text": "E"
+            },
+            {
+              "row": 3,
+              "col": 6,
+              "text": "V"
+            },
+            {
+              "row": 5,
+              "col": 9,
+              "text": "c"
+            },
+            {
+              "row": 5,
+              "col": 10,
+              "text": "u"
+            },
+            {
+              "row": 5,
+              "col": 11,
+              "text": "r"
+            },
+            {
+              "row": 5,
+              "col": 12,
+              "text": "s"
+            },
+            {
+              "row": 5,
+              "col": 13,
+              "text": "o"
+            },
+            {
+              "row": 5,
+              "col": 14,
+              "text": "r"
+            }
+          ],
+          "attributed_cells": [
+            {
+              "row": 2,
+              "col": 4,
+              "text": "B",
+              "attrs": {
+                "bold": true,
+                "reverse": false,
+                "fg": "blue",
+                "bg": null
+              }
+            },
+            {
+              "row": 2,
+              "col": 5,
+              "text": "O",
+              "attrs": {
+                "bold": true,
+                "reverse": false,
+                "fg": "blue",
+                "bg": null
+              }
+            },
+            {
+              "row": 2,
+              "col": 6,
+              "text": "L",
+              "attrs": {
+                "bold": true,
+                "reverse": false,
+                "fg": "blue",
+                "bg": null
+              }
+            },
+            {
+              "row": 2,
+              "col": 7,
+              "text": "D",
+              "attrs": {
+                "bold": true,
+                "reverse": false,
+                "fg": "blue",
+                "bg": null
+              }
+            },
+            {
+              "row": 3,
+              "col": 4,
+              "text": "R",
+              "attrs": {
+                "bold": false,
+                "reverse": true,
+                "fg": null,
+                "bg": null
+              }
+            },
+            {
+              "row": 3,
+              "col": 5,
+              "text": "E",
+              "attrs": {
+                "bold": false,
+                "reverse": true,
+                "fg": null,
+                "bg": null
+              }
+            },
+            {
+              "row": 3,
+              "col": 6,
+              "text": "V",
+              "attrs": {
+                "bold": false,
+                "reverse": true,
+                "fg": null,
+                "bg": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "utf8_boundaries",
+      "file": "terminal/utf8-boundaries.bin",
+      "cols": 36,
+      "rows": 5,
+      "fixture_sha256": "sha256:6f5a8561b33bd805cb54e33e66ae63a0f8c77a3c2d8460cf9269e00514bea038",
+      "expected": {
+        "cols": 36,
+        "rows": 5,
+        "active_screen": "primary",
+        "cursor": {
+          "row": 2,
+          "col": 11,
+          "visible": true
+        },
+        "modes": {
+          "application_cursor": false,
+          "bracketed_paste": false,
+          "cursor_visible": true,
+          "mouse_reporting": false
+        },
+        "visible_text": [
+          "utf8: café",
+          "split: αβγ",
+          "currency: €",
+          "",
+          ""
+        ],
+        "visible_cells": [
+          {
+            "row": 0,
+            "col": 0,
+            "text": "u"
+          },
+          {
+            "row": 0,
+            "col": 1,
+            "text": "t"
+          },
+          {
+            "row": 0,
+            "col": 2,
+            "text": "f"
+          },
+          {
+            "row": 0,
+            "col": 3,
+            "text": "8"
+          },
+          {
+            "row": 0,
+            "col": 4,
+            "text": ":"
+          },
+          {
+            "row": 0,
+            "col": 6,
+            "text": "c"
+          },
+          {
+            "row": 0,
+            "col": 7,
+            "text": "a"
+          },
+          {
+            "row": 0,
+            "col": 8,
+            "text": "f"
+          },
+          {
+            "row": 0,
+            "col": 9,
+            "text": "é"
+          },
+          {
+            "row": 1,
+            "col": 0,
+            "text": "s"
+          },
+          {
+            "row": 1,
+            "col": 1,
+            "text": "p"
+          },
+          {
+            "row": 1,
+            "col": 2,
+            "text": "l"
+          },
+          {
+            "row": 1,
+            "col": 3,
+            "text": "i"
+          },
+          {
+            "row": 1,
+            "col": 4,
+            "text": "t"
+          },
+          {
+            "row": 1,
+            "col": 5,
+            "text": ":"
+          },
+          {
+            "row": 1,
+            "col": 7,
+            "text": "α"
+          },
+          {
+            "row": 1,
+            "col": 8,
+            "text": "β"
+          },
+          {
+            "row": 1,
+            "col": 9,
+            "text": "γ"
+          },
+          {
+            "row": 2,
+            "col": 0,
+            "text": "c"
+          },
+          {
+            "row": 2,
+            "col": 1,
+            "text": "u"
+          },
+          {
+            "row": 2,
+            "col": 2,
+            "text": "r"
+          },
+          {
+            "row": 2,
+            "col": 3,
+            "text": "r"
+          },
+          {
+            "row": 2,
+            "col": 4,
+            "text": "e"
+          },
+          {
+            "row": 2,
+            "col": 5,
+            "text": "n"
+          },
+          {
+            "row": 2,
+            "col": 6,
+            "text": "c"
+          },
+          {
+            "row": 2,
+            "col": 7,
+            "text": "y"
+          },
+          {
+            "row": 2,
+            "col": 8,
+            "text": ":"
+          },
+          {
+            "row": 2,
+            "col": 10,
+            "text": "€"
+          }
+        ],
+        "attributed_cells": [],
+        "state_hash": "sha256:8110ebd2b94a22f35deff69f9464fa61c109342ae387e3b582125ac55a7a47a4"
+      },
+      "checkpoint": {
+        "ansi_base64": "G2MbWzE7MUh1G1sxOzJIdBtbMTszSGYbWzE7NEg4G1sxOzVIOhtbMTs3SGMbWzE7OEhhG1sxOzlIZhtbMTsxMEhlzIEbWzI7MUhzG1syOzJIcBtbMjszSGwbWzI7NEhpG1syOzVIdBtbMjs2SDobWzI7OEjOsRtbMjs5SM6yG1syOzEwSM6zG1szOzFIYxtbMzsySHUbWzM7M0hyG1szOzRIchtbMzs1SGUbWzM7NkhuG1szOzdIYxtbMzs4SHkbWzM7OUg6G1szOzExSOKCrBtbMG0bWzM7MTJI",
+        "byte_count": 219,
+        "sha256": "sha256:934f76a44c74fd99e6df71f008d484fd33617f064c3d7e3433bd6304744e9388",
+        "state_hash": "sha256:8110ebd2b94a22f35deff69f9464fa61c109342ae387e3b582125ac55a7a47a4"
+      },
+      "replay": {
+        "chunk_byte_lengths": [
+          11,
+          1,
+          1,
+          8,
+          1,
+          2,
+          1,
+          12,
+          5
+        ],
+        "success": {
+          "ack_output_seq": "4"
+        },
+        "gap": {
+          "retained_from_output_seq": "3",
+          "ack_output_seq": "1",
+          "expected_error": "replay_gap"
+        }
+      },
+      "resize": {
+        "cols": 30,
+        "rows": 4,
+        "expected": {
+          "cols": 30,
+          "rows": 4,
+          "active_screen": "primary",
+          "cursor": {
+            "row": 2,
+            "col": 11,
+            "visible": true
+          },
+          "modes": {
+            "application_cursor": false,
+            "bracketed_paste": false,
+            "cursor_visible": true,
+            "mouse_reporting": false
+          },
+          "visible_text": [
+            "utf8: café",
+            "split: αβγ",
+            "currency: €",
+            ""
+          ],
+          "visible_cells": [
+            {
+              "row": 0,
+              "col": 0,
+              "text": "u"
+            },
+            {
+              "row": 0,
+              "col": 1,
+              "text": "t"
+            },
+            {
+              "row": 0,
+              "col": 2,
+              "text": "f"
+            },
+            {
+              "row": 0,
+              "col": 3,
+              "text": "8"
+            },
+            {
+              "row": 0,
+              "col": 4,
+              "text": ":"
+            },
+            {
+              "row": 0,
+              "col": 6,
+              "text": "c"
+            },
+            {
+              "row": 0,
+              "col": 7,
+              "text": "a"
+            },
+            {
+              "row": 0,
+              "col": 8,
+              "text": "f"
+            },
+            {
+              "row": 0,
+              "col": 9,
+              "text": "é"
+            },
+            {
+              "row": 1,
+              "col": 0,
+              "text": "s"
+            },
+            {
+              "row": 1,
+              "col": 1,
+              "text": "p"
+            },
+            {
+              "row": 1,
+              "col": 2,
+              "text": "l"
+            },
+            {
+              "row": 1,
+              "col": 3,
+              "text": "i"
+            },
+            {
+              "row": 1,
+              "col": 4,
+              "text": "t"
+            },
+            {
+              "row": 1,
+              "col": 5,
+              "text": ":"
+            },
+            {
+              "row": 1,
+              "col": 7,
+              "text": "α"
+            },
+            {
+              "row": 1,
+              "col": 8,
+              "text": "β"
+            },
+            {
+              "row": 1,
+              "col": 9,
+              "text": "γ"
+            },
+            {
+              "row": 2,
+              "col": 0,
+              "text": "c"
+            },
+            {
+              "row": 2,
+              "col": 1,
+              "text": "u"
+            },
+            {
+              "row": 2,
+              "col": 2,
+              "text": "r"
+            },
+            {
+              "row": 2,
+              "col": 3,
+              "text": "r"
+            },
+            {
+              "row": 2,
+              "col": 4,
+              "text": "e"
+            },
+            {
+              "row": 2,
+              "col": 5,
+              "text": "n"
+            },
+            {
+              "row": 2,
+              "col": 6,
+              "text": "c"
+            },
+            {
+              "row": 2,
+              "col": 7,
+              "text": "y"
+            },
+            {
+              "row": 2,
+              "col": 8,
+              "text": ":"
+            },
+            {
+              "row": 2,
+              "col": 10,
+              "text": "€"
+            }
+          ],
+          "attributed_cells": []
+        }
+      },
+      "split_utf8": {
+        "chunk_byte_lengths": [
+          11,
+          1,
+          1,
+          8,
+          1,
+          2,
+          1,
+          12,
+          5
+        ]
+      },
+      "assertions": {
+        "cells": [
+          {
+            "row": 0,
+            "col": 9,
+            "text": "é"
+          }
+        ],
+        "absent_cells": [
+          {
+            "row": 0,
+            "col": 10
+          }
+        ],
+        "cursor": {
+          "row": 2,
+          "col": 11,
+          "visible": true
+        }
+      }
+    }
+  ]
+}

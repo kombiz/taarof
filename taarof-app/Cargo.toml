@@ -1,0 +1,57 @@
+[package]
+name = "taarof-app"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# System deps (Arch): pacman -S gtk4 libadwaita vte4
+
+[features]
+default = ["history", "opencode-history"]
+# Expose the broadcast-commit re-entrancy test harness symbols on the public API.
+# Enabled automatically in debug/test builds via cfg(debug_assertions); this flag
+# allows opt-in in CI release-mode builds that need the integration tests.
+harness = []
+# OpenCode session-history adapter; links the system libsqlite3 by default.
+opencode-history = ["dep:rusqlite"]
+history = ["dep:rusqlite"]
+# Packaging/portability: vendor SQLite into the binary for self-contained bundles.
+bundled-sqlite = ["history", "opencode-history", "rusqlite/bundled"]
+
+[dependencies]
+gtk = { version = "0.11", package = "gtk4", features = ["v4_6"] }
+gdk = { version = "0.11", package = "gdk4", features = ["v4_6"] }
+glib = "0.22"
+gio = "0.22"
+adw = { version = "0.9", package = "libadwaita", features = ["v1_4"] }
+vte = { version = "0.10", package = "vte4", features = ["v0_78"] }
+sourceview5 = "0.11"
+dirs = "6"
+urlencoding = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+libc = "0.2"
+getrandom = "0.2"
+base64 = "0.22"
+mime_guess = "2"
+notify-rust = "4"
+rusqlite = { version = "0.31", optional = true }
+signal-hook = "0.3"
+subtle = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
+axum = { version = "0.8", features = ["ws"] }
+fs2 = "0.4.3"
+
+[dev-dependencies]
+futures-util = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+tokio-tungstenite = "0.28"
+tower = { version = "0.5", features = ["util"] }
+
+[[example]]
+name = "performance_harness"
+required-features = ["harness"]

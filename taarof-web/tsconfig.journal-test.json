@@ -1,0 +1,30 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": ".tmp/journal-tests",
+    "rootDir": "src",
+    "noEmit": false,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": []
+  },
+  "include": [
+    "src/monitorBoard.test.ts",
+    "src/monitorPaneJournal.ts",
+    "src/monitorPaneJournal.test.ts",
+    "src/usePaneJournal.ts",
+    "src/usePaneJournal.test.ts",
+    "src/agentSessionPanes.test.ts",
+    "src/paneAttachFrames.test.ts",
+    "src/panePtyFrames.ts",
+    "src/panePtyFrames.test.ts",
+    "src/terminalLinks.test.ts",
+    "src/terminalOsc8Activation.test.ts",
+    "src/terminalLinkDisambiguation.test.ts",
+    "src/api.test.ts",
+    "src/runtimeProbe.test.ts",
+    "src/components/MonitorView.helpers.test.ts",
+    "src/components/AgentsView.helpers.test.ts"
+    ,"src/components/HistoryView.helpers.test.ts"
+  ]
+}

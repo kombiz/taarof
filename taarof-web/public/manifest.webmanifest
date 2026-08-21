@@ -1,0 +1,19 @@
+{
+  "name": "taarof mobile",
+  "short_name": "taarof",
+  "description": "Mobile-friendly read-only view for taarof workspaces, tabs, and tmux-backed panes.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#efe6d6",
+  "theme_color": "#10251b",
+  "icons": [
+    {
+      "src": "/icons/taarof-mobile.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

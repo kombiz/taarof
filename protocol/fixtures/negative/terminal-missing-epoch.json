@@ -1,0 +1,11 @@
+{
+  "kind": "output",
+  "protocol_version": { "major": 1, "minor": 0 },
+  "runtime_id": "018f0f1e-a2d3-4c55-8f7b-9023456789ab",
+  "session_name": "default",
+  "tab_id": "tab-1",
+  "pane_id": "pane-1",
+  "output_seq": "1",
+  "payload_base64": "b2sK",
+  "byte_count": 3
+}

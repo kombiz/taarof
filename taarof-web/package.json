@@ -1,0 +1,27 @@
+{
+  "name": "taarof-web",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test:journal": "tsc -p tsconfig.journal-test.json && node .tmp/journal-tests/monitorBoard.test.js && node .tmp/journal-tests/monitorPaneJournal.test.js && node .tmp/journal-tests/usePaneJournal.test.js && node .tmp/journal-tests/agentSessionPanes.test.js && node .tmp/journal-tests/paneAttachFrames.test.js && node .tmp/journal-tests/panePtyFrames.test.js && node .tmp/journal-tests/terminalLinks.test.js && node .tmp/journal-tests/terminalOsc8Activation.test.js && node .tmp/journal-tests/terminalLinkDisambiguation.test.js && node .tmp/journal-tests/api.test.js && node .tmp/journal-tests/runtimeProbe.test.js && node .tmp/journal-tests/components/MonitorView.helpers.test.js && node .tmp/journal-tests/components/AgentsView.helpers.test.js && node .tmp/journal-tests/components/HistoryView.helpers.test.js",
+    "test": "npm run test:journal",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "typescript": "^6.0.2",
+    "vite": "^8.0.16"
+  }
+}

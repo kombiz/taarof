@@ -1,0 +1,117 @@
+{
+  "positive": [
+    {
+      "name": "negotiate_request",
+      "type": "negotiation",
+      "file": "positive/negotiate-request.json"
+    },
+    {
+      "name": "all_terminal_frame_kinds",
+      "type": "terminal_frames",
+      "file": "positive/terminal-frames.json"
+    },
+    {
+      "name": "uint64_max_boundary",
+      "type": "terminal_frame",
+      "file": "positive/terminal-uint64-boundary.json"
+    }
+  ],
+  "negative": [
+    {
+      "name": "missing_epoch",
+      "type": "terminal_frame",
+      "file": "negative/terminal-missing-epoch.json",
+      "expected_error": "missing epoch"
+    },
+    {
+      "name": "stale_deadline",
+      "type": "terminal_frame",
+      "file": "negative/terminal-stale-deadline.json",
+      "expected_error": "deadline stale"
+    },
+    {
+      "name": "invalid_deadline_shape",
+      "type": "terminal_frame",
+      "file": "negative/terminal-invalid-deadline-shape.json",
+      "expected_error": "deadline_ms must be an integer Unix millisecond"
+    },
+    {
+      "name": "input_without_deadline",
+      "type": "terminal_frame",
+      "file": "negative/terminal-input-missing-deadline.json",
+      "expected_error": "missing deadline_ms"
+    },
+    {
+      "name": "missing_nonce",
+      "type": "terminal_frame",
+      "file": "negative/terminal-missing-nonce.json",
+      "expected_error": "missing nonce"
+    },
+    {
+      "name": "reused_nonce",
+      "type": "terminal_frames",
+      "file": "negative/terminal-reused-nonce.json",
+      "expected_error": "nonce has already been used"
+    },
+    {
+      "name": "output_over_limit",
+      "type": "terminal_frame",
+      "file": "negative/terminal-output-over-limit.json",
+      "expected_error": "output byte_count exceeds 262144"
+    },
+    {
+      "name": "control_over_limit",
+      "type": "terminal_frame",
+      "file": "negative/terminal-control-over-limit.json",
+      "expected_error": "control byte_count exceeds 65536"
+    },
+    {
+      "name": "checkpoint_byte_count_mismatch",
+      "type": "terminal_frame",
+      "file": "negative/terminal-checkpoint-byte-count-mismatch.json",
+      "expected_error": "checkpoint.ansi_base64 byte_count does not match decoded payload length"
+    },
+    {
+      "name": "input_byte_count_mismatch",
+      "type": "terminal_frame",
+      "file": "negative/terminal-input-byte-count-mismatch.json",
+      "expected_error": "payload_base64 byte_count does not match decoded payload length"
+    },
+    {
+      "name": "input_encoded_over_limit",
+      "type": "terminal_frame",
+      "file": "negative/terminal-input-encoded-over-limit.json",
+      "expected_error": "control decoded payload exceeds 65536"
+    },
+    {
+      "name": "uint64_above_max",
+      "type": "terminal_frame",
+      "file": "negative/terminal-uint64-above-max.json",
+      "expected_error": "ack_output_seq must be an unsigned 64-bit decimal string"
+    },
+    {
+      "name": "android_specific_capability",
+      "type": "negotiation",
+      "file": "negative/negotiate-android-capability.json",
+      "expected_error": "unsupported capability name: android_biometric_prompt"
+    }
+  ],
+  "terminal": [
+    {
+      "name": "basic_shell",
+      "file": "terminal/basic-shell.bin"
+    },
+    {
+      "name": "alternate_screen",
+      "file": "terminal/alternate-screen.bin"
+    },
+    {
+      "name": "cursor_modes",
+      "file": "terminal/cursor-modes.bin"
+    },
+    {
+      "name": "utf8_boundaries",
+      "file": "terminal/utf8-boundaries.bin"
+    }
+  ]
+}

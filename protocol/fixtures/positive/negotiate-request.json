@@ -1,0 +1,15 @@
+{
+  "protocol_version": { "major": 1, "minor": 0 },
+  "capabilities": [
+    "biometric_user_verification",
+    "raw_pty",
+    "legacy_snapshot",
+    "runtime_mutation"
+  ],
+  "nonce": "11111111-1111-4111-8111-111111111111",
+  "deadline_ms": 4102444800000,
+  "resume": {
+    "epoch": "6d43882a-7f60-40bb-9f6d-166f7b63d10d",
+    "output_seq": "42"
+  }
+}

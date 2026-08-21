@@ -1,0 +1,32 @@
+[
+  {
+    "kind": "input",
+    "protocol_version": { "major": 1, "minor": 0 },
+    "runtime_id": "018f0f1e-a2d3-4c55-8f7b-9023456789ab",
+    "session_name": "default",
+    "tab_id": "tab-1",
+    "pane_id": "pane-1",
+    "epoch": "6d43882a-7f60-40bb-9f6d-166f7b63d10d",
+    "input_seq": "1",
+    "grant_generation": "7",
+    "nonce": "77777777-7777-4777-8777-777777777777",
+    "deadline_ms": 4102444800000,
+    "payload_base64": "bHMK",
+    "byte_count": 3
+  },
+  {
+    "kind": "resize",
+    "protocol_version": { "major": 1, "minor": 0 },
+    "runtime_id": "018f0f1e-a2d3-4c55-8f7b-9023456789ab",
+    "session_name": "default",
+    "tab_id": "tab-1",
+    "pane_id": "pane-1",
+    "epoch": "6d43882a-7f60-40bb-9f6d-166f7b63d10d",
+    "input_seq": "2",
+    "grant_generation": "7",
+    "nonce": "77777777-7777-4777-8777-777777777777",
+    "deadline_ms": 4102444800000,
+    "cols": 100,
+    "rows": 30
+  }
+]

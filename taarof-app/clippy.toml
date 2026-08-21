@@ -1,0 +1,13 @@
+# `std::process::Child` has no `Drop` that reaps, so a spawned helper that is
+# never `wait()`ed stays in the process table as a zombie for the life of the
+# app. GUI helpers (browser, editor) hand off to an already-running instance and
+# exit immediately, which made this leak one zombie per opened link.
+#
+# Anything spawned purely for its side effect goes through
+# `crate::child_process::spawn_and_reap`. A call site that genuinely needs the
+# `Child` (to pipe output, poll `try_wait`, or hand ownership to a supervisor)
+# opts out with `#[allow(clippy::disallowed_methods)]` and a comment saying who
+# reaps it.
+disallowed-methods = [
+    { path = "std::process::Command::spawn", reason = "use crate::child_process::spawn_and_reap, or allow with a comment naming who reaps the child" },
+]

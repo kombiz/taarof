@@ -1,0 +1,78 @@
+# Public contributor tasks for taarof.
+# Rust is managed with rustup; Node is managed by mise when available.
+
+[tools]
+node = "lts"
+
+[tasks.setup]
+description = "Fetch/install dependencies for app + web client"
+run = [
+  "cargo fetch --manifest-path taarof-app/Cargo.toml",
+  "npm --prefix taarof-web ci",
+]
+
+[tasks.dev]
+description = "Run taarof in debug mode"
+run = "cargo run --manifest-path taarof-app/Cargo.toml"
+
+[tasks.build]
+description = "Build the release binary"
+run = "cargo build --release --manifest-path taarof-app/Cargo.toml"
+
+[tasks."web:build"]
+description = "Build the web client bundle"
+run = [
+  "npm --prefix taarof-web ci",
+  "npm --prefix taarof-web run build",
+]
+
+[tasks.lint]
+description = "Check Rust formatting and fail on clippy warnings"
+run = [
+  "cargo fmt --manifest-path taarof-app/Cargo.toml --all --check",
+  "cargo fmt --manifest-path wasm-sidebar/Cargo.toml --all --check",
+  "cargo clippy --manifest-path taarof-app/Cargo.toml --all-targets -- -D warnings",
+]
+
+[tasks.typecheck]
+description = "Compile-check the app and TypeScript client"
+run = [
+  "cargo check --manifest-path taarof-app/Cargo.toml --all-targets",
+  "cargo check --manifest-path taarof-app/Cargo.toml --no-default-features",
+  "npm --prefix taarof-web run build",
+]
+
+[tasks.test]
+description = "Run app and web tests"
+run = [
+  "cargo test --manifest-path taarof-app/Cargo.toml",
+  "npm --prefix taarof-web test",
+]
+
+[tasks."wasm:build"]
+description = "Build the experimental WASM sidebar"
+run = "cargo build --manifest-path wasm-sidebar/Cargo.toml --target wasm32-wasip1"
+
+[tasks."package:validate"]
+description = "Validate the local Linux package and release tarball"
+run = "bash packaging/linux/validate-local-install.sh"
+
+[tasks."release:scan"]
+description = "Scan the release tree for vulnerable dependencies and leaked secrets"
+run = [
+  "gitleaks dir --redact .",
+  "cargo audit --file taarof-app/Cargo.lock --target-os linux",
+  "cargo deny --manifest-path taarof-app/Cargo.toml check",
+  "npm --prefix taarof-web audit --omit=dev",
+  "osv-scanner scan source -r taarof-app taarof-web",
+]
+
+[tasks.ci]
+description = "Run the public contributor quality gate in a deterministic order"
+run = [
+  "mise run setup",
+  "mise run lint",
+  "mise run typecheck",
+  "mise run test",
+  "mise run package:validate",
+]

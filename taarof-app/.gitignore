@@ -1,0 +1,4 @@
+/target
+.claude-dev-helper/
+.complexity-log.md
+.todos-report.md/

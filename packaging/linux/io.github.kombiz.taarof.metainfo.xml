@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.kombiz.taarof</id>
+  <name>taarof</name>
+  <summary>GTK terminal workspace app with split panes and agent-aware status</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
+  <developer id="io.github.kombiz.taarof">
+    <name>taarof contributors</name>
+  </developer>
+  <launchable type="desktop-id">io.github.kombiz.taarof.desktop</launchable>
+  <icon type="stock">io.github.kombiz.taarof</icon>
+  <provides>
+    <binary>taarof-app</binary>
+  </provides>
+  <description>
+    <p>taarof is a Linux-native terminal workspace application built with GTK4, libadwaita, and VTE.</p>
+    <p>It restores sessions, groups tabs into workspaces, supports split panes, and exposes a Unix socket for automation and agent activity updates.</p>
+  </description>
+  <content_rating type="oars-1.1"/>
+  <categories>
+    <category>System</category>
+    <category>TerminalEmulator</category>
+  </categories>
+  <keywords>
+    <keyword>terminal</keyword>
+    <keyword>shell</keyword>
+    <keyword>workspace</keyword>
+    <keyword>panes</keyword>
+    <keyword>tabs</keyword>
+    <keyword>gtk</keyword>
+  </keywords>
+  <url type="homepage">https://github.com/kombiz/taarof</url>
+</component>

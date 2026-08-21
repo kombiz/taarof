@@ -1,0 +1,3491 @@
+#!/usr/bin/env python3
+"""Thin client for the taarof control surface.
+
+Reads: HTTP GET on 127.0.0.1:7800 (configurable).
+Writes: JSON messages over the Unix socket discovered via taarof-current.json.
+
+Run with --help on any subcommand. Repo docs cover install and examples.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # pragma: no cover
+    tomllib = None  # type: ignore[assignment]
+
+
+def _runtime_dir() -> Path:
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        return Path(xdg)
+    return Path(f"/run/user/{os.getuid()}")
+
+
+def _session_storage_key(session: str) -> str:
+    session = session.strip()
+    if not session:
+        return "default"
+    normalized: list[str] = []
+    last_dash = False
+    for char in session:
+        if char.isascii() and (char.isalnum() or char in "-_"):
+            normalized.append(char)
+            last_dash = False
+        elif not last_dash:
+            normalized.append("-")
+            last_dash = True
+    slug = "".join(normalized).strip("-")
+    if not slug:
+        slug = session.encode().hex()
+    slug = slug[:48]
+    digest = hashlib.sha256(session.encode()).hexdigest()[:32]
+    return f"{slug}-{digest}"
+
+
+def _registry_path(session: str | None) -> Path:
+    session = session.strip() if session else None
+    name = (
+        "taarof-current.json"
+        if not session
+        else f"taarof-current-{_session_storage_key(session)}.json"
+    )
+    return _runtime_dir() / name
+
+
+def _registry_data(session: str | None) -> dict[str, Any]:
+    reg = _registry_path(session)
+    if not reg.exists():
+        raise SystemExit(
+            f"taarof registry not found at {reg}. Is the app running? "
+            f"Set TAAROF_SOCK to override."
+        )
+    try:
+        data = json.loads(reg.read_text())
+    except json.JSONDecodeError as err:
+        raise SystemExit(f"invalid registry {reg}: {err}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"invalid registry {reg}: expected JSON object")
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Runtime identity
+#
+# (No task-tracker id in this file on purpose: the public-export scrubber in
+# scripts/bootstrap-taarof.sh only rewrites files with a known suffix, and this
+# CLI is extensionless, so a task ref here would leak verbatim.)
+#
+# Five surfaces can answer "what is running": the registry file, query-state,
+# the HTTP runtime-identity route, `--version`, and Doctor. They agree because
+# they all pass the app's identity block through `normalize_identity` rather
+# than each picking the fields it happens to care about.
+#
+# The invariant this code exists to hold: `source_state` is only ever "matches"
+# when the running binary recorded the revision it was built from. Two binaries
+# hashing the same proves they are the same binary — never that either was
+# built from the source in front of you. Missing provenance is "unknown".
+# ---------------------------------------------------------------------------
+
+#: Keep in step with taarof-app/Cargo.toml `version`; a contract test enforces it.
+CLI_VERSION = "0.1.0"
+IDENTITY_SCHEMA = "taarof.identity.v1"
+VERSION_SCHEMA = "taarof.version.v1"
+
+_SOURCE_STATES = ("matches", "differs", "unknown")
+_BINARY_STATES = ("current", "update_pending", "unknown")
+
+
+def _opt_str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _opt_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _valid_sha256(value: Any) -> str | None:
+    value = _opt_str(value)
+    if value is None or len(value) != 64:
+        return None
+    return value if all(char in "0123456789abcdefABCDEF" for char in value) else None
+
+
+def _sub(mapping: Any, key: str) -> dict[str, Any]:
+    if not isinstance(mapping, dict):
+        return {}
+    value = mapping.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def normalize_identity(raw: Any) -> dict[str, Any]:
+    """Coerce any surface's identity block into the one shape the CLI reports.
+
+    Unknown, missing or malformed input yields an all-unknown identity. A
+    reported `source_state` of "matches" is downgraded to "unknown" unless the
+    build revision that would justify it is actually present — so a stale or
+    over-eager producer cannot talk the CLI into vouching for freshness.
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+
+    build = _sub(raw, "build")
+    source_revision = _opt_str(build.get("source_revision"))
+    source_dirty = _opt_bool(build.get("source_dirty"))
+    source = _sub(raw, "source")
+    checkout_revision = _opt_str(source.get("revision"))
+    checkout_dirty = _opt_bool(source.get("dirty"))
+
+    source_state = raw.get("source_state")
+    if source_state not in _SOURCE_STATES:
+        source_state = "unknown"
+    if source_state == "matches" and not (
+        source_revision is not None
+        and source_revision == checkout_revision
+        and source_dirty is False
+        and checkout_dirty is False
+    ):
+        source_state = "unknown"
+
+    binary_state = raw.get("binary_state")
+    running = _sub(raw, "running")
+    installed = _sub(raw, "installed")
+    running_sha256 = _valid_sha256(running.get("sha256"))
+    installed_sha256 = _valid_sha256(installed.get("sha256"))
+    if running_sha256 is not None and installed_sha256 is not None:
+        running_matches_installed: bool | None = running_sha256 == installed_sha256
+    else:
+        running_matches_installed = None
+    if binary_state not in _BINARY_STATES or (
+        binary_state == "current" and running_matches_installed is not True
+    ):
+        binary_state = "unknown"
+    provenance = _sub(raw, "installed_provenance")
+
+    return {
+        "schema": IDENTITY_SCHEMA,
+        "app_version": _opt_str(raw.get("app_version")),
+        "source_revision": source_revision,
+        "source_describe": _opt_str(build.get("source_describe")),
+        "source_dirty": source_dirty,
+        "checkout_revision": checkout_revision,
+        "checkout_dirty": checkout_dirty,
+        "installed_source_revision": _opt_str(provenance.get("source_revision")),
+        "running_path": _opt_str(running.get("path")),
+        "installed_path": _opt_str(installed.get("path")),
+        "running_sha256": running_sha256,
+        "installed_sha256": installed_sha256,
+        "running_matches_installed": running_matches_installed,
+        "source_state": source_state,
+        "binary_state": binary_state,
+    }
+
+
+def identity_from_registry(data: Any) -> dict[str, Any]:
+    """Identity straight out of taarof-current.json — no round-trip needed."""
+    return normalize_identity(_sub(data, "identity") or None)
+
+
+def identity_from_query_state(payload: Any) -> dict[str, Any]:
+    """Identity from a `query-state` reply (envelope or bare data)."""
+    if isinstance(payload, dict) and "data" in payload:
+        payload = payload.get("data")
+    return normalize_identity(_sub(payload, "identity") or None)
+
+
+def identity_from_runtime_identity(payload: Any) -> dict[str, Any]:
+    """Identity from GET /api/v1/runtime-identity."""
+    if isinstance(payload, dict) and "data" in payload:
+        payload = payload.get("data")
+    return normalize_identity(_sub(payload, "identity") or None)
+
+
+def describe_identity(identity: dict[str, Any]) -> str:
+    """One human line that never implies more confidence than we have."""
+    source = {
+        "matches": "matches this checkout",
+        "differs": "DIFFERS from this checkout",
+        "unknown": "unknown (not provable)",
+    }[identity["source_state"]]
+    running_installed = {
+        True: "yes",
+        False: "no (an update is installed)",
+        None: "unknown",
+    }[identity["running_matches_installed"]]
+    return (
+        f"version={identity['app_version'] or 'unknown'} "
+        f"built-from={identity['source_revision'][:12] if identity['source_revision'] else 'unknown'} "
+        f"source={source} running-is-installed={running_installed} "
+        f"binary={identity['binary_state']}"
+    )
+
+
+def build_version_report(session: str | None) -> dict[str, Any]:
+    """Assemble `taarof --version`.
+
+    Prefers the registry because it needs no running socket, then falls back to
+    query-state for an app too old to publish identity into the registry. If
+    neither answers, the identity is unknown rather than absent — a caller must
+    still get a well-formed verdict to compare against other surfaces.
+    """
+    report: dict[str, Any] = {
+        "schema": VERSION_SCHEMA,
+        "cli_version": CLI_VERSION,
+        "identity_source": "unavailable",
+        "identity": normalize_identity(None),
+        "error": None,
+    }
+
+    registry: dict[str, Any] | None = None
+    try:
+        registry = _registry_data(session)
+    except SystemExit as err:
+        report["error"] = str(err)
+
+    if registry is not None and isinstance(registry.get("identity"), dict):
+        report["identity"] = identity_from_registry(registry)
+        report["identity_source"] = "registry"
+        return report
+
+    try:
+        response = socket_send({"action": "query-state"}, session=session, timeout=2.0)
+    except (OSError, ValueError, KeyError, TypeError, SystemExit) as err:
+        if report["error"] is None:
+            report["error"] = f"query-state unavailable ({type(err).__name__})"
+        return report
+
+    identity = identity_from_query_state(response)
+    if identity != normalize_identity(None):
+        report["identity"] = identity
+        report["identity_source"] = "query-state"
+        report["error"] = None
+    elif report["error"] is None:
+        report["error"] = "the running app does not publish runtime identity"
+    return report
+
+
+def cmd_version(args: argparse.Namespace) -> Any:
+    return build_version_report(getattr(args, "session", None))
+
+
+def render_version(result: Any) -> str | None:
+    if not isinstance(result, dict) or "identity" not in result:
+        return None
+    identity = result["identity"]
+    rows = [
+        ["cli", CLI_VERSION],
+        ["app", identity["app_version"] or "unknown"],
+        ["built from", identity["source_describe"] or identity["source_revision"] or "unknown"],
+        ["checkout now", identity["checkout_revision"] or "unknown"],
+        ["source match", identity["source_state"]],
+        ["installed from", identity["installed_source_revision"] or "unknown"],
+        ["running path", identity["running_path"] or "unknown"],
+        ["installed path", identity["installed_path"] or "unknown"],
+        ["running is installed", {True: "yes", False: "no", None: "unknown"}[
+            identity["running_matches_installed"]]],
+        ["binary state", identity["binary_state"]],
+        ["identity from", result.get("identity_source", "unavailable")],
+    ]
+    table = _render_table(["field", "value"], rows)
+    if result.get("error"):
+        return f"{table}\n\nnote: {result['error']}"
+    return table
+
+
+def check_identity(facts: dict[str, Any], session: str | None) -> dict[str, Any]:
+    """Doctor's source-provenance check.
+
+    Deliberately distinct from `app.update`: that one asks whether the running
+    binary is the installed binary, this one asks whether it was built from this
+    source. Only a proved match is `ok`; an unprovable one is `skip`, never a
+    green tick.
+    """
+    if not facts.get("alive") or not facts.get("socket_path"):
+        return _check(
+            "app.identity", "skip",
+            "app or control socket unavailable; runtime identity was not checked.",
+        )
+    try:
+        response = socket_send({"action": "query-state"}, session=session, timeout=2.0)
+    except (OSError, ValueError, KeyError, TypeError, SystemExit) as err:
+        return _check(
+            "app.identity", "skip",
+            f"query-state unavailable; runtime identity was not checked "
+            f"({type(err).__name__}).",
+        )
+
+    identity = identity_from_query_state(response)
+    source_state = identity["source_state"]
+    if source_state == "matches":
+        status = "ok"
+    elif source_state == "differs":
+        status = "warn"
+    else:
+        status = "skip"
+
+    return _check(
+        "app.identity", status, describe_identity(identity),
+        identity=identity,
+        source_state=source_state,
+        binary_state=identity["binary_state"],
+    )
+
+
+def _socket_path(session: str | None) -> str:
+    override = os.environ.get("TAAROF_SOCK")
+    if override:
+        return override
+    data = _registry_data(session)
+    path = data.get("socket_path")
+    if not path:
+        raise SystemExit(f"registry {_registry_path(session)} missing socket_path")
+    return path
+
+
+def _http_base() -> str:
+    return os.environ.get("TAAROF_HTTP", "http://127.0.0.1:7800")
+
+
+def _http_token(session: str | None) -> str | None:
+    override = os.environ.get("TAAROF_HTTP_TOKEN")
+    if override:
+        return override
+
+    data = _registry_data(session)
+    pid = data.get("pid")
+    if not isinstance(pid, int):
+        return None
+
+    token_path = _runtime_dir() / f"taarof-http-{pid}.token"
+    try:
+        token = token_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return token or None
+
+
+def http_get(path: str, session: str | None = None) -> Any:
+    url = _http_base().rstrip("/") + path
+    headers = {}
+    if path != "/health":
+        token = _http_token(session)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=5) as resp:  # noqa: S310
+        return json.loads(resp.read().decode())
+
+
+def socket_send(payload: dict[str, Any], session: str | None = None,
+                timeout: float = 10.0) -> dict[str, Any]:
+    path = _socket_path(session)
+    line = (json.dumps(payload, separators=(",", ":")) + "\n").encode()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(path)
+        sock.sendall(line)
+        # Half-close write side so server returns response and closes.
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        chunks: list[bytes] = []
+        while True:
+            buf = sock.recv(65536)
+            if not buf:
+                break
+            chunks.append(buf)
+    raw = b"".join(chunks).decode().strip()
+    if not raw:
+        raise SystemExit("no response from taarof socket")
+    # Server returns one JSON object. Tolerate trailing newline.
+    return json.loads(raw.splitlines()[-1])
+
+
+def _emit(obj: Any, pretty: bool) -> None:
+    if pretty:
+        print(json.dumps(obj, indent=2, sort_keys=True))
+    else:
+        print(json.dumps(obj, separators=(",", ":")))
+
+
+# ---------------------------------------------------------------------------
+# Human / table rendering
+# ---------------------------------------------------------------------------
+#
+# `_emit` handles machine (JSON) output. The renderers below turn a small set
+# of read-command payloads into stable, jq-free plain-text tables or concise
+# summaries. Each renderer takes the decoded response object and returns a
+# string (already terminated as needed) OR None to fall back to JSON.
+#
+# A command opts into human rendering by setting `_render=<name>` on its
+# subparser defaults; `RENDERERS` maps that name to a function. Rendering only
+# happens when the effective format is "table" (see `_resolve_format`).
+
+
+def _stdout_is_tty() -> bool:
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _resolve_format(fmt: str | None) -> str:
+    """Resolve a --format value to a concrete 'json' or 'table'."""
+    if fmt == "auto":
+        return "table" if _stdout_is_tty() else "json"
+    if fmt in ("json", "table"):
+        return fmt
+    return "json"
+
+
+def _unwrap_data(obj: Any) -> Any:
+    """Return the payload for socket/HTTP responses that wrap under `data`."""
+    if isinstance(obj, dict) and "data" in obj and set(obj.keys()) <= {"ok", "data"}:
+        return obj.get("data")
+    return obj
+
+
+def _render_table(headers: list[str], rows: list[list[str]]) -> str:
+    """Render aligned plain-text columns. Stdlib only, stable order."""
+    cols = [str(h) for h in headers]
+    body = [[("" if c is None else str(c)) for c in row] for row in rows]
+    widths = [len(h) for h in cols]
+    for row in body:
+        for i, cell in enumerate(row):
+            if len(cell) > widths[i]:
+                widths[i] = len(cell)
+    lines = []
+    header_line = "  ".join(cols[i].ljust(widths[i]) for i in range(len(cols)))
+    lines.append(header_line.rstrip())
+    lines.append("  ".join("-" * widths[i] for i in range(len(cols))))
+    for row in body:
+        lines.append("  ".join(row[i].ljust(widths[i]) for i in range(len(cols))).rstrip())
+    return "\n".join(lines)
+
+
+def _tab_agent_summary(tab: dict[str, Any]) -> str:
+    """Best-effort agent label from a tab's `agents` array or `agent_name`."""
+    names: list[str] = []
+    for agent in tab.get("agents") or []:
+        if isinstance(agent, dict):
+            name = agent.get("agent_name")
+            if name:
+                names.append(str(name))
+    if not names and tab.get("agent_name"):
+        names.append(str(tab["agent_name"]))
+    # De-duplicate preserving order.
+    seen: set[str] = set()
+    unique = [n for n in names if not (n in seen or seen.add(n))]
+    return ", ".join(unique)
+
+
+def _iter_tabs(payload: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Yield (workspace, tab) pairs from a list-tabs / query-state payload."""
+    out: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for ws in payload.get("workspaces") or []:
+        if not isinstance(ws, dict):
+            continue
+        for tab in ws.get("tabs") or []:
+            if isinstance(tab, dict):
+                out.append((ws, tab))
+    return out
+
+
+def render_list_tabs(obj: Any) -> str | None:
+    data = _unwrap_data(obj)
+    if not isinstance(data, dict):
+        return None
+    pairs = _iter_tabs(data)
+    if not pairs:
+        return "no tabs"
+    rows = []
+    for ws, tab in pairs:
+        rows.append([
+            tab.get("tab_id"),
+            tab.get("name") or "",
+            ws.get("name") or "",
+            _tab_agent_summary(tab),
+            "!" if tab.get("needs_attention") else "",
+        ])
+    return _render_table(["id", "name", "workspace", "agents", "attn"], rows)
+
+
+def render_query_state(obj: Any) -> str | None:
+    data = _unwrap_data(obj)
+    if not isinstance(data, dict):
+        return None
+    workspaces = data.get("workspaces") or []
+    pairs = _iter_tabs(data)
+    lines = []
+    session = data.get("session_name")
+    lines.append("session:    {}".format(session if session else "(unnamed)"))
+    lines.append("workspaces: {}".format(len(workspaces)))
+    lines.append("tabs:       {}".format(len(pairs)))
+    runtime_probe = data.get("runtime_probe")
+    if isinstance(runtime_probe, dict):
+        probe_state = runtime_probe.get("state") or "unknown"
+        component_text = []
+        for name in ("process", "ports"):
+            component = runtime_probe.get(name)
+            if not isinstance(component, dict):
+                continue
+            state = component.get("state") or "unknown"
+            age_ms = component.get("age_ms")
+            age = f" ({age_ms}ms)" if isinstance(age_ms, int) and not isinstance(age_ms, bool) else ""
+            component_text.append(f"{name}={state}{age}")
+        suffix = f" — {', '.join(component_text)}" if component_text else ""
+        lines.append(f"runtime probe: {probe_state}{suffix}")
+    lines.append("")
+    if not pairs:
+        lines.append("no tabs")
+        return "\n".join(lines)
+    rows = []
+    for ws, tab in pairs:
+        rows.append([
+            tab.get("tab_id"),
+            tab.get("name") or "",
+            ws.get("name") or "",
+            _tab_agent_summary(tab),
+            "!" if tab.get("needs_attention") else "",
+        ])
+    lines.append(_render_table(["id", "name", "workspace", "agents", "attn"], rows))
+    return "\n".join(lines)
+
+
+def render_query_history(obj: Any) -> str | None:
+    data = _unwrap_data(obj)
+    if not isinstance(data, dict) or not isinstance(data.get("records"), list):
+        return None
+    rows = []
+    for record in data["records"]:
+        if not isinstance(record, dict):
+            continue
+        rows.append([
+            record.get("id"),
+            record.get("ts_unix_ms"),
+            record.get("record_type") or "",
+            record.get("subtype") or "",
+            record.get("session") or "",
+            record.get("task_id") or "",
+            record.get("summary") or "",
+        ])
+    if not rows:
+        return "no history records"
+    return _render_table(
+        ["id", "timestamp_ms", "type", "subtype", "session", "task", "summary"], rows)
+
+
+def _agent_rows_from_state(payload: dict[str, Any]) -> list[list[Any]]:
+    """One row per live agent from a query-state payload.
+
+    Prefer each pane's `agents[]` array (fields: agent_name, pane_id,
+    session_id, activity{state,text}). When a tab has no `agents` key at all
+    (older app), fall back to the tab-level agent_name / agent_pane_id /
+    agent_session_id / agent_activity fields.
+    """
+    rows: list[list[Any]] = []
+    for ws, tab in _iter_tabs(payload):
+        ws_name = ws.get("name") or ""
+        tab_name = tab.get("name") or ""
+        agents = tab.get("agents")
+        if isinstance(agents, list) and agents:
+            for agent in agents:
+                if not isinstance(agent, dict):
+                    continue
+                activity = agent.get("activity") or {}
+                if not isinstance(activity, dict):
+                    activity = {}
+                rows.append([
+                    agent.get("agent_name") or "",
+                    ws_name,
+                    tab_name,
+                    agent.get("pane_id"),
+                    agent.get("session_id") or "",
+                    activity.get("state") or "",
+                    activity.get("text") or "",
+                ])
+        elif tab.get("agent_name"):
+            # Fallback path: no per-pane agents[] (older app).
+            activity = tab.get("agent_activity") or {}
+            if not isinstance(activity, dict):
+                activity = {}
+            rows.append([
+                tab.get("agent_name") or "",
+                ws_name,
+                tab_name,
+                tab.get("agent_pane_id"),
+                tab.get("agent_session_id") or "",
+                activity.get("state") or "",
+                activity.get("text") or "",
+            ])
+    return rows
+
+
+def render_agent_ls(obj: Any) -> str | None:
+    data = _unwrap_data(obj)
+    if not isinstance(data, dict):
+        return None
+    rows = _agent_rows_from_state(data)
+    if not rows:
+        return "no live agents"
+    return _render_table(
+        ["agent", "workspace", "tab", "pane", "session_id", "state", "activity"],
+        rows)
+
+
+def render_detached(obj: Any) -> str | None:
+    data = _unwrap_data(obj)
+    if not isinstance(data, list):
+        return None
+    if not data:
+        return "no detached sessions"
+    rows = []
+    for s in data:
+        if not isinstance(s, dict):
+            continue
+        rows.append([
+            s.get("session_name") or "",
+            s.get("host") or "",
+            s.get("workspace") or "",
+            "finished" if s.get("finished") else "running",
+            s.get("last_command") or "",
+        ])
+    return _render_table(["session", "host", "workspace", "state", "last_command"], rows)
+
+
+def render_dashboard_state(obj: Any) -> str | None:
+    data = _unwrap_data(obj)
+    if not isinstance(data, dict):
+        return None
+    sessions = data.get("sessions") or []
+    hosts = data.get("hosts") or []
+    lines = []
+    if hosts:
+        rows = []
+        for h in hosts:
+            if not isinstance(h, dict):
+                continue
+            rows.append([
+                h.get("name") or "",
+                h.get("cpu_percent"),
+                h.get("memory_percent"),
+                h.get("session_count"),
+            ])
+        lines.append("hosts:")
+        lines.append(_render_table(["name", "cpu%", "mem%", "sessions"], rows))
+    else:
+        lines.append("no hosts")
+    lines.append("")
+    if sessions:
+        rows = []
+        for s in sessions:
+            if not isinstance(s, dict):
+                continue
+            rows.append([
+                s.get("name") or "",
+                s.get("host") or "",
+                s.get("status") or "",
+                s.get("command") or "",
+            ])
+        lines.append("sessions:")
+        lines.append(_render_table(["name", "host", "status", "command"], rows))
+    else:
+        lines.append("no sessions")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# tmux inventory + selector resolution
+# ---------------------------------------------------------------------------
+#
+# `taarof tmux ls` and `taarof tmux attach <selector...>` share one merged view
+# of tmux sessions. `build_tmux_inventory` folds three read-only sources into a
+# de-duplicated list of rows, and `resolve_tmux_selector` maps friendly
+# selectors onto a single (session_name, host) identity. Both are pure functions
+# over plain dicts so tests drive them without a socket.
+#
+# Row schema (all keys always present; unknown values are None/""):
+#   session      generated tmux session name (identity part 1)
+#   host         host display label ("" == local) (identity part 2)
+#   ssh_target   explicit ssh target for the host, when known (attach forwards it)
+#   workspace    owning workspace name (attached rows only)
+#   tab          owning tab name (attached rows only)
+#   tab_id       owning tab id (attached rows only; switch-tab target)
+#   pane         pane id within the tab (attached rows only)
+#   state        "attached" | "detached"
+#   command      current command, when known
+#   cwd          working directory, when known
+#   updated_ms   best available unix-ms timestamp for age (None when unknown)
+
+
+TMUX_LS_COLUMNS = ["host", "workspace", "tab", "pane", "session", "state",
+                   "command", "cwd", "age"]
+
+
+def _tmux_host_label(value: Any) -> str:
+    """Normalise a host value to a canonical identity label.
+
+    None/'' and the common local spellings ("localhost", "127.0.0.1", "::1",
+    "local") all mean THIS machine and collapse to '' — query-state reports
+    local panes with tmux_host null while dashboard-state labels the same
+    session "localhost", and both must de-duplicate to one identity. Genuinely
+    remote hosts pass through unchanged and stay distinct.
+    """
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() in ("localhost", "127.0.0.1", "::1", "local"):
+        return ""
+    return text
+
+
+def _blank_row(session: str, host: str) -> dict[str, Any]:
+    return {
+        "session": session,
+        "host": host,
+        "ssh_target": None,
+        "workspace": None,
+        "tab": None,
+        "tab_id": None,
+        "pane": None,
+        "state": None,
+        "command": None,
+        "cwd": None,
+        "updated_ms": None,
+    }
+
+
+def _fill_missing(row: dict[str, Any], key: str, value: Any) -> None:
+    """Set row[key] only when it carries a real value and the slot is empty."""
+    if value in (None, ""):
+        return
+    if row.get(key) in (None, ""):
+        row[key] = value
+
+
+def build_tmux_inventory(
+    state: Any,
+    detached: Any,
+    dashboard: Any,
+) -> list[dict[str, Any]]:
+    """Merge attached (query-state), detached (list-detached), and dashboard
+    sessions into one de-duplicated list keyed by (session_name, host).
+
+    Each argument may be a raw response envelope (``{"ok", "data"}``) or the
+    already-unwrapped payload; ``_unwrap_data`` handles both. Any argument may be
+    None/empty. Attached rows are authoritative for workspace/tab/pane context;
+    detached/dashboard rows fill in gaps and contribute detached identities.
+    """
+    rows: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def row_for(session: Any, host: Any) -> dict[str, Any] | None:
+        if session in (None, ""):
+            return None
+        session = str(session)
+        host = _tmux_host_label(host)
+        key = (session, host)
+        row = rows.get(key)
+        if row is None:
+            row = _blank_row(session, host)
+            rows[key] = row
+        return row
+
+    # (1) attached sessions from query-state panes.
+    state_data = _unwrap_data(state) if state is not None else None
+    if isinstance(state_data, dict):
+        for ws in state_data.get("workspaces") or []:
+            if not isinstance(ws, dict):
+                continue
+            ws_name = ws.get("name") or ""
+            for tab in ws.get("tabs") or []:
+                if not isinstance(tab, dict):
+                    continue
+                tab_name = tab.get("name") or ""
+                for pane in tab.get("panes") or []:
+                    if not isinstance(pane, dict):
+                        continue
+                    session = pane.get("tmux_session")
+                    if session in (None, ""):
+                        continue
+                    row = row_for(session, pane.get("tmux_host"))
+                    if row is None:
+                        continue
+                    row["state"] = "attached"
+                    _fill_missing(row, "ssh_target", pane.get("tmux_host"))
+                    _fill_missing(row, "workspace", ws_name)
+                    _fill_missing(row, "tab", tab_name)
+                    if row.get("tab_id") is None:
+                        row["tab_id"] = tab.get("tab_id")
+                    if row.get("pane") in (None, ""):
+                        row["pane"] = pane.get("pane_id")
+                    probe = pane.get("tmux_probe")
+                    probe = probe if isinstance(probe, dict) else {}
+                    _fill_missing(row, "command", probe.get("current_command"))
+                    _fill_missing(row, "cwd", pane.get("cwd") or probe.get("cwd"))
+                    ts = probe.get("checked_at_unix_ms") \
+                        or probe.get("observed_at_unix_ms") \
+                        or pane.get("location_updated_at_unix_ms") \
+                        or pane.get("probe_updated_at_unix_ms")
+                    if row.get("updated_ms") is None and isinstance(ts, (int, float)):
+                        row["updated_ms"] = int(ts)
+
+    # (2) detached sessions from list-detached (array payload).
+    detached_data = _unwrap_data(detached) if detached is not None else None
+    if isinstance(detached_data, list):
+        for s in detached_data:
+            if not isinstance(s, dict):
+                continue
+            row = row_for(s.get("session_name"), s.get("host"))
+            if row is None:
+                continue
+            if row.get("state") is None:
+                row["state"] = "detached"
+            _fill_missing(row, "ssh_target", s.get("ssh_target"))
+            _fill_missing(row, "workspace", s.get("workspace"))
+            _fill_missing(row, "command", s.get("last_command"))
+
+    # (3) dashboard sessions from dashboard-state ({sessions:[...]}).
+    dashboard_data = _unwrap_data(dashboard) if dashboard is not None else None
+    if isinstance(dashboard_data, dict):
+        for s in dashboard_data.get("sessions") or []:
+            if not isinstance(s, dict):
+                continue
+            row = row_for(s.get("name"), s.get("host"))
+            if row is None:
+                continue
+            if row.get("state") is None:
+                status = s.get("status")
+                row["state"] = "detached" if s.get("is_detached") else (
+                    str(status) if status else "detached")
+            _fill_missing(row, "ssh_target", s.get("ssh_target"))
+            _fill_missing(row, "command", s.get("command"))
+            ts = s.get("started")
+            if row.get("updated_ms") is None and isinstance(ts, (int, float)):
+                row["updated_ms"] = int(ts)
+
+    # Any row that never got a state (identity from a source lacking one).
+    for row in rows.values():
+        if row.get("state") is None:
+            row["state"] = "detached"
+
+    # Stable order: host, then workspace/tab/session for readable output.
+    return sorted(
+        rows.values(),
+        key=lambda r: (
+            r.get("host") or "",
+            r.get("workspace") or "",
+            r.get("tab") or "",
+            r.get("session") or "",
+        ),
+    )
+
+
+def _format_age(updated_ms: Any, now_ms: int | None = None) -> str:
+    """Human 'age' from an update timestamp; '' when unknown or in the future."""
+    if not isinstance(updated_ms, (int, float)):
+        return ""
+    if now_ms is None:
+        import time
+        now_ms = int(time.time() * 1000)
+    delta = now_ms - int(updated_ms)
+    if delta < 0:
+        return ""
+    secs = delta // 1000
+    if secs < 60:
+        return f"{secs}s"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m"
+    hours = mins // 60
+    if hours < 24:
+        return f"{hours}h"
+    days = hours // 24
+    return f"{days}d"
+
+
+def _tmux_inventory_rows(inventory: list[dict[str, Any]],
+                         now_ms: int | None = None) -> list[list[str]]:
+    """Render inventory dicts into tmux-ls table rows (order = TMUX_LS_COLUMNS)."""
+    out: list[list[str]] = []
+    for row in inventory:
+        pane = row.get("pane")
+        out.append([
+            row.get("host") or "",
+            row.get("workspace") or "",
+            row.get("tab") or "",
+            "" if pane in (None, "") else str(pane),
+            row.get("session") or "",
+            row.get("state") or "",
+            row.get("command") or "",
+            row.get("cwd") or "",
+            _format_age(row.get("updated_ms"), now_ms),
+        ])
+    return out
+
+
+def render_tmux_ls(inventory: list[dict[str, Any]],
+                   now_ms: int | None = None) -> str:
+    """Render a merged tmux inventory as a table. Empty -> 'no tmux sessions'."""
+    if not inventory:
+        return "no tmux sessions"
+    return _render_table(TMUX_LS_COLUMNS, _tmux_inventory_rows(inventory, now_ms))
+
+
+def resolve_tmux_selector(
+    inventory: list[dict[str, Any]],
+    *,
+    positional: str | None = None,
+    workspace: str | None = None,
+    tab: str | None = None,
+    pane: str | None = None,
+    host: str | None = None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Resolve a friendly selector against a merged tmux inventory.
+
+    Returns ``(match, candidates)``:
+      * exactly one match  -> ``(row, [row])``
+      * ambiguous          -> ``(None, [row, row, ...])`` (>1 candidate)
+      * no match           -> ``(None, [])``
+
+    Selector forms (checked in this order):
+      * bare generated session name (exact ``session`` match), optionally with
+        ``--pane`` when combined with ``--tab``;
+      * ``--workspace W --tab T`` (names or ids);
+      * ``--tab T --pane N``;
+      * a single ``positional`` tried as: exact session name -> unique tab-name
+        match -> unique ``workspace:tab`` form.
+
+    ``host`` (a display label or ssh target) narrows candidates first, so an
+    otherwise-ambiguous bare name can resolve to a single (session, host).
+    Identity is always (session_name, host): same name on two hosts stays
+    ambiguous unless ``host`` disambiguates.
+    """
+    host_filter = _tmux_host_label(host) if host not in (None, "") else None
+
+    def host_matches(row: dict[str, Any]) -> bool:
+        if host_filter is None:
+            return True
+        return row.get("host") == host_filter \
+            or (row.get("ssh_target") or "") == host_filter
+
+    def norm(value: Any) -> str:
+        return "" if value is None else str(value)
+
+    pool = [r for r in inventory if host_matches(r)]
+
+    def finish(cands: list[dict[str, Any]]) -> tuple[dict[str, Any] | None,
+                                                     list[dict[str, Any]]]:
+        # De-duplicate by identity while preserving order.
+        seen: set[tuple[str, str]] = set()
+        unique: list[dict[str, Any]] = []
+        for row in cands:
+            key = (norm(row.get("session")), norm(row.get("host")))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(row)
+        if len(unique) == 1:
+            return unique[0], unique
+        return None, unique
+
+    # (a) explicit workspace + tab.
+    if workspace is not None and tab is not None:
+        cands = [
+            r for r in pool
+            if norm(r.get("workspace")) == norm(workspace)
+            and norm(r.get("tab")) == norm(tab)
+        ]
+        return finish(cands)
+
+    # (b) tab + pane.
+    if tab is not None and pane is not None:
+        cands = [
+            r for r in pool
+            if norm(r.get("tab")) == norm(tab) and norm(r.get("pane")) == norm(pane)
+        ]
+        return finish(cands)
+
+    # (c) tab alone (name or id).
+    if tab is not None and positional is None and workspace is None:
+        cands = [r for r in pool if norm(r.get("tab")) == norm(tab)]
+        return finish(cands)
+
+    # (d) single positional.
+    if positional is not None:
+        # exact session name first (fast path).
+        exact = [r for r in pool if norm(r.get("session")) == norm(positional)]
+        if exact:
+            return finish(exact)
+        # unique tab-name match.
+        by_tab = [r for r in pool if norm(r.get("tab")) == norm(positional)]
+        if by_tab:
+            return finish(by_tab)
+        # "workspace:tab" form.
+        if ":" in positional:
+            ws_part, _, tab_part = positional.partition(":")
+            by_ws_tab = [
+                r for r in pool
+                if norm(r.get("workspace")) == norm(ws_part)
+                and norm(r.get("tab")) == norm(tab_part)
+            ]
+            if by_ws_tab:
+                return finish(by_ws_tab)
+        return None, []
+
+    return None, []
+
+
+def render_workspaces(obj: Any) -> str | None:
+    data = _unwrap_data(obj)
+    if not isinstance(data, list):
+        return None
+    if not data:
+        return "no workspaces"
+    rows = []
+    for ws in data:
+        if not isinstance(ws, dict):
+            continue
+        rows.append([
+            ws.get("id"),
+            ws.get("name") or "",
+            ws.get("branch_name") or "",
+            ws.get("tab_count"),
+            ws.get("run_status") or "",
+        ])
+    return _render_table(["id", "name", "branch", "tabs", "status"], rows)
+
+
+def render_tabs(obj: Any) -> str | None:
+    """HTTP /tabs projection: a flat array of tab objects."""
+    data = _unwrap_data(obj)
+    if not isinstance(data, list):
+        return None
+    if not data:
+        return "no tabs"
+    rows = []
+    for tab in data:
+        if not isinstance(tab, dict):
+            continue
+        rows.append([
+            tab.get("tab_id"),
+            tab.get("name") or "",
+            tab.get("workspace_name") or "",
+            _tab_agent_summary(tab),
+            "!" if tab.get("needs_attention") else "",
+        ])
+    return _render_table(["id", "name", "workspace", "agents", "attn"], rows)
+
+
+def render_panes(obj: Any) -> str | None:
+    """HTTP /panes projection: a flat array of pane objects."""
+    data = _unwrap_data(obj)
+    if not isinstance(data, list):
+        return None
+    if not data:
+        return "no panes"
+    rows = []
+    for pane in data:
+        if not isinstance(pane, dict):
+            continue
+        rows.append([
+            pane.get("tab_id"),
+            pane.get("pane_id"),
+            pane.get("agent_name") or "",
+            pane.get("cwd") or "",
+        ])
+    return _render_table(["tab", "pane", "agent", "cwd"], rows)
+
+
+def render_sessions(obj: Any) -> str | None:
+    """HTTP /sessions projection: object with detached_sessions + dashboard."""
+    data = _unwrap_data(obj)
+    if not isinstance(data, dict):
+        return None
+    lines = []
+    session = data.get("session_name")
+    lines.append("session:         {}".format(session if session else "(unnamed)"))
+    lines.append("active_workspace: {}".format(data.get("active_workspace")))
+    lines.append("active_tab:       {}".format(data.get("active_tab")))
+    lines.append("")
+    detached = data.get("detached_sessions") or []
+    if detached:
+        rows = []
+        for s in detached:
+            if not isinstance(s, dict):
+                continue
+            rows.append([
+                s.get("session_name") or "",
+                s.get("host") or "",
+                s.get("workspace") or "",
+                "finished" if s.get("finished") else "running",
+            ])
+        lines.append("detached sessions:")
+        lines.append(_render_table(["session", "host", "workspace", "state"], rows))
+    else:
+        lines.append("no detached sessions")
+    return "\n".join(lines)
+
+
+def render_agent_sessions(obj: Any) -> str | None:
+    """Render a query-agent-sessions snapshot as a table.
+
+    Snapshot shape (from AgentSessionsSnapshot): {schema, generated_at_unix_ms,
+    providers:[{name, ok, history_available, session_count, ...}],
+    remote_hosts?:[{host, ok, stale, session_count, warning, ...}],
+    sessions:[{agent, session_id, title, cwd, status, host?, resume_command?,
+    live_binding?{...}, ...}]}.
+
+    Local and remote sessions share one table, so `host` is rendered as its own
+    column (blank for local) and `resume` shows the resume command verbatim —
+    the remote ones are host-qualified `ssh -t ...` commands, which is the whole
+    point of remote discovery. `remote_hosts` is additive and absent when no
+    remote host is configured or live.
+
+    If the response does not match this shape, return None so main() falls back
+    to JSON rather than crashing.
+    """
+    data = _unwrap_data(obj)
+    if not isinstance(data, dict) or "sessions" not in data:
+        return None
+    sessions = data.get("sessions")
+    if not isinstance(sessions, list):
+        return None
+    lines: list[str] = []
+    providers = data.get("providers")
+    if isinstance(providers, list) and providers:
+        prows = []
+        for prov in providers:
+            if not isinstance(prov, dict):
+                continue
+            prows.append([
+                prov.get("name") or "",
+                "ok" if prov.get("ok") else "err",
+                "yes" if prov.get("history_available") else "no",
+                prov.get("session_count"),
+            ])
+        if prows:
+            lines.append("providers:")
+            lines.append(_render_table(["provider", "ok", "history", "sessions"], prows))
+            lines.append("")
+    remote_hosts = data.get("remote_hosts")
+    if isinstance(remote_hosts, list) and remote_hosts:
+        hrows = []
+        for host in remote_hosts:
+            if not isinstance(host, dict):
+                continue
+            hrows.append([
+                host.get("host") or "",
+                "ok" if host.get("ok") else "err",
+                "yes" if host.get("stale") else "no",
+                host.get("session_count"),
+                host.get("warning") or host.get("error") or "",
+            ])
+        if hrows:
+            lines.append("remote hosts:")
+            lines.append(_render_table(
+                ["host", "ok", "stale", "sessions", "warning"], hrows))
+            lines.append("")
+    if not sessions:
+        lines.append("no agent sessions")
+        return "\n".join(lines)
+    rows = []
+    for sess in sessions:
+        if not isinstance(sess, dict):
+            continue
+        binding = sess.get("live_binding")
+        if isinstance(binding, dict):
+            live = binding.get("tab_name") or binding.get("tab_id")
+            live = str(live) if live is not None else ""
+        else:
+            live = ""
+        rows.append([
+            sess.get("agent") or "",
+            sess.get("host") or "",
+            sess.get("session_id") or "",
+            sess.get("status") or "",
+            sess.get("cwd") or "",
+            live,
+            sess.get("resume_command") or "",
+        ])
+    lines.append(_render_table(
+        ["agent", "host", "session_id", "status", "cwd", "live", "resume"], rows))
+    return "\n".join(lines)
+
+
+# Maps the `_render` default set on a subparser to its renderer function.
+RENDERERS = {
+    "list-tabs": render_list_tabs,
+    "query-state": render_query_state,
+    "list-detached": render_detached,
+    "dashboard-state": render_dashboard_state,
+    "workspaces": render_workspaces,
+    "tabs": render_tabs,
+    "panes": render_panes,
+    "sessions": render_sessions,
+    "agent-ls": render_agent_ls,
+    "agent-sessions": render_agent_sessions,
+    "query-history": render_query_history,
+    # "doctor" is registered after render_doctor is defined (see below).
+}
+
+
+# ---------------------------------------------------------------------------
+# Doctor: launch and runtime readiness diagnostics
+# ---------------------------------------------------------------------------
+#
+# `taarof doctor` is strictly non-mutating: it never writes files, opens tabs,
+# or sends state-changing socket commands. Each check is a small function that
+# returns a record `{"name", "status", "detail", ...}` so the checks are
+# unit-testable with patched env / mocked sockets. `run_doctor_checks` collects
+# them; the overall result is "ok" unless any check has status "error".
+
+DOCTOR_STATUSES = ("ok", "warn", "error", "skip")
+
+
+def _check(name: str, status: str, detail: str, **extra: Any) -> dict[str, Any]:
+    rec: dict[str, Any] = {"name": name, "status": status, "detail": detail}
+    rec.update(extra)
+    return rec
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness probe for a pid owned by (or visible to) us."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but owned by another user.
+        return True
+    except OSError:
+        # Fall back to /proc.
+        return Path(f"/proc/{pid}").exists()
+
+
+def _pid_exe(pid: int) -> str | None:
+    """Best-effort executable path for a pid via /proc/<pid>/exe."""
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+
+
+def _load_config() -> tuple[dict[str, Any] | None, str | None]:
+    """Return (parsed config, reason-if-unavailable). Never raises."""
+    cfg_path = Path.home() / ".config" / "taarof" / "config.toml"
+    if not cfg_path.exists():
+        return {}, None  # no config == all defaults
+    if tomllib is None:
+        return None, "Python 3.11+ (tomllib) required to parse config.toml"
+    try:
+        return tomllib.loads(cfg_path.read_text()), None
+    except (OSError, ValueError) as err:
+        return None, f"could not parse {cfg_path}: {err}"
+
+
+def _http_base_from_config(cfg: dict[str, Any] | None) -> str:
+    """Prefer TAAROF_HTTP, else derive from config [http].port, else default."""
+    override = os.environ.get("TAAROF_HTTP")
+    if override:
+        return override.rstrip("/")
+    port = 7800
+    if isinstance(cfg, dict):
+        http = cfg.get("http")
+        if isinstance(http, dict) and isinstance(http.get("port"), int):
+            port = http["port"]
+    return f"http://127.0.0.1:{port}"
+
+
+def _http_enabled(cfg: dict[str, Any] | None) -> bool:
+    if not isinstance(cfg, dict):
+        return False
+    http = cfg.get("http")
+    return bool(isinstance(http, dict) and http.get("enabled"))
+
+
+def _history_enabled(cfg: dict[str, Any] | None) -> bool:
+    if not isinstance(cfg, dict):
+        return False
+    history = cfg.get("history")
+    return bool(isinstance(history, dict) and history.get("enabled"))
+
+
+def check_app_registry(session: str | None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Check the app registry file. Returns (record, facts) where facts feed
+    later checks (pid, socket_path, exe, alive)."""
+    facts: dict[str, Any] = {"pid": None, "socket_path": None, "alive": False}
+    override = os.environ.get("TAAROF_SOCK")
+    reg = _registry_path(session)
+    facts["registry_path"] = str(reg)
+
+    if not reg.exists():
+        detail = (
+            f"registry not found at {reg} — the taarof app does not appear to be "
+            f"running (missing app)."
+        )
+        if override:
+            detail += f" TAAROF_SOCK={override} is set and will be used for the socket check."
+            facts["socket_path"] = override
+        return _check("app.registry", "error", detail, registry_path=str(reg)), facts
+
+    try:
+        data = json.loads(reg.read_text())
+    except (OSError, ValueError) as err:
+        return _check("app.registry", "error",
+                      f"registry {reg} exists but does not parse: {err}",
+                      registry_path=str(reg)), facts
+    if not isinstance(data, dict):
+        return _check("app.registry", "error",
+                      f"registry {reg} is not a JSON object",
+                      registry_path=str(reg)), facts
+
+    pid = data.get("pid")
+    socket_path = data.get("socket_path")
+    facts["pid"] = pid if isinstance(pid, int) else None
+    facts["socket_path"] = override or (socket_path if isinstance(socket_path, str) else None)
+
+    if not isinstance(pid, int):
+        return _check("app.registry", "warn",
+                      f"registry {reg} present but missing/invalid pid",
+                      registry_path=str(reg), socket_path=facts["socket_path"]), facts
+
+    alive = _pid_alive(pid)
+    facts["alive"] = alive
+    exe = _pid_exe(pid) if alive else None
+    if exe:
+        facts["exe"] = exe
+
+    if not alive:
+        return _check(
+            "app.registry", "error",
+            f"registry points at pid {pid} which is not alive — stale registry "
+            f"(the app died without cleaning up). Restart taarof.",
+            registry_path=str(reg), pid=pid, alive=False,
+            socket_path=facts["socket_path"],
+        ), facts
+
+    detail = f"app running as pid {pid}"
+    if exe:
+        detail += f" ({exe})"
+    return _check("app.registry", "ok", detail,
+                  registry_path=str(reg), pid=pid, alive=True, exe=exe,
+                  socket_path=facts["socket_path"]), facts
+
+
+def check_socket(facts: dict[str, Any], session: str | None,
+                 timeout: float = 2.0) -> dict[str, Any]:
+    """Round-trip a cheap read (`list-tabs`) over the Unix socket."""
+    path = facts.get("socket_path")
+    if not path:
+        return _check("socket.reachability", "error",
+                      "no socket_path known (registry missing or malformed); "
+                      "cannot probe the control socket.")
+    if not Path(path).exists():
+        stale = " — registry is stale (app died)" if facts.get("pid") and not facts.get("alive") \
+            else ""
+        return _check("socket.reachability", "error",
+                      f"socket file missing at {path}{stale}.", socket_path=path)
+
+    import time
+    start = time.monotonic()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        try:
+            sock.connect(path)
+        except ConnectionRefusedError:
+            return _check("socket.reachability", "error",
+                          f"connection refused at {path} — stale registry (app died "
+                          f"but left its socket file). Restart taarof.",
+                          socket_path=path)
+        except (FileNotFoundError, OSError) as err:
+            return _check("socket.reachability", "error",
+                          f"could not connect to {path}: {err}", socket_path=path)
+
+        line = (json.dumps({"action": "list-tabs"}, separators=(",", ":")) + "\n").encode()
+        try:
+            sock.sendall(line)
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            chunks: list[bytes] = []
+            while True:
+                buf = sock.recv(65536)
+                if not buf:
+                    break
+                chunks.append(buf)
+        except socket.timeout:
+            return _check("socket.reachability", "error",
+                          f"connected to {path} but got no response before {timeout}s — "
+                          f"closed/failed socket queue (app stuck). Restart taarof.",
+                          socket_path=path)
+        raw = b"".join(chunks).decode(errors="replace").strip()
+        if not raw:
+            return _check("socket.reachability", "error",
+                          f"connected to {path} but the server closed with no response — "
+                          f"closed/failed socket queue.", socket_path=path)
+        latency_ms = round((time.monotonic() - start) * 1000, 1)
+        try:
+            resp = json.loads(raw.splitlines()[-1])
+            ok = isinstance(resp, dict) and resp.get("ok") is not False
+        except ValueError:
+            ok = False
+        if not ok:
+            return _check("socket.reachability", "warn",
+                          f"socket responded at {path} but the reply was not a success "
+                          f"envelope (latency {latency_ms}ms).",
+                          socket_path=path, latency_ms=latency_ms)
+        return _check("socket.reachability", "ok",
+                      f"list-tabs round-trip ok ({latency_ms}ms).",
+                      socket_path=path, latency_ms=latency_ms)
+    finally:
+        sock.close()
+
+
+def check_update(facts: dict[str, Any], session: str | None) -> dict[str, Any]:
+    """Read the app's cached executable identity without doing local file IO."""
+    if not facts.get("alive") or not facts.get("socket_path"):
+        return _check(
+            "app.update", "skip",
+            "app or control socket unavailable; update status was not checked.",
+        )
+    try:
+        response = socket_send({"action": "query-state"}, session=session, timeout=2.0)
+    except (OSError, ValueError, KeyError, TypeError, SystemExit) as err:
+        return _check(
+            "app.update", "skip",
+            f"query-state unavailable; update status was not checked ({type(err).__name__}).",
+        )
+
+    data = response.get("data") if isinstance(response, dict) else None
+    update = data.get("update") if isinstance(data, dict) else None
+    if not isinstance(update, dict):
+        return _check(
+            "app.update", "skip",
+            "query-state did not include update status (older app or check pending).",
+        )
+
+    raw_state = update.get("state")
+    state = (
+        raw_state
+        if isinstance(raw_state, str)
+        and raw_state in {"current", "update_pending", "unknown"}
+        else "unknown"
+    )
+    raw_reason = update.get("reason")
+    reason = raw_reason if isinstance(raw_reason, str) else None
+    running = update.get("running") if isinstance(update.get("running"), dict) else {}
+    installed = update.get("installed") if isinstance(update.get("installed"), dict) else {}
+    running_sha256 = running.get("sha256") if isinstance(running.get("sha256"), str) else None
+    installed_sha256 = (
+        installed.get("sha256") if isinstance(installed.get("sha256"), str) else None
+    )
+    installed_path = installed.get("path") if isinstance(installed.get("path"), str) else None
+    checked_at_unix_ms = update.get("checked_at_unix_ms")
+    if (
+        not isinstance(checked_at_unix_ms, int)
+        or isinstance(checked_at_unix_ms, bool)
+        or checked_at_unix_ms < 0
+    ):
+        checked_at_unix_ms = None
+
+    status = {"current": "ok", "update_pending": "warn", "unknown": "skip"}[state]
+    short_running = running_sha256[:12] if running_sha256 else "unavailable"
+    short_installed = installed_sha256[:12] if installed_sha256 else "unavailable"
+    detail = (
+        f"state={state} running={short_running} "
+        f"installed={short_installed} path={installed_path or 'unavailable'} "
+        f"reason={reason or 'none'}; restart is operator-controlled."
+    )
+    return _check(
+        "app.update", status, detail,
+        state=state,
+        reason=reason,
+        running_sha256=running_sha256,
+        installed_sha256=installed_sha256,
+        installed_path=installed_path,
+        checked_at_unix_ms=checked_at_unix_ms,
+    )
+
+
+def check_runtime_probe(facts: dict[str, Any], session: str | None) -> dict[str, Any]:
+    """Report cached process/port truth without initiating a new runtime scan."""
+    if not facts.get("alive") or not facts.get("socket_path"):
+        return _check(
+            "runtime.probe", "skip",
+            "app or control socket unavailable; runtime probe truth was not checked.",
+        )
+    try:
+        response = socket_send({"action": "query-state"}, session=session, timeout=2.0)
+    except (OSError, ValueError, KeyError, TypeError, SystemExit) as err:
+        return _check(
+            "runtime.probe", "skip",
+            f"query-state unavailable; runtime probe truth was not checked ({type(err).__name__}).",
+        )
+
+    data = response.get("data") if isinstance(response, dict) else None
+    probe = data.get("runtime_probe") if isinstance(data, dict) else None
+    if not isinstance(probe, dict):
+        return _check(
+            "runtime.probe", "skip",
+            "query-state did not include runtime probe truth (older app).",
+        )
+
+    raw_state = probe.get("state")
+    state = raw_state if raw_state in {
+        "ok", "absent", "partial", "stale", "failed", "unknown"
+    } else "unknown"
+    component_details = []
+    fields: dict[str, Any] = {"state": state}
+    for name in ("process", "ports"):
+        component = probe.get(name)
+        component = component if isinstance(component, dict) else {}
+        raw_component_state = component.get("state")
+        component_state = raw_component_state if raw_component_state in {
+            "ok", "stale", "unknown", "error"
+        } else "unknown"
+        age_ms = component.get("age_ms")
+        if not isinstance(age_ms, int) or isinstance(age_ms, bool) or age_ms < 0:
+            age_ms = None
+        raw_reason = component.get("error")
+        reason = raw_reason if isinstance(raw_reason, str) else None
+        if reason:
+            reason = " ".join(reason.split())[:160]
+        detail = f"{name}={component_state}"
+        if age_ms is not None:
+            detail += f" age={age_ms}ms"
+        if reason:
+            detail += f" reason={reason}"
+        component_details.append(detail)
+        fields[f"{name}_state"] = component_state
+        fields[f"{name}_age_ms"] = age_ms
+        fields[f"{name}_error"] = reason
+
+    status = {
+        "ok": "ok",
+        "absent": "skip",
+        "partial": "warn",
+        "stale": "warn",
+        "failed": "error",
+        "unknown": "warn",
+    }[state]
+    if state == "absent":
+        detail = "runtime probe absent: no live process roots to inspect."
+    else:
+        detail = f"runtime probe {state}: {'; '.join(component_details)}."
+    return _check("runtime.probe", status, detail, **fields)
+
+
+def check_runtime_dir() -> dict[str, Any]:
+    """XDG_RUNTIME_DIR must exist, be owned by us, and be mode 0700."""
+    rd = _runtime_dir()
+    if not rd.exists():
+        return _check("runtime.permissions", "warn",
+                      f"runtime dir {rd} does not exist.", path=str(rd))
+    try:
+        st = rd.stat()
+    except OSError as err:
+        return _check("runtime.permissions", "warn",
+                      f"could not stat {rd}: {err}", path=str(rd))
+    uid = os.getuid()
+    mode = st.st_mode & 0o777
+    if st.st_uid != uid:
+        return _check("runtime.permissions", "warn",
+                      f"{rd} is owned by uid {st.st_uid}, not you ({uid}) — trust "
+                      f"boundary violation for the control socket.",
+                      path=str(rd), owner_uid=st.st_uid, mode=oct(mode))
+    if mode != 0o700:
+        return _check("runtime.permissions", "warn",
+                      f"{rd} is mode {oct(mode)}, expected 0o700 — other users may "
+                      f"reach the control socket. Run: chmod 700 {rd}",
+                      path=str(rd), mode=oct(mode))
+    return _check("runtime.permissions", "ok",
+                  f"{rd} owned by you and mode 0700.", path=str(rd), mode=oct(mode))
+
+
+def check_http(facts: dict[str, Any], cfg: dict[str, Any] | None,
+               cfg_reason: str | None, session: str | None,
+               timeout: float = 2.0) -> list[dict[str, Any]]:
+    """Return three records: health reachability, token discovery, authed state."""
+    base = _http_base_from_config(cfg)
+
+    if cfg_reason is not None:
+        # Could not read config; report skip but still allow env override probing.
+        if not os.environ.get("TAAROF_HTTP"):
+            note = _check("http.health", "skip",
+                          f"HTTP config unreadable ({cfg_reason}); set TAAROF_HTTP to probe.",
+                          base=base)
+            return [note,
+                    _check("http.token", "skip", "skipped (HTTP config unreadable)."),
+                    _check("http.state", "skip", "skipped (HTTP config unreadable).")]
+    elif not _http_enabled(cfg) and not os.environ.get("TAAROF_HTTP"):
+        hint = "HTTP API disabled. Enable with [http]\\nenabled = true in config.toml."
+        return [_check("http.health", "skip", hint, base=base),
+                _check("http.token", "skip", "skipped (HTTP disabled)."),
+                _check("http.state", "skip", "skipped (HTTP disabled).")]
+
+    records: list[dict[str, Any]] = []
+
+    # (a) /health reachability
+    health_ok = False
+    try:
+        req = urllib.request.Request(base + "/health")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            resp.read()
+        health_ok = True
+        records.append(_check("http.health", "ok", f"GET {base}/health reachable.", base=base))
+    except urllib.error.HTTPError as err:
+        # Reachable but non-2xx still means the server is up.
+        health_ok = True
+        records.append(_check("http.health", "warn",
+                              f"GET {base}/health returned HTTP {err.code}.", base=base))
+    except (urllib.error.URLError, OSError) as err:
+        records.append(_check("http.health", "error",
+                              f"GET {base}/health failed: {err}. Is HTTP enabled and the "
+                              f"app running?", base=base))
+
+    # (b) token discovery
+    token = os.environ.get("TAAROF_HTTP_TOKEN")
+    token_source = "env" if token else None
+    token_path_str = None
+    if not token:
+        pid = facts.get("pid")
+        if isinstance(pid, int):
+            tp = _runtime_dir() / f"taarof-http-{pid}.token"
+            token_path_str = str(tp)
+            try:
+                token = tp.read_text(encoding="utf-8").strip() or None
+                if token:
+                    token_source = str(tp)
+            except OSError:
+                token = None
+    if token:
+        records.append(_check("http.token", "ok",
+                              f"bearer token found ({token_source}).",
+                              token_source=token_source))
+    else:
+        where = token_path_str or "runtime dir (pid unknown)"
+        records.append(_check("http.token", "error",
+                              f"no HTTP bearer token found at {where} — missing token; "
+                              f"cannot authenticate. Is the app running with HTTP enabled?"))
+
+    # (c) authenticated GET /api/v1/state
+    if not health_ok:
+        records.append(_check("http.state", "skip",
+                              "skipped (/health not reachable)."))
+    elif not token:
+        records.append(_check("http.state", "skip",
+                              "skipped (no bearer token)."))
+    else:
+        try:
+            req = urllib.request.Request(
+                base + "/api/v1/state", headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+                json.loads(resp.read().decode())
+            records.append(_check("http.state", "ok",
+                                  f"authenticated GET {base}/api/v1/state ok.", base=base))
+        except urllib.error.HTTPError as err:
+            records.append(_check("http.state", "error",
+                                  f"GET {base}/api/v1/state -> HTTP {err.code} "
+                                  f"(token rejected?).", base=base))
+        except (urllib.error.URLError, OSError, ValueError) as err:
+            records.append(_check("http.state", "error",
+                                  f"GET {base}/api/v1/state failed: {err}", base=base))
+    return records
+
+
+def check_history(cfg: dict[str, Any] | None, cfg_reason: str | None,
+                  session: str | None) -> dict[str, Any]:
+    if cfg_reason is not None:
+        return _check("history", "error", f"history config unreadable ({cfg_reason}).")
+    configured_enabled = _history_enabled(cfg)
+    try:
+        response = socket_send({"action": "query-state"}, session=session)
+    except (OSError, ValueError, SystemExit) as err:
+        if not configured_enabled:
+            return _check("history", "skip",
+                          "history disabled. Enable with [history] enabled = true.")
+        return _check("history", "error", f"could not query history status: {err}")
+    data = response.get("data") if isinstance(response, dict) else None
+    history = data.get("history") if isinstance(data, dict) else None
+    if not isinstance(history, dict):
+        if not configured_enabled:
+            return _check("history", "skip",
+                          "history disabled. Enable with [history] enabled = true.")
+        return _check("history", "error",
+                      "running app does not report history status; restart an updated build.")
+    state = history.get("state") or "unknown"
+    available = bool(history.get("available"))
+    lag_ms = history.get("lag_ms", 0)
+    queue_depth = history.get("queue_depth", 0)
+    schema = history.get("schema_version", 0)
+    reason = history.get("reason")
+    durable = history.get("last_durable_seq")
+    if not isinstance(durable, dict):
+        durable = {"event": 0, "work": 0, "id": 0}
+    durable = {
+        "event": durable.get("event", 0),
+        "work": durable.get("work", 0),
+        "id": durable.get("id", 0),
+    }
+    dropped = history.get("dropped", 0)
+    storage = history.get("storage")
+    if not isinstance(storage, dict):
+        storage = {}
+    storage = {
+        "main_bytes": storage.get("main_bytes", 0),
+        "wal_bytes": storage.get("wal_bytes", 0),
+        "soft_max_bytes": storage.get("soft_max_bytes", 0),
+        "record_count": storage.get("record_count", 0),
+        "oldest_record_ts_unix_ms": storage.get("oldest_record_ts_unix_ms"),
+        "newest_record_ts_unix_ms": storage.get("newest_record_ts_unix_ms"),
+    }
+    maintenance = history.get("maintenance")
+    if not isinstance(maintenance, dict):
+        maintenance = {}
+    maintenance = {
+        "last_result": maintenance.get("last_result", "never"),
+        "last_run_at_unix_ms": maintenance.get("last_run_at_unix_ms"),
+        "rows_removed_last": maintenance.get("rows_removed_last", 0),
+        "rows_removed_total": maintenance.get("rows_removed_total", 0),
+        "consecutive_failures": maintenance.get("consecutive_failures", 0),
+        "last_error": maintenance.get("last_error"),
+    }
+    detail = (
+        f"schema {schema}, DB/WAL {storage['main_bytes']}/{storage['wal_bytes']} bytes, "
+        f"records {storage['record_count']} "
+        f"(oldest/newest {storage['oldest_record_ts_unix_ms']}/"
+        f"{storage['newest_record_ts_unix_ms']}), maintenance "
+        f"{maintenance['last_result']} removed {maintenance['rows_removed_last']} "
+        f"(total {maintenance['rows_removed_total']}), queue {queue_depth}, "
+        f"writer lag {lag_ms}ms, durable "
+        f"event/work/id {durable['event']}/{durable['work']}/{durable['id']}, "
+        f"dropped {dropped}"
+    )
+    fields = {
+        "available": available, "schema_version": schema, "lag_ms": lag_ms,
+        "queue_depth": queue_depth, "last_durable_seq": durable,
+        "dropped": dropped, "storage": storage, "maintenance": maintenance,
+    }
+    total_bytes = storage["main_bytes"] + storage["wal_bytes"]
+    over_soft_cap = (
+        storage["soft_max_bytes"] > 0
+        and total_bytes > storage["soft_max_bytes"]
+    )
+    if state == "misconfigured":
+        return _check("history", "error",
+                      f"history {state}: {reason or 'invalid configuration'} ({detail}).",
+                      **fields)
+    if not configured_enabled and state == "disabled":
+        return _check("history", "skip",
+                      "history disabled. Enable with [history] enabled = true.",
+                      **fields)
+    if not available or state == "unavailable":
+        return _check("history", "error",
+                      f"history {state}: {reason or 'unavailable'} ({detail}).",
+                      **fields)
+    if maintenance["consecutive_failures"] > 0 or over_soft_cap or state != "ok":
+        if maintenance["consecutive_failures"] > 0:
+            warning = maintenance["last_error"] or "history maintenance is failing"
+        elif over_soft_cap:
+            warning = (
+                f"storage remains over the {storage['soft_max_bytes']} byte soft cap"
+            )
+        else:
+            warning = reason or f"history state is {state}"
+        return _check("history", "warn",
+                      f"history needs attention: {warning} ({detail}).",
+                      **fields)
+    if available and state == "ok":
+        return _check("history", "ok",
+                      f"history available ({detail}).",
+                      **fields)
+    return _check("history", "error",
+                  f"history {state}: {reason or 'unavailable'} ({detail}).",
+                  **fields)
+
+
+def check_tmux() -> list[dict[str, Any]]:
+    """tmux binary presence, local server liveness, nested-tmux warning."""
+    import shutil
+    records: list[dict[str, Any]] = []
+    tmux = shutil.which("tmux")
+    if not tmux:
+        records.append(_check("tmux.binary", "warn",
+                              "tmux not found on PATH — tmux-backed tabs unavailable."))
+        return records
+    records.append(_check("tmux.binary", "ok", f"tmux found at {tmux}."))
+
+    try:
+        proc = subprocess.run([tmux, "list-sessions"],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        records.append(_check("tmux.server", "warn",
+                              f"could not run tmux list-sessions: {err}"))
+    else:
+        combined = (proc.stdout + proc.stderr).lower()
+        no_server_markers = (
+            "no server running",
+            "no sessions",
+            "error connecting",
+            "failed to connect",
+            "no such file or directory",
+        )
+        if proc.returncode == 0:
+            n = len([ln for ln in proc.stdout.splitlines() if ln.strip()])
+            records.append(_check("tmux.server", "ok",
+                                  f"local tmux server running ({n} session(s))."))
+        elif any(m in combined for m in no_server_markers):
+            records.append(_check("tmux.server", "skip",
+                                  "no local tmux server running (this is normal until a "
+                                  "tmux tab is created)."))
+        else:
+            records.append(_check("tmux.server", "warn",
+                                  f"tmux list-sessions exited {proc.returncode}: "
+                                  f"{proc.stderr.strip() or proc.stdout.strip()}"))
+
+    if os.environ.get("TMUX"):
+        records.append(_check("tmux.nested", "warn",
+                              "$TMUX is set — you are inside a tmux session; taarof's own "
+                              "tmux tabs would nest. Consider running taarof outside tmux."))
+    return records
+
+
+def check_hosts(cfg: dict[str, Any] | None, cfg_reason: str | None,
+                probe: bool) -> list[dict[str, Any]]:
+    """Report configured [hosts.<name>] entries; optionally ssh-probe them."""
+    if cfg_reason is not None:
+        return [_check("hosts.config", "skip",
+                       f"host config unreadable ({cfg_reason}).")]
+    hosts = (cfg or {}).get("hosts")
+    if not isinstance(hosts, dict) or not hosts:
+        return [_check("hosts.config", "skip",
+                       "no [hosts.*] configured in config.toml.")]
+
+    records: list[dict[str, Any]] = []
+    for name in sorted(hosts):
+        entry = hosts[name]
+        target = entry.get("address") if isinstance(entry, dict) else None
+        cname = f"hosts.{name}"
+        if not target:
+            records.append(_check(cname, "skip",
+                                  f"host '{name}' has no address (local-only entry)."))
+            continue
+        if not probe:
+            records.append(_check(cname, "skip",
+                                  f"ssh target {target} not probed (use --probe-hosts).",
+                                  target=target))
+            continue
+        records.append(_probe_host(cname, target))
+    return records
+
+
+def _probe_host(cname: str, target: str) -> dict[str, Any]:
+    """Attempt a non-interactive `ssh -o BatchMode=yes <target> true`.
+
+    BatchMode=yes fails fast instead of hanging on a password prompt, so a
+    permission-denied result specifically flags remote SSH prompt risk.
+    """
+    try:
+        proc = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+             "-o", "StrictHostKeyChecking=accept-new", target, "true"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return _check(cname, "error",
+                      f"ssh {target} timed out (host unreachable or hanging).",
+                      target=target)
+    except OSError as err:
+        return _check(cname, "warn", f"could not run ssh for {target}: {err}", target=target)
+    if proc.returncode == 0:
+        return _check(cname, "ok", f"ssh {target} reachable (key auth).", target=target)
+    err = proc.stderr.lower()
+    if "permission denied" in err or "password" in err or "publickey" in err:
+        return _check(cname, "warn",
+                      f"ssh {target} refused non-interactive auth — would prompt for a "
+                      f"password interactively (remote SSH prompt risk). Set up key auth.",
+                      target=target)
+    return _check(cname, "warn",
+                  f"ssh {target} failed (exit {proc.returncode}): "
+                  f"{proc.stderr.strip() or 'unknown error'}",
+                  target=target)
+
+
+def run_doctor_checks(session: str | None, *, probe_hosts: bool = False) -> dict[str, Any]:
+    """Collect all doctor checks into {"ok", "checks"}. Never raises."""
+    checks: list[dict[str, Any]] = []
+
+    reg_record, facts = check_app_registry(session)
+    checks.append(reg_record)
+    checks.append(check_socket(facts, session))
+    checks.append(check_update(facts, session))
+    # Separate from `app.update` on purpose: same-binary is not same-source.
+    checks.append(check_identity(facts, session))
+    checks.append(check_runtime_probe(facts, session))
+    checks.append(check_runtime_dir())
+
+    cfg, cfg_reason = _load_config()
+    checks.extend(check_http(facts, cfg, cfg_reason, session))
+    checks.append(check_history(cfg, cfg_reason, session))
+    checks.extend(check_tmux())
+    checks.extend(check_hosts(cfg, cfg_reason, probe_hosts))
+
+    overall_ok = not any(c.get("status") == "error" for c in checks)
+    return {"ok": overall_ok, "checks": checks}
+
+
+def cmd_doctor(args: argparse.Namespace) -> Any:
+    return run_doctor_checks(args.session, probe_hosts=args.probe_hosts)
+
+
+def render_doctor(result: dict[str, Any]) -> str:
+    """Human table of doctor checks."""
+    checks = result.get("checks") or []
+    rows = [[c.get("status", ""), c.get("name", ""), c.get("detail", "")] for c in checks]
+    table = _render_table(["status", "check", "detail"], rows)
+    overall = "ok" if result.get("ok") else "PROBLEMS FOUND"
+    return f"{table}\n\noverall: {overall}"
+
+
+RENDERERS["doctor"] = render_doctor
+RENDERERS["version"] = render_version
+
+
+# ---------------------------------------------------------------------------
+# Command builders
+# ---------------------------------------------------------------------------
+
+def _optional(d: dict[str, Any], key: str, value: Any) -> None:
+    if value is not None:
+        d[key] = value
+
+
+_SILENT_FAILURE = object()
+
+
+def cmd_health(args: argparse.Namespace) -> Any:
+    return http_get("/health", session=args.session)
+
+
+def cmd_http_get(args: argparse.Namespace) -> Any:
+    return http_get(f"/api/v1/{args._route}", session=args.session)
+
+
+def cmd_events(args: argparse.Namespace) -> Any:
+    suffix = ""
+    if args.since is not None:
+        suffix = f"?since_seq={args.since}"
+    return http_get(f"/api/v1/events{suffix}", session=args.session)
+
+
+def cmd_list_tabs(args: argparse.Namespace) -> Any:
+    return socket_send({"action": "list-tabs"}, session=args.session)
+
+
+def cmd_query_state(args: argparse.Namespace) -> Any:
+    return socket_send({"action": "query-state"}, session=args.session)
+
+
+def cmd_query_events(args: argparse.Namespace) -> Any:
+    msg: dict[str, Any] = {"action": "query-events"}
+    _optional(msg, "since_seq", args.since)
+    _optional(msg, "limit", args.limit)
+    return socket_send(msg, session=args.session)
+
+
+def cmd_query_history(args: argparse.Namespace) -> Any:
+    msg: dict[str, Any] = {"action": "query-history"}
+    for key in (
+        "since_id", "limit", "from_ts", "to_ts", "record_type", "session_filter",
+        "workspace", "pane", "task", "repository", "authority", "verification",
+    ):
+        value = getattr(args, key)
+        target = "session" if key == "session_filter" else key
+        _optional(msg, target, value)
+    return socket_send(msg, session=args.session)
+
+
+def _send_keys_payload(args: argparse.Namespace) -> str:
+    if args.keys_file is not None:
+        try:
+            keys = Path(args.keys_file).read_text(encoding="utf-8")
+        except OSError as err:
+            raise SystemExit(f"failed to read --keys-file {args.keys_file}: {err}")
+    elif args.stdin:
+        keys = sys.stdin.read()
+    else:
+        keys = args.keys
+
+    if args.raw_hex:
+        keys = bytes.fromhex(keys).decode("latin-1")
+    return keys
+
+
+def cmd_send_keys(args: argparse.Namespace) -> Any:
+    keys = _send_keys_payload(args)
+    msg = {"action": "send-keys", "pane": args.pane, "keys": keys}
+    _optional(msg, "tab", args.tab)
+    return socket_send(msg, session=args.session)
+
+
+def cmd_run(args: argparse.Namespace) -> Any:
+    msg = {"action": "run-in-pane", "pane": args.pane, "command": args.command}
+    _optional(msg, "tab", args.tab)
+    return socket_send(msg, session=args.session)
+
+
+def cmd_get_text(args: argparse.Namespace) -> Any:
+    msg: dict[str, Any] = {"action": "get-text", "pane": args.pane}
+    _optional(msg, "tab", args.tab)
+    _optional(msg, "scrollback", args.scrollback)
+    return socket_send(msg, session=args.session)
+
+
+def cmd_open_pane(args: argparse.Namespace) -> Any:
+    msg: dict[str, Any] = {"action": "open-pane", "command": args.command}
+    _optional(msg, "tab", args.tab)
+    _optional(msg, "direction", args.direction)
+    _optional(msg, "working_dir", args.cwd)
+    return socket_send(msg, session=args.session)
+
+
+def cmd_close_pane(args: argparse.Namespace) -> Any:
+    msg = {"action": "close-pane", "pane": args.pane}
+    _optional(msg, "tab", args.tab)
+    return socket_send(msg, session=args.session)
+
+
+def cmd_create_tab(args: argparse.Namespace) -> Any:
+    msg: dict[str, Any] = {"action": "create-tab"}
+    _optional(msg, "name", args.name)
+    _optional(msg, "working_dir", args.cwd)
+    _optional(msg, "command", args.command)
+    return socket_send(msg, session=args.session)
+
+
+def cmd_close_tab(args: argparse.Namespace) -> Any:
+    return socket_send({"action": "close-tab", "tab": args.tab}, session=args.session)
+
+
+def cmd_switch_tab(args: argparse.Namespace) -> Any:
+    return socket_send({"action": "switch-tab", "tab": args.tab}, session=args.session)
+
+
+def cmd_rename_tab(args: argparse.Namespace) -> Any:
+    return socket_send({"action": "rename-tab", "tab": args.tab, "name": args.name},
+                       session=args.session)
+
+
+def cmd_reorder_tab(args: argparse.Namespace) -> Any:
+    return socket_send({"action": "reorder-tab", "tab": args.tab, "index": args.index},
+                       session=args.session)
+
+
+def cmd_notify(args: argparse.Namespace) -> Any:
+    msg: dict[str, Any] = {"action": "notify", "message": args.message}
+    _optional(msg, "tab", args.tab)
+    return socket_send(msg, session=args.session)
+
+
+def cmd_agent_status(args: argparse.Namespace) -> Any:
+    msg: dict[str, Any] = {"action": "agent-status", "state": args.state}
+    _optional(msg, "tab", args.tab)
+    _optional(msg, "pane", args.pane)
+    _optional(msg, "text", args.text)
+    _optional(msg, "source", args.source)
+    return socket_send(msg, session=args.session)
+
+
+_WORK_CONTEXT_ENV = {
+    "session": "TAAROF_WORK_SESSION",
+    "workspace_origin": "TAAROF_WORK_WORKSPACE_ORIGIN",
+    "tab_origin": "TAAROF_WORK_TAB_ORIGIN",
+    "pane_origin": "TAAROF_WORK_PANE_ORIGIN",
+    "task_id": "TAAROF_WORK_TASK_ID",
+    "checkout_root": "TAAROF_WORK_CHECKOUT_ROOT",
+    "binding_token": "TAAROF_WORK_BINDING_TOKEN",
+}
+
+
+def _work_context_from_env() -> dict[str, str]:
+    context: dict[str, str] = {}
+    missing: list[str] = []
+    for field, env_name in _WORK_CONTEXT_ENV.items():
+        value = os.environ.get(env_name)
+        if value:
+            context[field] = value
+        else:
+            missing.append(env_name)
+    if missing:
+        raise SystemExit(
+            "work-report has no complete bound-pane context; missing "
+            + ", ".join(missing)
+            + ". Stop and do not guess. A dispatched task injects context. For a "
+              "manually-bound pane, use this explicit workflow:\n"
+              "SESSION='your-named-session'\n"
+              "taarof --session \"$SESSION\" panes\n"
+              "eval \"$(taarof --session \"$SESSION\" work-context "
+              "--tab <numeric-tab-id> --pane <numeric-pane-id> --shell)\""
+        )
+    return context
+
+
+def cmd_work_report(args: argparse.Namespace) -> Any:
+    context = _work_context_from_env()
+    context_session = context["session"]
+    if args.session is not None and args.session != context_session:
+        raise SystemExit(
+            "work-report --session does not match TAAROF_WORK_SESSION; "
+            "stop and refresh the bound-pane context"
+        )
+    msg: dict[str, Any] = {
+        "action": "work-report",
+        "milestone": args.milestone,
+        **context,
+    }
+    _optional(msg, "note", args.note)
+    return socket_send(msg, session=args.session or context_session)
+
+
+def cmd_work_context(args: argparse.Namespace) -> Any:
+    if not args.session:
+        raise SystemExit(
+            "work-context requires explicit --session before the command; "
+            "stop and select the intended taarof session"
+        )
+    msg: dict[str, Any] = {
+        "action": "work-context",
+        "tab": str(args.tab),
+        "pane": args.pane,
+    }
+    response = socket_send(msg, session=args.session)
+    if not args.shell:
+        return response
+    if not isinstance(response, dict) or response.get("ok") is False:
+        error = response.get("error") if isinstance(response, dict) else None
+        print(
+            json.dumps({"ok": False, "error": error or "work-context failed"}),
+            file=sys.stderr,
+        )
+        return _SILENT_FAILURE
+    data = response.get("data")
+    if not isinstance(data, dict):
+        print(
+            json.dumps({"ok": False, "error": "work-context response is missing data"}),
+            file=sys.stderr,
+        )
+        return _SILENT_FAILURE
+    if data.get("session") != args.session:
+        print(
+            json.dumps({"ok": False, "error": "work-context session mismatch"}),
+            file=sys.stderr,
+        )
+        return _SILENT_FAILURE
+    fields = [
+        (env_name, data.get(field)) for field, env_name in _WORK_CONTEXT_ENV.items()
+    ]
+    fields.extend([
+        ("TAAROF_WORK_TASK_TITLE", data.get("task_title")),
+        ("TAAROF_WORK_INSTRUCTIONS", data.get("instructions")),
+    ])
+    if any(value in (None, "") for _, value in fields):
+        print(
+            json.dumps({"ok": False, "error": "work-context response is incomplete"}),
+            file=sys.stderr,
+        )
+        return _SILENT_FAILURE
+    for env_name, value in fields:
+        print(f"export {env_name}={shlex.quote(str(value))}")
+    return None
+
+
+def cmd_agent_ls(args: argparse.Namespace) -> Any:
+    return socket_send({"action": "query-state"}, session=args.session)
+
+
+def cmd_agent_sessions(args: argparse.Namespace) -> Any:
+    return socket_send({"action": "query-agent-sessions"}, session=args.session)
+
+
+def cmd_workspace_create(args: argparse.Namespace) -> Any:
+    msg: dict[str, Any] = {"action": "create-workspace"}
+    _optional(msg, "name", args.name)
+    return socket_send(msg, session=args.session)
+
+
+def cmd_workspace_switch(args: argparse.Namespace) -> Any:
+    return socket_send(
+        {"action": "switch-workspace", "workspace": args.workspace},
+        session=args.session,
+    )
+
+
+def cmd_workspace_rename(args: argparse.Namespace) -> Any:
+    return socket_send(
+        {"action": "rename-workspace", "workspace": args.workspace, "name": args.name},
+        session=args.session,
+    )
+
+
+def cmd_agent_workspace(args: argparse.Namespace) -> Any:
+    msg: dict[str, Any] = {
+        "action": "agent-workspace",
+        "branch": args.branch,
+        # Keep the server-side operation lifetime aligned with this client's
+        # synchronous wait. A timed-out caller is removed before GTK apply,
+        # so an abandoned invocation cannot later open a workspace.
+        "timeout_seconds": args.timeout,
+    }
+    _optional(msg, "repo", args.repo)
+    _optional(msg, "command", args.command)
+    # Worktree creation may legitimately initialize Git state or wait on a
+    # filesystem lock. Keep the synchronous response contract, but do not use
+    # the short query timeout that is appropriate for `query-state`.
+    return socket_send(msg, session=args.session, timeout=args.timeout)
+
+
+def cmd_create_tmux_tab(args: argparse.Namespace) -> Any:
+    msg: dict[str, Any] = {"action": "create-tmux-tab"}
+    _optional(msg, "name", args.name)
+    _optional(msg, "host", args.host)
+    _optional(msg, "working_dir", args.cwd)
+    return socket_send(msg, session=args.session)
+
+
+def cmd_detach_pane(args: argparse.Namespace) -> Any:
+    msg = {"action": "detach-pane", "pane": args.pane}
+    _optional(msg, "tab", args.tab)
+    return socket_send(msg, session=args.session)
+
+
+def cmd_attach_session(args: argparse.Namespace) -> Any:
+    msg: dict[str, Any] = {"action": "attach-session", "session_name": args.name}
+    _optional(msg, "host", getattr(args, "host", None))
+    _optional(msg, "ssh_target", getattr(args, "ssh_target", None))
+    return socket_send(msg, session=args.session)
+
+
+def cmd_list_detached(args: argparse.Namespace) -> Any:
+    return socket_send({"action": "list-detached"}, session=args.session)
+
+
+def cmd_dashboard_state(args: argparse.Namespace) -> Any:
+    return socket_send({"action": "dashboard-state"}, session=args.session)
+
+
+def cmd_open_dashboard(args: argparse.Namespace) -> Any:
+    return socket_send({"action": "open-dashboard"}, session=args.session)
+
+
+def _gather_tmux_inventory(session: str | None) -> list[dict[str, Any]]:
+    """Query the three read-only sources and merge them into one inventory.
+
+    dashboard-state is best-effort: some builds may not populate it, so a failed
+    query degrades gracefully to the attached + detached view.
+    """
+    state = socket_send({"action": "query-state"}, session=session)
+    detached = socket_send({"action": "list-detached"}, session=session)
+    try:
+        dashboard: Any = socket_send({"action": "dashboard-state"}, session=session)
+    except (SystemExit, OSError, ValueError):
+        dashboard = None
+    return build_tmux_inventory(state, detached, dashboard)
+
+
+def cmd_tmux_ls(args: argparse.Namespace) -> Any:
+    inventory = _gather_tmux_inventory(args.session)
+    fmt = args.format or getattr(args, "_format_default", None) or "auto"
+    if _resolve_format(fmt) == "table":
+        print(render_tmux_ls(inventory))
+        return None
+    _emit({"ok": True, "sessions": inventory}, args.pretty)
+    return None
+
+
+def cmd_tmux_attach(args: argparse.Namespace) -> Any:
+    """Resolve a friendly selector to a (session, host), then act on its state.
+
+    * resolved row is ATTACHED (live tab in this taarof instance): "attach"
+      means focus it — send switch-tab to its tab id. The app-side
+      attach-session only accepts sessions from the detached list, so
+      attach-session would fail here anyway.
+    * resolved row is DETACHED: send attach-session (host/ssh_target forwarded).
+
+    The returned JSON carries a `sent` key echoing the payload actually sent so
+    callers can see which path ran.
+
+    Bare-session fast path: when only a positional is given and it exactly names
+    a session with no ambiguity, resolution collapses to that row directly; an
+    unknown lone name still attaches literally (the app may know sessions the
+    read surfaces do not). Any ambiguity prints a candidates table and exits 1
+    without attaching.
+    """
+    inventory = _gather_tmux_inventory(args.session)
+    match, candidates = resolve_tmux_selector(
+        inventory,
+        positional=args.selector,
+        workspace=args.workspace,
+        tab=args.tab,
+        pane=args.pane,
+        host=args.host,
+    )
+
+    # Bare-session fast path / back-compat: a lone positional session name that
+    # the inventory does not know about is still attached literally (the app may
+    # know a session the read surfaces do not, and this preserves the historical
+    # `tmux attach <name>` behaviour). Only genuine ambiguity blocks.
+    bare_name = (
+        args.selector is not None
+        and args.workspace is None
+        and args.tab is None
+        and args.pane is None
+    )
+    if match is None and bare_name and not candidates:
+        msg: dict[str, Any] = {
+            "action": "attach-session", "session_name": args.selector}
+        _optional(msg, "host", args.host)
+        _optional(msg, "ssh_target", args.ssh_target)
+        return _send_with_echo(msg, args.session)
+
+    if match is None:
+        described = _describe_tmux_selector(args)
+        if not candidates:
+            print(f"no tmux session matches {described}", file=sys.stderr)
+            raise SystemExit(1)
+        print(f"ambiguous tmux selector {described}: {len(candidates)} candidates",
+              file=sys.stderr)
+        print(render_tmux_ls(candidates), file=sys.stderr)
+        print("hint: narrow with --host, --workspace/--tab, or an exact session name.",
+              file=sys.stderr)
+        raise SystemExit(1)
+
+    # Already attached -> focus its live tab. attach-session is detached-only
+    # app-side ("Session not found in detached list"), and focusing is what
+    # "attach" means for a session that is already open here.
+    if match.get("state") == "attached":
+        tab_target = match.get("tab_id")
+        if tab_target in (None, ""):
+            tab_target = match.get("tab")
+        if tab_target not in (None, ""):
+            # The socket protocol takes the tab target as a string (id or name).
+            msg = {"action": "switch-tab", "tab": str(tab_target)}
+            return _send_with_echo(msg, args.session)
+        # Attached but no tab known (shouldn't happen) — fall through.
+
+    msg = {"action": "attach-session", "session_name": match["session"]}
+    # Forward host/ssh_target: an explicit flag wins, else use resolved values.
+    host = args.host or (match.get("host") or None)
+    ssh_target = args.ssh_target or match.get("ssh_target")
+    _optional(msg, "host", host)
+    _optional(msg, "ssh_target", ssh_target)
+    return _send_with_echo(msg, args.session)
+
+
+def _send_with_echo(msg: dict[str, Any], session: str | None) -> Any:
+    """Send a socket payload; echo it back as `sent` in the response dict so the
+    caller can see which action ran (switch-tab vs attach-session)."""
+    resp = socket_send(msg, session=session)
+    if isinstance(resp, dict):
+        return {**resp, "sent": msg}
+    return resp
+
+
+def _describe_tmux_selector(args: argparse.Namespace) -> str:
+    """Human description of the selector args for error messages."""
+    parts: list[str] = []
+    if args.selector is not None:
+        parts.append(repr(args.selector))
+    if args.workspace is not None:
+        parts.append(f"--workspace {args.workspace!r}")
+    if args.tab is not None:
+        parts.append(f"--tab {args.tab!r}")
+    if args.pane is not None:
+        parts.append(f"--pane {args.pane!r}")
+    if args.host is not None:
+        parts.append(f"--host {args.host!r}")
+    return " ".join(parts) if parts else "(no selector given)"
+
+
+# ---------------------------------------------------------------------------
+# Workspace manifest (export / apply)
+# ---------------------------------------------------------------------------
+
+def _toml_escape(value: str) -> str:
+    """Escape a string for inclusion as a TOML basic-string value."""
+    replacements = {"\\": "\\\\", "\"": "\\\"", "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    out = "".join(replacements.get(c, c) for c in value)
+    return f'"{out}"'
+
+
+def _toml_write_kv(lines: list[str], key: str, value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool):
+        lines.append(f"{key} = {'true' if value else 'false'}")
+    elif isinstance(value, (int, float)):
+        lines.append(f"{key} = {value}")
+    elif isinstance(value, str):
+        lines.append(f"{key} = {_toml_escape(value)}")
+    elif isinstance(value, list):
+        items = ", ".join(_toml_escape(v) if isinstance(v, str) else str(v) for v in value)
+        lines.append(f"{key} = [{items}]")
+    else:
+        raise TypeError(f"unsupported TOML type for {key}: {type(value)}")
+
+
+def _tab_to_manifest(tab: dict[str, Any]) -> dict[str, Any]:
+    """Convert a list-tabs tab entry into a manifest-friendly dict."""
+    panes = tab.get("panes") or []
+    primary = panes[0] if panes else {}
+    tmux_session = primary.get("tmux_session")
+    tmux_host = primary.get("tmux_host")
+    cwd_host = primary.get("cwd_host")
+    cwd = primary.get("cwd")
+    out: dict[str, Any] = {"name": tab.get("name") or "tab"}
+    if primary.get("remote_shell") and not cwd_host and not tmux_host:
+        raise SystemExit(
+            f"cannot export remote tab {out['name']!r}: query-state has no "
+            "cwd_host or tmux_host SSH target")
+    if tab.get("agent_name"):
+        out["agent"] = tab["agent_name"]
+    # OSC 7 reports cwd_host for local shells too. Only remote_shell establishes
+    # that cwd_host is an SSH target; tmux_host is tracked independently.
+    if tmux_host:
+        out["tmux_host"] = tmux_host
+    if primary.get("remote_shell") and cwd_host:
+        out["remote"] = cwd_host
+    if cwd:
+        out["cwd"] = cwd
+    if tmux_session:
+        out["tmux_session"] = tmux_session
+    # Extra panes preserved so export is lossless-ish
+    if len(panes) > 1:
+        extras = []
+        for pane in panes[1:]:
+            entry: dict[str, Any] = {"pane_id": pane.get("pane_id")}
+            if (pane.get("remote_shell") and not pane.get("cwd_host")
+                    and not pane.get("tmux_host")):
+                raise SystemExit(
+                    f"cannot export remote pane {pane.get('pane_id')!r} in tab "
+                    f"{out['name']!r}: query-state has no cwd_host or tmux_host SSH target")
+            if pane.get("cwd"):
+                entry["cwd"] = pane["cwd"]
+            if pane.get("remote_shell") and pane.get("cwd_host"):
+                entry["remote"] = pane["cwd_host"]
+            if pane.get("tmux_session"):
+                entry["tmux_session"] = pane["tmux_session"]
+            if pane.get("tmux_host"):
+                entry["tmux_host"] = pane["tmux_host"]
+            extras.append(entry)
+        out["extra_panes"] = extras
+    return out
+
+
+def _render_manifest_toml(state: dict[str, Any]) -> str:
+    """Render a list-tabs payload as a TOML workspace manifest."""
+    lines: list[str] = [
+        "# taarof workspace manifest",
+        "# Generated by `taarof workspace export`.",
+        "# Apply with `taarof workspace apply FILE --workspace NAME`.",
+        "",
+    ]
+    workspaces = state.get("workspaces") or []
+    for ws in workspaces:
+        lines.append("[[workspace]]")
+        _toml_write_kv(lines, "name", ws.get("name"))
+        _toml_write_kv(lines, "repo_root", ws.get("repo_root"))
+        _toml_write_kv(lines, "branch", ws.get("branch_name"))
+        _toml_write_kv(lines, "is_worktree", ws.get("is_worktree"))
+        lines.append("")
+        for tab in ws.get("tabs") or []:
+            entry = _tab_to_manifest(tab)
+            lines.append("[[workspace.tab]]")
+            _toml_write_kv(lines, "name", entry.get("name"))
+            _toml_write_kv(lines, "agent", entry.get("agent"))
+            _toml_write_kv(lines, "remote", entry.get("remote"))
+            _toml_write_kv(lines, "tmux_host", entry.get("tmux_host"))
+            _toml_write_kv(lines, "tmux_session", entry.get("tmux_session"))
+            _toml_write_kv(lines, "cwd", entry.get("cwd"))
+            extras = entry.get("extra_panes") or []
+            for pane in extras:
+                lines.append("")
+                lines.append("[[workspace.tab.extra_pane]]")
+                for k, v in pane.items():
+                    _toml_write_kv(lines, k, v)
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def cmd_workspace_export(args: argparse.Namespace) -> Any:
+    resp = socket_send({"action": "list-tabs"}, session=args.session)
+    if not resp.get("ok"):
+        return resp
+    data = resp.get("data") or {}
+    if args.format == "json":
+        payload: Any = data
+        if args.workspace:
+            payload = {
+                "workspaces": [
+                    w for w in data.get("workspaces", [])
+                    if w.get("name") == args.workspace or str(w.get("id")) == args.workspace
+                ]
+            }
+        if args.out:
+            Path(args.out).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            return {"ok": True, "written": args.out}
+        return payload
+    # TOML default
+    if args.workspace:
+        data = {
+            "workspaces": [
+                w for w in data.get("workspaces", [])
+                if w.get("name") == args.workspace or str(w.get("id")) == args.workspace
+            ]
+        }
+    text = _render_manifest_toml(data)
+    if args.out:
+        Path(args.out).write_text(text)
+        return {"ok": True, "written": args.out, "workspaces": len(data.get("workspaces", []))}
+    print(text, end="")
+    return None  # handled above, suppress json emit
+
+
+def _ssh_tmux_ensure(host_address: str, session: str, cwd: str | None,
+                     *, dry_run: bool) -> dict[str, Any]:
+    """Ensure a tmux session exists on `host_address`; create it idempotently."""
+    ensure_cmd = f"tmux has-session -t {shlex.quote(session)} 2>/dev/null || " \
+        f"tmux new-session -d -s {shlex.quote(session)}"
+    if cwd:
+        ensure_cmd += f" -c {shlex.quote(cwd)}"
+    step: dict[str, Any] = {"host": host_address, "session": session, "cwd": cwd,
+                            "command": ensure_cmd}
+    if dry_run:
+        step["action"] = "would-ensure"
+        return step
+    proc = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", host_address,
+         ensure_cmd],
+        capture_output=True, text=True, timeout=20,
+    )
+    step["action"] = "ensured"
+    step["exit_code"] = proc.returncode
+    if proc.returncode != 0:
+        step["stderr"] = proc.stderr.strip()
+    return step
+
+
+def _local_tmux_ensure(session: str, cwd: str | None,
+                       *, dry_run: bool) -> dict[str, Any]:
+    step: dict[str, Any] = {"host": "local", "session": session, "cwd": cwd}
+    if dry_run:
+        step["action"] = "would-ensure"
+        return step
+    check = subprocess.run(
+        ["tmux", "has-session", "-t", session],
+        capture_output=True, text=True,
+    )
+    if check.returncode == 0:
+        step["action"] = "already-present"
+        step["exit_code"] = 0
+        return step
+    create = ["tmux", "new-session", "-d", "-s", session]
+    if cwd:
+        create += ["-c", cwd]
+    proc = subprocess.run(create, capture_output=True, text=True)
+    step["action"] = "created"
+    step["exit_code"] = proc.returncode
+    if proc.returncode != 0:
+        step["stderr"] = proc.stderr.strip()
+    return step
+
+
+def _resolve_host_alias(alias: str) -> str:
+    """Map a host alias from the taarof config to its SSH address."""
+    cfg_path = Path.home() / ".config" / "taarof" / "config.toml"
+    if not cfg_path.exists() or tomllib is None:
+        return alias
+    try:
+        cfg = tomllib.loads(cfg_path.read_text())
+    except (OSError, ValueError):
+        return alias
+    hosts = cfg.get("hosts") or {}
+    entry = hosts.get(alias)
+    if isinstance(entry, dict) and isinstance(entry.get("address"), str):
+        return entry["address"]
+    return alias
+
+
+def _is_local_hostname(host: Any) -> bool:
+    """Return whether an old manifest's remote label names this machine."""
+    if not isinstance(host, str):
+        return False
+    label = host.strip().lower().rstrip(".")
+    if not label or "@" in label:
+        return False
+    local_labels: set[str] = set()
+    for resolver in (socket.gethostname, socket.getfqdn):
+        try:
+            resolved = resolver().strip().lower().rstrip(".")
+        except OSError:
+            continue
+        if resolved:
+            local_labels.add(resolved)
+            local_labels.add(resolved.split(".", 1)[0])
+    return label in local_labels
+
+
+def _add_tab_warning(tab_report: dict[str, Any], warning: str) -> None:
+    previous = tab_report.get("warning")
+    tab_report["warning"] = f"{previous}; {warning}" if previous else warning
+
+
+def cmd_workspace_apply(args: argparse.Namespace) -> Any:
+    if tomllib is None:
+        raise SystemExit("tomllib not available; need Python 3.11+ to parse manifests")
+    manifest = tomllib.loads(Path(args.file).read_text())
+    wanted_name = args.workspace
+    workspaces = manifest.get("workspace") or []
+    if isinstance(workspaces, dict):
+        workspaces = [workspaces]
+    if wanted_name:
+        workspaces = [w for w in workspaces if w.get("name") == wanted_name]
+    if not workspaces:
+        raise SystemExit(
+            f"no workspace matched (--workspace={wanted_name!r} in {args.file})")
+
+    report: dict[str, Any] = {"dry_run": args.dry_run, "workspaces": []}
+    for ws in workspaces:
+        ws_report: dict[str, Any] = {"name": ws.get("name"), "tabs": [], "tmux": []}
+        for tab in ws.get("tab") or []:
+            tab_report: dict[str, Any] = {"name": tab.get("name")}
+            session = tab.get("tmux_session")
+            manifest_remote = tab.get("remote")
+            tmux_host = tab.get("tmux_host")
+            if _is_local_hostname(manifest_remote):
+                if tmux_host:
+                    _add_tab_warning(
+                        tab_report,
+                        "legacy remote field matches the local hostname; using tmux_host "
+                        "as the SSH target",
+                    )
+                else:
+                    _add_tab_warning(
+                        tab_report,
+                        "remote field matches the local hostname; preserving SSH because "
+                        "legacy local exports and intentional SSH-to-self are ambiguous",
+                    )
+            # tmux_host is the recorded connection target. cwd_host/remote may
+            # be the server's OSC 7 hostname and need not be an SSH alias.
+            remote_alias = tmux_host or manifest_remote
+            cwd = tab.get("cwd")
+            command: str | None = None
+
+            if session and remote_alias:
+                address = _resolve_host_alias(remote_alias)
+                if args.ensure_tmux:
+                    ws_report["tmux"].append(
+                        _ssh_tmux_ensure(address, session, cwd, dry_run=args.dry_run))
+                remote_command = f"tmux attach -t {shlex.quote(session)}"
+                command = f"ssh -t {shlex.quote(address)} {shlex.quote(remote_command)}"
+            elif session:
+                if args.ensure_tmux:
+                    ws_report["tmux"].append(
+                        _local_tmux_ensure(session, cwd, dry_run=args.dry_run))
+                command = f"tmux attach -t {shlex.quote(session)}"
+            elif remote_alias:
+                # Remote host, no tmux — plain SSH (warn: not shareable).
+                address = _resolve_host_alias(remote_alias)
+                base = f"ssh -t {shlex.quote(address)}"
+                if cwd:
+                    remote_command = f"cd {shlex.quote(cwd)} && exec $SHELL -l"
+                    base += f" {shlex.quote(remote_command)}"
+                command = base
+                _add_tab_warning(
+                    tab_report, "remote tab without tmux_session is not shareable")
+            # else: purely local shell, no command (taarof opens default shell)
+
+            payload: dict[str, Any] = {"action": "create-tab"}
+            if tab.get("name"):
+                payload["name"] = tab["name"]
+            if cwd and not remote_alias and not session:
+                payload["working_dir"] = cwd
+            if command:
+                payload["command"] = command
+
+            tab_report["payload"] = payload
+            if args.dry_run:
+                tab_report["action"] = "would-create"
+            else:
+                resp = socket_send(payload, session=args.session)
+                tab_report["action"] = "created"
+                tab_report["response"] = resp
+                if not resp.get("ok"):
+                    ws_report["tabs"].append(tab_report)
+                    ws_report["error"] = f"failed on tab {tab.get('name')!r}"
+                    report["workspaces"].append(ws_report)
+                    if args.fail_fast:
+                        return {"ok": False, "error": ws_report["error"], "report": report}
+                    continue
+            ws_report["tabs"].append(tab_report)
+        report["workspaces"].append(ws_report)
+    report["ok"] = True
+    return report
+
+
+def cmd_raw(args: argparse.Namespace) -> Any:
+    payload = json.loads(args.json)
+    if not isinstance(payload, dict):
+        raise SystemExit("raw payload must be a JSON object")
+    return socket_send(payload, session=args.session)
+
+
+def cmd_socket_path(args: argparse.Namespace) -> Any:
+    return {"socket_path": _socket_path(args.session)}
+
+
+# ---------------------------------------------------------------------------
+# Config: path / default / validate
+# ---------------------------------------------------------------------------
+#
+# Real TOML validation and default generation live in the taarof-app binary
+# (the actual parser) — never re-implemented here — so the two never drift.
+# These commands shell out to it and fall back gracefully when it is absent.
+
+_CONVENTIONAL_CONFIG_PATH = Path.home() / ".config" / "taarof" / "config.toml"
+_CONVENTIONAL_KEYBINDINGS_PATH = Path.home() / ".config" / "taarof" / "keybindings.toml"
+
+# Minimal static starter used only when the binary is unavailable. The binary's
+# `config-default` is authoritative; this is a clearly-labelled fallback.
+_FALLBACK_DEFAULT_CONFIG = """\
+# taarof configuration (~/.config/taarof/config.toml)
+#
+# WARNING: taarof-app binary not found — this is a minimal fallback template,
+# not the authoritative default. Run `taarof config default` again once the app
+# is installed to get the full commented config.
+
+# [sidebar]
+# position = "left"
+
+# [tmux]
+# enabled = false
+# close_behavior = "close"   # "close" or "detach"
+
+# [http]
+# enabled = false
+# port = 7800
+"""
+
+
+def _find_app_binary() -> str | None:
+    """Locate the taarof-app binary.
+
+    Discovery order:
+      1. $TAAROF_APP_BIN (explicit override)
+      2. the running app's executable via /proc/<pid>/exe (registry pid)
+      3. `taarof-app` on PATH
+    Returns an absolute path / command name, or None if nothing is found.
+    """
+    import shutil
+
+    override = os.environ.get("TAAROF_APP_BIN")
+    if override:
+        return override
+
+    # Best-effort: the executable backing the currently running app.
+    try:
+        data = _registry_data(None)
+    except SystemExit:
+        data = None
+    if isinstance(data, dict):
+        pid = data.get("pid")
+        if isinstance(pid, int):
+            exe = _pid_exe(pid)
+            if exe and Path(exe).exists():
+                return exe
+
+    return shutil.which("taarof-app")
+
+
+def _run_app_binary(app_bin: str, args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [app_bin, *args], capture_output=True, text=True, timeout=15
+    )
+
+
+def cmd_config_path(args: argparse.Namespace) -> Any:
+    app_bin = _find_app_binary()
+    if app_bin:
+        extra = ["--json"] if args.format == "json" else []
+        try:
+            proc = _run_app_binary(app_bin, ["config-paths", *extra])
+        except (OSError, subprocess.TimeoutExpired) as err:
+            print(f"# taarof-app config-paths failed ({err}); using conventional paths",
+                  file=sys.stderr)
+        else:
+            if proc.returncode == 0:
+                sys.stdout.write(proc.stdout)
+                raise SystemExit(0)
+            print(proc.stderr, file=sys.stderr, end="")
+            raise SystemExit(proc.returncode)
+
+    # Fallback: print conventional paths with a note.
+    if args.format == "json":
+        _emit(
+            {
+                "config": str(_CONVENTIONAL_CONFIG_PATH),
+                "keybindings": str(_CONVENTIONAL_KEYBINDINGS_PATH),
+                "note": "taarof-app not found; conventional paths",
+            },
+            args.pretty,
+        )
+    else:
+        print(f"config: {_CONVENTIONAL_CONFIG_PATH}")
+        print(f"keybindings: {_CONVENTIONAL_KEYBINDINGS_PATH}")
+        print("# note: taarof-app not found; showing conventional paths", file=sys.stderr)
+    raise SystemExit(0)
+
+
+def cmd_config_default(args: argparse.Namespace) -> Any:
+    app_bin = _find_app_binary()
+    text: str
+    if app_bin:
+        try:
+            proc = _run_app_binary(app_bin, ["config-default"])
+        except (OSError, subprocess.TimeoutExpired) as err:
+            print(f"# taarof-app config-default failed ({err}); using fallback template",
+                  file=sys.stderr)
+            text = _FALLBACK_DEFAULT_CONFIG
+        else:
+            if proc.returncode == 0:
+                text = proc.stdout
+            else:
+                print(proc.stderr, file=sys.stderr, end="")
+                raise SystemExit(proc.returncode)
+    else:
+        print("# note: taarof-app not found; using fallback template", file=sys.stderr)
+        text = _FALLBACK_DEFAULT_CONFIG
+
+    if not args.write:
+        sys.stdout.write(text)
+        raise SystemExit(0)
+
+    dest = _CONVENTIONAL_CONFIG_PATH
+    if dest.exists() and not args.force:
+        raise SystemExit(
+            f"refusing to overwrite existing {dest} (pass --force to overwrite)"
+        )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(text, encoding="utf-8")
+    print(f"wrote {dest}")
+    raise SystemExit(0)
+
+
+def cmd_config_validate(args: argparse.Namespace) -> Any:
+    app_bin = _find_app_binary()
+    if not app_bin:
+        raise SystemExit(
+            "taarof-app not found; cannot validate config. "
+            "Set TAAROF_APP_BIN or install taarof-app."
+        )
+
+    extra: list[str] = []
+    # Default to the binary's human table output; opt into JSON with --format json
+    # (or --format auto on a non-TTY, matching the rest of the CLI).
+    fmt = args.format or "table"
+    if _resolve_format(fmt) == "json":
+        extra.append("--json")
+    if args.config:
+        extra += ["--config", args.config]
+    if args.keybindings:
+        extra += ["--keybindings", args.keybindings]
+
+    try:
+        proc = _run_app_binary(app_bin, ["config-validate", *extra])
+    except (OSError, subprocess.TimeoutExpired) as err:
+        raise SystemExit(f"taarof-app config-validate failed: {err}")
+
+    sys.stdout.write(proc.stdout)
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    raise SystemExit(proc.returncode)
+
+
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+#
+# Each command's arguments live in a small `_cfg_*` configurator so both the
+# flat command (compat surface) and the grouped namespace command share exactly
+# the same argument spec and handler. `_render` is only set on read commands.
+
+def _cfg_list_tabs(s: argparse.ArgumentParser) -> None:
+    s.set_defaults(func=cmd_list_tabs, _render="list-tabs")
+
+
+def _cfg_create_tab(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--name")
+    s.add_argument("--cwd")
+    s.add_argument("--command")
+    s.set_defaults(func=cmd_create_tab)
+
+
+def _cfg_close_tab(s: argparse.ArgumentParser) -> None:
+    s.add_argument("tab")
+    s.set_defaults(func=cmd_close_tab)
+
+
+def _cfg_switch_tab(s: argparse.ArgumentParser) -> None:
+    s.add_argument("tab")
+    s.set_defaults(func=cmd_switch_tab)
+
+
+def _cfg_rename_tab(s: argparse.ArgumentParser) -> None:
+    s.add_argument("tab")
+    s.add_argument("--name", required=True)
+    s.set_defaults(func=cmd_rename_tab)
+
+
+def _cfg_reorder_tab(s: argparse.ArgumentParser) -> None:
+    s.add_argument("tab", help="Tab id, 'current', or other resolvable target.")
+    s.add_argument("--index", type=int, required=True,
+                   help="0-based position within the tab's workspace (clamped).")
+    s.set_defaults(func=cmd_reorder_tab)
+
+
+def _cfg_run(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--tab")
+    s.add_argument("--pane", type=int, required=True)
+    s.add_argument("--command", required=True)
+    s.set_defaults(func=cmd_run)
+
+
+def _cfg_open_pane(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--tab")
+    s.add_argument("--command", required=True)
+    s.add_argument("--direction", choices=["vertical", "horizontal"])
+    s.add_argument("--cwd")
+    s.set_defaults(func=cmd_open_pane)
+
+
+def _cfg_close_pane(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--tab")
+    s.add_argument("--pane", type=int, required=True)
+    s.set_defaults(func=cmd_close_pane)
+
+
+def _cfg_send_keys(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--tab")
+    s.add_argument("--pane", type=int, required=True)
+    source = s.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--keys",
+        help="String to send. Use --raw-hex for hex bytes like '03' for Ctrl-C.",
+    )
+    source.add_argument("--keys-file", help="Read keys from a UTF-8 text file.")
+    source.add_argument("--stdin", action="store_true", help="Read keys from standard input.")
+    s.add_argument("--raw-hex", action="store_true", help="Interpret input as hex bytes.")
+    s.set_defaults(func=cmd_send_keys)
+
+
+def _cfg_get_text(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--tab")
+    s.add_argument("--pane", type=int, required=True)
+    s.add_argument("--scrollback", type=int)
+    s.set_defaults(func=cmd_get_text)
+
+
+def _cfg_detach_pane(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--tab")
+    s.add_argument("--pane", type=int, required=True)
+    s.set_defaults(func=cmd_detach_pane)
+
+
+def _cfg_create_tmux_tab(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--name")
+    s.add_argument("--host")
+    s.add_argument("--cwd")
+    s.set_defaults(func=cmd_create_tmux_tab)
+
+
+def _cfg_attach_session(s: argparse.ArgumentParser) -> None:
+    s.add_argument("name")
+    s.add_argument(
+        "--host",
+        help="Disambiguate which host owns the detached session (matches a "
+        "detached session's host label). Sent only when provided.")
+    s.add_argument(
+        "--ssh-target",
+        help="Explicit ssh target to reach the session's host (e.g. user@box). "
+        "Sent only when provided.")
+    s.set_defaults(func=cmd_attach_session)
+
+
+def _cfg_list_detached(s: argparse.ArgumentParser) -> None:
+    s.set_defaults(func=cmd_list_detached, _render="list-detached")
+
+
+def _cfg_tmux_ls(s: argparse.ArgumentParser) -> None:
+    s.set_defaults(func=cmd_tmux_ls)
+
+
+def _cfg_tmux_attach(s: argparse.ArgumentParser) -> None:
+    s.add_argument(
+        "selector", nargs="?",
+        help="Bare tmux session name, a tab name, or a 'workspace:tab' form. "
+        "Omit when using --workspace/--tab/--pane.")
+    s.add_argument("--workspace", help="Owning workspace name or id (with --tab).")
+    s.add_argument("--tab", help="Owning tab name or id.")
+    s.add_argument("--pane", help="Pane id within --tab.")
+    s.add_argument(
+        "--host",
+        help="Restrict to / disambiguate a host (label or ssh target). "
+        "Forwarded to the attach payload.")
+    s.add_argument(
+        "--ssh-target",
+        help="Explicit ssh target for the host (e.g. user@box). Forwarded as-is.")
+    s.set_defaults(func=cmd_tmux_attach)
+
+
+def _cfg_agent_status(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--tab")
+    s.add_argument("--pane", type=int, help="Stable pane ID within the target tab.")
+    s.add_argument(
+        "--state",
+        choices=["idle", "running", "waiting-input", "errored", "done"],
+        required=True,
+        help="Agent activity state (canonical wire names sent as-is).")
+    s.add_argument("--text")
+    s.add_argument("--source")
+    s.set_defaults(func=cmd_agent_status)
+
+
+def _cfg_agent_workspace(s: argparse.ArgumentParser) -> None:
+    def positive_timeout(value: str) -> float:
+        try:
+            timeout = float(value)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError("must be a positive number of seconds") from error
+        if timeout <= 0:
+            raise argparse.ArgumentTypeError("must be a positive number of seconds")
+        return timeout
+
+    s.add_argument("--repo")
+    s.add_argument("--branch", required=True)
+    s.add_argument("--command")
+    s.add_argument(
+        "--timeout",
+        type=positive_timeout,
+        default=120.0,
+        help="Seconds to wait for worktree create/reuse and its final response (default: 120).",
+    )
+    s.set_defaults(func=cmd_agent_workspace)
+
+
+def _cfg_work_report(s: argparse.ArgumentParser) -> None:
+    s.add_argument(
+        "milestone", choices=["started", "progress", "blocked", "finished"],
+        help="Observational pane-local milestone; never mutates .plan or tracker mirrors.")
+    s.add_argument(
+        "--note", help="Optional short single-line note (server validates and bounds it).")
+    s.set_defaults(func=cmd_work_report)
+
+
+def _cfg_work_context(s: argparse.ArgumentParser) -> None:
+    def positive_numeric_id(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError("must be a positive numeric ID") from error
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("must be a positive numeric ID")
+        return parsed
+
+    s.add_argument("--tab", required=True, type=positive_numeric_id,
+                   help="Explicit positive numeric tab id (names/current are rejected).")
+    s.add_argument("--pane", required=True, type=positive_numeric_id,
+                   help="Explicit positive numeric pane id.")
+    s.add_argument(
+        "--shell", action="store_true",
+        help="Print shell exports for eval in a manually-bound pane.")
+    s.set_defaults(func=cmd_work_context)
+
+
+def _cfg_agent_ls(s: argparse.ArgumentParser) -> None:
+    s.set_defaults(func=cmd_agent_ls, _render="agent-ls")
+
+
+def _cfg_agent_sessions(s: argparse.ArgumentParser) -> None:
+    s.set_defaults(func=cmd_agent_sessions, _render="agent-sessions")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # `common_base` holds the args every command shares. `common` adds the
+    # read-command --format flag on top. The workspace subgroup uses
+    # `common_base` only, because `workspace export` has its own unrelated
+    # --format {toml,json}. (Parents share action objects by reference, so we
+    # must not let a resolve-conflict mutate a --format action shared with the
+    # top-level parser.)
+    common_base = argparse.ArgumentParser(add_help=False)
+    # Keep a value supplied before the subcommand from being overwritten by
+    # the inherited subparser action's absent default.
+    common_base.add_argument(
+        "--session", default=argparse.SUPPRESS,
+        help="Named taarof session (defaults to unnamed).",
+    )
+    common_base.add_argument("--pretty", action="store_true", help="Indent JSON output.")
+
+    common = argparse.ArgumentParser(add_help=False, parents=[common_base])
+    common.add_argument(
+        "--format", choices=["json", "table", "auto"], default=None,
+        help="Output format for read commands. json (default for flat commands, "
+        "byte-compatible with older output), table (human columns), or auto "
+        "(table on a TTY, json otherwise). Grouped commands default to auto.",
+    )
+
+    p = argparse.ArgumentParser(prog="taarof", parents=[common],
+                                description="Control the running taarof app.")
+    # Documented here for `--help`, but handled before parsing (see `main`)
+    # because the subcommand is required and `--version` legitimately has none.
+    p.add_argument(
+        "--version", "-V", action="store_true",
+        help="Report CLI, app and source-build identity, then exit.")
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=lambda **kw:
+                           argparse.ArgumentParser(parents=[common], **kw))
+
+    # Read-only HTTP
+    sub.add_parser("health").set_defaults(func=cmd_health)
+    for route in ("runtime-identity", "state", "sessions", "workspaces", "tabs", "panes"):
+        s = sub.add_parser(route, help=f"GET /api/v1/{route}")
+        s.set_defaults(func=cmd_http_get, _route=route, _render=route)
+    s = sub.add_parser("events", help="GET /api/v1/events (HTTP)")
+    s.add_argument("--since", type=int, help="since_seq filter")
+    s.set_defaults(func=cmd_events)
+
+    # Socket reads
+    _cfg_list_tabs(sub.add_parser("list-tabs"))
+    sub.add_parser("query-state").set_defaults(func=cmd_query_state, _render="query-state")
+    sub.add_parser(
+        "version",
+        help="Report CLI, app and source-build identity (same data as --version).",
+    ).set_defaults(func=cmd_version, _render="version", _format_default="auto")
+    s = sub.add_parser("query-events")
+    s.add_argument("--since", type=int)
+    s.add_argument("--limit", type=int)
+    s.set_defaults(func=cmd_query_events)
+    s = sub.add_parser("query-history")
+    s.add_argument("--since-id", type=int)
+    s.add_argument("--limit", type=int)
+    s.add_argument("--from-ts", type=int)
+    s.add_argument("--to-ts", type=int)
+    s.add_argument("--record-type", choices=("event", "diagnostic", "work"))
+    s.add_argument("--history-session", dest="session_filter")
+    s.add_argument("--workspace")
+    s.add_argument("--pane")
+    s.add_argument("--task")
+    s.add_argument("--repository")
+    s.add_argument("--authority")
+    s.add_argument("--verification")
+    s.set_defaults(func=cmd_query_history, _render="query-history")
+    _cfg_get_text(sub.add_parser("get-text"))
+
+    # Pane/tab writes
+    _cfg_send_keys(sub.add_parser("send-keys", help="Raw key input (use for Ctrl-C, TUI, etc)."))
+    _cfg_run(sub.add_parser("run", help="Shell command + newline (safer than send-keys)."))
+    _cfg_open_pane(sub.add_parser("open-pane"))
+    _cfg_close_pane(sub.add_parser("close-pane"))
+    _cfg_create_tab(sub.add_parser("create-tab"))
+    _cfg_close_tab(sub.add_parser("close-tab"))
+    _cfg_switch_tab(sub.add_parser("switch-tab"))
+    _cfg_rename_tab(sub.add_parser("rename-tab"))
+    _cfg_reorder_tab(sub.add_parser(
+        "reorder-tab", help="Move a tab to a workspace-relative position (0-based)."))
+
+    # Notifications & agent activity
+    s = sub.add_parser("notify")
+    s.add_argument("--tab")
+    s.add_argument("--message", required=True)
+    s.set_defaults(func=cmd_notify)
+
+    _cfg_agent_status(sub.add_parser("agent-status"))
+    _cfg_work_report(sub.add_parser(
+        "work-report", help="Append an observational milestone for the bound calling pane."))
+    _cfg_work_context(sub.add_parser(
+        "work-context", help="Bootstrap report context for an explicitly selected bound pane."))
+    _cfg_agent_workspace(sub.add_parser(
+        "agent-workspace",
+        help="Create/reuse a git worktree workspace and optionally run a command."))
+
+    # tmux-backed / detach
+    _cfg_create_tmux_tab(sub.add_parser("create-tmux-tab"))
+    _cfg_detach_pane(sub.add_parser("detach-pane"))
+    _cfg_attach_session(sub.add_parser("attach-session"))
+
+    _cfg_list_detached(sub.add_parser("list-detached"))
+    sub.add_parser("dashboard-state").set_defaults(
+        func=cmd_dashboard_state, _render="dashboard-state")
+    sub.add_parser("open-dashboard").set_defaults(func=cmd_open_dashboard)
+
+    # -----------------------------------------------------------------------
+    # Grouped command namespaces.
+    #
+    # These route to the SAME handlers as the flat commands above (the flat
+    # commands remain the compatibility surface). Grouped read commands default
+    # to --format auto since they are new and carry no back-compat constraint.
+    # -----------------------------------------------------------------------
+    def _group(name: str, help_text: str, dest: str):
+        gparser = sub.add_parser(name, help=help_text)
+        return gparser.add_subparsers(
+            dest=dest, required=True,
+            parser_class=lambda **kw: argparse.ArgumentParser(parents=[common], **kw))
+
+    # taarof tab ls|create|close|switch|rename|reorder
+    tab_sub = _group("tab", "Tab operations (grouped alias of *-tab commands).",
+                     "tab_cmd")
+    _cfg_list_tabs(tab_sub.add_parser("ls", help="List tabs (alias of list-tabs)."))
+    _cfg_create_tab(tab_sub.add_parser("create", help="alias of create-tab"))
+    _cfg_close_tab(tab_sub.add_parser("close", help="alias of close-tab"))
+    _cfg_switch_tab(tab_sub.add_parser("switch", help="alias of switch-tab"))
+    _cfg_rename_tab(tab_sub.add_parser("rename", help="alias of rename-tab"))
+    _cfg_reorder_tab(tab_sub.add_parser("reorder", help="alias of reorder-tab"))
+
+    # taarof pane run|open|close|send-keys|get-text|detach
+    pane_sub = _group("pane", "Pane operations (grouped alias of pane commands).",
+                      "pane_cmd")
+    _cfg_run(pane_sub.add_parser("run", help="alias of run"))
+    _cfg_open_pane(pane_sub.add_parser("open", help="alias of open-pane"))
+    _cfg_close_pane(pane_sub.add_parser("close", help="alias of close-pane"))
+    _cfg_send_keys(pane_sub.add_parser("send-keys", help="alias of send-keys"))
+    _cfg_get_text(pane_sub.add_parser("get-text", help="alias of get-text"))
+    _cfg_detach_pane(pane_sub.add_parser("detach", help="alias of detach-pane"))
+
+    # taarof tmux ls|create-tab|attach|ls-detached
+    tmux_sub = _group("tmux", "tmux-backed operations (grouped aliases).", "tmux_cmd")
+    _cfg_tmux_ls(tmux_sub.add_parser(
+        "ls", help="List all tmux sessions (attached + detached), one table."))
+    _cfg_create_tmux_tab(tmux_sub.add_parser("create-tab", help="alias of create-tmux-tab"))
+    _cfg_tmux_attach(tmux_sub.add_parser(
+        "attach",
+        help="Attach a tmux session by friendly selector (session name, tab, "
+        "workspace:tab, or --workspace/--tab/--pane)."))
+    _cfg_list_detached(tmux_sub.add_parser("ls-detached", help="alias of list-detached"))
+
+    # taarof agent status|workspace
+    agent_sub = _group("agent", "Agent activity operations (grouped aliases).",
+                       "agent_cmd")
+    _cfg_agent_status(agent_sub.add_parser("status", help="alias of agent-status"))
+    _cfg_agent_workspace(agent_sub.add_parser("workspace", help="alias of agent-workspace"))
+    _cfg_agent_ls(agent_sub.add_parser(
+        "ls", help="List live agents (one row per agent) from query-state."))
+    _cfg_agent_sessions(agent_sub.add_parser(
+        "sessions", help="List discovered agent sessions (query-agent-sessions)."))
+
+    # Config: path / default / validate. Real parsing lives in the taarof-app
+    # binary; these shell out (with graceful fallbacks) and never re-implement
+    # validation rules in Python.
+    config_sub = _group(
+        "config", "Inspect, generate, and validate taarof configuration.", "config_cmd")
+
+    cp = config_sub.add_parser("path", help="Print resolved config.toml / keybindings.toml paths.")
+    cp.set_defaults(func=cmd_config_path)
+
+    cd = config_sub.add_parser(
+        "default", help="Print a commented starter config.toml (or --write it).")
+    cd.add_argument("--write", action="store_true",
+                    help="Write to the resolved config path instead of stdout.")
+    cd.add_argument("--force", action="store_true",
+                    help="With --write, overwrite an existing config.toml.")
+    cd.set_defaults(func=cmd_config_default)
+
+    cv = config_sub.add_parser("validate", help="Validate config.toml and keybindings.toml.")
+    cv.add_argument("--config", help="Path to config.toml (default: resolved path).")
+    cv.add_argument("--keybindings", help="Path to keybindings.toml (default: resolved path).")
+    cv.set_defaults(func=cmd_config_validate)
+
+    # Grouped read commands default to auto format (TTY -> table, else json).
+    for group_sub in (tab_sub, pane_sub, tmux_sub, agent_sub):
+        for parser_action in group_sub.choices.values():
+            parser_action.set_defaults(_format_default="auto")
+
+    # Workspace manifest. Uses common_base (no read-command --format) because
+    # `workspace export` defines its own --format {toml,json}.
+    s = sub.add_parser("workspace", help="Workspace manifest export/apply.")
+    ws_sub = s.add_subparsers(dest="workspace_cmd", required=True,
+                              parser_class=lambda **kw:
+                              argparse.ArgumentParser(parents=[common_base], **kw))
+
+    sx = ws_sub.add_parser("export", help="Dump live workspaces as a manifest.")
+    sx.add_argument("--workspace", help="Filter to one workspace by name or id.")
+    sx.add_argument("--format", choices=["toml", "json"], default="toml")
+    sx.add_argument("--out", help="Write to file instead of stdout.")
+    sx.set_defaults(func=cmd_workspace_export)
+
+    sa = ws_sub.add_parser("apply", help="Recreate tabs from a workspace manifest.")
+    sa.add_argument("file", help="Path to a manifest TOML file.")
+    sa.add_argument("--workspace", help="Apply only the workspace with this name.")
+    sa.add_argument("--dry-run", action="store_true",
+                    help="Print what would happen; make no changes.")
+    sa.add_argument("--no-ensure-tmux", dest="ensure_tmux", action="store_false",
+                    default=True,
+                    help="Skip tmux has-session / new-session bootstrapping.")
+    sa.add_argument("--fail-fast", action="store_true",
+                    help="Stop on first tab failure.")
+    sa.set_defaults(func=cmd_workspace_apply)
+
+    # Workspace lifecycle: create/switch/rename. These drive the workspace-level
+    # socket actions (create-workspace / switch-workspace / rename-workspace),
+    # mirroring the GUI's New Workspace / switch / rename so behavior stays
+    # consistent. --format controls how the response envelope is rendered.
+    def _ws_format(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument(
+            "--format", choices=["json", "table", "auto"], default="auto",
+            help="Response output format (default auto).")
+
+    wc = ws_sub.add_parser("create", help="Create a new workspace.")
+    wc.add_argument(
+        "name", nargs="?",
+        help="Workspace name. Omit to auto-name like the GUI (\"Workspace N\").")
+    _ws_format(wc)
+    wc.set_defaults(func=cmd_workspace_create)
+
+    wsw = ws_sub.add_parser("switch", help="Switch to a workspace by name or id.")
+    wsw.add_argument("workspace", help="Workspace name or numeric id.")
+    _ws_format(wsw)
+    wsw.set_defaults(func=cmd_workspace_switch)
+
+    wr = ws_sub.add_parser("rename", help="Rename a workspace.")
+    wr.add_argument("workspace", help="Workspace name or numeric id to rename.")
+    wr.add_argument("name", help="New workspace name.")
+    _ws_format(wr)
+    wr.set_defaults(func=cmd_workspace_rename)
+
+    # Escape hatch
+    s = sub.add_parser("raw", help="Send a raw JSON payload to the socket.")
+    s.add_argument("json", help="JSON object, e.g. '{\"action\":\"list-tabs\"}'")
+    s.set_defaults(func=cmd_raw)
+
+    sub.add_parser("socket-path", help="Print the resolved socket path.").set_defaults(
+        func=cmd_socket_path)
+
+    # Diagnostics: non-mutating launch + runtime readiness report.
+    sd = sub.add_parser(
+        "doctor",
+        help="Diagnose local launch and runtime health (non-mutating).")
+    sd.add_argument(
+        "--probe-hosts", action="store_true",
+        help="Actually ssh -o BatchMode=yes each configured host (short timeout). "
+        "Off by default so doctor never triggers a remote password prompt.")
+    sd.set_defaults(func=cmd_doctor, _render="doctor")
+
+    return p
+
+
+#: Top-level options that consume the following token, so a `--version` scan
+#: can tell an option's value apart from the subcommand name.
+_TOP_LEVEL_VALUE_FLAGS = ("--session", "--format")
+
+
+def _version_requested(argv: list[str]) -> tuple[bool, str | None]:
+    """Detect a bare `taarof --version` before argparse demands a subcommand.
+
+    Scans only the pre-subcommand options, so `taarof --session dev --version`
+    works while a subcommand's own flags are left entirely to argparse.
+    """
+    session: str | None = None
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in ("--version", "-V"):
+            return True, session
+        if token in _TOP_LEVEL_VALUE_FLAGS:
+            if token == "--session" and index + 1 < len(argv):
+                session = argv[index + 1]
+            index += 2
+            continue
+        if token.startswith("--session="):
+            session = token.split("=", 1)[1]
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return False, session  # subcommand reached
+    return False, session
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    wants_version, version_session = _version_requested(raw_argv)
+    if wants_version:
+        report = build_version_report(version_session)
+        _emit(report, "--pretty" in raw_argv)
+        return 0
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not hasattr(args, "session"):
+        args.session = None
+    try:
+        result = args.func(args)
+    except urllib.error.URLError as err:
+        print(json.dumps({"ok": False, "error": f"http error: {err}"}), file=sys.stderr)
+        return 2
+    except (ConnectionError, FileNotFoundError, socket.timeout) as err:
+        print(json.dumps({"ok": False, "error": f"socket error: {err}"}), file=sys.stderr)
+        return 2
+    if result is None:
+        return 0
+    if result is _SILENT_FAILURE:
+        return 1
+
+    # `doctor` reports overall health via `ok`; a False there means "problems
+    # found" (exit 1) but we still want to render the full check table, unlike a
+    # failed-command envelope which suppresses the human renderer.
+    if getattr(args, "_render", None) == "doctor" and isinstance(result, dict):
+        fmt = args.format or getattr(args, "_format_default", None) or "auto"
+        if _resolve_format(fmt) == "table":
+            print(render_doctor(result))
+        else:
+            _emit(result, args.pretty)
+        return 0 if result.get("ok") else 1
+
+    exit_fail = isinstance(result, dict) and result.get("ok") is False
+
+    # Resolve effective format. Flat commands default to json (byte-compatible
+    # with older output); grouped commands default to auto via _format_default.
+    fmt = args.format or getattr(args, "_format_default", None) or "json"
+    effective = _resolve_format(fmt)
+    render_name = getattr(args, "_render", None)
+
+    if effective == "table" and render_name and not exit_fail:
+        renderer = RENDERERS.get(render_name)
+        rendered = renderer(result) if renderer else None
+        if rendered is not None:
+            print(rendered)
+            return 0
+        # Renderer declined (unexpected shape); fall through to JSON.
+
+    _emit(result, args.pretty)
+    if exit_fail:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

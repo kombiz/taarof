@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Generic taarof wrapper for CLIs that do not expose native hook events.
+# Usage:
+#   taarof-agent-wrapper codex --help
+#   taarof-agent-wrapper aider --model sonnet
+# Exit status is preserved from the wrapped command.
+
+set -uo pipefail
+
+termprop_set() {
+  local name="$1"
+  local value="${2-}"
+  value="${value//$'\r'/ }"
+  value="${value//$'\n'/ }"
+  printf '\e]666;%s=%s\e\\' "$name" "$value"
+}
+
+termprop_reset() {
+  printf '\e]666;%s\e\\' "$1"
+}
+
+taarof_agent_running() {
+  local source="$1"
+  local text="${2-}"
+  if [[ -n "$text" ]]; then
+    termprop_set "vte.ext.taarof.agent.text" "$text"
+  else
+    termprop_reset "vte.ext.taarof.agent.text"
+  fi
+  if [[ -n "$source" ]]; then
+    termprop_set "vte.ext.taarof.agent.source" "$source"
+  else
+    termprop_reset "vte.ext.taarof.agent.source"
+  fi
+  termprop_set "vte.ext.taarof.agent.state" "running"
+}
+
+taarof_agent_done() {
+  local source="$1"
+  local text="${2-}"
+  if [[ -n "$text" ]]; then
+    termprop_set "vte.ext.taarof.agent.text" "$text"
+  else
+    termprop_reset "vte.ext.taarof.agent.text"
+  fi
+  if [[ -n "$source" ]]; then
+    termprop_set "vte.ext.taarof.agent.source" "$source"
+  else
+    termprop_reset "vte.ext.taarof.agent.source"
+  fi
+  termprop_set "vte.ext.taarof.agent.state" "done"
+}
+
+taarof_agent_idle() {
+  termprop_set "vte.ext.taarof.agent.state" "idle"
+  termprop_reset "vte.ext.taarof.agent.text"
+  termprop_reset "vte.ext.taarof.agent.source"
+}
+
+if [[ $# -lt 1 ]]; then
+  echo "usage: taarof-agent-wrapper <binary> [args...]" >&2
+  exit 2
+fi
+
+binary="$1"
+shift
+
+status_source="$(basename "$binary")"
+start_text="${TAAROF_AGENT_START_TEXT:-$status_source}"
+
+taarof_agent_running "$status_source" "$start_text"
+"$binary" "$@"
+rc=$?
+
+if [[ $rc -eq 0 ]]; then
+  taarof_agent_done "$status_source" "done"
+else
+  taarof_agent_done "$status_source" "failed ($rc)"
+fi
+
+exit "$rc"

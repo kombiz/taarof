@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Exact commit SHA to rehearse without publishing
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  linux-tarball:
+    if: github.repository == 'kombiz/taarof'
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie-slim
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            git \
+            gzip \
+            libadwaita-1-dev \
+            libgtk-4-dev \
+            libgtksourceview-5-dev \
+            libvte-2.91-gtk4-dev \
+            pkg-config \
+            tar
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit || github.sha }}
+
+      # actions/checkout only registers the safe directory under a temporary
+      # HOME, so later container steps run as root against a runner-owned
+      # checkout and git aborts with "dubious ownership". Persist the exception
+      # so commit validation and the tarball's SOURCE_DATE_EPOCH can read git.
+      - name: Trust checkout directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Validate rehearsal commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REQUESTED_COMMIT: ${{ inputs.commit }}
+        run: |
+          printf '%s\n' "$REQUESTED_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+          test "$REQUESTED_COMMIT" = "$GITHUB_SHA"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: taarof-web/package-lock.json
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build taarof-web
+        run: npm ci --include=dev && npm run build
+        working-directory: taarof-web
+
+      - name: Build taarof-app release binary
+        run: |
+          cargo build --release --features bundled-sqlite --manifest-path taarof-app/Cargo.toml
+          bash packaging/linux/emit-artifact-provenance.sh taarof-app/target/release/taarof-app
+        env:
+          TAAROF_REPRODUCIBLE_BUILD: "true"
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/usr/src/taarof
+
+      - name: Build Linux release tarball
+        run: bash packaging/linux/release-bundle.sh dist/release
+
+      - name: Verify release checksum
+        run: sha256sum -c taarof-linux-x86_64.tar.gz.sha256
+        working-directory: dist/release
+
+      # Provenance is a release asset, not an optional enhancement. If the
+      # configured GitHub attestation service cannot persist this bundle, stop
+      # here: neither the workflow artifact nor a tag release may proceed.
+      - name: Attest release tarball provenance
+        id: attest
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/release/taarof-linux-x86_64.tar.gz.sha256
+
+      - name: Stage provenance bundle
+        run: |
+          cp \
+            "${{ steps.attest.outputs.bundle-path }}" \
+            dist/release/taarof-linux-x86_64.tar.gz.intoto.jsonl
+          test -s dist/release/taarof-linux-x86_64.tar.gz.intoto.jsonl
+
+      - name: Verify release artifact set
+        run: |
+          test -s dist/release/taarof-linux-x86_64.tar.gz
+          test -s dist/release/taarof-linux-x86_64.tar.gz.sha256
+          test -s dist/release/taarof-linux-x86_64.tar.gz.intoto.jsonl
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: taarof-linux-x86_64
+          path: |
+            dist/release/taarof-linux-x86_64.tar.gz
+            dist/release/taarof-linux-x86_64.tar.gz.sha256
+            dist/release/taarof-linux-x86_64.tar.gz.intoto.jsonl
+          if-no-files-found: error
+
+  publish-github-release:
+    needs: linux-tarball
+    if: github.repository == 'kombiz/taarof' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: taarof-linux-x86_64
+          path: dist/release
+
+      - name: Verify downloaded release checksum
+        run: sha256sum -c taarof-linux-x86_64.tar.gz.sha256
+        working-directory: dist/release
+
+      - name: Verify downloaded release asset set
+        run: |
+          test -s dist/release/taarof-linux-x86_64.tar.gz
+          test -s dist/release/taarof-linux-x86_64.tar.gz.sha256
+          test -s dist/release/taarof-linux-x86_64.tar.gz.intoto.jsonl
+
+      # The preceding checksum verification already proves the tarball and its
+      # checksum are present; the asset-set check proves provenance is present
+      # too. Keep the publisher strict as a second line of defense.
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/release/taarof-linux-x86_64.tar.gz
+            dist/release/taarof-linux-x86_64.tar.gz.sha256
+            dist/release/taarof-linux-x86_64.tar.gz.intoto.jsonl
+          fail_on_unmatched_files: true
+          generate_release_notes: true

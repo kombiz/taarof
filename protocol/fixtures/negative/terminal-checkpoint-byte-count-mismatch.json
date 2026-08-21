@@ -1,0 +1,17 @@
+{
+  "kind": "checkpoint",
+  "protocol_version": { "major": 1, "minor": 0 },
+  "runtime_id": "018f0f1e-a2d3-4c55-8f7b-9023456789ab",
+  "session_name": "default",
+  "tab_id": "tab-1",
+  "pane_id": "pane-1",
+  "epoch": "6d43882a-7f60-40bb-9f6d-166f7b63d10d",
+  "output_seq": "1",
+  "cols": 80,
+  "rows": 24,
+  "checkpoint": {
+    "ansi_base64": "G1tj",
+    "byte_count": 2,
+    "state_hash": "sha256:98617003f7e7fd4e84a4533dce9cf141e94781b4c3c50c45cc4d3c294a7b068e"
+  }
+}

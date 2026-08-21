@@ -1,0 +1,12 @@
+{
+  "kind": "output",
+  "protocol_version": { "major": 1, "minor": 0 },
+  "runtime_id": "018f0f1e-a2d3-4c55-8f7b-9023456789ab",
+  "session_name": "default",
+  "tab_id": "tab-1",
+  "pane_id": "pane-1",
+  "epoch": "6d43882a-7f60-40bb-9f6d-166f7b63d10d",
+  "output_seq": "1",
+  "payload_base64": "",
+  "byte_count": 262145
+}

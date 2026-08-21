@@ -1,0 +1,644 @@
+#!/usr/bin/env bash
+# taarof — agent workspace launcher for multi-agent AI development
+# Usage:
+#   taarof <session> host1 host2 ...  → widescreen fleet view (up to 3 hosts per tab)
+#   taarof <session>                  → local workspace in current directory
+#   taarof --list                     → list active zellij sessions
+#   taarof --attach <session>         → attach to existing session
+set -euo pipefail
+
+PLUGIN="file:${XDG_CONFIG_HOME:-${HOME}/.config}/zellij/plugins/taarof-sidebar.wasm"
+HOSTS_PER_TAB="${TAAROF_HOSTS_PER_TAB:-3}"
+CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
+TAAROF_HOSTS_CONFIG="${CONFIG_HOME}/agent-terminal/taarof-hosts.json"
+TAAROF_STATE_DIR="${DATA_HOME}/agent-terminal/taarof"
+ALERTS_LOG="${DATA_HOME}/agent-terminal/alerts.log"
+
+usage() {
+    cat <<'EOF'
+taarof — agent workspace launcher
+
+Usage:
+  taarof [--cwd <path>] <session>                         Local workspace
+  taarof [--cwd <path>] <session> host1 host2 ...         Fleet view (SSH)
+  taarof [--cwd <path>] <session> --preset <name>         Fleet from preset
+  taarof add <session> [--cwd <path>] host1 ...           Add another fleet tab
+  taarof add <session> --preset <name>                    Add preset hosts
+  taarof --list                     List active Zellij sessions
+  taarof --attach <name>            Attach to existing session
+  taarof --dry-run [...]            Print generated KDL layout without launching
+
+Examples:
+  taarof myapp                                       Local dev in $(pwd)
+  taarof --cwd ~/src/example fleet build.example.invalid test.example.invalid
+                                                       Start in repo, open both hosts
+  taarof fleet --preset project                     Use saved example host group
+  taarof add fleet --cwd ~/src/example docs.example.invalid
+                                                       Add another fleet tab
+  taarof add fleet --preset project                 Add example preset as a tab
+  taarof infra admin@10.0.0.5                 Single remote tab
+EOF
+    exit 0
+}
+
+[[ $# -eq 0 ]] && usage
+[[ "$1" == "-h" || "$1" == "--help" ]] && usage
+[[ "${2:-}" == "-h" || "${2:-}" == "--help" ]] && usage
+
+if [[ "$1" == "--list" ]]; then
+    zellij list-sessions
+    exit 0
+fi
+
+DRY_RUN=0
+if [[ "$1" == "--dry-run" ]]; then
+    DRY_RUN=1
+    shift
+fi
+
+if [[ "$1" == "--attach" ]]; then
+    [[ -z "${2:-}" ]] && { echo "Usage: taarof --attach <session>"; exit 1; }
+    zellij attach "$2"
+    exit 0
+fi
+MODE="launch"
+if [[ "$1" == "add" ]]; then
+    MODE="add"
+    shift
+fi
+
+START_DIR="${PWD}"
+REMOTE_CWD=""
+PRESETS=()
+
+# --- Helper: short label from user@host ---
+short_label() {
+    local h="$1"
+    local host_part="${h##*@}"
+    # Strip .ts suffix for cleaner labels
+    host_part="${host_part%.ts}"
+    # If user@ present, show user@short
+    if [[ "$h" == *@* ]]; then
+        local user_part="${h%%@*}"
+        echo "${user_part}@${host_part}"
+    else
+        echo "${host_part}"
+    fi
+}
+
+kdl_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
+session_state_path() {
+    local session="$1"
+    echo "${TAAROF_STATE_DIR}/${session}"
+}
+
+require_jq() {
+    command -v jq >/dev/null 2>&1 || {
+        echo "taarof: jq is required for presets/host inventory (${TAAROF_HOSTS_CONFIG})"
+        exit 1
+    }
+}
+
+host_config_exists() {
+    [[ -f "$TAAROF_HOSTS_CONFIG" ]]
+}
+
+json_string_or_empty() {
+    local query="${!#}"
+    local jq_args=("${@:1:$#-1}")
+    jq -er "${query} // empty" "${jq_args[@]}" "$TAAROF_HOSTS_CONFIG" 2>/dev/null || true
+}
+
+expand_preset_tokens() {
+    local preset="$1"
+    require_jq
+    mapfile -t preset_tokens < <(jq -er --arg preset "$preset" '.presets[$preset][]?' "$TAAROF_HOSTS_CONFIG" 2>/dev/null)
+    if [[ ${#preset_tokens[@]} -eq 0 ]]; then
+        echo "taarof: preset '$preset' not found in ${TAAROF_HOSTS_CONFIG}"
+        exit 1
+    fi
+    printf '%s\n' "${preset_tokens[@]}"
+}
+
+compose_ssh_target() {
+    local user="$1"
+    local host="$2"
+    if [[ "$host" == *@* || -z "$user" ]]; then
+        printf '%s' "$host"
+    else
+        printf '%s@%s' "$user" "$host"
+    fi
+}
+
+resolve_host_token() {
+    local token="$1"
+    local label=""
+    local host="$token"
+    local user=""
+    local remote_cwd="$REMOTE_CWD"
+    local ssh_target=""
+    local matched=""
+
+    if host_config_exists; then
+        require_jq
+        matched="$(jq -er --arg token "$token" '
+            .defaults.user as $default_user
+            | .hosts
+            | to_entries[]
+            | .key as $key
+            | .value as $value
+            | ($value.user // $default_user // "") as $user
+            | ($value.host // "") as $host
+            | (if $user != "" then "\($user)@\($host)" else $host end) as $ssh
+            | select($key == $token or $host == $token or $ssh == $token)
+            | [$key, ($value.label // ""), $host, $user, ($value.remote_cwd // "")]
+            | @tsv
+        ' "$TAAROF_HOSTS_CONFIG" 2>/dev/null | head -n 1)" || true
+        if [[ -n "$matched" ]]; then
+            local matched_key
+            IFS=$'\t' read -r matched_key label host user remote_cwd <<< "$matched"
+            [[ -z "$label" ]] && label="$matched_key"
+            if [[ -n "$REMOTE_CWD" ]]; then
+                remote_cwd="$REMOTE_CWD"
+            fi
+        else
+            host="$token"
+            if [[ "$host" != *@* ]]; then
+                user="$(json_string_or_empty '.defaults.user')"
+            fi
+        fi
+    fi
+
+    ssh_target="$(compose_ssh_target "$user" "$host")"
+    if [[ -z "$label" ]]; then
+        label="$(short_label "$host")"
+    fi
+
+    printf '%s\t%s\t%s\n' "$label" "$ssh_target" "$remote_cwd"
+}
+
+resolve_host_specs() {
+    local raw_tokens=()
+    local token
+    local preset
+
+    for preset in "${PRESETS[@]}"; do
+        while IFS= read -r token; do
+            raw_tokens+=("$token")
+        done < <(expand_preset_tokens "$preset")
+    done
+
+    raw_tokens+=("$@")
+
+    if [[ ${#raw_tokens[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    for token in "${raw_tokens[@]}"; do
+        resolve_host_token "$token"
+    done
+}
+
+save_session_state() {
+    local session="$1"
+    local cwd_value="$2"
+    shift 2
+    local state_dir
+    state_dir="$(session_state_path "$session")"
+    mkdir -p "$state_dir"
+    printf '%s\n' "$cwd_value" > "${state_dir}/cwd"
+    : > "${state_dir}/hosts"
+    if [[ $# -gt 0 ]]; then
+        printf '%s\n' "$@" > "${state_dir}/hosts"
+    fi
+}
+
+append_session_hosts() {
+    local session="$1"
+    shift
+    local state_dir
+    state_dir="$(session_state_path "$session")"
+    mkdir -p "$state_dir"
+    touch "${state_dir}/hosts"
+    for h in "$@"; do
+        if ! grep -qxF "$h" "${state_dir}/hosts" 2>/dev/null; then
+            printf '%s\n' "$h" >> "${state_dir}/hosts"
+        fi
+    done
+}
+
+load_session_cwd() {
+    local session="$1"
+    local state_dir
+    state_dir="$(session_state_path "$session")"
+    [[ -f "${state_dir}/cwd" ]] && cat "${state_dir}/cwd"
+}
+
+load_session_hosts() {
+    local session="$1"
+    local state_dir
+    state_dir="$(session_state_path "$session")"
+    [[ -f "${state_dir}/hosts" ]] && cat "${state_dir}/hosts"
+}
+
+build_ssh_args() {
+    local ssh_target="$1"
+    local host_cwd="$2"
+    local indent="$3"
+    local remote_cmd
+
+    printf '%scommand "ssh"\n' "$indent"
+    if [[ -n "$host_cwd" ]]; then
+        remote_cmd="cd -- $(printf '%q' "$host_cwd") && exec bash -l"
+        printf '%sargs "-t" "%s" "%s"\n' "$indent" "$ssh_target" "$(kdl_escape "$remote_cmd")"
+    else
+        printf '%sargs "-t" "%s"\n' "$indent" "$ssh_target"
+    fi
+}
+
+alerts_tail_command() {
+    kdl_escape "touch ${ALERTS_LOG@Q} && tail -n 20 -F ${ALERTS_LOG@Q}"
+}
+
+overview_command() {
+    local session="$1"
+    local state_dir
+    state_dir="$(session_state_path "$session")"
+    kdl_escape "while true; do clear; echo 'taarof overview'; echo; echo 'session: ${session}'; if [[ -f ${state_dir@Q}/cwd ]]; then echo \"cwd: \$(cat ${state_dir@Q}/cwd)\"; fi; echo; echo 'hosts:'; if [[ -s ${state_dir@Q}/hosts ]]; then awk -F '\t' '{ printf \"%2d. %-14s %s\", NR, \$1, \$2; if (\$3 != \"\") printf \"  (%s)\", \$3; printf \"\\n\" }' ${state_dir@Q}/hosts; else echo '  none yet'; fi; echo; echo 'Controls'; echo '  Alt+h/j/k/l  move focus'; echo '  Alt+t        new tab'; echo '  Alt+n        new pane'; echo '  taarof add ... attach more hosts'; sleep 2; done"
+}
+
+emit_alerts_pane() {
+    cat <<ALERTS
+                pane size="30%" name="alerts" {
+                    command "bash"
+                    args "-lc" "$(alerts_tail_command)"
+                }
+ALERTS
+}
+
+# --- Emit sidebars (reused in every tab) ---
+emit_left_sidebar() {
+    cat <<SIDEBAR
+            pane size=10 borderless=false {
+                plugin location="${PLUGIN}" {
+                    role "tabs"
+                }
+            }
+SIDEBAR
+}
+
+emit_right_sidebar() {
+    cat <<SIDEBAR
+            pane size=36 borderless=false {
+                plugin location="${PLUGIN}" {
+                    role "info"
+                }
+            }
+SIDEBAR
+}
+
+# --- Emit a single remote-host detail tab ---
+emit_host_tab() {
+    local spec="$1"
+    local idx="$2"
+    local label ssh_target host_cwd
+    local focus_attr=""
+    [[ "$idx" == "1" ]] && focus_attr=' focus=true'
+    IFS=$'\t' read -r label ssh_target host_cwd <<< "$spec"
+
+    cat <<TAB
+    tab name="${label}"${focus_attr} {
+        pane split_direction="vertical" {
+$(emit_left_sidebar)
+            pane {
+                pane split_direction="vertical" {
+                    pane name="agent-1 [${label}]" {
+                        focus true
+$(build_ssh_args "$ssh_target" "$host_cwd" "                        ")
+                    }
+                    pane name="agent-2 [${label}]" {
+$(build_ssh_args "$ssh_target" "$host_cwd" "                        ")
+                    }
+                }
+                pane size="25%" name="term [${label}]" {
+$(build_ssh_args "$ssh_target" "$host_cwd" "                    ")
+                }
+            }
+$(emit_right_sidebar)
+        }
+    }
+TAB
+}
+
+# --- Emit a single host column for fleet view ---
+emit_host_column() {
+    local spec="$1"
+    local focused="$2"
+    local label ssh_target host_cwd
+    local focus_line=""
+    [[ "$focused" == "1" ]] && focus_line='                        focus true'
+    IFS=$'\t' read -r label ssh_target host_cwd <<< "$spec"
+
+    cat <<COL
+                pane name="${label}" split_direction="horizontal" {
+                    pane name="agent-1 [${label}]" {
+${focus_line}
+$(build_ssh_args "$ssh_target" "$host_cwd" "                        ")
+                    }
+                    pane name="agent-2 [${label}]" {
+$(build_ssh_args "$ssh_target" "$host_cwd" "                        ")
+                    }
+                    pane size="20%" name="term [${label}]" {
+$(build_ssh_args "$ssh_target" "$host_cwd" "                        ")
+                    }
+                }
+COL
+}
+
+# --- Emit overview tab for orchestration ---
+emit_overview_tab() {
+    local session="$1"
+    local cwd_escaped
+    cwd_escaped="$(kdl_escape "$START_DIR")"
+
+    cat <<TAB
+    tab name="overview" focus=true {
+        pane split_direction="vertical" {
+            pane {
+                pane split_direction="horizontal" {
+                    pane name="orchestrator" cwd "${cwd_escaped}" {
+                        focus true
+                    }
+                    pane size="32%" name="inventory" {
+                        command "bash"
+                        args "-lc" "$(overview_command "$session")"
+                    }
+                }
+$(emit_alerts_pane)
+            }
+$(emit_right_sidebar)
+        }
+    }
+TAB
+}
+
+# --- Emit a fleet tab with up to HOSTS_PER_TAB visible hosts ---
+emit_fleet_tab() {
+    local tab_name="$1"
+    local focus_enabled="$2"
+    shift 2
+    local specs=("$@")
+    local focus_attr=""
+
+    [[ "$focus_enabled" == "1" ]] && focus_attr=' focus=true'
+
+    cat <<TAB
+    tab name="${tab_name}"${focus_attr} {
+        pane split_direction="vertical" {
+            pane split_direction="vertical" {
+TAB
+
+    local idx=0
+    for spec in "${specs[@]}"; do
+        local focused="0"
+        [[ "$idx" -eq 0 ]] && focused="1"
+        emit_host_column "$spec" "$focused"
+        idx=$((idx + 1))
+    done
+
+    cat <<TAB
+            }
+$(emit_right_sidebar)
+        }
+    }
+TAB
+}
+
+# --- Generate layout ---
+generate_layout() {
+    echo "layout {"
+
+    if [[ ${#HOST_SPECS[@]} -eq 0 ]]; then
+        # Local mode: 4 fixed tabs
+        cat <<LOCAL
+    cwd "$(kdl_escape "$START_DIR")"
+    tab name="⚡ work" focus=true {
+        pane split_direction="vertical" {
+$(emit_left_sidebar)
+            pane {
+                pane split_direction="vertical" {
+                    pane name="agent-1" { focus true }
+                    pane name="agent-2"
+                }
+                pane size="25%" name="terminal"
+            }
+$(emit_right_sidebar)
+        }
+    }
+    tab name="🔍 focus" {
+        pane split_direction="vertical" {
+$(emit_left_sidebar)
+            pane name="focus" { focus true }
+$(emit_right_sidebar)
+        }
+    }
+    tab name="📁 files" {
+        pane split_direction="vertical" {
+$(emit_left_sidebar)
+            pane {
+                pane name="editor" { focus true }
+                pane size="30%" name="file-terminal"
+            }
+$(emit_right_sidebar)
+        }
+    }
+    tab name="📊 monitor" {
+        pane split_direction="vertical" {
+$(emit_left_sidebar)
+            pane {
+                pane split_direction="vertical" {
+                    pane name="logs"
+                    pane name="status"
+                }
+                pane size="25%" name="alerts" {
+                    command "bash"
+                    args "-lc" "$(alerts_tail_command)"
+                }
+            }
+$(emit_right_sidebar)
+        }
+    }
+LOCAL
+    else
+        # Multi-host mode: fleet view with up to HOSTS_PER_TAB visible per tab.
+        emit_overview_tab "$SESSION"
+        local page=1
+        local start=0
+        while [[ "$start" -lt "${#HOST_SPECS[@]}" ]]; do
+            local tab_name="fleet"
+            [[ "$page" -gt 1 ]] && tab_name="fleet-${page}"
+            emit_fleet_tab "$tab_name" "0" "${HOST_SPECS[@]:start:HOSTS_PER_TAB}"
+            start=$((start + HOSTS_PER_TAB))
+            page=$((page + 1))
+        done
+    fi
+
+    echo "}"
+}
+
+# --- Shared option parser (eliminates three copies of the same case block) ---
+# Parses --cwd, --remote-cwd, --preset flags. Stops at first non-flag arg.
+# Sets START_DIR, REMOTE_CWD, PRESETS[]. Remaining args left in PARSE_REST[].
+parse_common_opts() {
+    local prefix="$1"
+    shift
+    PARSE_REST=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) usage ;;
+            --cwd)
+                [[ -z "${2:-}" ]] && { echo "${prefix}: --cwd requires a path"; exit 1; }
+                START_DIR="$2"
+                REMOTE_CWD="$2"
+                shift 2
+                ;;
+            --remote-cwd)
+                [[ -z "${2:-}" ]] && { echo "${prefix}: --remote-cwd requires a path"; exit 1; }
+                REMOTE_CWD="$2"
+                shift 2
+                ;;
+            --preset)
+                [[ -z "${2:-}" ]] && { echo "${prefix}: --preset requires a name"; exit 1; }
+                PRESETS+=("$2")
+                shift 2
+                ;;
+            --*)
+                echo "${prefix}: unknown option '$1'"
+                exit 1
+                ;;
+            *)
+                PARSE_REST+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
+
+# --- Parse mode-specific args ---
+if [[ "$MODE" == "add" ]]; then
+    [[ $# -lt 1 ]] && { echo "Usage: taarof add <session> [--cwd <path>] [--remote-cwd <path>] [--preset <name>] host1 [host2 ...]"; exit 1; }
+    TARGET_SESSION="$1"
+    shift
+    parse_common_opts "taarof add" "$@"
+    ADD_HOSTS=("${PARSE_REST[@]}")
+    if [[ -z "$REMOTE_CWD" ]]; then
+        REMOTE_CWD="$(load_session_cwd "$TARGET_SESSION")"
+    fi
+else
+    parse_common_opts "taarof" "$@"
+    set -- "${PARSE_REST[@]}"
+    [[ $# -lt 1 ]] && usage
+    SESSION="$1"
+    shift
+    HOSTS=("$@")
+fi
+
+mkdir -p "$TAAROF_STATE_DIR"
+
+if [[ "$MODE" == "add" ]]; then
+    ADD_SPECS=()
+    if mapfile -t ADD_SPECS < <(resolve_host_specs "${ADD_HOSTS[@]}"); then
+        :
+    fi
+    [[ ${#ADD_SPECS[@]} -eq 0 ]] && {
+        echo "taarof add: provide at least one host or --preset"
+        exit 1
+    }
+    existing_hosts=()
+    if mapfile -t existing_hosts < <(load_session_hosts "$TARGET_SESSION"); then
+        :
+    fi
+    NEW_SPECS=()
+    for spec in "${ADD_SPECS[@]}"; do
+        already_present="0"
+        for existing in "${existing_hosts[@]}"; do
+            if [[ "$spec" == "$existing" ]]; then
+                already_present="1"
+                break
+            fi
+        done
+        [[ "$already_present" == "0" ]] && NEW_SPECS+=("$spec")
+    done
+    [[ ${#NEW_SPECS[@]} -eq 0 ]] && {
+        echo "taarof add: all requested hosts are already present in ${TARGET_SESSION}"
+        exit 0
+    }
+    append_session_hosts "$TARGET_SESSION" "${NEW_SPECS[@]}"
+    local_page_count=0
+    if [[ ${#existing_hosts[@]} -gt 0 ]]; then
+        local_page_count=$(( (${#existing_hosts[@]} + HOSTS_PER_TAB - 1) / HOSTS_PER_TAB ))
+    fi
+    new_page=$((local_page_count + 1))
+    tab_name="fleet-${new_page}"
+    [[ "$new_page" -eq 1 ]] && tab_name="fleet"
+
+    TMPFILE=$(mktemp "/tmp/taarof-${TARGET_SESSION}-add-XXXXXX.kdl")
+    trap 'rm -f "$TMPFILE"' EXIT
+    {
+        echo "layout {"
+        emit_fleet_tab "$tab_name" "0" "${NEW_SPECS[@]}"
+        echo "}"
+    } > "$TMPFILE"
+
+    echo "➕ taarof: adding ${#NEW_SPECS[@]} host(s) to ${TARGET_SESSION}"
+    echo "   tab:   ${tab_name}"
+    if [[ -n "$REMOTE_CWD" ]]; then
+        echo "   cwd:   ${REMOTE_CWD}"
+    fi
+    zellij --session "$TARGET_SESSION" action new-tab --layout "$TMPFILE" --name "$tab_name"
+    exit 0
+fi
+
+HOST_SPECS=()
+if mapfile -t HOST_SPECS < <(resolve_host_specs "${HOSTS[@]}"); then
+    :
+fi
+
+save_session_state "$SESSION" "${REMOTE_CWD:-$START_DIR}" "${HOST_SPECS[@]}"
+
+# --- Launch ---
+TMPFILE=$(mktemp "/tmp/taarof-${SESSION}-XXXXXX.kdl")
+trap 'rm -f "$TMPFILE"' EXIT
+
+generate_layout > "$TMPFILE"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    cat "$TMPFILE"
+    exit 0
+fi
+
+echo "🚀 taarof: launching ${SESSION}"
+if [[ ${#HOST_SPECS[@]} -gt 0 ]]; then
+    pages=$(( (${#HOST_SPECS[@]} + HOSTS_PER_TAB - 1) / HOSTS_PER_TAB ))
+    echo "   hosts: ${#HOST_SPECS[@]}"
+    if [[ ${#PRESETS[@]} -gt 0 ]]; then
+        echo "   preset: ${PRESETS[*]}"
+    fi
+    echo "   view:  overview + ${pages} fleet tab(s), ${HOSTS_PER_TAB} host(s) max per tab"
+    if [[ -n "$REMOTE_CWD" ]]; then
+        echo "   cwd:   ${REMOTE_CWD}"
+    fi
+else
+    echo "   mode:  local (4 tabs)"
+    echo "   cwd:   ${START_DIR}"
+fi
+
+ZELLIJ= zellij -s "$SESSION" -n "$TMPFILE" 2>/dev/null \
+    || ZELLIJ= zellij -n "$TMPFILE"

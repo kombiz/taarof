@@ -1,0 +1,15 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=taarof
+GenericName=Terminal Workspace
+Comment=GTK terminal workspace app with tabs, panes, session restore, and agent-aware status
+Exec=taarof-app
+TryExec=taarof-app
+Icon=io.github.kombiz.taarof
+Terminal=false
+Categories=System;TerminalEmulator;GTK;
+Keywords=terminal;shell;workspace;panes;tabs;gtk;
+StartupNotify=true
+StartupWMClass=io.github.kombiz.taarof
+SingleMainWindow=true

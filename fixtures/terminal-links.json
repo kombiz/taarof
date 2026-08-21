@@ -1,0 +1,211 @@
+{
+  "version": 1,
+  "ambiguous_file_tlds": [
+    "sh",
+    "md",
+    "rs",
+    "py",
+    "app",
+    "dev",
+    "io",
+    "mov",
+    "so",
+    "to",
+    "zip"
+  ],
+  "url_only_tlds": [
+    "ai",
+    "biz",
+    "com",
+    "edu",
+    "gov",
+    "info",
+    "net",
+    "org",
+    "xyz"
+  ],
+  "non_tld_file_extensions": ["ts", "js"],
+  "cases": [
+    {
+      "token": "foo.ts",
+      "ambiguous": false,
+      "candidates": [{ "kind": "file", "path": "foo.ts" }]
+    },
+    {
+      "token": "main.js",
+      "ambiguous": false,
+      "candidates": [{ "kind": "file", "path": "main.js" }]
+    },
+    {
+      "token": "build.sh",
+      "ambiguous": true,
+      "candidates": [
+        { "kind": "file", "path": "build.sh" },
+        { "kind": "url", "url": "https://build.sh" }
+      ]
+    },
+    {
+      "token": "build.sh:0",
+      "ambiguous": true,
+      "candidates": [
+        { "kind": "file", "path": "build.sh", "line": 0 },
+        { "kind": "url", "url": "https://build.sh:0" }
+      ]
+    },
+    {
+      "token": "README.md",
+      "ambiguous": true,
+      "candidates": [
+        { "kind": "file", "path": "README.md" },
+        { "kind": "url", "url": "https://README.md" }
+      ]
+    },
+    {
+      "token": "main.rs",
+      "ambiguous": true,
+      "candidates": [
+        { "kind": "file", "path": "main.rs" },
+        { "kind": "url", "url": "https://main.rs" }
+      ]
+    },
+    {
+      "token": "script.py",
+      "ambiguous": true,
+      "candidates": [
+        { "kind": "file", "path": "script.py" },
+        { "kind": "url", "url": "https://script.py" }
+      ]
+    },
+    {
+      "token": "README.md:12",
+      "ambiguous": true,
+      "candidates": [
+        { "kind": "file", "path": "README.md", "line": 12 },
+        { "kind": "url", "url": "https://README.md:12" }
+      ]
+    },
+    {
+      "token": "terminal.rs:112",
+      "ambiguous": true,
+      "candidates": [
+        { "kind": "file", "path": "terminal.rs", "line": 112 },
+        { "kind": "url", "url": "https://terminal.rs:112" }
+      ]
+    },
+    {
+      "token": "localhost:3000",
+      "ambiguous": false,
+      "candidates": [{ "kind": "url", "url": "http://localhost:3000" }]
+    },
+    {
+      "token": "github.com/example/taarof",
+      "ambiguous": true,
+      "candidates": [
+        { "kind": "url", "url": "https://github.com/example/taarof" },
+        { "kind": "file", "path": "github.com/example/taarof" }
+      ]
+    },
+    {
+      "token": "docs.rs/serde",
+      "ambiguous": true,
+      "candidates": [
+        { "kind": "url", "url": "https://docs.rs/serde" },
+        { "kind": "file", "path": "docs.rs/serde" }
+      ]
+    },
+    {
+      "token": "crates.io/crates/serde",
+      "ambiguous": true,
+      "candidates": [
+        { "kind": "url", "url": "https://crates.io/crates/serde" },
+        { "kind": "file", "path": "crates.io/crates/serde" }
+      ]
+    },
+    {
+      "token": "astral.sh/uv",
+      "ambiguous": true,
+      "candidates": [
+        { "kind": "url", "url": "https://astral.sh/uv" },
+        { "kind": "file", "path": "astral.sh/uv" }
+      ]
+    },
+    {
+      "token": "apps.example.com",
+      "ambiguous": false,
+      "candidates": [{ "kind": "url", "url": "https://apps.example.com" }]
+    },
+    {
+      "token": "https://example.com/x",
+      "ambiguous": false,
+      "candidates": [{ "kind": "url", "url": "https://example.com/x" }]
+    },
+    {
+      "token": "https://en.wikipedia.org/wiki/Ruby_(programming_language)",
+      "ambiguous": false,
+      "candidates": [
+        {
+          "kind": "url",
+          "url": "https://en.wikipedia.org/wiki/Ruby_(programming_language)"
+        }
+      ]
+    },
+    {
+      "token": "./build.sh",
+      "ambiguous": false,
+      "candidates": [{ "kind": "file", "path": "./build.sh" }]
+    },
+    {
+      "token": "/usr/bin/env",
+      "ambiguous": false,
+      "candidates": [{ "kind": "file", "path": "/usr/bin/env" }]
+    },
+    {
+      "token": "foo.md:99999",
+      "ambiguous": false,
+      "candidates": [{ "kind": "file", "path": "foo.md", "line": 99999 }]
+    },
+    {
+      "token": "foo.md:+1",
+      "ambiguous": false,
+      "candidates": [{ "kind": "file", "path": "foo.md", "line": 1 }]
+    },
+    {
+      "token": "foo.md:-1",
+      "ambiguous": false,
+      "candidates": []
+    },
+    {
+      "token": "foo.md:4294967296",
+      "ambiguous": false,
+      "candidates": []
+    },
+    {
+      "token": "example.com:8080",
+      "ambiguous": false,
+      "candidates": [{ "kind": "url", "url": "https://example.com:8080" }]
+    },
+    {
+      "token": "example.com.",
+      "ambiguous": false,
+      "candidates": [{ "kind": "url", "url": "https://example.com" }]
+    },
+    {
+      "token": "(example.com)",
+      "ambiguous": false,
+      "candidates": [{ "kind": "url", "url": "https://example.com" }]
+    },
+    {
+      "token": "../script.py",
+      "ambiguous": false,
+      "candidates": [{ "kind": "file", "path": "../script.py" }]
+    },
+    {
+      "token": "archive.zip",
+      "ambiguous": true,
+      "candidates": [
+        { "kind": "file", "path": "archive.zip" },
+        { "kind": "url", "url": "https://archive.zip" }
+      ]
+    }
+  ]
+}
