@@ -24,7 +24,7 @@ Operational guide for `taarof`.
 
 ## Verify the running local build
 
-On `your-linux-host`, use `/tmp/user/Documents/coding/development/legacy-app` as the only active local runtime checkout unless the live process proves otherwise.
+Locate the active runtime checkout from the live process rather than assuming a path.
 
 From the repo root:
 
@@ -219,7 +219,7 @@ Back up these files before risky changes or local experiments:
 | --- | --- |
 | Known failure patterns | `TROUBLESHOOTING.md` |
 | HTTP API and `/health` | `docs/local-query-api.md` |
-| Homelab control gateway | `an external authenticated gateway` |
+| Remote-control gateway | External authenticated gateway (outside this tree) |
 | Release and packaging flow | `docs/release.md` |
 | tmux-backed pane behavior | `docs/tmux-integration.md` |
 

@@ -363,7 +363,7 @@ rewrite `config.toml`; a live config reload reapplies `dock.visible`.
 | `pull_requests` | Boolean | `false` | `true`, `false` | Adds a GitHub PR view for local branches using `gh pr list`. |
 | `default_view` | string | `tasks` | `tasks`, `pull_requests` | Initial persistent panel view. Compatibility aliases include `pull-requests` and `prs`. |
 
-GitHub and Linear are mirrors in the a private deployment setup; `.plan/tasks.json` remains
+GitHub and Linear are mirrors in the private deployment setup; `.plan/tasks.json` remains
 canonical task truth.
 
 ### `[loop_runner]`

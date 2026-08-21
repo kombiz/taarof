@@ -422,8 +422,7 @@ services:
   restart. **Reload into update**, when the update dialog is available, starts
   a new process through the normal session-save path.
 
-See `docs/configuration.md` for the per-file lifecycle and ADR-0009
-(`docs/adr/0009-operator-controlled-reload-into-installed-updates.md`) for the
+See `docs/configuration.md` for the per-file lifecycle, including the
 boundary between live reload and executable reload.
 
 ### Platform Compatibility
@@ -752,10 +751,6 @@ Contributions are welcome. Start with the
 [contribution guide](CONTRIBUTING.md), and please follow the
 [code of conduct](CODE_OF_CONDUCT.md) when participating.
 
-<!-- Screenshots: EXAMPLE-18 (GH #120) tracks the M1 hero image and M2 demo GIF.
-     The capture pipeline lives in testing/kasm/capture-demo-media.sh with the
-     asset contract in docs/media/README.md; assets land here once a take
-     passes the visual acceptance in docs/media/capture-runbook.md. -->
 
 ## Architecture
 
@@ -771,7 +766,5 @@ Contributions are welcome. Start with the
 | `task_launch.rs`, `mise/`, `task_panel.rs`, `sidebar/discovery.rs`, `palette.rs` | One safe task-launch plan shared by palette, sidebar, task panel, and task actions. |
 | `git.rs`, `tmux.rs`, `host.rs` | Off-GTK Git/worktree operations, tmux control, and remote-host probes. |
 
-For the fuller source tour and data-flow diagram, see the repository-root
-`ARCHITECTURE.md`. `agent-skills/legacy/` preserves the
-pre-Taarof Ghostty/Zellij/Textual material; it is not an architecture map for
-the shipped app.
+The module table above is the source tour for this tree; the fuller
+data-flow material lives in the private development history.

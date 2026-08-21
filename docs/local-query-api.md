@@ -1329,7 +1329,7 @@ For a private deployment-style personal homelab use, the preferred remote contro
 4. The browser talks only to the HTTPS gateway and never receives the raw local
    bearer token or Unix socket path.
 
-See `an external authenticated gateway` for the operator-facing deployment shape.
+The operator-facing deployment shape is documented outside this public tree.
 
 #### Control-mode review gates
 

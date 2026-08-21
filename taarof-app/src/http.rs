@@ -4758,7 +4758,6 @@ mod tests {
             kind: PaneAttachKind::Vte,
         };
         let snapshot = PaneSnapshot {
-            // REINSTALL-VICTIM(2026-07-17): 'workstation'/'old-workstation' was the pre-reinstall machine. Current host: workstation (hostname your-linux-host, desktop.example.ts.net, 192.0.2.10). Verify whether this reference should be updated or deleted. Flags all 'workstation' references in this file.
             output: "Vault CLI loaded. ☕\nworkstation:sample-project main ? }".into(),
             width: 120,
             height: 40,

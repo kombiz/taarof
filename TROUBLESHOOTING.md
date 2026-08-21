@@ -221,7 +221,7 @@ command -v mako &>/dev/null && echo "mako: OK" || echo "mako: MISSING"
 > **Historical / non-primary.** This covers the pre-`taarof` Zellij "Agent
 > Harness" (`agent-run` + `agents.json`), not the shipped runtime — see
 > `agent-skills/legacy/agent-launch-skill.md` and `CLAUDE.md` → "Secrets". Do **not**
-> store provider credentials in `agents.json`; in the a private deployment homelab secrets
+> store provider credentials in `agents.json`; in the private deployment homelab secrets
 > live in Infisical and are injected at launch (`infisical run -- <agent>`).
 > The `${VAR}` references below assume the value is already exported into the
 > environment at runtime, never written into the committed config.

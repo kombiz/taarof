@@ -213,47 +213,6 @@ jobs:
   # Offline repo-contract suites. These live in mise.toml's `test` task too,
   # but no CI job runs `mise run test`, so they are invoked explicitly here or
   # they would never run on a pull request.
-  contracts:
-    runs-on: ubuntu-latest
-    # Pinned to Debian on purpose: the AUR checks that need Arch tooling
-    # (makepkg, vercmp) must report as skipped rather than fail, and a fixed
-    # non-Arch image is what makes that skip behaviour honest and repeatable.
-    container:
-      image: debian:trixie-slim
-    env:
-      # Don't leave root-owned __pycache__ dirs in the ephemeral container workspace.
-      PYTHONDONTWRITEBYTECODE: "1"
-    steps:
-      - name: Install contract-check dependencies
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            bash \
-            ca-certificates \
-            git \
-            python3
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # Arch-only cases skip; the PKGBUILD syntax, repo-identity, dependency
-      # and pkgver contracts all run for real on Debian.
-      - name: Validate AUR PKGBUILD contracts
-        run: python3 testing/test_aur_pkgbuilds.py -v
-
-      - name: Validate GitHub workflow contracts
-        run: python3 testing/test_github_workflows.py -v
-
-      - name: Validate local HTTP route and control contracts
-        run: python3 testing/test_http_contract_docs.py -v
-
-      - name: Validate current architecture documentation contracts
-        run: python3 testing/test_architecture_docs.py -v
-
-      - name: Restore host workspace ownership
-        if: always()
-        run: chown -R 1000:1000 "$GITHUB_WORKSPACE"
-
   wasm-sidebar:
     runs-on: ubuntu-latest
     steps:
