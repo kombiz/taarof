@@ -30,6 +30,7 @@ cleanup() {
 trap cleanup EXIT
 
 bash "$repo_root/testing/test-release-bundle-provenance.sh"
+python3 "$repo_root/testing/test_bundle_provenance.py"
 
 manifest_license="$(
     sed -n 's/^license[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' \
@@ -45,18 +46,28 @@ icon_path="$prefix/share/icons/hicolor/scalable/apps/$desktop_id.svg"
 web_index_path="$prefix/share/taarof/web/index.html"
 release_out_dir="$(mktemp -d)"
 
-cargo build --release --features bundled-sqlite --manifest-path "$repo_root/taarof-app/Cargo.toml"
-bash "$script_dir/emit-artifact-provenance.sh" "$repo_root/taarof-app/target/release/taarof-app"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/taarof-app/target}"
+cargo build --locked --release --manifest-path "$repo_root/agent-launcher/Cargo.toml"
+cargo build --locked --release --features bundled-sqlite --manifest-path "$repo_root/taarof-app/Cargo.toml"
+bash "$script_dir/emit-artifact-provenance.sh" "${CARGO_TARGET_DIR:-$repo_root/taarof-app/target}/release/taarof-app"
 (cd "$repo_root/taarof-web" && npm ci --include=dev && npm run build)
 bash "$script_dir/install-local.sh" "$prefix"
 
 test -x "$binary_path"
 test -x "$cli_path"
+test -x "$prefix/bin/agent"
+for argument in --version --build-info --help providers; do
+    HOME="$prefix" "$prefix/bin/agent" "$argument" >/dev/null
+done
 test -f "$desktop_path"
 test -f "$metainfo_path"
 test -f "$icon_path"
 test -f "$web_index_path"
 test -f "$prefix/share/taarof/install-manifest.json"
+test -f "$prefix/share/taarof/bundle-manifest.json"
+for helper in osc7.bash osc7.zsh osc7.fish agent-status.bash agent-status.zsh taarof-shell-integration.sh taarof-shell-integration.fish; do
+    test -f "$prefix/share/taarof/shell/$helper"
+done
 
 grep -Fx "Exec=$binary_path" "$desktop_path" >/dev/null
 grep -Fx "TryExec=$binary_path" "$desktop_path" >/dev/null
@@ -75,11 +86,17 @@ tar -xzf "$release_tarball_path" -C "$bundle_extract_dir"
 bash "$bundle_extract_dir/taarof-linux-x86_64/install.sh" "$bundle_prefix"
 test -x "$bundle_prefix/bin/taarof-app"
 test -x "$bundle_prefix/bin/taarof"
+test -x "$bundle_prefix/bin/agent"
+HOME="$bundle_prefix" "$bundle_prefix/bin/agent" providers >/dev/null
+cmp "$prefix/share/taarof/bundle-manifest.json" "$bundle_prefix/share/taarof/bundle-manifest.json"
 test -f "$bundle_prefix/share/applications/$desktop_id.desktop"
 test -f "$bundle_prefix/share/metainfo/$desktop_id.metainfo.xml"
 test -f "$bundle_prefix/share/icons/hicolor/scalable/apps/$desktop_id.svg"
 test -f "$bundle_prefix/share/taarof/web/index.html"
 test -f "$bundle_prefix/share/taarof/install-manifest.json"
+for helper in osc7.bash osc7.zsh osc7.fish agent-status.bash agent-status.zsh taarof-shell-integration.sh taarof-shell-integration.fish; do
+    cmp "$prefix/share/taarof/shell/$helper" "$bundle_prefix/share/taarof/shell/$helper"
+done
 grep -Fx "Exec=$bundle_prefix/bin/taarof-app" \
     "$bundle_prefix/share/applications/$desktop_id.desktop" >/dev/null
 grep -Fx "TryExec=$bundle_prefix/bin/taarof-app" \

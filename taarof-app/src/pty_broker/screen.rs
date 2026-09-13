@@ -1,4 +1,24 @@
+use glib::Unichar;
 use serde::{Deserialize, Serialize};
+
+/// Maximum UTF-8 payload retained by one model cell, including its base glyph.
+pub const CELL_TEXT_MAX_BYTES: usize = 1024;
+
+/// A prefix was retained, but it cannot truthfully seed a terminal renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelDegraded;
+
+impl std::fmt::Display for ModelDegraded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("terminal model contains overflowed cells; erase or overwrite them, or reset the terminal before retrying")
+    }
+}
+impl std::error::Error for ModelDegraded {}
+impl From<ModelDegraded> for std::io::Error {
+    fn from(error: ModelDegraded) -> Self {
+        Self::new(std::io::ErrorKind::InvalidData, error)
+    }
+}
 
 const ESC: char = '\x1b';
 
@@ -14,6 +34,7 @@ pub struct CellAttrs {
 struct Cell {
     text: String,
     attrs: CellAttrs,
+    degraded: bool,
 }
 
 impl Default for Cell {
@@ -21,6 +42,7 @@ impl Default for Cell {
         Self {
             text: " ".to_string(),
             attrs: CellAttrs::default(),
+            degraded: false,
         }
     }
 }
@@ -106,6 +128,8 @@ enum ParserState {
     Ground,
     Esc,
     Csi { raw: String },
+    // Discard OSC payloads without allocating; retain a possible ST prefix.
+    Osc { escaped: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +141,8 @@ pub struct TerminalStateModel {
     active_screen: ActiveScreen,
     cursor: CursorState,
     saved_primary_cursor: CursorState,
+    join_previous: bool,
+    saved_primary_join_previous: bool,
     attrs: CellAttrs,
     modes: ModeState,
     parser: ParserState,
@@ -141,6 +167,8 @@ impl TerminalStateModel {
                 col: 0,
                 visible: true,
             },
+            join_previous: false,
+            saved_primary_join_previous: false,
             attrs: CellAttrs::default(),
             modes: ModeState::default(),
             parser: ParserState::Ground,
@@ -163,8 +191,8 @@ impl TerminalStateModel {
                 Err(error) if error.valid_up_to() > 0 => {
                     let valid = self.utf8_pending[..error.valid_up_to()].to_vec();
                     let text = std::str::from_utf8(&valid).expect("valid prefix");
-                    self.feed_text(text);
                     self.utf8_pending.drain(..error.valid_up_to());
+                    self.feed_text(text);
                 }
                 Err(error) if error.error_len().is_some() => {
                     let len = error.error_len().unwrap();
@@ -188,9 +216,41 @@ impl TerminalStateModel {
             clamp(self.saved_primary_cursor.col, 0, cols.saturating_sub(1));
     }
 
-    pub fn projection(&self) -> TerminalProjection {
+    /// Dimensions without constructing or copying a screen projection.
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.cols, self.rows)
+    }
+
+    /// Overflow is carried by the cells themselves, including hidden buffers.
+    pub fn has_degraded_cells(&self) -> bool {
+        self.primary
+            .iter()
+            .chain(&self.alternate)
+            .flatten()
+            .any(|cell| cell.degraded)
+    }
+
+    /// Allocation-free checked accounting for retained UTF-8 payload.
+    pub fn retained_text_bytes(&self) -> Option<usize> {
+        self.primary
+            .iter()
+            .chain(&self.alternate)
+            .flatten()
+            .try_fold(0usize, |total, cell| total.checked_add(cell.text.len()))
+    }
+
+    fn require_complete(&self) -> Result<(), ModelDegraded> {
+        if self.has_degraded_cells() {
+            Err(ModelDegraded)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn projection(&self) -> Result<TerminalProjection, ModelDegraded> {
+        self.require_complete()?;
         let screen = self.active_screen();
-        TerminalProjection {
+        Ok(TerminalProjection {
             cols: self.cols,
             rows: self.rows,
             active_screen: self.active_screen.as_str(),
@@ -199,17 +259,74 @@ impl TerminalStateModel {
             visible_text: visible_text(screen),
             visible_cells: material_cells(screen),
             attributed_cells: attributed_cells(screen),
-        }
+        })
     }
 
-    pub fn state_hash(&self) -> String {
-        sha256_hex(
-            stable_json(&serde_json::to_value(self.projection()).expect("projection serializes"))
+    pub fn state_hash(&self) -> Result<String, ModelDegraded> {
+        Ok(sha256_hex(
+            stable_json(&serde_json::to_value(self.projection()?).expect("projection serializes"))
                 .as_bytes(),
-        )
+        ))
     }
 
-    pub fn checkpoint(&self) -> CanonicalCheckpoint {
+    /// Conservative bound checked before checkpoint/projection/hash allocation.
+    /// Includes grid scratch space, cursor/SGR escapes, both visible buffers when
+    /// needed, and pending framing. Failure leaves model and cursor unchanged.
+    pub fn checkpoint_fits(&self, limit: usize) -> bool {
+        if self.has_degraded_cells() {
+            return false;
+        }
+        let Some(mut bound) = self
+            .cols
+            .checked_mul(self.rows)
+            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_add(1024))
+        else {
+            return false;
+        };
+        if bound > limit {
+            return false;
+        }
+        let cell_escape = format!("\x1b[{};{}H", self.rows, self.cols).len() + 24;
+        let screens = if self.active_screen == ActiveScreen::Alternate {
+            vec![&self.primary, &self.alternate]
+        } else {
+            vec![&self.primary]
+        };
+        for screen in screens {
+            for row in screen {
+                for cell in row {
+                    if cell.text != " " && !cell.text.is_empty() {
+                        let Some(next) = cell
+                            .text
+                            .len()
+                            .checked_mul(2)
+                            .and_then(|n| n.checked_add(cell_escape))
+                            .and_then(|n| bound.checked_add(n))
+                        else {
+                            return false;
+                        };
+                        bound = next;
+                        if bound > limit {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        if let ParserState::Csi { raw } = &self.parser {
+            let Some(next) = bound.checked_add(raw.len()) else {
+                return false;
+            };
+            bound = next;
+        }
+        bound
+            .checked_add(self.utf8_pending.len())
+            .is_some_and(|n| n <= limit)
+    }
+
+    pub fn checkpoint(&self) -> Result<CanonicalCheckpoint, ModelDegraded> {
+        self.require_complete()?;
         let mut ansi = Vec::new();
         ansi.extend_from_slice(b"\x1bc");
         if self.active_screen == ActiveScreen::Alternate {
@@ -221,6 +338,7 @@ impl TerminalStateModel {
                 self.saved_primary_cursor,
                 &CellAttrs::default(),
                 self.cols,
+                self.saved_primary_join_previous,
             );
             ansi.extend_from_slice(b"\x1b[?1049h");
         }
@@ -247,13 +365,31 @@ impl TerminalStateModel {
             self.cursor,
             &self.attrs,
             self.cols,
+            self.join_previous,
         );
-        CanonicalCheckpoint {
+        // A checkpoint may end in the middle of a control sequence or UTF-8
+        // character. Re-enter that framing before replaying its remaining bytes.
+        match &self.parser {
+            ParserState::Ground => {}
+            ParserState::Esc => ansi.push(0x1b),
+            ParserState::Csi { raw } => {
+                ansi.extend_from_slice(b"\x1b[");
+                ansi.extend_from_slice(raw.as_bytes());
+            }
+            ParserState::Osc { escaped } => {
+                ansi.extend_from_slice(b"\x1b]");
+                if *escaped {
+                    ansi.push(0x1b);
+                }
+            }
+        }
+        ansi.extend_from_slice(&self.utf8_pending);
+        Ok(CanonicalCheckpoint {
             cols: self.cols,
             rows: self.rows,
             ansi,
-            state_hash: self.state_hash(),
-        }
+            state_hash: self.state_hash()?,
+        })
     }
 
     fn reset(&mut self) {
@@ -266,10 +402,11 @@ impl TerminalStateModel {
             visible: true,
         };
         self.saved_primary_cursor = self.cursor;
+        self.join_previous = false;
+        self.saved_primary_join_previous = false;
         self.attrs = CellAttrs::default();
         self.modes = ModeState::default();
         self.parser = ParserState::Ground;
-        self.utf8_pending.clear();
     }
 
     fn active_screen(&self) -> &Vec<Vec<Cell>> {
@@ -294,6 +431,14 @@ impl TerminalStateModel {
 
     fn feed_char(&mut self, ch: char) {
         match &mut self.parser {
+            ParserState::Osc { escaped } => {
+                if matches!(ch, '\x07' | '\x18' | '\x1a') || (*escaped && ch == '\\') {
+                    self.parser = ParserState::Ground;
+                } else {
+                    *escaped = ch == ESC;
+                }
+                return;
+            }
             ParserState::Esc => {
                 self.handle_esc(ch);
                 return;
@@ -312,9 +457,18 @@ impl TerminalStateModel {
         }
         match ch {
             ESC => self.parser = ParserState::Esc,
-            '\r' => self.cursor.col = 0,
-            '\n' => self.line_feed(),
-            '\x08' => self.cursor.col = self.cursor.col.saturating_sub(1),
+            '\r' => {
+                self.cursor.col = 0;
+                self.join_previous = false;
+            }
+            '\n' => {
+                self.line_feed();
+                self.join_previous = false;
+            }
+            '\x08' => {
+                self.cursor.col = self.cursor.col.saturating_sub(1);
+                self.join_previous = false;
+            }
             c if c >= ' ' => self.put_char(c),
             _ => {}
         }
@@ -323,6 +477,8 @@ impl TerminalStateModel {
     fn handle_esc(&mut self, ch: char) {
         match ch {
             '[' => self.parser = ParserState::Csi { raw: String::new() },
+            ']' => self.parser = ParserState::Osc { escaped: false },
+            ESC => self.parser = ParserState::Esc,
             'c' => self.reset(),
             _ => self.parser = ParserState::Ground,
         }
@@ -330,6 +486,9 @@ impl TerminalStateModel {
 
     fn execute_csi(&mut self, raw: &str, final_char: char) {
         let private_mode = raw.starts_with('?');
+        if final_char != 'm' && !private_mode {
+            self.join_previous = false;
+        }
         let params = parse_params(if private_mode { &raw[1..] } else { raw });
         match final_char {
             'm' => self.set_sgr(&params),
@@ -431,6 +590,8 @@ impl TerminalStateModel {
                 1000 => self.modes.mouse_reporting = enabled,
                 1049 if enabled => {
                     self.saved_primary_cursor = self.cursor;
+                    self.saved_primary_join_previous = self.join_previous;
+                    self.join_previous = false;
                     self.active_screen = ActiveScreen::Alternate;
                     self.alternate = blank_screen(self.cols, self.rows);
                     self.cursor = CursorState {
@@ -441,6 +602,9 @@ impl TerminalStateModel {
                 }
                 1049 => {
                     self.active_screen = ActiveScreen::Primary;
+                    // Returning from the alternate screen restores a cursor,
+                    // not xterm's preceding printed-character context.
+                    self.join_previous = false;
                     self.cursor = CursorState {
                         visible: self.modes.cursor_visible,
                         ..self.saved_primary_cursor
@@ -456,26 +620,64 @@ impl TerminalStateModel {
         if is_combining_mark(ch) {
             if self.cursor.col > 0 {
                 let row = self.cursor.row;
-                let col = self.cursor.col - 1;
-                self.active_screen_mut()[row][col].text.push(ch);
+                let mut col = self.cursor.col - 1;
+                if self.active_screen()[row][col].text.is_empty() && col > 0 {
+                    col -= 1;
+                }
+                let cell = &mut self.active_screen_mut()[row][col];
+                if !cell.degraded {
+                    match cell.text.len().checked_add(ch.len_utf8()) {
+                        Some(length) if length <= CELL_TEXT_MAX_BYTES => {
+                            // Avoid geometric growth beyond the per-cell budget.
+                            cell.text.reserve_exact(ch.len_utf8());
+                            cell.text.push(ch);
+                        }
+                        _ => cell.degraded = true,
+                    }
+                }
             }
             return;
         }
-        if self.cursor.col >= self.cols {
+        let width = if ch.is_wide() { 2 } else { 1 }.min(self.cols);
+        if self.cursor.col + width > self.cols {
             self.cursor.col = 0;
             self.line_feed();
         }
         let row = self.cursor.row;
         let col = self.cursor.col;
         let attrs = self.attrs.clone();
+        self.clear_cell(row, col);
+        if width == 2 {
+            self.clear_cell(row, col + 1);
+            self.active_screen_mut()[row][col + 1] = Cell {
+                text: String::new(),
+                attrs: attrs.clone(),
+                degraded: false,
+            };
+        }
         self.active_screen_mut()[row][col] = Cell {
             text: ch.to_string(),
             attrs,
+            degraded: false,
         };
-        self.cursor.col += 1;
+        self.cursor.col += width;
+        self.join_previous = true;
         if self.cursor.col >= self.cols {
             self.cursor.col = self.cols;
         }
+    }
+
+    // An empty cell is the continuation of the preceding double-width cell.
+    // Erasing or overwriting either half invalidates the complete glyph.
+    fn clear_cell(&mut self, row: usize, col: usize) {
+        let screen = self.active_screen_mut();
+        if screen[row][col].text.is_empty() && col > 0 {
+            screen[row][col - 1] = Cell::default();
+        }
+        if col + 1 < screen[row].len() && screen[row][col + 1].text.is_empty() {
+            screen[row][col + 1] = Cell::default();
+        }
+        screen[row][col] = Cell::default();
     }
 
     fn line_feed(&mut self) {
@@ -497,7 +699,7 @@ impl TerminalStateModel {
         };
         let row = self.cursor.row;
         for col in start..end {
-            self.active_screen_mut()[row][col] = Cell::default();
+            self.clear_cell(row, col);
         }
     }
 }
@@ -533,7 +735,7 @@ fn material_cells(screen: &[Vec<Cell>]) -> Vec<VisibleCell> {
     let mut cells = Vec::new();
     for (row_idx, row) in screen.iter().enumerate() {
         for (col, cell) in row.iter().enumerate() {
-            if cell.text != " " {
+            if cell.text != " " && !cell.text.is_empty() {
                 cells.push(VisibleCell {
                     row: row_idx,
                     col,
@@ -549,7 +751,7 @@ fn attributed_cells(screen: &[Vec<Cell>]) -> Vec<AttributedCell> {
     let mut cells = Vec::new();
     for (row_idx, row) in screen.iter().enumerate() {
         for (col, cell) in row.iter().enumerate() {
-            if cell.text != " " && cell.attrs != CellAttrs::default() {
+            if cell.text != " " && !cell.text.is_empty() && cell.attrs != CellAttrs::default() {
                 cells.push(AttributedCell {
                     row: row_idx,
                     col,
@@ -566,7 +768,7 @@ fn append_screen(ansi: &mut Vec<u8>, rows: &[Vec<Cell>]) {
     let mut current_attrs = CellAttrs::default();
     for (row_idx, row) in rows.iter().enumerate() {
         for (col, cell) in row.iter().enumerate() {
-            if cell.text == " " {
+            if cell.text == " " || cell.text.is_empty() {
                 continue;
             }
             ansi.extend_from_slice(format!("\x1b[{};{}H", row_idx + 1, col + 1).as_bytes());
@@ -595,13 +797,37 @@ fn append_cursor_restore(
     cursor: CursorState,
     ambient_attrs: &CellAttrs,
     cols: usize,
+    join_previous: bool,
 ) {
     if cursor.col >= cols && cols > 0 {
         // The cursor is in the deferred-wrap position past the last column,
         // which CUP cannot address; rewrite the final cell so the replayed
         // parser advances into the wrap position naturally.
-        ansi.extend_from_slice(format!("\x1b[{};{}H", cursor.row + 1, cols).as_bytes());
-        let cell = &screen[cursor.row][cols - 1];
+        let col = if screen[cursor.row][cols - 1].text.is_empty() && cols > 1 {
+            cols - 2
+        } else {
+            cols - 1
+        };
+        ansi.extend_from_slice(format!("\x1b[{};{}H", cursor.row + 1, col + 1).as_bytes());
+        let cell = &screen[cursor.row][col];
+        append_sgr_transition(ansi, ambient_attrs, &cell.attrs);
+        ansi.extend_from_slice(cell.text.as_bytes());
+        append_sgr_transition(ansi, &cell.attrs, ambient_attrs);
+    } else if join_previous && cursor.col > 0 && !screen[cursor.row][cursor.col - 1].text.is_empty()
+    {
+        // CUP clears xterm's preceding-character context. Rewrite the previous
+        // cell so a combining mark in the next replay frame still joins it.
+        let col = cursor.col - 1;
+        let cell = &screen[cursor.row][col];
+        ansi.extend_from_slice(format!("\x1b[{};{}H", cursor.row + 1, col + 1).as_bytes());
+        append_sgr_transition(ansi, ambient_attrs, &cell.attrs);
+        ansi.extend_from_slice(cell.text.as_bytes());
+        append_sgr_transition(ansi, &cell.attrs, ambient_attrs);
+    } else if join_previous && cursor.col > 1 && screen[cursor.row][cursor.col - 1].text.is_empty()
+    {
+        let col = cursor.col - 2;
+        let cell = &screen[cursor.row][col];
+        ansi.extend_from_slice(format!("\x1b[{};{}H", cursor.row + 1, col + 1).as_bytes());
         append_sgr_transition(ansi, ambient_attrs, &cell.attrs);
         ansi.extend_from_slice(cell.text.as_bytes());
         append_sgr_transition(ansi, &cell.attrs, ambient_attrs);
@@ -944,6 +1170,189 @@ mod tests {
     }
 
     #[test]
+    fn combining_text_retention_is_bounded_under_long_streams() {
+        let mut model = TerminalStateModel::new(4, 2);
+        model.feed(b"a");
+        let chunk = "\u{301}".repeat(4096);
+        for index in 1..=1024 {
+            model.feed(chunk.as_bytes());
+            if [128, 512, 1024].contains(&index) {
+                println!("combining-retention input_bytes={} cell_bytes={} cell_capacity={} model_text_bytes={}",
+                    index * chunk.len(), model.primary[0][0].text.len(),
+                    model.primary[0][0].text.capacity(), model.retained_text_bytes().unwrap());
+            }
+        }
+        assert!(
+            model.primary[0][0].text.len() <= CELL_TEXT_MAX_BYTES,
+            "retained {} bytes in one cell",
+            model.primary[0][0].text.len()
+        );
+        assert!(model.primary[0][0].text.capacity() <= CELL_TEXT_MAX_BYTES);
+    }
+
+    #[test]
+    fn overflow_refuses_all_projections_until_affected_cells_are_removed() {
+        for recovery in [b"\rZ".as_slice(), b"\r\x1b[K", b"\x1b[2J", b"\x1bc"] {
+            let mut model = TerminalStateModel::new(4, 2);
+            model.feed(b"a");
+            model.feed("\u{20dd}".repeat(341).as_bytes());
+            assert_eq!(model.primary[0][0].text.len(), CELL_TEXT_MAX_BYTES);
+            assert!(model.checkpoint().is_ok(), "exact byte limit is supported");
+            model.feed("\u{301}".as_bytes());
+            let retained = model.retained_text_bytes();
+            assert_eq!(model.projection(), Err(ModelDegraded));
+            assert_eq!(model.state_hash(), Err(ModelDegraded));
+            assert_eq!(model.checkpoint(), Err(ModelDegraded));
+            assert!(!model.checkpoint_fits(usize::MAX));
+            // Unrelated output does not authorize recovery or release storage.
+            model.feed(b"X");
+            assert!(model.has_degraded_cells());
+            assert_eq!(model.retained_text_bytes(), retained);
+            model.feed(recovery);
+            assert!(!model.has_degraded_cells());
+            let checkpoint = model.checkpoint().unwrap();
+            let mut restored = TerminalStateModel::new(4, 2);
+            restored.feed(&checkpoint.ansi);
+            assert_eq!(model.projection(), restored.projection());
+        }
+    }
+
+    #[test]
+    fn hidden_degraded_buffers_and_wide_continuations_preserve_refusal() {
+        let mut model = TerminalStateModel::new(4, 2);
+        model.feed("界".as_bytes());
+        model.feed("\u{301}".repeat(1024).as_bytes());
+        model.feed(b"\x1b[?1049hALT");
+        assert!(
+            model.checkpoint().is_err(),
+            "hidden primary is still degraded"
+        );
+        model.feed(b"\x1b[2J");
+        assert!(
+            model.checkpoint().is_err(),
+            "erasing alternate does not erase primary"
+        );
+        model.feed(b"\x1b[?1049l\x1b[1;2HZ");
+        assert!(
+            model.checkpoint().is_ok(),
+            "overwriting wide continuation erases whole glyph"
+        );
+        model.feed(b"\x1b[?1049hA");
+        model.feed("\u{301}".repeat(1024).as_bytes());
+        model.feed(b"\x1b[?1049l");
+        assert!(
+            model.checkpoint().is_err(),
+            "hidden alternate is still degraded"
+        );
+        model.feed(b"\x1bc");
+        assert!(model.checkpoint().is_ok(), "RIS resets both buffers");
+    }
+
+    #[test]
+    fn checkpoint_budget_counts_cursor_restore_of_oversized_combining_cell() {
+        let mut model = TerminalStateModel::new(4, 2);
+        let text = format!("a{}", "\u{301}".repeat(70 * 1024));
+        model.feed(text.as_bytes());
+        assert!(!model.checkpoint_fits(256 * 1024));
+        assert_eq!(model.checkpoint(), Err(ModelDegraded));
+        assert_eq!(model.projection(), Err(ModelDegraded));
+        assert_eq!(model.state_hash(), Err(ModelDegraded));
+        let mut normal = TerminalStateModel::new(80, 24);
+        normal.feed(b"normal bounded checkpoint");
+        assert!(normal.checkpoint_fits(256 * 1024));
+    }
+
+    #[test]
+    fn checkpoint_replays_split_utf8_and_wide_cells() {
+        for text in [
+            "A界e\u{301}B",
+            "日本語!",
+            "abc界X",
+            "界\u{301}!",
+            "界\x1b[2G!",
+            "abc界",
+        ] {
+            let bytes = text.as_bytes();
+            for split in 0..=bytes.len() {
+                let mut original = TerminalStateModel::new(5, 4);
+                original.feed(&bytes[..split]);
+                let mut restored = TerminalStateModel::new(5, 4);
+                restored.feed(&original.checkpoint().unwrap().ansi);
+                original.feed(&bytes[split..]);
+                restored.feed(&bytes[split..]);
+                assert_eq!(
+                    original.projection().unwrap(),
+                    restored.projection().unwrap(),
+                    "{text:?} split {split}"
+                );
+            }
+        }
+        let mut model = TerminalStateModel::new(10, 4);
+        model.feed("A界e\u{301}B".as_bytes());
+        assert_eq!(model.projection().unwrap().cursor.col, 5);
+        assert_eq!(model.projection().unwrap().visible_cells[2].col, 3);
+        assert_eq!(
+            model.projection().unwrap().visible_cells[2].text,
+            "e\u{301}"
+        );
+    }
+
+    #[test]
+    fn osc_cancel_and_repeated_escape_keep_framing() {
+        for bytes in [
+            &b"\x1b]2;inert\x18OK"[..],
+            &b"\x1b]2;inert\x1aOK"[..],
+            &b"\x1b]2;inert\x1b\x1b\\OK"[..],
+            &b"\x1b\x1b]2;inert\x07OK"[..],
+        ] {
+            let mut model = TerminalStateModel::new(80, 4);
+            for byte in bytes {
+                model.feed(std::slice::from_ref(byte));
+            }
+            assert_eq!(model.projection().unwrap().visible_text[0], "OK");
+        }
+    }
+
+    #[test]
+    fn osc_strings_never_become_text_at_any_chunk_boundary() {
+        for command in [
+            "2;INERT_TITLE",
+            "7;file://example.invalid/inert",
+            "8;;https://example.invalid/inert",
+        ] {
+            for terminator in ["\x07", "\x1b\\"] {
+                let bytes = format!("before\x1b]{command}{terminator}after").into_bytes();
+                for split in 0..=bytes.len() {
+                    let mut model = TerminalStateModel::new(80, 4);
+                    model.feed(&bytes[..split]);
+                    let mut resumed = TerminalStateModel::new(80, 4);
+                    resumed.feed(&model.checkpoint().unwrap().ansi);
+                    resumed.feed(&bytes[split..]);
+                    model.feed(&bytes[split..]);
+                    assert_eq!(
+                        resumed.projection().unwrap(),
+                        model.projection().unwrap(),
+                        "checkpoint split {split}"
+                    );
+                    assert_eq!(
+                        model.projection().unwrap().visible_text[0],
+                        "beforeafter",
+                        "{command:?}, {terminator:?}, split {split}"
+                    );
+                    let mut restored = TerminalStateModel::new(80, 4);
+                    restored.feed(&model.checkpoint().unwrap().ansi);
+                    assert_eq!(restored.projection().unwrap(), model.projection().unwrap());
+                }
+                let mut model = TerminalStateModel::new(80, 4);
+                for byte in &bytes {
+                    model.feed(std::slice::from_ref(byte));
+                }
+                assert_eq!(model.projection().unwrap().visible_text[0], "beforeafter");
+            }
+        }
+    }
+
+    #[test]
     fn checkpoint_fixtures_match_expected_projection_and_hash() {
         for fixture in fixtures().fixtures {
             let bytes = fixture_bytes(&fixture);
@@ -951,15 +1360,15 @@ mod tests {
             feed_fixture(&mut model, &fixture, &bytes);
 
             let mut projection =
-                serde_json::to_value(model.projection()).expect("projection serializes");
-            projection["state_hash"] = Value::String(model.state_hash());
+                serde_json::to_value(model.projection().unwrap()).expect("projection serializes");
+            projection["state_hash"] = Value::String(model.state_hash().unwrap());
             assert_eq!(projection, fixture.expected, "{} projection", fixture.name);
 
             let expected_hash = fixture.expected["state_hash"]
                 .as_str()
                 .expect("state_hash in fixture");
             assert_eq!(
-                model.state_hash(),
+                model.state_hash().unwrap(),
                 expected_hash,
                 "{} state hash",
                 fixture.name
@@ -974,7 +1383,7 @@ mod tests {
             let mut model = TerminalStateModel::new(fixture.cols, fixture.rows);
             feed_fixture(&mut model, &fixture, &bytes);
 
-            let checkpoint = model.checkpoint();
+            let checkpoint = model.checkpoint().unwrap();
             let expected_ansi = STANDARD
                 .decode(&fixture.checkpoint.ansi_base64)
                 .expect("checkpoint base64 decodes");
@@ -1004,8 +1413,8 @@ mod tests {
             let mut reconstructed = TerminalStateModel::new(checkpoint.cols, checkpoint.rows);
             reconstructed.feed(&checkpoint.ansi);
             assert_eq!(
-                reconstructed.projection(),
-                model.projection(),
+                reconstructed.projection().unwrap(),
+                model.projection().unwrap(),
                 "{} checkpoint reconstructs",
                 fixture.name
             );
@@ -1021,7 +1430,7 @@ mod tests {
             model.resize(fixture.resize.cols, fixture.resize.rows);
 
             assert_eq!(
-                serde_json::to_value(model.projection()).expect("projection serializes"),
+                serde_json::to_value(model.projection().unwrap()).expect("projection serializes"),
                 fixture.resize.expected,
                 "{} resized projection",
                 fixture.name
@@ -1033,67 +1442,88 @@ mod tests {
     fn checkpoint_preserves_active_attributes_for_future_output() {
         let mut original = TerminalStateModel::new(10, 2);
         original.feed(b"\x1b[31m");
-        let checkpoint = original.checkpoint();
+        let checkpoint = original.checkpoint().unwrap();
         let mut restored = TerminalStateModel::new(10, 2);
         restored.feed(&checkpoint.ansi);
         original.feed(b"x");
         restored.feed(b"x");
-        assert_eq!(restored.projection(), original.projection());
+        assert_eq!(
+            restored.projection().unwrap(),
+            original.projection().unwrap()
+        );
     }
 
     #[test]
     fn checkpoint_preserves_primary_cursor_while_alternate_screen_is_active() {
         let mut original = TerminalStateModel::new(10, 3);
         original.feed(b"\x1b[2;4H\x1b[?1049halt");
-        let checkpoint = original.checkpoint();
+        let checkpoint = original.checkpoint().unwrap();
         let mut restored = TerminalStateModel::new(10, 3);
         restored.feed(&checkpoint.ansi);
         original.feed(b"\x1b[?1049lX");
         restored.feed(b"\x1b[?1049lX");
-        assert_eq!(restored.projection(), original.projection());
+        assert_eq!(
+            restored.projection().unwrap(),
+            original.projection().unwrap()
+        );
     }
 
     #[test]
     fn checkpoint_does_not_bleed_primary_attrs_into_alternate_screen() {
         let mut original = TerminalStateModel::new(10, 3);
         original.feed(b"\x1b[31mred\x1b[0m\x1b[?1049hplain");
-        let checkpoint = original.checkpoint();
+        let checkpoint = original.checkpoint().unwrap();
         let mut restored = TerminalStateModel::new(10, 3);
         restored.feed(&checkpoint.ansi);
-        assert_eq!(restored.projection(), original.projection());
+        assert_eq!(
+            restored.projection().unwrap(),
+            original.projection().unwrap()
+        );
     }
 
     #[test]
     fn checkpoint_round_trips_deferred_wrap_saved_primary_cursor() {
         let mut original = TerminalStateModel::new(5, 3);
         original.feed(b"\x1b[1mhello\x1b[?1049halt");
-        let checkpoint = original.checkpoint();
+        let checkpoint = original.checkpoint().unwrap();
         let mut restored = TerminalStateModel::new(5, 3);
         restored.feed(&checkpoint.ansi);
-        assert_eq!(restored.projection(), original.projection());
+        assert_eq!(
+            restored.projection().unwrap(),
+            original.projection().unwrap()
+        );
         original.feed(b"\x1b[?1049lX");
         restored.feed(b"\x1b[?1049lX");
-        assert_eq!(restored.projection(), original.projection());
+        assert_eq!(
+            restored.projection().unwrap(),
+            original.projection().unwrap()
+        );
     }
 
     #[test]
     fn checkpoint_round_trips_deferred_wrap_cursor() {
         let mut original = TerminalStateModel::new(5, 2);
         original.feed(b"hello");
-        let checkpoint = original.checkpoint();
+        let checkpoint = original.checkpoint().unwrap();
         let mut restored = TerminalStateModel::new(5, 2);
         restored.feed(&checkpoint.ansi);
-        assert_eq!(restored.projection(), original.projection());
+        assert_eq!(
+            restored.projection().unwrap(),
+            original.projection().unwrap()
+        );
         original.feed(b"X");
         restored.feed(b"X");
-        assert_eq!(restored.projection(), original.projection());
+        assert_eq!(
+            restored.projection().unwrap(),
+            original.projection().unwrap()
+        );
     }
 
     #[test]
     fn csi_2k_erases_the_entire_line() {
         let mut model = TerminalStateModel::new(10, 2);
         model.feed(b"stale\x1b[3G\x1b[2K");
-        assert!(model.projection().visible_cells.is_empty());
+        assert!(model.projection().unwrap().visible_cells.is_empty());
     }
 
     #[test]
@@ -1106,7 +1536,7 @@ mod tests {
             let bytes = fixture_bytes(&fixture);
             let mut model = TerminalStateModel::new(fixture.cols, fixture.rows);
             feed_fixture(&mut model, &fixture, &bytes);
-            let projection = model.projection();
+            let projection = model.projection().unwrap();
             let assertions = fixture.assertions.expect("assertions present");
 
             if let Some(cells) = assertions.cells {

@@ -543,6 +543,40 @@ popover.menu modelbutton:focus-visible {
     color: #fff8e8;
 }
 
+.agent-headless-children {
+    margin: 3px 0 0 13px;
+    padding-left: 7px;
+    border-left: 1px dashed rgba(160, 141, 111, 0.42);
+}
+
+.agent-headless-child {
+    min-height: 0;
+    padding: 2px 3px;
+    border-radius: 4px;
+    color: #d8cdb6;
+}
+
+.agent-headless-child.working { color: #a7d8a6; }
+.agent-headless-child.waiting { color: #e6c769; }
+.agent-headless-child.done { color: #88c5cb; }
+.agent-headless-child.errored { color: #e4998e; }
+
+.agent-headless-marker {
+    color: #a08d6f;
+    font-size: 9px;
+}
+
+.agent-headless-label {
+    font-size: 9px;
+    font-weight: 650;
+}
+
+.agent-headless-state {
+    margin-left: 4px;
+    font-size: 8px;
+    font-weight: 800;
+}
+
 .tab-row.activity-done:not(.attention) {
     border-left-color: #6bb0b8;
 }
@@ -1829,3 +1863,51 @@ popover.menu separator {
     background-color: #34291a;
     border-color: #e0a43a;
 }
+
+/* Activity belongs to the whole row/card, with readable text in every state.
+ * Explicit active-row selectors keep selection from hiding activity tint. */
+.agent-activity-card.working,
+.tab-agent-child.working,
+.tab-row.active .tab-agent-child.working,
+.agent-headless-child.working {
+    background-color: #24362b;
+}
+.agent-activity-card.waiting,
+.tab-agent-child.waiting,
+.tab-row.active .tab-agent-child.waiting,
+.agent-headless-child.waiting {
+    background-color: #3d3420;
+}
+.agent-activity-card.done,
+.tab-agent-child.done,
+.tab-row.active .tab-agent-child.done,
+.agent-headless-child.done {
+    background-color: #24383c;
+}
+.agent-activity-card.errored,
+.tab-agent-child.errored,
+.tab-row.active .tab-agent-child.errored,
+.agent-headless-child.errored {
+    background-color: #402b2b;
+}
+.agent-activity-card.idle,
+.tab-agent-child.idle,
+.tab-row.active .tab-agent-child.idle,
+.agent-headless-child.idle {
+    background-color: #302d28;
+}
+.agent-activity-card:hover,
+.tab-agent-child:hover,
+.tab-row.active .tab-agent-child:hover {
+    outline: 1px solid #e0a43a;
+    outline-offset: -1px;
+}
+
+/* Small card captions/pills keep AA text contrast over every activity tint. */
+.agent-activity-context,
+.agent-headless-marker { color: #d8cdb6; }
+.agent-activity-status.working,
+.agent-activity-status.waiting,
+.agent-activity-status.done,
+.agent-activity-status.errored,
+.agent-activity-status.idle { color: #fff8e8; }

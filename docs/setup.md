@@ -65,6 +65,7 @@ Without `mise`, run the underlying commands:
 
 ```bash
 cargo build --release --manifest-path taarof-app/Cargo.toml
+cargo build --release --manifest-path agent-launcher/Cargo.toml
 npm --prefix taarof-web ci
 npm --prefix taarof-web run build
 bash packaging/linux/install-local.sh
@@ -72,6 +73,27 @@ bash packaging/linux/install-local.sh
 
 The installer writes only under the selected prefix (default `~/.local`) and
 does not start or enable the optional remote-control gateway.
+
+### Contributor verification
+
+After installing the native packages above, run `mise run ci` for the full
+local gate. It installs locked web dependencies, builds the web bundle, checks
+the optional performance harness, and runs native, CLI, and frontend tests.
+Pull-request CI also compiles the harness and runs the CLI regression suite.
+
+For standalone native tests in a fresh checkout, build the web assets first:
+`runtime_smoke` exercises the web-asset resolver and requires `taarof-web/dist`.
+
+```bash
+npm --prefix taarof-web ci
+npm --prefix taarof-web run build
+cargo test --manifest-path taarof-app/Cargo.toml
+python3 taarof-cli/test_taarof_cli.py
+cargo check --manifest-path taarof-app/Cargo.toml --example performance_harness --features harness
+```
+
+These are headless checks. Use the Kasm desktop and its visual checklist in
+`testing/kasm/README.md` for GTK/VTE interaction evidence.
 
 ## 2. Create and validate local configuration
 
@@ -104,25 +126,48 @@ Taarof reads terminal escape sequences; it does not poll the shell for its
 working directory. Install both integrations:
 
 - OSC 7 reports the current host and directory.
-- OSC 133 marks prompts so copy-recent-output and prompt navigation are exact.
+- OSC 133 marks prompts for terminal interoperability. The helper also sends
+  VTE's `OSC 666;vte.shell.precmd!` signal, which Taarof uses for exact
+  copy-recent-output and prompt navigation.
 
-For Bash:
+Source builds and tarball/local installs deliver the same helpers. Installation
+never edits your shell startup files. Select the source below:
 
 ```bash
-mkdir -p ~/.config/taarof
-install -m 0644 taarof-app/resources/osc7.bash ~/.config/taarof/osc7.bash
-install -m 0644 examples/taarof-shell-integration.sh ~/.config/taarof/taarof-shell-integration.sh
-printf '\n%s\n' \
-  'source "$HOME/.config/taarof/osc7.bash"' \
-  'source "$HOME/.config/taarof/taarof-shell-integration.sh"' >> ~/.bashrc
+# Installed package (replace ~/.local if you chose another install prefix):
+shell_dir="$HOME/.local/share/taarof/shell"
+# From a source checkout instead, copy the helpers to your own directory:
+# mkdir -p "$HOME/.config/taarof/shell"
+# cp taarof-app/resources/osc7.* examples/taarof-shell-integration.* "$HOME/.config/taarof/shell/"
+# shell_dir="$HOME/.config/taarof/shell"
 ```
 
-For Zsh, replace `osc7.bash` and `.bashrc` with `osc7.zsh` and `.zshrc`.
-Before appending, check that each `source` line is not already present. Fish
-needs native functions; the example at the top of
-`examples/taarof-shell-integration.sh` contains the supported Fish equivalent.
+Add these two lines once to `~/.bashrc`, after checking for existing entries:
 
-Open a new shell and verify that changing directory updates the pane's CWD.
+```bash
+source "$HOME/.local/share/taarof/shell/osc7.bash"
+source "$HOME/.local/share/taarof/shell/taarof-shell-integration.sh"
+```
+
+Adjust those paths to your selected directory. For Zsh use `osc7.zsh` in
+`~/.zshrc`, followed by the same `.sh` marker helper. For Fish use native files
+in `~/.config/fish/config.fish`:
+
+```fish
+source "$HOME/.local/share/taarof/shell/osc7.fish"
+source "$HOME/.local/share/taarof/shell/taarof-shell-integration.fish"
+```
+
+Repeated sourcing preserves existing prompt hooks without duplicate registration.
+Bash emits command-start C through PS0 (Bash 4.4+) without replacing a DEBUG
+trap; Zsh and Fish use native preexec hooks. Prompt tracking in Taarof requires
+the VTE signal in addition to the standard OSC133 markers. Open a new shell and verify
+that changing into a directory with spaces or Unicode updates the pane's CWD.
+
+Contributor verification requires Bash, Zsh and Fish installed:
+`python3 testing/test_shell_integration.py` exercises real interactive shells and
+copied remote payloads in private temporary homes. To verify an installed payload,
+set `TAAROF_TEST_SHELL_DIR=/your/prefix/share/taarof/shell` for that command.
 
 ## 4. Optional local features
 
@@ -228,20 +273,21 @@ On each remote:
    wanted.
 3. Use SSH keys. Taarof background probes use `BatchMode=yes` and cannot answer
    password, passphrase, or host-key prompts.
-4. Install the OSC 7 and OSC 133 shell files from the checkout exactly as in
+4. Install the OSC 7 and OSC 133 shell files from your source or installed payload as in
    the local shell-integration section.
 
 Copy the integration files without modifying the remote shell yet:
 
 ```bash
 ssh HOST 'mkdir -p ~/.config/taarof'
-scp taarof-app/resources/osc7.bash \
-    examples/taarof-shell-integration.sh \
+scp "$shell_dir/osc7.bash" "$shell_dir/taarof-shell-integration.sh" \
     HOST:.config/taarof/
 ```
 
 Then inspect the remote rc file, add the two idempotent `source` lines, and open
-a new SSH session. For Zsh, copy `osc7.zsh` instead.
+a new SSH session. For Zsh, copy `osc7.zsh` instead. For Fish, copy
+`osc7.fish` and `taarof-shell-integration.fish` and use the Fish source lines.
+These steps copy public helper files only; they do not install credentials.
 
 ### Local SSH configuration
 
@@ -363,3 +409,134 @@ survive. For rollback, stop Taarof, restore the previous
 binary and configuration, and relaunch. If the gateway is enabled, re-pin its
 `runtime.instance_id` after every Taarof restart as described in the remote
 terminal runbook.
+
+### Standalone agent launcher
+
+The installer also ships `agent`. It discovers local provider history without a
+running Taarof process. When available, the same-user private Unix socket adds
+fresh live identities and cached remote history. `agent --session NAME --json`
+selects a named runtime (or use `TAAROF_SESSION` / `TAAROF_SOCK`). A missing or
+unresponsive runtime reports a diagnostic and preserves local results.
+`agent --attach '<stable-ref JSON>'` focuses an exact live tmux-backed pane;
+`--resume` starts a provider from history. Remote Resume uses the configured SSH
+destination, quoted structured program/argv/cwd, and a TTY. Stale or failed
+remote records remain visible with their actions disabled.
+`agent --json` returns the `agent.sessions.v2` catalog;
+`agent providers` and `agent doctor` return versioned provider inventories and
+per-provider history diagnostics without starting provider processes.
+
+Start a provider with `agent --new codex`. To resume exactly, pass the JSON
+`stable_ref` object from the catalog as one quoted argument to `agent --resume`,
+or use an exact session ID that is unique across the catalog. Ambiguous IDs,
+unavailable executables and missing working directories fail without launching.
+The provider replaces the launcher in the terminal and retains its ordinary
+signals and exit status. Model, approval, sandbox and account settings come from
+the provider's own configuration.
+
+The launcher requires an existing absolute `HOME` for local history. An absent
+store is reported as unavailable; unreadable, malformed, or over-budget stores
+are reported as degraded. JSONL samples admit at most 64 lines, 1 MiB per line,
+and 16 MiB total; the Kimi index admits at most 10,000 records within the same
+byte budget. Pi's session map is capped at 1 MiB. Valid files remain visible
+when another file is corrupt, but exact resume refuses a degraded provider
+until a fresh scan succeeds. An incomplete write can therefore temporarily
+prevent resume; retry after the provider finishes writing.
+
+### Rust workspace and reproducible artifacts
+
+The desktop app, shared session core, and standalone launcher share the root
+`Cargo.toml` workspace and `Cargo.lock`. Keep their dependency identity relative
+to this common workspace: independent sibling crates acquire checkout-dependent
+Cargo metadata even when Rust source paths are remapped. The gateway and WASM
+experiment remain separate packages with their own lockfiles.
+
+Run Cargo from the repository root. `.cargo/config.toml` keeps shipped artifacts
+in `taarof-app/target`, including `release/agent`; `CARGO_TARGET_DIR` overrides
+that directory for isolated/container builds. Installed names remain
+`bin/taarof-app`, `bin/taarof`, and `bin/agent`. Packaging explicitly selects the
+build directory and uses the root lockfile.
+
+The public-export validator compares both executables, provenance, and entire
+release bundles across independent exports. Failed validation retains its
+scratch directory and reports its path for inspection.
+
+### Complete bundle source identity
+
+`agent --build-info` prints compile-time `agent.build.v1` identity without
+reading provider history or contacting Taarof. The launcher and desktop share
+the same build-provenance implementation; installed filenames alone never
+establish matching source.
+
+A package includes `share/taarof/bundle-manifest.json` with schema
+`taarof.bundle.v1`, the compiled `source_revision`, explicit `source_dirty`,
+`app_build_id`, `agent_build_id`, and SHA-256 values for `taarof-app`, `taarof`,
+and `agent`. Generation verifies the desktop sidecar against its executable,
+checks the launcher's own embedded identity, and compares CLI bytes with the
+tracked blob at that exact source revision for clean builds. Dirty builds remain
+packageable and installable with `source_dirty: true`; their hashes establish
+artifact integrity, but they are unreviewed and do not prove exact committed
+source. Desktop and launcher must agree on source, dirty state, profile and epoch.
+The installer checks the manifest
+before copying programs and verifies the installed bytes before copying it.
+
+Release acceptance and the installed smoke require a clean committed checkout. A local
+development install can still run when complete provenance is unavailable,
+but reports that limitation and removes any previous complete bundle manifest.
+The existing desktop `install-manifest.json` remains available separately.
+### Keyboard session picker
+
+Bare `agent` opens a local-first picker. New lists executable providers with a
+declared new-session capability. Sessions from the current repository and its
+linked worktrees come first, then other sessions, newest-message first within
+each group. Ctrl+S also offers global time order and Active/Recent groups,
+where Active requires an exact live binding and Recent
+lists saved history. A stopped Taarof process does not prevent
+local New and Recent use. `agent --new` opens only New rows; `agent --resume`
+opens session rows.
+
+| Key | Behavior |
+| --- | --- |
+| Type / Backspace | Fuzzy search provider, title, repository, directory, host and session name |
+| Up / Down | Move selection |
+| Enter | Run the declared default: New, or Attach when available for an exact live row, otherwise Resume |
+| Tab | Cycle local, all hosts and active-only scope |
+| Ctrl+N | Clear filters and focus New rows |
+| Ctrl+P | Cycle provider filter, including all providers |
+| Ctrl+R | Refresh while preserving exact selection |
+| Ctrl+S | Cycle repository-first, global last-message order and Active/Recent groups |
+| Ctrl+F | Fork only when the selected row declares that capability |
+| ? | Toggle keyboard help |
+| Esc / Ctrl+C | Exit without launching |
+
+Attach uses the existing live process; Resume launches the provider using saved
+history; New starts a new session; Fork creates a separate session from history.
+Unsupported actions have no key action. Preview content is bounded metadata,
+action meaning, confidence and degraded-source warnings. It excludes transcript
+bodies and execution arguments. Labels cannot emit terminal control sequences.
+
+A disappeared selection stays unselected until you choose again. Before launch,
+the picker obtains a fresh catalog and requires the exact identity, capability
+and structured plan to match. A changed or unavailable action stays in the picker
+with an explanation. Terminal modes are restored before handing over to the
+provider and when cancellation or execution fails.
+
+The picker displays **Last sent**: the timestamp of your latest message to the
+agent, in local time with its UTC offset. New actions remain at the top.
+Changing the sort does not change the selected session.
+
+Repository matching uses the Git common directory, so sessions in linked
+worktrees and other branches of this checkout belong together. Separate clones
+and nested repositories remain separate. A remote path is never matched against
+a local repository merely because the text looks the same. Outside a Git
+repository, the default falls back to global time order. Missing or unreadable
+repository metadata stays in the other/unknown group; discovery uses bounded
+local metadata reads without spawning Git per row.
+
+Local Claude, Codex, and Pi history supplies message timestamps. Discovery reads
+at most the final 1 MiB of each selected history file, independently of the title
+sample. Assistant output, tool results, and file modification times do not count
+as messages sent by you. If the newest message has no valid timestamp, the tail
+is incomplete, or no user message is found within that budget, the time is
+`unknown`. Kimi, OpenCode, remote history, and external adapters currently also
+show `unknown`. Unknown times sort after known times, with history-update time
+used only to order ties. Refresh with Ctrl+R to pick up newly sent messages.

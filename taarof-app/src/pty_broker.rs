@@ -1,4 +1,11 @@
 pub mod epoch;
+mod input;
+mod output;
+pub use input::{InputOutcome, InputReceipt, InputStatus, INPUT_MAX_BYTES};
+pub use output::{
+    NativeSubscription, OutputObserver, SubscriberStats, MAX_NATIVE_SUBSCRIBERS, MAX_WEB_OBSERVERS,
+    NATIVE_QUEUE_BYTES, NATIVE_QUEUE_CHUNKS, OUTPUT_CHUNK_BYTES,
+};
 pub mod replay;
 pub mod screen;
 pub mod unix_pty;

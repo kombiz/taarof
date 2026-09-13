@@ -26,7 +26,7 @@ pub(crate) use self::broadcast::{
     copy_recent_output_from_active_terminal, copy_ring_entry_to_clipboard,
     copy_vte_selection_and_record, install_clipboard_ring_state, join_logical_lines,
     last_agent_message_for_active_pane, paste_clipboard_to_active_scope, resolve_pane_send_target,
-    send_bytes_to_pane, LastAgentMessageResolution, LastMessageCopy, PaneSendTarget, PromptJump,
+    send_bytes_to_pane, LastAgentMessageResolution, PaneSendTarget, PromptJump,
 };
 pub use self::broadcast::{build_send_to_pane_payload, SendToPaneMode};
 #[cfg(any(test, feature = "harness", debug_assertions))]
@@ -3226,21 +3226,23 @@ pub fn focus_pane_in_direction(
         return false;
     };
 
-    // Update focused pane and grab focus
-    let mut st = state.borrow_mut();
-    let Some(tab) = st.find_tab_mut(tab_id) else {
-        return false;
+    let terminal = {
+        let mut st = state.borrow_mut();
+        let Some(tab) = st.find_tab_mut(tab_id) else {
+            return false;
+        };
+        let Some(leaf) = tab.panes.leaf(target_id) else {
+            return false;
+        };
+        let terminal = leaf.terminal.clone();
+        tab.focused_pane_id = target_id;
+        terminal
     };
 
-    tab.focused_pane_id = target_id;
-
-    // Get the terminal for the target pane and focus it
-    if let Some(leaf) = tab.panes.leaf(target_id) {
-        leaf.terminal.grab_focus();
-        true
-    } else {
-        false
-    }
+    // GTK emits focus-enter synchronously; its pane tracker borrows AppState.
+    // Release our borrow before entering GTK so directional focus can re-enter.
+    terminal.grab_focus();
+    true
 }
 
 pub fn restore_tab(

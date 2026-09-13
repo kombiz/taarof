@@ -363,8 +363,8 @@ rewrite `config.toml`; a live config reload reapplies `dock.visible`.
 | `pull_requests` | Boolean | `false` | `true`, `false` | Adds a GitHub PR view for local branches using `gh pr list`. |
 | `default_view` | string | `tasks` | `tasks`, `pull_requests` | Initial persistent panel view. Compatibility aliases include `pull-requests` and `prs`. |
 
-GitHub and Linear are mirrors in the private deployment setup; `.plan/tasks.json` remains
-canonical task truth.
+Task discovery reads the repository-owned `.plan/tasks.json`; manage its
+contents using that repository's development workflow.
 
 ### `[loop_runner]`
 
@@ -465,7 +465,7 @@ Every bindable action and its default:
 | `toggle-broadcast-input` | `<Control><Shift>b` | Toggle input broadcast. |
 | `copy` | `<Control><Shift>c` | Copy the selection. |
 | `copy-recent-output` | `<Control><Shift>o` | Copy the current prompt's output or configured recent rows. |
-| `copy-last-message` | `<Control><Shift>m` | Copy the last detected agent message. |
+| `copy-last-message` | `<Control><Shift>m` | Copy the last agent message from the pane's native transcript, byte for byte. When no transcript matches, nothing is copied and the toast points to `copy-recent-output`. |
 | `paste` | `<Control><Shift>v` | Paste clipboard text. |
 | `toggle-selection-mode` | `<Control><Shift>s` | Toggle keyboard selection mode. |
 | `split-vertical` | `<Control><Shift>backslash` | Split left/right. |
@@ -627,3 +627,27 @@ or workspace state and should be treated as generated data.
 - Verify SSH remotes with `BatchMode=yes` before relying on background probes.
 - Verify the live binary and API after installation; a successful build alone
   is not runtime proof.
+
+### Codex transcript discovery and activity
+
+The native transcript adapter uses `CODEX_HOME/sessions` when `CODEX_HOME` is
+set in the Taarof process environment; otherwise it uses `~/.codex/sessions`.
+Start Taarof with the same Codex home used by its panes. A custom home set only
+inside a pane is not visible to the parent app. Discovery still requires an
+exact session ID or an unambiguous process-start/cwd match; it never chooses the
+newest transcript just because it shares a project directory.
+
+Activity labels describe observations, not task acceptance. An open native turn
+keeps the agent WORKING during silent thinking for up to five minutes after its
+last timestamped record. Old records do not become fresh when read. IDLE means
+there is no fresh observation of work; it is not proof that a provider is idle.
+TURN ENDED means the turn ended, without verifying task success. The web
+navigator labels missing or stale process observations UNKNOWN.
+
+### Standalone launcher external providers
+
+`agent` reads explicitly enabled schema-1 TOML manifests from
+`$XDG_CONFIG_HOME/agent/providers.d/` (default `~/.config/agent/providers.d/`).
+Adapters are same-user executable code; PATH discovery does not enable them.
+See [adapter protocol and conformance](agent-provider-adapters.md) for the
+manifest, synthetic example, bounds, and no-secrets/no-transcripts contract.

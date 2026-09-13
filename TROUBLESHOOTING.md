@@ -196,6 +196,7 @@ environment. Many X11-era tools and assumptions do not apply.
 | `WAYLAND_DISPLAY` is empty | Not running inside a Wayland session | Ensure you're running inside Hyprland. If SSH'd in, Wayland env vars won't be set — this is expected. |
 | Ghostty won't start after AUR update | Binary needs rebuild against new libs | Rebuild: `yay -S ghostty`. If that fails, check AUR comments for patches. |
 | Closing a restored background tab freezes GTK and floods the Wayland socket | The direct close callback unparents its own tab row during GTK signal dispatch, while row-owned controllers or per-row sources can retain stale widget state | Defer user-initiated close to the next GLib main-loop turn, keep permanent row callbacks weak, and cancel the row handle's sources before unparenting. Run `testing/kasm/test-restored-background-close.sh` through `container-run.sh` to verify socket, CPU, I/O, fd, and thread stability. |
+| Directional split-pane focus aborts with `RefCell already borrowed` | Calling `grab_focus()` while holding an `AppState` borrow synchronously re-enters the pane focus tracker | Clone the destination terminal and release the state borrow before entering GTK. Run `testing/e2e-gui/run-pane-focus-wayland-e2e.sh` on a disposable Hyprland workspace to exercise all four keyboard directions. |
 
 **Wayland tool equivalents:**
 | X11 Tool | Wayland Replacement | Package |
@@ -308,6 +309,79 @@ pane borderless=#true    // v2 boolean syntax
 ---
 
 ## Taarof Issues
+
+### Unread child input freezes GTK or sibling panes
+
+The broker master is nonblocking. GTK must only validate and call
+`submit_input`; never call synchronous `write_input` while borrowing AppState.
+That method is for the off-thread native conduit relay, which preserves VTE's
+encoding and applies bounded backpressure. Each pane's input worker handles
+partial writes, deadlines and cancellation; browser acknowledgements report
+actual accepted bytes. Keep receiver close/admission synchronized so an expired
+unserviced bridge cannot dispatch later or misreport a raced partial write as
+zero. Run `pty_input_dispatch` and the Kasm input responsiveness probe below.
+The broker reader must poll and tolerate EAGAIN because it shares the master's
+nonblocking file description. Conduit descriptors retain their existing mode.
+
+### Raw browser attach duplicates output after a checkpoint
+
+A checkpoint's output cursor and screen must be captured together under the
+broker state lock through `BrokeredPane::bounded_checkpoint()` for web subscribers. Separate replay/model
+reads can include a byte in the screen while advertising a cursor before it,
+then replay that same byte again. Terminal output overlap is not harmless:
+cursor movement and erasure also have effects. Keep initial attach and replay-gap
+recovery on the same atomic checkpoint path in `http/pty.rs`.
+
+### Browser legacy attach stays one update behind
+
+The observe and control WebSocket routes must send the shared subscription's
+exact initial snapshot. Capturing separately before subscription can send A,
+then silently consume a newer hub baseline B; an idle pane never repairs the
+client. `PaneAttachSubscription::initial_snapshot` marks only the returned
+watch value seen, so updates during the initial send remain pending.
+Seed and update captures both preserve ANSI to avoid an idle-only redraw when
+switching representations. The `legacy_attach_seed` tests exercise both routes
+and VTE/tmux source modes, including reused hubs, A-to-B-to-silence and capture
+counts. Run `cargo test --manifest-path taarof-app/Cargo.toml legacy_attach_seed`.
+
+### A new pane or helper retains an earlier pane's PTY
+
+Both child and VTE-conduit pairs must use the shared atomic close-on-exec
+allocator in `pty_broker/unix_pty.rs`. Setting FD_CLOEXEC after allocation leaves
+an exec race with workers. The allocator keeps descriptors above stdio, including
+when a launcher closed standard handles, so the child can safely duplicate its
+slave onto 0/1/2. Keep `VTE_VERSION=8203` in the terminal child's `SpawnSpec.env`;
+do not set it in the multithreaded parent. Run the descriptor integration tests
+and `testing/kasm/test_pty_descriptor_boundary.py` for real GTK/VTE lifecycle proof.
+
+### Browser Copy output inserts newlines or drops spaces
+
+`Copy output` reads xterm's rendered buffer. Join rows marked `isWrapped`
+without inserting a newline; trim unused cells rather than written spaces.
+Keep hard line breaks through the cursor and any populated rows below it.
+The buffer cannot reconstruct erased output or original tab/control bytes.
+
+Run `npm --prefix taarof-web test` for the logical-line fixtures. With Chromium
+and Node installed, `node testing/browser-copy-output.mjs` exercises the real
+browser toolbar and xterm at two widths and after resize, including scrollback,
+Unicode, blank lines, significant spaces, and selection. This isolated harness
+uses synthetic terminal content, a stub transport, and an in-page clipboard
+sink; it never attaches to the installed app or writes the system clipboard.
+
+### Standalone native tests cannot find web assets
+
+The `runtime_smoke` tests exercise the web-asset resolver, including its
+checkout fallback. Run `npm --prefix taarof-web ci` followed by
+`npm --prefix taarof-web run build` before `cargo test` in a fresh checkout.
+The full `mise run ci` gate already builds these assets before native tests.
+
+### Performance harness fails to implement RuntimeProbeSource
+
+The opt-in `harness` feature must track the shipped probe interface.
+`listen_table` returns `ListenTableProbe`; the complete synthetic fixture uses
+`ListenTableProbe::Complete`, preserving both its data and source-read count.
+The local and hosted gates compile the `performance_harness` example explicitly
+because default-feature `--all-targets` skips this required-feature example.
 
 ### HTTP tmux control returns 504 but the pane changes later
 

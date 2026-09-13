@@ -17,6 +17,7 @@ pub(crate) struct AgentPaneProjection {
     pub(crate) context: String,
     pub(crate) activity: String,
     pub(crate) state: AgentLifecycle,
+    pub(crate) children: Vec<crate::agents::AgentInstance>,
 }
 
 fn activity_for_agent_pane(
@@ -76,6 +77,37 @@ fn project_tab_agent_panes_for_ids(
                 .map(|binding| format!("Bound task · {} · {}", binding.task_id, binding.title))
                 .or_else(|| workspace.branch_name.clone())
                 .unwrap_or_else(|| workspace.name.clone());
+            let parent_id = format!(
+                "{}:{}",
+                crate::agents::agent_badge(agent_name).name,
+                state
+                    .pane_transcripts
+                    .get(&(tab.id, instance.pane_id))
+                    .map(|transcript| transcript.session_id.as_str())
+                    .unwrap_or("unknown")
+            );
+            let children = state
+                .pane_transcripts
+                .get(&(tab.id, instance.pane_id))
+                .into_iter()
+                .flat_map(|transcript| transcript.child_agents.iter())
+                .filter(|child| child.parent_id == parent_id)
+                .filter(|child| {
+                    !matches!(child.state, AgentLifecycle::Done | AgentLifecycle::Errored)
+                        || now_unix_ms.saturating_sub(child.updated_at_unix_ms) <= 5_000
+                })
+                .map(|child| crate::agents::AgentInstance {
+                    stable_id: child.stable_id.clone(),
+                    parent_id: Some(child.parent_id.clone()),
+                    provider: child.provider.clone(),
+                    label: child.label.clone(),
+                    state: child.state,
+                    activity: child.activity.clone(),
+                    tab_id: tab.id,
+                    pane_id: instance.pane_id,
+                    headless: true,
+                })
+                .collect();
             AgentPaneProjection {
                 workspace_name: workspace.name.clone(),
                 tab_id: tab.id,
@@ -88,6 +120,7 @@ fn project_tab_agent_panes_for_ids(
                 // Keep the detail line for meaningful activity only.
                 activity: activity.map_or_else(String::new, |value| value.text.clone()),
                 state: projection_state,
+                children,
             }
         })
         .collect()
@@ -247,6 +280,7 @@ mod tests {
             tab_pids: std::collections::BTreeMap::new(),
             pane_pids: std::collections::BTreeMap::new(),
             pane_process_states: std::collections::HashMap::new(),
+            pane_exact_agents: std::collections::HashMap::new(),
             pane_agents: pane_ids
                 .iter()
                 .map(|pane_id| {
@@ -373,5 +407,36 @@ mod tests {
 
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].state, AgentLifecycle::Idle);
+    }
+
+    #[test]
+    fn headless_children_inherit_the_exact_parent_pane_without_becoming_rows() {
+        let mut state = AppState::new();
+        let (tab_id, panes) = seed_agent_panes(&mut state, 1, "claude");
+        state.pane_transcripts.insert(
+            (tab_id, panes[0]),
+            crate::agents::TranscriptState {
+                agent: "claude".into(),
+                session_id: "parent".into(),
+                child_agents: vec![crate::agents::HeadlessAgentEvidence {
+                    stable_id: "claude:tool-a".into(),
+                    parent_id: "claude:parent".into(),
+                    provider: "claude".into(),
+                    label: "researcher".into(),
+                    state: AgentLifecycle::Working,
+                    activity: "inspect parser".into(),
+                    updated_at_unix_ms: crate::events::unix_time_ms(),
+                }],
+                ..Default::default()
+            },
+        );
+
+        let cards = project_panes(&state, tab_id, &panes);
+        assert_eq!(cards.len(), 1, "a headless child is not a pane row");
+        assert_eq!(cards[0].children.len(), 1);
+        let child = &cards[0].children[0];
+        assert!(child.headless);
+        assert_eq!((child.tab_id, child.pane_id), (tab_id, panes[0]));
+        assert_eq!(child.parent_id.as_deref(), Some("claude:parent"));
     }
 }

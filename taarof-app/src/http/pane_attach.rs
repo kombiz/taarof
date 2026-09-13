@@ -1,7 +1,7 @@
 //! WebSocket pane-attach state machine and pane snapshot helpers.
 
 use super::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex as StdMutex,
@@ -87,6 +87,13 @@ pub struct PaneDirtyRegistry {
 }
 
 impl PaneDirtyRegistry {
+    pub(crate) fn retain_tabs(&self, live: &HashSet<u32>) {
+        self.signals
+            .lock()
+            .expect("pane dirty registry lock should hold")
+            .retain(|key, _| live.contains(&key.tab_id));
+    }
+
     pub fn signal_for(&self, key: PaneKey) -> Arc<PaneDirtySignal> {
         let mut signals = self
             .signals
@@ -99,8 +106,60 @@ impl PaneDirtyRegistry {
         )
     }
 
-    pub fn mark_dirty(&self, tab_id: u32, pane_id: u32) {
-        self.signal_for(PaneKey { tab_id, pane_id }).mark_dirty();
+    /// Late VTE callbacks after tab removal must not recreate registry entries.
+    /// Before the first subscriber, the initial snapshot supplies current state.
+    pub fn mark_dirty(&self, tab_id: u32, pane_id: u32) -> bool {
+        let signals = self
+            .signals
+            .lock()
+            .expect("pane dirty registry lock should hold");
+        let Some(signal) = signals.get(&PaneKey { tab_id, pane_id }) else {
+            return false;
+        };
+        signal.mark_dirty();
+        true
+    }
+
+    fn release_unused(&self, key: PaneKey, signal: &Arc<PaneDirtySignal>) {
+        let mut signals = self
+            .signals
+            .lock()
+            .expect("pane dirty registry lock should hold");
+        if signals
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, signal) && Arc::strong_count(current) == 2)
+        {
+            signals.remove(&key);
+        }
+    }
+}
+
+// A resolve/capture can fail or be cancelled after allocating its signal.
+// Keep cleanup local to that pending subscription; an active source's Arc
+// prevents removal, and an old lease cannot delete a replacement registration.
+struct PendingDirtyRegistration<'a> {
+    registry: &'a PaneDirtyRegistry,
+    key: PaneKey,
+    signal: &'a Arc<PaneDirtySignal>,
+}
+
+impl Drop for PendingDirtyRegistration<'_> {
+    fn drop(&mut self) {
+        self.registry.release_unused(self.key, self.signal);
+    }
+}
+
+// Own the registration before spawning: aborting an unpolled task must also
+// release its entry. The running source borrows the signal instead of cloning it.
+struct SourceDirtyRegistration {
+    registry: Arc<PaneDirtyRegistry>,
+    key: PaneKey,
+    signal: Arc<PaneDirtySignal>,
+}
+
+impl Drop for SourceDirtyRegistration {
+    fn drop(&mut self) {
+        self.registry.release_unused(self.key, &self.signal);
     }
 }
 
@@ -613,14 +672,29 @@ impl PaneAttachHub {
             });
         }
 
-        let dirty_generation = self.dirty.signal_for(key).current_generation();
-        let snapshot = self.capture_snapshot(target.clone(), false).await?;
+        let dirty = self.dirty.signal_for(key);
+        let _pending_registration = PendingDirtyRegistration {
+            registry: &self.dirty,
+            key,
+            signal: &dirty,
+        };
+        let dirty_generation = dirty.current_generation();
+        // Seed and subsequent captures use one representation. Switching ANSI
+        // seed to plain text would produce an idle-only replacement/flicker.
+        let snapshot = self.capture_snapshot(target.clone(), true).await?;
         let baseline = PaneAttachBaseline::from_replace_snapshot(&target, &snapshot);
         let (updates, rx) = watch::channel(PaneAttachUpdate::Replace {
             target: target.clone(),
             snapshot,
         });
-        let task = self.spawn_source_task(key, target, baseline, dirty_generation, updates.clone());
+        let task = self.spawn_source_task(
+            key,
+            target,
+            baseline,
+            dirty_generation,
+            updates.clone(),
+            Arc::clone(&dirty),
+        );
 
         let mut sources = self
             .sources
@@ -685,13 +759,28 @@ impl PaneAttachHub {
         baseline: PaneAttachBaseline,
         dirty_generation: u64,
         updates: watch::Sender<PaneAttachUpdate>,
+        dirty: Arc<PaneDirtySignal>,
     ) -> AbortHandle {
         let hub = Arc::clone(self);
+        let registration = SourceDirtyRegistration {
+            registry: Arc::clone(&self.dirty),
+            key,
+            signal: dirty,
+        };
         let task = tokio::spawn(async move {
+            // Keep the guard across both source kinds, including tmux sources
+            // whose initial capture completed after the tab was pruned.
+            let registration = registration;
             match target.kind {
                 PaneAttachKind::Vte => {
-                    hub.run_vte_source(key, baseline, dirty_generation, updates)
-                        .await
+                    hub.run_vte_source(
+                        key,
+                        baseline,
+                        dirty_generation,
+                        updates,
+                        &registration.signal,
+                    )
+                    .await
                 }
                 PaneAttachKind::Tmux { .. } => hub.run_polled_source(key, baseline, updates).await,
             }
@@ -707,8 +796,8 @@ impl PaneAttachHub {
         mut baseline: PaneAttachBaseline,
         mut last_dirty_generation: u64,
         updates: watch::Sender<PaneAttachUpdate>,
+        dirty: &PaneDirtySignal,
     ) {
-        let dirty = self.dirty.signal_for(key);
         let mut consecutive_not_found_polls = 0usize;
 
         loop {
@@ -720,7 +809,7 @@ impl PaneAttachHub {
                         PaneAttachResolveOutcome::Retry => continue,
                         PaneAttachResolveOutcome::Closed => break,
                     };
-                    match self.capture_snapshot(target.clone(), false).await {
+                    match self.capture_snapshot(target.clone(), true).await {
                         Ok(snapshot) => {
                             if baseline.has_changed(&target, &snapshot) {
                                 if updates.send(PaneAttachUpdate::Replace {
@@ -774,7 +863,7 @@ impl PaneAttachHub {
                 PaneAttachResolveOutcome::Closed => break,
             };
 
-            match self.capture_snapshot(target.clone(), false).await {
+            match self.capture_snapshot(target.clone(), true).await {
                 Ok(snapshot) => {
                     if baseline.has_changed(&target, &snapshot) {
                         if updates
@@ -882,6 +971,18 @@ pub(super) struct PaneAttachSubscription {
     pub(super) rx: watch::Receiver<PaneAttachUpdate>,
 }
 
+impl PaneAttachSubscription {
+    // Mark exactly the snapshot returned to the route as seen. Updates arriving
+    // while that frame is sent remain pending on the watch receiver.
+    fn initial_snapshot(&mut self) -> Result<(PaneAttachTarget, PaneSnapshot), String> {
+        match self.rx.borrow_and_update().clone() {
+            PaneAttachUpdate::Replace { target, snapshot } => Ok((target, snapshot)),
+            PaneAttachUpdate::Error(message) => Err(message),
+            PaneAttachUpdate::Gone => Err(format!("pane {} was not found", self.key.pane_id)),
+        }
+    }
+}
+
 impl Drop for PaneAttachSubscription {
     fn drop(&mut self) {
         self.hub.release(self.key);
@@ -910,38 +1011,6 @@ async fn handle_pane_attach_socket(
         }
     };
 
-    let snapshot = match capture_pane_snapshot_from_state(&state, target.clone(), true).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            eprintln!(
-                "taarof: tmux snapshot failed for pane {pane_id}: {error}",
-                pane_id = target.pane_id,
-                error = error,
-            );
-            let _ = socket
-                .send(Message::text(
-                    pane_attach_error_frame(
-                        target.pane_id,
-                        "tmux snapshot failed; pane may have exited",
-                    )
-                    .to_string(),
-                ))
-                .await;
-            let _ = socket.send(Message::Close(None)).await;
-            return;
-        }
-    };
-
-    let snapshot_frame = snapshot_frame_json(&target, &snapshot);
-    trace_attach_frame("snapshot", &target, &snapshot_frame);
-    if socket
-        .send(Message::text(snapshot_frame.to_string()))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
     let mut subscription = match state.pane_attach_hub.subscribe(target.clone()).await {
         Ok(subscription) => subscription,
         Err(error) => {
@@ -960,7 +1029,25 @@ async fn handle_pane_attach_socket(
         }
     };
 
-    if send_terminal_update_if_closed(&mut socket, pane_id, &mut subscription, false).await {
+    let (seed_target, snapshot) = match subscription.initial_snapshot() {
+        Ok(seed) => seed,
+        Err(message) => {
+            let _ = socket
+                .send(Message::text(
+                    pane_attach_error_frame(pane_id, &message).to_string(),
+                ))
+                .await;
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+    };
+    let snapshot_frame = snapshot_frame_json(&seed_target, &snapshot);
+    trace_attach_frame("snapshot", &seed_target, &snapshot_frame);
+    if socket
+        .send(Message::text(snapshot_frame.to_string()))
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -976,7 +1063,7 @@ async fn handle_pane_attach_socket(
                 if update.is_err() {
                     break;
                 }
-                if send_terminal_update_if_closed(&mut socket, pane_id, &mut subscription, true).await {
+                if send_terminal_update_if_closed(&mut socket, pane_id, &mut subscription).await {
                     break;
                 }
             }
@@ -1008,36 +1095,6 @@ async fn handle_pane_control_socket(
 
     emit_pane_control_lifecycle_event(&state, "opened", &target, None);
 
-    let snapshot = match capture_pane_snapshot_from_state(&state, target.clone(), true).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            trace_attach_capture_error(&target, &error);
-            let _ = socket
-                .send(Message::text(
-                    pane_attach_error_frame(
-                        target.pane_id,
-                        "tmux snapshot failed; pane may have exited",
-                    )
-                    .to_string(),
-                ))
-                .await;
-            let _ = socket.send(Message::Close(None)).await;
-            emit_pane_control_lifecycle_event(&state, "closed", &target, Some("snapshot_failed"));
-            return;
-        }
-    };
-
-    let snapshot_frame = snapshot_frame_json(&target, &snapshot);
-    trace_attach_frame("control-snapshot", &target, &snapshot_frame);
-    if socket
-        .send(Message::text(snapshot_frame.to_string()))
-        .await
-        .is_err()
-    {
-        emit_pane_control_lifecycle_event(&state, "closed", &target, Some("send_failed"));
-        return;
-    }
-
     let mut subscription = match state.pane_attach_hub.subscribe(target.clone()).await {
         Ok(subscription) => subscription,
         Err(error) => {
@@ -1057,22 +1114,37 @@ async fn handle_pane_control_socket(
         }
     };
 
-    let mut last_control_output = snapshot.output.clone();
-    let mut last_control_size = (snapshot.width, snapshot.height);
-
-    if send_control_terminal_update_if_closed(
-        &mut socket,
-        pane_id,
-        &mut subscription,
-        false,
-        &mut last_control_output,
-        &mut last_control_size,
-    )
-    .await
+    let (seed_target, snapshot) = match subscription.initial_snapshot() {
+        Ok(seed) => seed,
+        Err(message) => {
+            let _ = socket
+                .send(Message::text(
+                    pane_attach_error_frame(pane_id, &message).to_string(),
+                ))
+                .await;
+            let _ = socket.send(Message::Close(None)).await;
+            emit_pane_control_lifecycle_event(
+                &state,
+                "closed",
+                &target,
+                Some("initial_update_closed"),
+            );
+            return;
+        }
+    };
+    let snapshot_frame = snapshot_frame_json(&seed_target, &snapshot);
+    trace_attach_frame("control-snapshot", &seed_target, &snapshot_frame);
+    if socket
+        .send(Message::text(snapshot_frame.to_string()))
+        .await
+        .is_err()
     {
-        emit_pane_control_lifecycle_event(&state, "closed", &target, Some("initial_update_closed"));
+        emit_pane_control_lifecycle_event(&state, "closed", &target, Some("send_failed"));
         return;
     }
+
+    let mut last_control_output = snapshot.output.clone();
+    let mut last_control_size = (snapshot.width, snapshot.height);
 
     let mut close_reason = "client_closed";
     loop {
@@ -1118,7 +1190,6 @@ async fn handle_pane_control_socket(
                     &mut socket,
                     pane_id,
                     &mut subscription,
-                    true,
                     &mut last_control_output,
                     &mut last_control_size,
                 ).await {
@@ -1316,7 +1387,6 @@ async fn send_control_terminal_update_if_closed(
     socket: &mut axum::extract::ws::WebSocket,
     pane_id: u32,
     subscription: &mut PaneAttachSubscription,
-    send_replace: bool,
     last_output: &mut String,
     last_size: &mut (u32, u32),
 ) -> bool {
@@ -1325,9 +1395,6 @@ async fn send_control_terminal_update_if_closed(
     let update = subscription.rx.borrow_and_update().clone();
     match update {
         PaneAttachUpdate::Replace { target, snapshot } => {
-            if !send_replace {
-                return false;
-            }
             let Some(update_frame) =
                 control_terminal_update_frame_json(&target, &snapshot, last_output, *last_size)
             else {
@@ -1377,16 +1444,12 @@ async fn send_terminal_update_if_closed(
     socket: &mut axum::extract::ws::WebSocket,
     pane_id: u32,
     subscription: &mut PaneAttachSubscription,
-    send_replace: bool,
 ) -> bool {
     use axum::extract::ws::Message;
 
     let update = subscription.rx.borrow_and_update().clone();
     match update {
         PaneAttachUpdate::Replace { target, snapshot } => {
-            if !send_replace {
-                return false;
-            }
             let replace_frame = replace_frame_json(&target, &snapshot);
             trace_attach_frame("replace", &target, &replace_frame);
             socket
@@ -1414,20 +1477,6 @@ async fn send_terminal_update_if_closed(
             true
         }
     }
-}
-
-async fn capture_pane_snapshot_from_state(
-    state: &HttpState,
-    target: PaneAttachTarget,
-    preserve_ansi: bool,
-) -> Result<PaneSnapshot, String> {
-    capture_pane_snapshot(
-        Arc::clone(&state.pane_snapshotter),
-        Arc::clone(&state.pane_snapshot_slots),
-        target,
-        preserve_ansi,
-    )
-    .await
 }
 
 async fn capture_pane_snapshot(
@@ -1631,4 +1680,125 @@ fn pane_attach_error_frame(pane_id: u32, error: &str) -> Value {
         "pane_id": pane_id,
         "error": error,
     })
+}
+
+#[cfg(test)]
+mod tab_cleanup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tab_cleanup_late_source_completion_and_abort_release_registration() {
+        for (abort_before_poll, kind) in [
+            (false, PaneAttachKind::Vte),
+            (true, PaneAttachKind::Vte),
+            (
+                false,
+                PaneAttachKind::Tmux {
+                    session_name: "inert".into(),
+                    target: crate::tmux::TmuxTarget::Local,
+                },
+            ),
+            (
+                true,
+                PaneAttachKind::Tmux {
+                    session_name: "inert".into(),
+                    target: crate::tmux::TmuxTarget::Local,
+                },
+            ),
+        ] {
+            let (bridge, mut requests) = mpsc::channel(8);
+            let registry = Arc::new(PaneDirtyRegistry::default());
+            let hub = PaneAttachHub::new_with_intervals(
+                bridge,
+                Arc::new(|_, _| {
+                    Box::pin(async {
+                        Ok(PaneSnapshot {
+                            output: "inert".into(),
+                            width: 80,
+                            height: 24,
+                        })
+                    })
+                }),
+                Arc::new(Semaphore::new(1)),
+                Arc::clone(&registry),
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+            );
+            // GTK already resolved this target; close/prune wins before subscribe.
+            registry.retain_tabs(&HashSet::new());
+            let target = PaneAttachTarget {
+                tab_id: 4,
+                pane_id: 0,
+                kind,
+            };
+            let responder = tokio::spawn(async move {
+                while let Some(HttpBridgeRequest::ResolvePaneAttach { reply, .. }) =
+                    requests.recv().await
+                {
+                    let _ = reply.send(PaneAttachLookup::NotFound);
+                }
+            });
+            let subscription = hub.subscribe(target).await.unwrap();
+            assert_eq!(registry.signals.lock().unwrap().len(), 1);
+            if abort_before_poll {
+                // subscribe has no yielding operation in this inert capture;
+                // source is cancelled before Tokio first polls its future.
+                drop(subscription);
+            } else {
+                let mut subscription = subscription;
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        subscription.rx.changed().await.unwrap();
+                        if matches!(*subscription.rx.borrow(), PaneAttachUpdate::Gone) {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                drop(subscription);
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !registry.signals.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("ended source must release late registration without another prune");
+            responder.abort();
+        }
+    }
+
+    #[test]
+    fn tab_cleanup_dirty_callbacks_and_failed_capture_do_not_recreate_entries() {
+        let registry = PaneDirtyRegistry::default();
+        let key = PaneKey {
+            tab_id: 4,
+            pane_id: 0,
+        };
+        let dirty = registry.signal_for(key);
+        assert!(registry.mark_dirty(4, 0));
+        registry.retain_tabs(&HashSet::new());
+        assert!(!registry.mark_dirty(4, 0));
+        assert!(registry.signals.lock().unwrap().is_empty());
+        // An already-spawned source owns this Arc directly and can observe its
+        // generation without looking the deleted key up in the registry again.
+        assert_eq!(dirty.current_generation(), 1);
+
+        let failed_capture = registry.signal_for(key);
+        {
+            let _cancelled = PendingDirtyRegistration {
+                registry: &registry,
+                key,
+                signal: &failed_capture,
+            };
+        }
+        assert!(registry.signals.lock().unwrap().is_empty());
+        let active = registry.signal_for(key);
+        let second_capture = registry.signal_for(key);
+        registry.release_unused(key, &second_capture);
+        assert_eq!(registry.signals.lock().unwrap().len(), 1);
+        assert!(Arc::ptr_eq(&active, &second_capture));
+    }
 }

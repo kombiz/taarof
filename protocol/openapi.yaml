@@ -1,0 +1,1576 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Taarof remote protocol and local HTTP APIs",
+    "version": "1.0.0",
+    "license": { "name": "GPL-3.0-or-later" }
+  },
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "servers": [
+    {
+      "url": "https://{tailnet-host}/remote",
+      "variables": {
+        "tailnet-host": {
+          "default": "taarof.desktop.example.ts.net",
+          "description": "Private tailnet HTTPS hostname. Public internet routing is out of scope."
+        }
+      }
+    },
+    {
+      "url": "http://127.0.0.1:{port}",
+      "description": "Shipped local HTTP server. Only operations marked x-taarof-surface: loopback-http run here.",
+      "variables": {
+        "port": {
+          "default": "7800",
+          "description": "Configured local HTTP port."
+        }
+      }
+    }
+  ],
+  "security": [{ "TaarofSignedSession": [] }],
+  "paths": {
+    "/v1/negotiate": {
+      "post": {
+        "operationId": "negotiateProtocol",
+        "summary": "Negotiate protocol version, neutral capabilities, and resource limits.",
+        "security": [],
+        "x-taarof-required-scopes": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/NegotiateRequest" },
+              "examples": {
+                "default": {
+                  "value": {
+                    "protocol_version": { "major": 1, "minor": 0 },
+                    "capabilities": ["biometric_user_verification", "raw_pty", "runtime_mutation"],
+                    "nonce": "11111111-1111-4111-8111-111111111111",
+                    "deadline_ms": 4102444800000
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Negotiated protocol profile.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/NegotiateResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/v1/runtime": {
+      "get": {
+        "operationId": "getRuntimeState",
+        "summary": "Read the configured runtime identity and high-level state.",
+        "x-taarof-required-scopes": ["observe"],
+        "responses": {
+          "200": {
+            "description": "Runtime state.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RuntimeState" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/v1/navigation": {
+      "get": {
+        "operationId": "getNavigation",
+        "summary": "Read workspace, tab, and pane navigation metadata.",
+        "x-taarof-required-scopes": ["observe"],
+        "responses": {
+          "200": {
+            "description": "Navigation tree.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/NavigationState" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/v1/navigation/selection": {
+      "post": {
+        "operationId": "selectPane",
+        "summary": "Select the observed pane. Pane control is revoked when selection changes.",
+        "x-taarof-required-scopes": ["observe"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PaneSelectionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "204": { "description": "Pane selected." },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/v1/pairing/offers": {
+      "post": {
+        "operationId": "createPairingOffer",
+        "summary": "Create a five-minute, one-use pairing offer from the owner host.",
+        "security": [{ "OwnerHostLocal": [] }],
+        "x-taarof-required-scopes": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreatePairingOfferRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Pairing offer.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PairingOffer" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/v1/pairing/offers/{offer_id}/enroll": {
+      "post": {
+        "operationId": "enrollDesktopPairingOffer",
+        "summary": "Submit a challenge-bound Linux desktop enrollment for local owner confirmation.",
+        "security": [],
+        "x-taarof-required-scopes": [],
+        "parameters": [{ "$ref": "#/components/parameters/OfferId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/DesktopEnrollmentRequest" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Enrollment verified and pending owner-host confirmation.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PendingDevice" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/v1/pairing/offers/{offer_id}/confirm": {
+      "post": {
+        "operationId": "confirmPairingOffer",
+        "summary": "Confirm a pending paired device after local operator review.",
+        "security": [{ "OwnerHostLocal": [] }],
+        "x-taarof-required-scopes": [],
+        "parameters": [{ "$ref": "#/components/parameters/OfferId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ConfirmPairingRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Device enrolled.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Device" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/pairing/offers/{offer_id}/reject": {
+      "post": {
+        "operationId": "rejectPairingOffer",
+        "summary": "Reject a pending pairing offer.",
+        "security": [{ "OwnerHostLocal": [] }],
+        "x-taarof-required-scopes": [],
+        "parameters": [{ "$ref": "#/components/parameters/OfferId" }],
+        "responses": {
+          "204": { "description": "Offer rejected." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/devices": {
+      "get": {
+        "operationId": "listDevices",
+        "summary": "List paired devices and revocation state.",
+        "security": [{ "OwnerHostLocal": [] }],
+        "x-taarof-required-scopes": [],
+        "responses": {
+          "200": {
+            "description": "Devices.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["devices"],
+                  "properties": {
+                    "devices": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/Device" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/devices/{device_id}": {
+      "delete": {
+        "operationId": "revokeDevice",
+        "summary": "Revoke a paired device and close live grants.",
+        "security": [{ "OwnerHostLocal": [] }],
+        "x-taarof-required-scopes": [],
+        "parameters": [{ "$ref": "#/components/parameters/DeviceId" }],
+        "responses": {
+          "204": { "description": "Device revoked." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/observe-sessions": {
+      "post": {
+        "operationId": "createObserveSession",
+        "summary": "Create a renewable observe session lasting at most one hour.",
+        "x-taarof-required-scopes": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateObserveSessionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Observe session.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ObserveSession" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/v1/observe-sessions/{observe_session_id}": {
+      "delete": {
+        "operationId": "closeObserveSession",
+        "summary": "Close an observe session and any dependent control grants.",
+        "x-taarof-required-scopes": ["observe"],
+        "parameters": [{ "$ref": "#/components/parameters/ObserveSessionId" }],
+        "responses": {
+          "204": { "description": "Observe session closed." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/control-sessions": {
+      "post": {
+        "operationId": "createControlSession",
+        "summary": "Create pane-control or five-minute runtime-mutation control after user verification.",
+        "x-taarof-required-scopes": ["observe"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateControlSessionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Control session.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControlSession" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/v1/control-sessions/{control_session_id}": {
+      "delete": {
+        "operationId": "closeControlSession",
+        "summary": "Relinquish a control session.",
+        "x-taarof-required-scopes": ["pane-control", "runtime-mutation"],
+        "parameters": [{ "$ref": "#/components/parameters/ControlSessionId" }],
+        "responses": {
+          "204": { "description": "Control session closed." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/tabs": {
+      "post": {
+        "operationId": "createTab",
+        "summary": "Create a runtime-bound tab.",
+        "x-taarof-required-scopes": ["runtime-mutation"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateTabRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created tab.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Tab" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/v1/tabs/{tab_id}/panes/{pane_id}/splits": {
+      "post": {
+        "operationId": "createSplit",
+        "summary": "Create a split from a target pane.",
+        "x-taarof-required-scopes": ["runtime-mutation", "pane-control"],
+        "parameters": [
+          { "$ref": "#/components/parameters/TabId" },
+          { "$ref": "#/components/parameters/PaneId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateSplitRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created split pane.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Pane" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "getLoopbackHealth",
+        "summary": "Read unauthenticated local runtime health.",
+        "security": [],
+        "x-taarof-surface": "loopback-http",
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackHealth" },
+          "500": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "503": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "504": { "$ref": "#/components/responses/LoopbackJsonError" }
+        }
+      }
+    },
+    "/api/v1/runtime-identity": {
+      "get": {
+        "operationId": "getLoopbackRuntimeIdentity",
+        "summary": "Read the local HTTP-router runtime identity.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackRuntimeIdentity" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" }
+        }
+      }
+    },
+    "/api/v1/state": {
+      "get": {
+        "operationId": "getLoopbackState",
+        "summary": "Read the full local state snapshot.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackState" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/agent-sessions": {
+      "get": {
+        "operationId": "getLoopbackAgentSessions",
+        "summary": "Read the agent-session catalog (v1 by default, v2 opt-in).",
+        "parameters": [{ "name": "schema", "in": "query", "required": false, "schema": { "type": "string", "enum": ["taarof.agent-sessions.v1", "agent.sessions.v2"], "default": "taarof.agent-sessions.v1" } }],
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackAgentSessions" },
+          "400": { "$ref": "#/components/responses/LoopbackRequestError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/sessions": {
+      "get": {
+        "operationId": "getLoopbackSessions",
+        "summary": "Read local session and dashboard metadata.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackSessions" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/workspaces": {
+      "get": {
+        "operationId": "getLoopbackWorkspaces",
+        "summary": "Read the local workspace projection.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackWorkspaces" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/tabs": {
+      "get": {
+        "operationId": "getLoopbackTabs",
+        "summary": "Read the local tab projection.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackTabs" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/panes": {
+      "get": {
+        "operationId": "getLoopbackPanes",
+        "summary": "Read the local pane projection.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackPanes" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/file-preview": {
+      "get": {
+        "operationId": "getLoopbackFilePreview",
+        "summary": "Read a bounded local-pane file preview.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "parameters": [
+          { "$ref": "#/components/parameters/LoopbackFileTab" },
+          { "$ref": "#/components/parameters/LoopbackFilePane" },
+          { "$ref": "#/components/parameters/LoopbackFilePath" },
+          { "$ref": "#/components/parameters/LoopbackFileLine" },
+          { "$ref": "#/components/parameters/LoopbackFileColumn" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackFilePreview" },
+          "400": { "$ref": "#/components/responses/LoopbackRequestError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "403": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "404": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "413": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "415": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/file-stat": {
+      "get": {
+        "operationId": "getLoopbackFileStat",
+        "summary": "Read metadata for a local-pane file without reading contents. line and col are accepted by the shared Rust query extractor but ignored.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "parameters": [
+          { "$ref": "#/components/parameters/LoopbackFileTab" },
+          { "$ref": "#/components/parameters/LoopbackFilePane" },
+          { "$ref": "#/components/parameters/LoopbackFilePath" },
+          { "$ref": "#/components/parameters/LoopbackFileLine" },
+          { "$ref": "#/components/parameters/LoopbackFileColumn" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackFileStat" },
+          "400": { "$ref": "#/components/responses/LoopbackRequestError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "403": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "404": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "413": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "415": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/control/send-keys": {
+      "post": {
+        "operationId": "sendLoopbackKeys",
+        "summary": "Send raw keys to a local pane through the socket control path.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "x-taarof-loopback-control": true,
+        "requestBody": { "$ref": "#/components/requestBodies/LoopbackSendKeys" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackSendKeys" },
+          "400": { "$ref": "#/components/responses/LoopbackRequestError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "403": { "$ref": "#/components/responses/LoopbackForbidden" },
+          "415": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "422": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/control/run-in-pane": {
+      "post": {
+        "operationId": "runLoopbackCommandInPane",
+        "summary": "Run a command in a local pane through the socket control path.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "x-taarof-loopback-control": true,
+        "requestBody": { "$ref": "#/components/requestBodies/LoopbackRunInPane" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackRunInPane" },
+          "400": { "$ref": "#/components/responses/LoopbackRequestError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "403": { "$ref": "#/components/responses/LoopbackForbidden" },
+          "415": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "422": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/control/switch-tab": {
+      "post": {
+        "operationId": "switchLoopbackTab",
+        "summary": "Focus a local tab through the socket control path.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "x-taarof-loopback-control": true,
+        "requestBody": { "$ref": "#/components/requestBodies/LoopbackSwitchTab" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackSwitchTab" },
+          "400": { "$ref": "#/components/responses/LoopbackRequestError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "403": { "$ref": "#/components/responses/LoopbackForbidden" },
+          "415": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "422": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/control/create-tab": {
+      "post": {
+        "operationId": "createLoopbackTab",
+        "summary": "Create a local tab through the socket control path.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "x-taarof-loopback-control": true,
+        "requestBody": { "$ref": "#/components/requestBodies/LoopbackCreateTab" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackCreateTab" },
+          "400": { "$ref": "#/components/responses/LoopbackRequestError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "403": { "$ref": "#/components/responses/LoopbackForbidden" },
+          "415": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "422": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/control/split-pane": {
+      "post": {
+        "operationId": "splitLoopbackPane",
+        "summary": "Split a local tab through the socket control path.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "x-taarof-loopback-control": true,
+        "requestBody": { "$ref": "#/components/requestBodies/LoopbackSplitPane" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackSplitPane" },
+          "400": { "$ref": "#/components/responses/LoopbackRequestError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "403": { "$ref": "#/components/responses/LoopbackForbidden" },
+          "415": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "422": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/tabs/{tab_id}/panes/{pane_id}/attach": {
+      "get": {
+        "operationId": "attachLoopbackPaneSnapshot",
+        "summary": "Upgrade to the read-only local pane snapshot stream.",
+        "security": [{ "TaarofLoopbackBearer": [] }, { "TaarofLoopbackWebSocketToken": [] }],
+        "x-taarof-surface": "loopback-http",
+        "parameters": [
+          { "$ref": "#/components/parameters/LoopbackTabPath" },
+          { "$ref": "#/components/parameters/LoopbackPanePath" },
+          { "$ref": "#/components/parameters/LoopbackWebSocketToken" }
+        ],
+        "responses": {
+          "101": { "$ref": "#/components/responses/LoopbackWebSocketUpgrade" },
+          "400": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "404": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "409": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "429": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/tabs/{tab_id}/panes/{pane_id}/control/ws": {
+      "get": {
+        "operationId": "controlLoopbackPane",
+        "summary": "Upgrade to the local browser pane-control WebSocket.",
+        "security": [{ "TaarofLoopbackBearer": [] }, { "TaarofLoopbackWebSocketToken": [] }],
+        "x-taarof-surface": "loopback-http",
+        "x-taarof-loopback-control": true,
+        "parameters": [
+          { "$ref": "#/components/parameters/LoopbackTabPath" },
+          { "$ref": "#/components/parameters/LoopbackPanePath" },
+          { "$ref": "#/components/parameters/LoopbackWebSocketToken" }
+        ],
+        "responses": {
+          "101": { "$ref": "#/components/responses/LoopbackWebSocketUpgrade" },
+          "400": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "403": { "$ref": "#/components/responses/LoopbackForbidden" },
+          "404": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "409": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "429": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/tabs/{tab_id}/panes/{pane_id}/pty/ws": {
+      "get": {
+        "operationId": "attachLoopbackPty",
+        "summary": "Upgrade to the broker-owned local PTY protocol stream.",
+        "security": [{ "TaarofLoopbackBearer": [] }, { "TaarofLoopbackWebSocketToken": [] }],
+        "x-taarof-surface": "loopback-http",
+        "x-taarof-loopback-control": true,
+        "parameters": [
+          { "$ref": "#/components/parameters/LoopbackTabPath" },
+          { "$ref": "#/components/parameters/LoopbackPanePath" },
+          { "$ref": "#/components/parameters/LoopbackWebSocketToken" },
+          { "$ref": "#/components/parameters/LoopbackPtyEpoch" },
+          { "$ref": "#/components/parameters/LoopbackPtyOutputSequence" }
+        ],
+        "responses": {
+          "101": { "$ref": "#/components/responses/LoopbackWebSocketUpgrade" },
+          "400": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "403": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "404": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "409": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "429": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/panes/{pane_id}/attach": {
+      "get": {
+        "operationId": "attachLegacyLoopbackPaneSnapshot",
+        "summary": "Upgrade to the legacy read-only local pane snapshot stream.",
+        "security": [{ "TaarofLoopbackBearer": [] }, { "TaarofLoopbackWebSocketToken": [] }],
+        "x-taarof-surface": "loopback-http",
+        "parameters": [
+          { "$ref": "#/components/parameters/LoopbackPanePath" },
+          { "$ref": "#/components/parameters/LoopbackWebSocketToken" }
+        ],
+        "responses": {
+          "101": { "$ref": "#/components/responses/LoopbackWebSocketUpgrade" },
+          "400": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "404": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "409": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "429": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "operationId": "getLoopbackEvents",
+        "summary": "Read a local event-feed page.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "parameters": [
+          { "$ref": "#/components/parameters/LoopbackSinceSequence" },
+          { "$ref": "#/components/parameters/LoopbackLimit" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackEvents" },
+          "400": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" },
+          "500": { "$ref": "#/components/responses/LoopbackInternalError" },
+          "503": { "$ref": "#/components/responses/LoopbackUnavailable" },
+          "504": { "$ref": "#/components/responses/LoopbackGatewayTimeout" }
+        }
+      }
+    },
+    "/api/v1/history": {
+      "get": {
+        "operationId": "getLoopbackHistory",
+        "summary": "Read a bounded local sanitized-history page.",
+        "security": [{ "TaarofLoopbackBearer": [] }],
+        "x-taarof-surface": "loopback-http",
+        "parameters": [
+          { "$ref": "#/components/parameters/LoopbackSinceId" },
+          { "$ref": "#/components/parameters/LoopbackLimit" },
+          { "$ref": "#/components/parameters/LoopbackFromTimestamp" },
+          { "$ref": "#/components/parameters/LoopbackToTimestamp" },
+          { "$ref": "#/components/parameters/LoopbackRecordType" },
+          { "$ref": "#/components/parameters/LoopbackSession" },
+          { "$ref": "#/components/parameters/LoopbackWorkspace" },
+          { "$ref": "#/components/parameters/LoopbackPane" },
+          { "$ref": "#/components/parameters/LoopbackTask" },
+          { "$ref": "#/components/parameters/LoopbackRepository" },
+          { "$ref": "#/components/parameters/LoopbackAuthority" },
+          { "$ref": "#/components/parameters/LoopbackVerification" },
+          { "$ref": "#/components/parameters/LoopbackSeverity" },
+          { "$ref": "#/components/parameters/LoopbackText" },
+          { "$ref": "#/components/parameters/LoopbackHistoryOrder" },
+          { "$ref": "#/components/parameters/LoopbackScanBudget" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/LoopbackHistory" },
+          "400": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "401": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "500": { "$ref": "#/components/responses/LoopbackJsonError" },
+          "503": { "$ref": "#/components/responses/LoopbackJsonError" }
+        }
+      }
+    },
+    "/api/v1/events/ws": {
+      "get": {
+        "operationId": "streamLoopbackEvents",
+        "summary": "Upgrade to the local live event stream.",
+        "security": [{ "TaarofLoopbackBearer": [] }, { "TaarofLoopbackWebSocketToken": [] }],
+        "x-taarof-surface": "loopback-http",
+        "parameters": [{ "$ref": "#/components/parameters/LoopbackWebSocketToken" }],
+        "responses": {
+          "101": { "$ref": "#/components/responses/LoopbackWebSocketUpgrade" },
+          "400": { "$ref": "#/components/responses/LoopbackPlainTextError" },
+          "401": { "$ref": "#/components/responses/LoopbackUnauthorized" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "TaarofSignedSession": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "Taarof-Session",
+        "description": "Opaque server-side session id. Each request also carries Taarof-Nonce, Taarof-Deadline, and Taarof-Signature; the detached signature covers method, path, body hash, session id, nonce, and deadline."
+      },
+      "OwnerHostLocal": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Taarof-Owner-Host",
+        "description": "Same-user owner-host channel. Not exposed to remote clients."
+      },
+      "TaarofLoopbackBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "per-process opaque token",
+        "description": "Default authentication for every protected loopback HTTP operation, including WebSocket handshakes. The per-process token is stored in a mode-0600 file in the private runtime directory. It authenticates local HTTP observation and, only with the separate loopback control gate, the marked mutating subset."
+      },
+      "TaarofLoopbackWebSocketToken": {
+        "type": "apiKey",
+        "in": "query",
+        "name": "token",
+        "description": "WebSocket-handshake-only alternative to the default Authorization: Bearer token. This exists for browser WebSocket clients, which cannot set arbitrary headers; it does not authenticate REST requests and does not relax the loopback or http_control gates."
+      }
+    },
+    "parameters": {
+      "OfferId": { "name": "offer_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/Uuid" } },
+      "DeviceId": { "name": "device_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/Uuid" } },
+      "ObserveSessionId": { "name": "observe_session_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/Uuid" } },
+      "ControlSessionId": { "name": "control_session_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/Uuid" } },
+      "TabId": { "name": "tab_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/TabId" } },
+      "PaneId": { "name": "pane_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/PaneId" } },
+      "LoopbackTabPath": { "name": "tab_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/LoopbackUint32" } },
+      "LoopbackPanePath": { "name": "pane_id", "in": "path", "required": true, "schema": { "$ref": "#/components/schemas/LoopbackUint32" } },
+      "LoopbackWebSocketToken": { "name": "token", "in": "query", "required": false, "description": "Browser-only WebSocket bearer-token alternative; Authorization is the default.", "schema": { "type": "string" } },
+      "LoopbackPtyEpoch": { "name": "epoch", "in": "query", "required": false, "schema": { "type": "string" } },
+      "LoopbackPtyOutputSequence": { "name": "output_seq", "in": "query", "required": false, "schema": { "type": "string" } },
+      "LoopbackFileTab": { "name": "tab", "in": "query", "required": true, "schema": { "$ref": "#/components/schemas/LoopbackUint32" } },
+      "LoopbackFilePane": { "name": "pane", "in": "query", "required": true, "schema": { "$ref": "#/components/schemas/LoopbackUint32" } },
+      "LoopbackFilePath": { "name": "path", "in": "query", "required": true, "schema": { "type": "string" } },
+      "LoopbackFileLine": { "name": "line", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/LoopbackUint32" } },
+      "LoopbackFileColumn": { "name": "col", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/LoopbackUint32" } },
+      "LoopbackSinceSequence": { "name": "since_seq", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/LoopbackUint64" } },
+      "LoopbackSinceId": { "name": "since_id", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/LoopbackUint64" } },
+      "LoopbackLimit": { "name": "limit", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/LoopbackUsize" } },
+      "LoopbackFromTimestamp": { "name": "from_ts", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/LoopbackUint64" } },
+      "LoopbackToTimestamp": { "name": "to_ts", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/LoopbackUint64" } },
+      "LoopbackRecordType": { "name": "record_type", "in": "query", "required": false, "schema": { "type": "string" } },
+      "LoopbackSession": { "name": "session", "in": "query", "required": false, "schema": { "type": "string" } },
+      "LoopbackWorkspace": { "name": "workspace", "in": "query", "required": false, "schema": { "type": "string" } },
+      "LoopbackPane": { "name": "pane", "in": "query", "required": false, "schema": { "type": "string" } },
+      "LoopbackTask": { "name": "task", "in": "query", "required": false, "schema": { "type": "string" } },
+      "LoopbackRepository": { "name": "repository", "in": "query", "required": false, "schema": { "type": "string" } },
+      "LoopbackAuthority": { "name": "authority", "in": "query", "required": false, "schema": { "type": "string" } },
+      "LoopbackVerification": { "name": "verification", "in": "query", "required": false, "schema": { "type": "string" } },
+      "LoopbackSeverity": { "name": "severity", "in": "query", "required": false, "schema": { "type": "string" } },
+      "LoopbackText": { "name": "text", "in": "query", "required": false, "schema": { "type": "string" } },
+      "LoopbackHistoryOrder": { "name": "order", "in": "query", "required": false, "schema": { "type": "string", "enum": ["asc", "desc"], "default": "asc" } },
+      "LoopbackScanBudget": { "name": "scan_budget", "in": "query", "required": false, "schema": { "$ref": "#/components/schemas/LoopbackUsize" } }
+    },
+    "requestBodies": {
+      "LoopbackSendKeys": {
+        "required": true,
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackSendKeysRequest" } } }
+      },
+      "LoopbackRunInPane": {
+        "required": true,
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackRunInPaneRequest" } } }
+      },
+      "LoopbackSwitchTab": {
+        "required": true,
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackSwitchTabRequest" } } }
+      },
+      "LoopbackCreateTab": {
+        "required": true,
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackCreateTabRequest" } } }
+      },
+      "LoopbackSplitPane": {
+        "required": true,
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackSplitPaneRequest" } } }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed or invalid request.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+      },
+      "Unauthorized": {
+        "description": "Authentication failed.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+      },
+      "Forbidden": {
+        "description": "Authenticated session lacks the required scope.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+      },
+      "NotFound": {
+        "description": "Requested resource was not found.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+      },
+      "RateLimited": {
+        "description": "Default rate limit exceeded: 120 metadata requests per minute or 30 control operations per second.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorBody" } } }
+      },
+      "LoopbackHealth": {
+        "description": "Runtime health summary.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackHealthResponse" } } }
+      },
+      "LoopbackRuntimeIdentity": {
+        "description": "HTTP-router runtime identity.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackRuntimeIdentityResponse" } } }
+      },
+      "LoopbackState": { "description": "Full taarof.state.v1 snapshot.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackStateResponse" } } } },
+      "LoopbackAgentSessions": { "description": "Version-selected agent catalog; v1 remains the default.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackAgentSessionsResponse" } } } },
+      "LoopbackSessions": { "description": "Session and dashboard summary.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackSessionsResponse" } } } },
+      "LoopbackWorkspaces": { "description": "Workspace projection.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackWorkspacesResponse" } } } },
+      "LoopbackTabs": { "description": "Flattened tab projection.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackTabsResponse" } } } },
+      "LoopbackPanes": { "description": "Flattened pane projection.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackPanesResponse" } } } },
+      "LoopbackFilePreview": { "description": "Bounded local-pane file preview.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackFilePreviewResponse" } } } },
+      "LoopbackFileStat": { "description": "Local-pane file metadata.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackFileStatResponse" } } } },
+      "LoopbackEvents": { "description": "taarof.events.v1 event page.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackEventsResponse" } } } },
+      "LoopbackHistory": { "description": "taarof.history.v1 sanitized history page.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackHistoryResponse" } } } },
+      "LoopbackSendKeys": { "description": "Socket acknowledgement for send-keys.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackSendKeysResponse" } } } },
+      "LoopbackRunInPane": { "description": "Socket acknowledgement for run-in-pane.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackRunInPaneResponse" } } } },
+      "LoopbackSwitchTab": { "description": "Socket acknowledgement for switch-tab.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackSwitchTabResponse" } } } },
+      "LoopbackCreateTab": { "description": "Socket result with the created tab ID.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackCreateTabResponse" } } } },
+      "LoopbackSplitPane": { "description": "Socket result with the created pane ID.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackSplitPaneResponse" } } } },
+      "LoopbackJsonError": {
+        "description": "A handler-generated loopback JSON error.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackErrorEnvelope" } } }
+      },
+      "LoopbackPlainTextError": {
+        "description": "An Axum extractor or WebSocket-handshake error. The server returns text/plain, not the JSON error envelope.",
+        "content": { "text/plain": { "schema": { "type": "string" } } }
+      },
+      "LoopbackRequestError": {
+        "description": "Invalid request. Handler validation returns JSON; extractor failures return text/plain.",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/LoopbackErrorEnvelope" } },
+          "text/plain": { "schema": { "type": "string" } }
+        }
+      },
+      "LoopbackUnauthorized": {
+        "description": "Bearer authentication failed. This StatusCode response has no guaranteed body."
+      },
+      "LoopbackForbidden": {
+        "description": "The loopback control gate is disabled. This StatusCode response has no guaranteed body."
+      },
+      "LoopbackInternalError": {
+        "description": "The local bridge or server failed. This StatusCode response has no guaranteed body."
+      },
+      "LoopbackUnavailable": {
+        "description": "The local bridge is unavailable. This StatusCode response has no guaranteed body."
+      },
+      "LoopbackGatewayTimeout": {
+        "description": "The local bridge did not reply before its timeout. This StatusCode response has no guaranteed body."
+      },
+      "LoopbackWebSocketUpgrade": {
+        "description": "Successful WebSocket HTTP upgrade. WebSocket messages are not an HTTP response body.",
+        "headers": {
+          "Connection": { "required": true, "schema": { "type": "string", "const": "upgrade" } },
+          "Upgrade": { "required": true, "schema": { "type": "string", "const": "websocket" } }
+        }
+      }
+    },
+    "schemas": {
+      "ProtocolVersion": { "$ref": "./schemas/common.json#/$defs/ProtocolVersion" },
+      "Uuid": { "$ref": "./schemas/common.json#/$defs/Uuid" },
+      "Uint64DecimalString": { "$ref": "./schemas/common.json#/$defs/Uint64DecimalString" },
+      "UnixDeadlineMs": { "$ref": "./schemas/common.json#/$defs/UnixDeadlineMs" },
+      "Nonce": { "$ref": "./schemas/common.json#/$defs/Nonce" },
+      "Capability": { "$ref": "./schemas/common.json#/$defs/Capability" },
+      "Scope": { "$ref": "./schemas/common.json#/$defs/Scope" },
+      "RuntimeRef": { "$ref": "./schemas/common.json#/$defs/RuntimeRef" },
+      "PaneRef": { "$ref": "./schemas/common.json#/$defs/PaneRef" },
+      "ConnectionCursor": { "$ref": "./schemas/common.json#/$defs/ConnectionCursor" },
+      "ErrorBody": { "$ref": "./schemas/common.json#/$defs/ErrorBody" },
+      "ResourceLimits": { "$ref": "./schemas/common.json#/$defs/ResourceLimits" },
+      "TabId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9._:-]+$"
+      },
+      "PaneId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9._:-]+$"
+      },
+      "SignedFields": {
+        "type": "object",
+        "required": ["nonce", "deadline_ms"],
+        "properties": {
+          "nonce": { "$ref": "#/components/schemas/Nonce" },
+          "deadline_ms": { "$ref": "#/components/schemas/UnixDeadlineMs" }
+        }
+      },
+      "NegotiateRequest": {
+        "type": "object",
+        "unevaluatedProperties": false,
+        "allOf": [
+          { "$ref": "#/components/schemas/SignedFields" },
+          {
+            "type": "object",
+            "required": ["protocol_version", "capabilities", "nonce", "deadline_ms"],
+            "properties": {
+              "protocol_version": { "$ref": "#/components/schemas/ProtocolVersion" },
+              "capabilities": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "$ref": "#/components/schemas/Capability" }
+              },
+              "nonce": { "$ref": "#/components/schemas/Nonce" },
+              "deadline_ms": { "$ref": "#/components/schemas/UnixDeadlineMs" },
+              "resume": { "$ref": "#/components/schemas/ConnectionCursor" }
+            }
+          }
+        ]
+      },
+      "NegotiateResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["protocol_version", "capabilities", "limits"],
+        "properties": {
+          "protocol_version": { "$ref": "#/components/schemas/ProtocolVersion" },
+          "capabilities": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Capability" }
+          },
+          "limits": { "$ref": "#/components/schemas/ResourceLimits" }
+        }
+      },
+      "RuntimeState": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["runtime", "status", "capabilities"],
+        "properties": {
+          "runtime": { "$ref": "#/components/schemas/RuntimeRef" },
+          "status": { "type": "string", "enum": ["online", "degraded", "unavailable"] },
+          "capabilities": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Capability" }
+          }
+        }
+      },
+      "NavigationState": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["runtime", "tabs", "selected_pane"],
+        "properties": {
+          "runtime": { "$ref": "#/components/schemas/RuntimeRef" },
+          "tabs": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Tab" }
+          },
+          "selected_pane": { "$ref": "#/components/schemas/PaneRef" }
+        }
+      },
+      "Tab": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tab_id", "title", "panes"],
+        "properties": {
+          "tab_id": { "$ref": "#/components/schemas/TabId" },
+          "title": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "panes": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Pane" }
+          }
+        }
+      },
+      "Pane": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pane_id", "title", "transport", "durability"],
+        "properties": {
+          "pane_id": { "$ref": "#/components/schemas/PaneId" },
+          "title": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "transport": { "type": "string", "enum": ["raw_pty", "legacy_snapshot"] },
+          "durability": { "type": "string", "enum": ["runtime-bound", "tmux-backed"] },
+          "cols": { "type": "integer", "minimum": 2, "maximum": 500 },
+          "rows": { "type": "integer", "minimum": 2, "maximum": 200 }
+        }
+      },
+      "PaneSelectionRequest": {
+        "type": "object",
+        "unevaluatedProperties": false,
+        "allOf": [
+          { "$ref": "#/components/schemas/SignedFields" },
+          {
+            "type": "object",
+            "required": ["pane", "nonce", "deadline_ms"],
+            "properties": {
+              "pane": { "$ref": "#/components/schemas/PaneRef" },
+              "nonce": { "$ref": "#/components/schemas/Nonce" },
+              "deadline_ms": { "$ref": "#/components/schemas/UnixDeadlineMs" }
+            }
+          }
+        ]
+      },
+      "CreatePairingOfferRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["protocol_version", "expires_in_ms"],
+        "properties": {
+          "protocol_version": { "$ref": "#/components/schemas/ProtocolVersion" },
+          "expires_in_ms": { "type": "integer", "const": 300000 }
+        }
+      },
+      "PairingOffer": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["offer_id", "expires_at_ms", "private_https_origin", "spki_sha256"],
+        "properties": {
+          "offer_id": { "$ref": "#/components/schemas/Uuid" },
+          "expires_at_ms": { "$ref": "#/components/schemas/UnixDeadlineMs" },
+          "private_https_origin": { "type": "string", "format": "uri" },
+          "spki_sha256": { "type": "string", "pattern": "^sha256:[A-Za-z0-9+/=]{44}$" }
+        }
+      },
+      "DesktopEnrollmentRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["device_class", "device_name", "observe_public_key", "control_public_key", "possession_signature"],
+        "properties": {
+          "device_class": { "type": "string", "const": "linux-desktop" },
+          "device_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "observe_public_key": { "type": "string", "pattern": "^[A-Za-z0-9+/]{43}=$" },
+          "control_public_key": { "type": "string", "pattern": "^[A-Za-z0-9+/]{43}=$" },
+          "possession_signature": { "type": "string", "pattern": "^[A-Za-z0-9+/]{86}==$" }
+        }
+      },
+      "PendingDevice": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pending_id", "device_name", "key_fingerprint"],
+        "properties": {
+          "pending_id": { "$ref": "#/components/schemas/Uuid" },
+          "device_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "key_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+        }
+      },
+      "ConfirmPairingRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["device_name", "key_fingerprint", "attestation_summary"],
+        "properties": {
+          "device_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "key_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+          "attestation_summary": { "type": "string", "minLength": 1, "maxLength": 256 }
+        }
+      },
+      "Device": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["device_id", "device_name", "key_fingerprint", "created_at_ms", "revoked"],
+        "properties": {
+          "device_id": { "$ref": "#/components/schemas/Uuid" },
+          "device_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "key_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+          "created_at_ms": { "$ref": "#/components/schemas/UnixDeadlineMs" },
+          "revoked": { "type": "boolean" }
+        }
+      },
+      "CreateObserveSessionRequest": {
+        "type": "object",
+        "unevaluatedProperties": false,
+        "allOf": [
+          { "$ref": "#/components/schemas/SignedFields" },
+          {
+            "type": "object",
+            "required": ["device_id", "server_challenge", "signature", "nonce", "deadline_ms"],
+            "properties": {
+              "device_id": { "$ref": "#/components/schemas/Uuid" },
+              "server_challenge": { "type": "string", "minLength": 32, "maxLength": 512 },
+              "signature": { "type": "string", "minLength": 64, "maxLength": 2048 },
+              "nonce": { "$ref": "#/components/schemas/Nonce" },
+              "deadline_ms": { "$ref": "#/components/schemas/UnixDeadlineMs" }
+            }
+          }
+        ]
+      },
+      "ObserveSession": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["observe_session_id", "scope", "expires_at_ms"],
+        "properties": {
+          "observe_session_id": { "$ref": "#/components/schemas/Uuid" },
+          "scope": { "type": "string", "const": "observe" },
+          "expires_at_ms": { "$ref": "#/components/schemas/UnixDeadlineMs" }
+        }
+      },
+      "CreateControlSessionRequest": {
+        "type": "object",
+        "unevaluatedProperties": false,
+        "allOf": [
+          { "$ref": "#/components/schemas/SignedFields" },
+          {
+            "type": "object",
+            "required": ["observe_session_id", "scope", "grant_generation", "control_challenge", "signature", "nonce", "deadline_ms"],
+            "properties": {
+              "observe_session_id": { "$ref": "#/components/schemas/Uuid" },
+              "scope": { "type": "string", "enum": ["pane-control", "runtime-mutation"] },
+              "pane": { "$ref": "#/components/schemas/PaneRef" },
+              "grant_generation": { "$ref": "#/components/schemas/Uint64DecimalString" },
+              "control_challenge": { "type": "string", "minLength": 32, "maxLength": 512 },
+              "signature": { "type": "string", "minLength": 64, "maxLength": 2048 },
+              "nonce": { "$ref": "#/components/schemas/Nonce" },
+              "deadline_ms": { "$ref": "#/components/schemas/UnixDeadlineMs" }
+            }
+          }
+        ]
+      },
+      "ControlSession": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["control_session_id", "scope", "grant_generation", "expires_at_ms"],
+        "properties": {
+          "control_session_id": { "$ref": "#/components/schemas/Uuid" },
+          "scope": { "type": "string", "enum": ["pane-control", "runtime-mutation"] },
+          "grant_generation": { "$ref": "#/components/schemas/Uint64DecimalString" },
+          "expires_at_ms": { "$ref": "#/components/schemas/UnixDeadlineMs" }
+        }
+      },
+      "CreateTabRequest": {
+        "type": "object",
+        "unevaluatedProperties": false,
+        "allOf": [
+          { "$ref": "#/components/schemas/SignedFields" },
+          {
+            "type": "object",
+            "required": ["runtime", "title", "nonce", "deadline_ms"],
+            "properties": {
+              "runtime": { "$ref": "#/components/schemas/RuntimeRef" },
+              "title": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "nonce": { "$ref": "#/components/schemas/Nonce" },
+              "deadline_ms": { "$ref": "#/components/schemas/UnixDeadlineMs" }
+            }
+          }
+        ]
+      },
+      "CreateSplitRequest": {
+        "type": "object",
+        "unevaluatedProperties": false,
+        "allOf": [
+          { "$ref": "#/components/schemas/SignedFields" },
+          {
+            "type": "object",
+            "required": ["direction", "nonce", "deadline_ms"],
+            "properties": {
+              "direction": { "type": "string", "enum": ["horizontal", "vertical"] },
+              "nonce": { "$ref": "#/components/schemas/Nonce" },
+              "deadline_ms": { "$ref": "#/components/schemas/UnixDeadlineMs" }
+            }
+          }
+        ]
+      },
+      "LoopbackUint32": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 4294967295
+      },
+      "LoopbackUint64": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 18446744073709551615
+      },
+      "LoopbackUsize": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Rust usize; the accepted upper bound is platform-dependent."
+      },
+      "LoopbackNullableString": {
+        "type": ["string", "null"]
+      },
+      "LoopbackSendKeysRequest": {
+        "type": "object",
+        "required": ["pane", "keys"],
+        "properties": {
+          "tab": { "$ref": "#/components/schemas/LoopbackNullableString" },
+          "pane": { "$ref": "#/components/schemas/LoopbackUint32" },
+          "keys": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "LoopbackRunInPaneRequest": {
+        "type": "object",
+        "required": ["pane", "command"],
+        "properties": {
+          "tab": { "$ref": "#/components/schemas/LoopbackNullableString" },
+          "pane": { "$ref": "#/components/schemas/LoopbackUint32" },
+          "command": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "LoopbackSwitchTabRequest": {
+        "type": "object",
+        "required": ["tab"],
+        "properties": {
+          "tab": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "LoopbackCreateTabRequest": {
+        "type": "object",
+        "properties": {
+          "name": { "$ref": "#/components/schemas/LoopbackNullableString" },
+          "working_dir": { "$ref": "#/components/schemas/LoopbackNullableString" },
+          "command": { "$ref": "#/components/schemas/LoopbackNullableString" }
+        },
+        "additionalProperties": true
+      },
+      "LoopbackSplitPaneRequest": {
+        "type": "object",
+        "properties": {
+          "tab": { "$ref": "#/components/schemas/LoopbackNullableString" },
+          "direction": { "$ref": "#/components/schemas/LoopbackNullableString" },
+          "command": { "$ref": "#/components/schemas/LoopbackNullableString" },
+          "working_dir": { "$ref": "#/components/schemas/LoopbackNullableString" },
+          "idempotency_key": { "$ref": "#/components/schemas/LoopbackNullableString" }
+        },
+        "additionalProperties": true
+      },
+      "LoopbackHealthResponse": {
+        "type": "object",
+        "required": ["ok", "degraded"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "degraded": { "type": "boolean" }
+        },
+        "additionalProperties": false
+      },
+      "LoopbackRuntimeIdentityResponse": {
+        "type": "object",
+        "required": ["ok", "data"],
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "data": {
+            "type": "object",
+            "required": ["schema", "runtime_id", "session_name", "identity"],
+            "properties": {
+              "schema": { "type": "string", "const": "taarof.runtime-identity.v1" },
+              "runtime_id": { "type": "string" },
+              "session_name": { "type": "string" },
+              "identity": { "type": "object" }
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "LoopbackStateSnapshot": {
+        "type": "object",
+        "required": ["schema", "generated_at_unix_ms", "session_name", "active_workspace", "active_tab", "capabilities", "health", "update", "identity", "diagnostics", "workspaces", "active_ports", "alerts", "recent_alerts", "saved_views", "saved_views_error", "saved_templates", "saved_templates_error", "agent_jobs", "runtime_probe", "dashboard", "detached_sessions", "events", "history", "work_ledger", "work"],
+        "properties": {
+          "schema": { "const": "taarof.state.v1" }, "generated_at_unix_ms": { "type": "integer", "minimum": 0 }, "session_name": { "type": ["string", "null"] },
+          "active_workspace": { "$ref": "#/components/schemas/LoopbackUint32" }, "active_tab": { "type": ["integer", "null"], "minimum": 0 },
+          "capabilities": { "$ref": "#/components/schemas/LoopbackCapabilities" }, "health": { "$ref": "#/components/schemas/LoopbackHealthSnapshot" },
+          "update": { "$ref": "#/components/schemas/LoopbackExtensibleObject" }, "identity": { "$ref": "#/components/schemas/LoopbackExtensibleObject" }, "diagnostics": { "$ref": "#/components/schemas/LoopbackDiagnostics" },
+          "workspaces": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackWorkspace" } }, "active_ports": { "type": "array", "items": { "type": "object" } }, "alerts": { "type": "array", "items": { "type": "object" } }, "recent_alerts": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackEvent" } },
+          "saved_views": { "type": "array", "items": { "type": "object" } }, "saved_views_error": { "type": ["string", "null"] }, "saved_templates": { "type": "array", "items": { "type": "object" } }, "saved_templates_error": { "type": ["string", "null"] }, "agent_jobs": { "type": "array", "items": { "type": "object" } }, "runtime_probe": { "$ref": "#/components/schemas/LoopbackExtensibleObject" }, "dashboard": { "$ref": "#/components/schemas/LoopbackDashboard" }, "detached_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackDetachedSession" } }, "events": { "$ref": "#/components/schemas/LoopbackEventStoreStatus" }, "history": { "$ref": "#/components/schemas/LoopbackExtensibleObject" }, "work_ledger": { "$ref": "#/components/schemas/LoopbackExtensibleObject" }, "work": { "$ref": "#/components/schemas/LoopbackExtensibleObject" }
+        },
+        "additionalProperties": false
+      },
+      "LoopbackCapabilities": {
+        "type": "object", "required": ["events", "agent_jobs", "history", "update_watch", "runtime_identity"], "additionalProperties": false,
+        "properties": { "events": { "type": "boolean" }, "agent_jobs": { "type": "boolean" }, "history": { "type": "boolean" }, "update_watch": { "type": "boolean" }, "runtime_identity": { "type": "boolean" } }
+      },
+      "LoopbackHealthSnapshot": {
+        "type": "object", "required": ["state", "degraded", "degraded_components", "components", "probe_failures", "command_failures", "events", "event_drops", "last_error_at_unix_ms", "last_event_drop_at_unix_ms", "update"], "additionalProperties": false,
+        "properties": { "state": { "enum": ["ok", "degraded"] }, "degraded": { "type": "boolean" }, "degraded_components": { "type": "integer", "minimum": 0 }, "components": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackHealthComponent" } }, "probe_failures": { "type": "integer", "minimum": 0 }, "command_failures": { "type": "integer", "minimum": 0 }, "events": { "$ref": "#/components/schemas/LoopbackExtensibleObject" }, "event_drops": { "type": "integer", "minimum": 0 }, "last_error_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 }, "last_event_drop_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 }, "update": { "$ref": "#/components/schemas/LoopbackExtensibleObject" } }
+      },
+      "LoopbackHealthComponent": {
+        "type": "object", "required": ["kind", "label", "state", "error", "checked_at_unix_ms", "observed_at_unix_ms"], "additionalProperties": true,
+        "properties": { "kind": { "enum": ["history", "dashboard", "host", "tmux-pane", "events"] }, "label": { "type": "string" }, "state": { "type": "string" }, "error": { "type": ["string", "null"] }, "checked_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 }, "observed_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 }, "workspace_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "workspace_name": { "type": "string" }, "tab_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "tab_name": { "type": "string" }, "pane_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "ssh_target": { "type": ["string", "null"] } }
+      },
+      "LoopbackDiagnostics": {
+        "type": "object", "required": ["log_path", "archive_path", "retention", "counters", "last_failure_at_unix_ms", "last_event_drop_at_unix_ms", "recent"], "additionalProperties": false,
+        "properties": { "log_path": { "type": ["string", "null"] }, "archive_path": { "type": ["string", "null"] }, "retention": { "type": "object", "required": ["recent_record_limit", "log_max_bytes", "archive_count"], "additionalProperties": false, "properties": { "recent_record_limit": { "type": "integer", "minimum": 0 }, "log_max_bytes": { "type": "integer", "minimum": 0 }, "archive_count": { "type": "integer", "minimum": 0 } } }, "counters": { "type": "object", "required": ["total_records", "warning_records", "error_records", "command_failures", "probe_failures", "event_drops", "lifecycle_events", "write_failures"], "additionalProperties": false, "properties": { "total_records": { "type": "integer", "minimum": 0 }, "warning_records": { "type": "integer", "minimum": 0 }, "error_records": { "type": "integer", "minimum": 0 }, "command_failures": { "type": "integer", "minimum": 0 }, "probe_failures": { "type": "integer", "minimum": 0 }, "event_drops": { "type": "integer", "minimum": 0 }, "lifecycle_events": { "type": "integer", "minimum": 0 }, "write_failures": { "type": "integer", "minimum": 0 } } }, "last_failure_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 }, "last_event_drop_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 }, "recent": { "type": "array", "items": { "type": "object" } } }
+      },
+      "LoopbackWorkspace": {
+        "type": "object", "required": ["id", "name", "active_tab", "collapsed", "repo_root", "working_tree_path", "branch_name", "tool_version_chip", "is_worktree", "linked_issue", "run_status", "tmux_backed", "host_config_name", "host_status", "tab_count", "tabs"], "additionalProperties": false,
+        "properties": { "id": { "$ref": "#/components/schemas/LoopbackUint32" }, "name": { "type": "string" }, "active_tab": { "type": ["integer", "null"], "minimum": 0 }, "collapsed": { "type": "boolean" }, "repo_root": { "type": ["string", "null"] }, "working_tree_path": { "type": ["string", "null"] }, "branch_name": { "type": ["string", "null"] }, "tool_version_chip": { "type": ["string", "null"] }, "is_worktree": { "type": "boolean" }, "linked_issue": { "type": ["string", "null"] }, "run_status": { "enum": ["idle", "running", "errored"] }, "tmux_backed": { "type": "boolean" }, "host_config_name": { "type": ["string", "null"] }, "host_status": { "type": ["object", "null"] }, "tab_count": { "type": "integer", "minimum": 0 }, "tabs": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackTab" } } }
+      },
+      "LoopbackTab": {
+        "type": "object", "required": ["tab_id", "name", "kind", "focused_pane", "agent_running", "agent_name", "agent_session_id", "agent_pane_id", "agent_activity", "agents", "needs_attention", "notification_msg", "workspace_action", "discovery_cwd", "listening_ports", "ports_updated_at_unix_ms", "ports_label", "tracking", "panes"], "additionalProperties": false,
+        "properties": { "tab_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "name": { "type": "string" }, "kind": { "enum": ["terminal", "dashboard"] }, "focused_pane": { "$ref": "#/components/schemas/LoopbackUint32" }, "agent_running": { "type": "boolean" }, "agent_name": { "type": ["string", "null"] }, "agent_session_id": { "type": ["string", "null"] }, "agent_pane_id": { "type": ["integer", "null"], "minimum": 0 }, "agent_activity": { "type": ["object", "null"] }, "agents": { "type": "array", "items": { "type": "object" } }, "needs_attention": { "type": "boolean" }, "notification_msg": { "type": ["string", "null"] }, "workspace_action": { "type": ["string", "null"] }, "discovery_cwd": { "type": ["string", "null"] }, "listening_ports": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 65535 } }, "ports_updated_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 }, "ports_label": { "type": "string" }, "tracking": { "type": ["object", "null"] }, "panes": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackPane" } }, "workspace_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "workspace_name": { "type": "string" } }
+      },
+      "LoopbackTabProjection": { "allOf": [{ "$ref": "#/components/schemas/LoopbackTab" }, { "type": "object", "required": ["workspace_id", "workspace_name"], "properties": { "workspace_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "workspace_name": { "type": "string" } } }] },
+      "LoopbackPane": {
+        "type": "object", "required": ["pane_id", "shell_running", "has_child_process", "remote_shell", "cwd", "cwd_host", "location_updated_at_unix_ms", "probe_updated_at_unix_ms", "tmux_session", "tmux_host", "tmux_probe", "attach_supported", "attach_kind", "pty_capability", "cols", "rows", "agent_name", "agent_session_id", "current_task", "transcript"], "additionalProperties": false,
+        "properties": { "pane_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "shell_running": { "type": "boolean" }, "has_child_process": { "type": ["boolean", "null"] }, "remote_shell": { "type": "boolean" }, "cwd": { "type": ["string", "null"] }, "cwd_host": { "type": ["string", "null"] }, "location_updated_at_unix_ms": { "type": "integer", "minimum": 0 }, "probe_updated_at_unix_ms": { "type": "integer", "minimum": 0 }, "tmux_session": { "type": ["string", "null"] }, "tmux_host": { "type": ["string", "null"] }, "tmux_probe": { "type": ["object", "null"] }, "attach_supported": { "type": "boolean" }, "attach_kind": { "enum": ["tmux", "vte", "unsupported"] }, "pty_capability": { "enum": ["raw_pty", "legacy_snapshot"] }, "cols": { "type": ["integer", "null"], "minimum": 0 }, "rows": { "type": ["integer", "null"], "minimum": 0 }, "agent_name": { "type": ["string", "null"] }, "agent_session_id": { "type": ["string", "null"] }, "current_task": { "type": "object" }, "transcript": { "type": ["object", "null"] }, "workspace_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "tab_id": { "$ref": "#/components/schemas/LoopbackUint32" } }
+      },
+      "LoopbackPaneProjection": { "allOf": [{ "$ref": "#/components/schemas/LoopbackPane" }, { "type": "object", "required": ["workspace_id", "tab_id"], "properties": { "workspace_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "tab_id": { "$ref": "#/components/schemas/LoopbackUint32" } } }] },
+      "LoopbackDetachedSession": { "type": "object", "required": ["session_name", "host", "workspace", "ssh_target", "last_command", "finished"], "additionalProperties": false, "properties": { "session_name": { "type": "string" }, "host": { "type": ["string", "null"] }, "workspace": { "type": ["string", "null"] }, "ssh_target": { "type": ["string", "null"] }, "last_command": { "type": ["string", "null"] }, "finished": { "type": "boolean" } } },
+      "LoopbackDashboard": { "type": "object", "required": ["probe_state", "observed_at_unix_ms", "checked_at_unix_ms", "error", "sessions", "hosts"], "additionalProperties": false, "properties": { "probe_state": { "type": "string" }, "observed_at_unix_ms": { "type": "integer", "minimum": 0 }, "checked_at_unix_ms": { "type": "integer", "minimum": 0 }, "error": { "type": ["string", "null"] }, "sessions": { "type": "array", "items": { "type": "object" } }, "hosts": { "type": "array", "items": { "type": "object" } } } },
+      "LoopbackEventStoreStatus": { "type": "object", "required": ["high_watermark", "next_seq", "stored", "capacity", "dropped", "last_dropped_at_unix_ms"], "additionalProperties": false, "properties": { "high_watermark": { "type": "integer", "minimum": 0 }, "next_seq": { "type": "integer", "minimum": 0 }, "stored": { "type": "integer", "minimum": 0 }, "capacity": { "type": "integer", "minimum": 0 }, "dropped": { "type": "integer", "minimum": 0 }, "last_dropped_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 } } },
+      "LoopbackExtensibleObject": { "type": "object", "additionalProperties": true, "description": "Runtime-owned versioned object. Its nested fields are intentionally additive; callers must rely on the documented stable discriminator and known fields only." },
+      "AgentStableRef": {"type": "object", "required": ["provider_id", "host_identity", "session_id"], "additionalProperties": false, "properties": {"provider_id": {"type": "string"}, "host_identity": {"type": "string"}, "session_id": {"type": "string"}}},
+      "AgentSessionDisplay": {"type": "object", "required": ["provider", "session_id", "host", "title", "cwd"], "additionalProperties": false, "properties": {"provider": {"type": "string", "maxLength": 256}, "session_id": {"type": "string", "maxLength": 256}, "host": {"type": "string", "maxLength": 256}, "title": {"type": "string", "maxLength": 256}, "cwd": {"type": "string", "maxLength": 256}, "repo_root": {"type": "string", "maxLength": 256}}},
+      "AgentRemoteTarget": {"type": "object", "required": ["host_identity", "ssh_target"], "additionalProperties": false, "properties": {"host_identity": {"type": "string"}, "ssh_target": {"type": "string"}}},
+      "AgentActionPlan": {"type": "object", "required": ["kind", "transport", "program", "argv", "cwd", "confirmation"], "additionalProperties": false, "properties": {"kind": {"enum": ["new", "resume", "attach", "fork"]}, "transport": {"enum": ["local", "ssh"]}, "program": {"type": "string"}, "argv": {"type": "array", "items": {"type": "string"}}, "cwd": {"type": "string"}, "remote": {"$ref": "#/components/schemas/AgentRemoteTarget"}, "confirmation": {"enum": ["required", "none"]}}},
+      "AgentSessionV2": {"type": "object", "required": ["stable_ref", "display", "started_at_unix_ms", "updated_at_unix_ms", "state", "source", "confidence", "warnings", "actions"], "additionalProperties": false, "properties": {"stable_ref": {"$ref": "#/components/schemas/AgentStableRef"}, "display": {"$ref": "#/components/schemas/AgentSessionDisplay"}, "started_at_unix_ms": {"type": ["integer", "null"], "minimum": 0}, "updated_at_unix_ms": {"type": "integer", "minimum": 0}, "state": {"enum": ["active", "recent"]}, "source": {"enum": ["local_history", "remote_history"]}, "confidence": {"enum": ["provider_identity", "exact_live_binding"]}, "warnings": {"type": "array", "items": {"type": "string", "maxLength": 256}}, "live_binding": {"$ref": "#/components/schemas/LoopbackLiveAgentBinding"}, "actions": {"type": "array", "items": {"$ref": "#/components/schemas/AgentActionPlan"}}}},
+      "LoopbackAgentSessionsV2": {"type": "object", "required": ["schema", "generated_at_unix_ms", "providers", "sessions", "remote_hosts"], "additionalProperties": false, "properties": {"schema": {"const": "agent.sessions.v2"}, "generated_at_unix_ms": {"type": "integer", "minimum": 0}, "providers": {"type": "array", "items": {"$ref": "#/components/schemas/LoopbackAgentProvider"}}, "sessions": {"type": "array", "items": {"$ref": "#/components/schemas/AgentSessionV2"}}, "remote_hosts": {"type": "array", "items": {"$ref": "#/components/schemas/LoopbackRemoteAgentHost"}}}},
+      "LoopbackAgentSessionsSnapshot": { "oneOf": [{ "$ref": "#/components/schemas/LoopbackAgentSessionsV1" }, { "$ref": "#/components/schemas/LoopbackAgentSessionsV2" }] },
+      "LoopbackAgentSessionsV1": {
+        "type": "object", "required": ["schema", "generated_at_unix_ms", "providers", "sessions"], "additionalProperties": false,
+        "properties": { "schema": { "const": "taarof.agent-sessions.v1" }, "generated_at_unix_ms": { "type": "integer", "minimum": 0 }, "providers": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackAgentProvider" } }, "sessions": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackAgentSession" } }, "remote_hosts": { "type": "array", "description": "Additive: omitted entirely when no remote host is configured or live.", "items": { "$ref": "#/components/schemas/LoopbackRemoteAgentHost" } } }
+      },
+      "LoopbackRemoteAgentHost": { "type": "object", "required": ["host", "ssh_target", "ok", "stale", "session_count", "dropped_lines", "truncated_files"], "additionalProperties": false, "properties": { "host": { "type": "string" }, "ssh_target": { "type": "string" }, "ok": { "type": "boolean" }, "stale": { "type": "boolean", "description": "Degraded rather than merely cached: a failed probe, no probe yet, or a round older than the freshness window." }, "error": { "type": "string" }, "session_count": { "type": "integer", "minimum": 0 }, "dropped_lines": { "type": "integer", "minimum": 0, "description": "Record lines present on the host but not represented in sessions." }, "truncated_files": { "type": "integer", "minimum": 0, "description": "Files whose per-file byte budget trimmed the sample early." }, "warning": { "type": "string" }, "observed_at_unix_ms": { "type": "integer", "minimum": 0 } } },
+      "LoopbackAgentProvider": { "type": "object", "required": ["name", "ok", "history_available", "session_count"], "additionalProperties": false, "properties": { "name": { "type": "string" }, "ok": { "type": "boolean" }, "history_available": { "type": "boolean" }, "warning": { "type": "string" }, "error": { "type": "string" }, "session_count": { "type": "integer", "minimum": 0 } } },
+      "LoopbackAgentSession": { "type": "object", "required": ["agent", "session_id", "title", "cwd", "updated_at_unix_ms", "status"], "additionalProperties": false, "properties": { "agent": { "type": "string" }, "session_id": { "type": "string" }, "title": { "type": "string" }, "cwd": { "type": "string" }, "host": { "type": "string", "description": "Additive: present only on sessions discovered on a remote host." }, "repo_root": { "type": "string" }, "started_at_unix_ms": { "type": "integer", "minimum": 0 }, "updated_at_unix_ms": { "type": "integer", "minimum": 0 }, "status": { "type": "string" }, "live_binding": { "$ref": "#/components/schemas/LoopbackLiveAgentBinding" }, "resume_command": { "type": "string" }, "resume_unavailable_reason": { "type": "string" } } },
+      "LoopbackLiveAgentBinding": { "type": "object", "required": ["agent", "workspace_id", "workspace_name", "tab_id", "tab_name", "pane_id"], "additionalProperties": false, "properties": { "agent": { "type": "string" }, "session_id": { "type": "string" }, "cwd": { "type": "string" }, "workspace_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "workspace_name": { "type": "string" }, "tab_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "tab_name": { "type": "string" }, "pane_id": { "$ref": "#/components/schemas/LoopbackUint32" } } },
+      "LoopbackSessionsSnapshot": { "type": "object", "required": ["session_name", "active_workspace", "active_tab", "dashboard", "detached_sessions"], "additionalProperties": false, "properties": { "session_name": { "type": ["string", "null"] }, "active_workspace": { "$ref": "#/components/schemas/LoopbackUint32" }, "active_tab": { "$ref": "#/components/schemas/LoopbackUint32" }, "dashboard": { "$ref": "#/components/schemas/LoopbackDashboard" }, "detached_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackDetachedSession" } } } },
+      "LoopbackFilePreview": { "type": "object", "required": ["tab_id", "pane_id", "path", "display_path", "cwd", "line", "col", "size_bytes", "max_bytes", "truncated", "content"], "additionalProperties": false, "properties": { "tab_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "pane_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "path": { "type": "string" }, "display_path": { "type": "string" }, "cwd": { "type": "string" }, "line": { "type": ["integer", "null"], "minimum": 0 }, "col": { "type": ["integer", "null"], "minimum": 0 }, "size_bytes": { "type": "integer", "minimum": 0 }, "max_bytes": { "type": "integer", "minimum": 0 }, "truncated": { "const": false }, "content": { "type": "string" } } },
+      "LoopbackFileStat": { "type": "object", "required": ["tab_id", "pane_id", "path", "display_path", "cwd", "exists", "is_file", "is_dir"], "additionalProperties": false, "properties": { "tab_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "pane_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "path": { "type": "string" }, "display_path": { "type": "string" }, "cwd": { "type": "string" }, "exists": { "type": "boolean" }, "is_file": { "type": "boolean" }, "is_dir": { "type": "boolean" } } },
+      "LoopbackEvent": { "type": "object", "required": ["seq", "ts_unix_ms", "event_type", "payload"], "additionalProperties": false, "properties": { "seq": { "type": "integer", "minimum": 0 }, "ts_unix_ms": { "type": "integer", "minimum": 0 }, "event_type": { "type": "string" }, "payload": { "type": "object", "additionalProperties": true, "description": "Event-specific allowlisted metadata; the event_type selects its fields." } } },
+      "LoopbackEventsPage": { "type": "object", "required": ["schema", "since_seq", "limit", "next_seq", "high_watermark", "oldest_seq", "gap", "gap_from", "gap_to", "resnapshot_required", "capacity", "dropped", "last_dropped_at_unix_ms", "events"], "additionalProperties": false, "properties": { "schema": { "const": "taarof.events.v1" }, "since_seq": { "type": ["integer", "null"], "minimum": 0 }, "limit": { "type": "integer", "minimum": 1, "maximum": 500 }, "next_seq": { "type": "integer", "minimum": 0 }, "high_watermark": { "type": "integer", "minimum": 0 }, "oldest_seq": { "type": ["integer", "null"], "minimum": 0 }, "gap": { "type": "boolean" }, "gap_from": { "type": ["integer", "null"], "minimum": 0 }, "gap_to": { "type": ["integer", "null"], "minimum": 0 }, "resnapshot_required": { "type": "boolean" }, "capacity": { "type": "integer", "minimum": 0 }, "dropped": { "type": "integer", "minimum": 0 }, "last_dropped_at_unix_ms": { "type": ["integer", "null"], "minimum": 0 }, "events": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackEvent" } } } },
+      "LoopbackHistoryPage": { "type": "object", "required": ["schema", "since_id", "limit", "next_id", "has_more", "scanned", "scan_exhausted", "truncated", "filters", "records"], "additionalProperties": false, "properties": { "schema": { "const": "taarof.history.v1" }, "since_id": { "type": ["integer", "null"], "minimum": 0 }, "limit": { "type": "integer", "minimum": 1, "maximum": 500 }, "next_id": { "type": "integer", "minimum": 0 }, "has_more": { "type": "boolean" }, "scanned": { "type": "integer", "minimum": 0 }, "scan_exhausted": { "type": "boolean" }, "truncated": { "type": "boolean" }, "filters": { "$ref": "#/components/schemas/LoopbackHistoryFilters" }, "records": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackHistoryRecord" } } } },
+      "LoopbackHistoryFilters": { "type": "object", "required": ["from_ts", "to_ts", "record_type", "session", "workspace", "pane", "task", "repository", "authority", "verification", "severity", "text", "order", "scan_budget"], "additionalProperties": false, "properties": { "from_ts": { "type": ["integer", "null"], "minimum": 0 }, "to_ts": { "type": ["integer", "null"], "minimum": 0 }, "record_type": { "type": ["string", "null"], "enum": ["event", "diagnostic", "work", null] }, "session": { "type": ["string", "null"] }, "workspace": { "type": ["string", "null"] }, "pane": { "type": ["string", "null"] }, "task": { "type": ["string", "null"] }, "repository": { "type": ["string", "null"] }, "authority": { "type": ["string", "null"] }, "verification": { "type": ["string", "null"] }, "severity": { "type": ["string", "null"], "enum": ["info", "warn", "error", null] }, "text": { "type": ["string", "null"] }, "order": { "enum": ["asc", "desc"] }, "scan_budget": { "type": ["integer", "null"], "minimum": 1, "maximum": 100000 } } },
+      "LoopbackHistoryRecord": { "type": "object", "required": ["id", "ts_unix_ms", "record_type", "subtype", "session"], "additionalProperties": false, "properties": { "id": { "type": "integer", "minimum": 0 }, "ts_unix_ms": { "type": "integer", "minimum": 0 }, "record_type": { "enum": ["event", "diagnostic", "work"] }, "subtype": { "type": "string" }, "source_space": { "type": "string" }, "source_seq": { "type": "integer", "minimum": 0 }, "session": { "type": "string" }, "workspace_origin": { "type": "string" }, "tab_origin": { "type": "string" }, "pane_origin": { "type": "string" }, "task_id": { "type": "string" }, "repository": { "type": "string" }, "authority": { "type": "string" }, "verification": { "type": "string" }, "level": { "enum": ["info", "warn", "error"] }, "summary": { "type": "string" }, "attrs": { "type": "object", "additionalProperties": true, "description": "Record-type-specific allowlisted attributes." } } },
+      "LoopbackStateResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "$ref": "#/components/schemas/LoopbackStateSnapshot" } }
+      },
+      "LoopbackAgentSessionsResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "$ref": "#/components/schemas/LoopbackAgentSessionsSnapshot" } }
+      },
+      "LoopbackSessionsResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "$ref": "#/components/schemas/LoopbackSessionsSnapshot" } }
+      },
+      "LoopbackWorkspacesResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackWorkspace" } } }
+      },
+      "LoopbackTabsResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackTabProjection" } } }
+      },
+      "LoopbackPanesResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "type": "array", "items": { "$ref": "#/components/schemas/LoopbackPaneProjection" } } }
+      },
+      "LoopbackFilePreviewResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "$ref": "#/components/schemas/LoopbackFilePreview" } }
+      },
+      "LoopbackFileStatResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "$ref": "#/components/schemas/LoopbackFileStat" } }
+      },
+      "LoopbackEventsResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "$ref": "#/components/schemas/LoopbackEventsPage" } }
+      },
+      "LoopbackHistoryResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "$ref": "#/components/schemas/LoopbackHistoryPage" } }
+      },
+      "LoopbackSendKeysResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "$ref": "#/components/schemas/LoopbackSocketAcknowledgement" } }
+      },
+      "LoopbackRunInPaneResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "$ref": "#/components/schemas/LoopbackSocketAcknowledgement" } }
+      },
+      "LoopbackSwitchTabResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "$ref": "#/components/schemas/LoopbackSocketAcknowledgement" } }
+      },
+      "LoopbackCreateTabResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "$ref": "#/components/schemas/LoopbackSocketCreatedTab" } }
+      },
+      "LoopbackSplitPaneResponse": {
+        "type": "object", "required": ["ok", "data"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "data": { "$ref": "#/components/schemas/LoopbackSocketCreatedPane" } }
+      },
+      "LoopbackSocketAcknowledgement": {
+        "type": "object", "required": ["ok"], "additionalProperties": false,
+        "properties": { "ok": { "const": true } }
+      },
+      "LoopbackSocketCreatedTab": {
+        "type": "object", "required": ["ok", "tab_id"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "tab_id": { "$ref": "#/components/schemas/LoopbackUint32" } }
+      },
+      "LoopbackSocketCreatedPane": {
+        "type": "object", "required": ["ok", "workspace_id", "tab_id", "pane_id"], "additionalProperties": false,
+        "properties": { "ok": { "const": true }, "workspace_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "tab_id": { "$ref": "#/components/schemas/LoopbackUint32" }, "pane_id": { "$ref": "#/components/schemas/LoopbackUint32" } }
+      },
+      "LoopbackErrorEnvelope": {
+        "type": "object",
+        "required": ["ok", "error"],
+        "properties": {
+          "ok": { "type": "boolean", "const": false },
+          "error": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    }
+  }
+}

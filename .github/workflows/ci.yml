@@ -26,6 +26,12 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Check agent launcher formatting
+        run: cargo fmt --manifest-path agent-launcher/Cargo.toml --check
+
+      - name: Check agent-session-core formatting
+        run: cargo fmt --manifest-path agent-session-core/Cargo.toml --check
+
       - name: Check taarof-app formatting
         run: cargo fmt --manifest-path taarof-app/Cargo.toml --all --check
 
@@ -45,7 +51,7 @@ jobs:
         uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: taarof-app
+          working-directory: .
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
@@ -138,8 +144,22 @@ jobs:
         run: npm ci && npm run build
         working-directory: taarof-web
 
+      - name: Check standalone agent launcher
+        run: |
+          cargo clippy --manifest-path agent-launcher/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path agent-launcher/Cargo.toml
+
+      - name: Check shared agent-session core
+        run: |
+          cargo clippy --manifest-path agent-session-core/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo test --manifest-path agent-session-core/Cargo.toml
+          cargo test --manifest-path agent-session-core/Cargo.toml --no-default-features
+
       - name: Lint taarof-app
         run: cargo clippy --manifest-path taarof-app/Cargo.toml --all-targets -- -D warnings
+
+      - name: Compile performance harness
+        run: cargo check --manifest-path taarof-app/Cargo.toml --example performance_harness --features harness
 
       - name: Run taarof-app tests
         run: cargo test --manifest-path taarof-app/Cargo.toml
@@ -213,6 +233,18 @@ jobs:
   # Offline repo-contract suites. These live in mise.toml's `test` task too,
   # but no CI job runs `mise run test`, so they are invoked explicitly here or
   # they would never run on a pull request.
+  contracts:
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Validate local HTTP contracts
+        run: python3 testing/test_http_contract_docs.py -v
+      - name: Install shell test dependencies
+        run: sudo apt-get update && sudo apt-get install -y zsh fish
+      - name: Verify shell integration
+        run: python3 testing/test_shell_integration.py
+
   wasm-sidebar:
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
     steps:
@@ -228,4 +260,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build sidebar WASM artifact
-        run: cargo build --manifest-path wasm-sidebar/Cargo.toml --target wasm32-wasip1
+        run: cargo build --manifest-path wasm-sidebar/Cargo.toml --target wasm32-wasip1 --target-dir wasm-sidebar/target

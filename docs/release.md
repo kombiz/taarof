@@ -25,15 +25,17 @@ write scope, because it grants no repository access: it only lets the job mint a
 OIDC JWT for its own identity, which `anthropics/claude-code-action` exchanges
 for a short-lived app token.
 
-The only retained `[self-hosted, Linux, X64, builder]` job is the Pages deploy,
-which runs only on trusted `push`/`workflow_dispatch` events and never checks
-out a pull-request ref. `pull_request_target` is not used anywhere in this
-repository's workflows and must never be combined with a persistent runner.
-`testing/test_github_workflows.py` parses every `.yml` and `.yaml` workflow and
-fails closed for unknown YAML, dynamic/custom/group runners on PR-reachable
-jobs, persistent PR checkout refs, CI permissions wider than `contents: read`,
-any repository-scoped write on a PR-reachable job, or custom-secret references
-in untrusted `pull_request` jobs.
+Persistent self-hosted jobs are limited to trusted `push`/`workflow_dispatch`
+events and never check out a pull-request ref. Pages deploys on
+`[self-hosted, Linux, X64, builder]`; the aggregate Local CI gate targets the
+development builder with `[self-hosted, Linux, X64, docker, builder,
+development]`. `pull_request_target` is not used anywhere in this repository's
+workflows and must never be combined with a persistent runner.
+Local CI executes the gate through `testing/ci/container-run.sh`, keeping the
+GTK/VTE toolchain in a repository-owned image and build outputs inside the
+disposable container rather than requiring desktop development packages on the
+generic builder host.
+Public CI runs the HTTP contract verifier in `testing/test_http_contract_docs.py` and the real-shell verifier in `testing/test_shell_integration.py`. Private runner-policy checks remain in the development repository.
 
 ## Pre-release checks
 
@@ -96,6 +98,22 @@ unlocks the separate publication job. That job downloads the same named
 artifact, re-verifies its checksum, and publishes its tarball, checksum, and the
 required provenance bundle. Creating or pushing that tag remains a human
 approval step.
+
+### Latest exact-head rehearsal attempt
+
+On August 22, 2026, the non-publishing workflow was dispatched for exact commit
+`2d3ff6679073148411bed6448bebc42d50f1879a` in
+[run 32603958112](https://github.com/Example-Org/Example-Repo/actions/runs/32603958112).
+GitHub rejected the `linux-tarball` job before any workflow step started because
+the account's Actions billing or spending limit needs attention. The
+`publish-github-release` job was skipped, no workflow artifact was created, and
+the repository still had no tags or GitHub Releases after the attempt.
+
+This is exact-head failure evidence, not a successful rehearsal. EXAMPLE-163
+remains open until Actions can schedule the job and the required tarball,
+checksum, and provenance artifact can be inspected. Re-dispatch the same
+candidate SHA only while it remains the intended candidate; otherwise dispatch
+the new immutable candidate head and replace this evidence.
 
 ## Release-readiness sign-off
 
@@ -273,3 +291,49 @@ until the unvalidated areas above have been exercised.
   still prefer the repo-local `taarof-web/dist` bundle first.
 - `wasm-sidebar` is validated as a buildable artifact in CI, but release
   packaging for it remains manual.
+
+## Standalone launcher proof receipt
+
+Run the automated installed-command smoke against an explicit installation and
+its extracted release bundle. The harness never installs software, starts a real
+provider, contacts an operator socket, or stops/restarts Taarof. Its launcher
+commands use a fresh HOME, configuration root and runtime directory with only
+synthetic histories and adapters.
+
+```sh
+bash testing/e2e-gui/run-agent-launcher-e2e.sh \
+  --prefix /absolute/installed/prefix \
+  --package-dir /absolute/extracted/taarof-linux-x86_64 \
+  --package-archive /absolute/taarof-linux-x86_64.tar.gz \
+  --source-sha FULL_REVIEWED_COMMIT_SHA \
+  --receipt /absolute/new-agent-release-receipt.json
+```
+
+`--package-archive` additionally checks the archive's command bytes and records
+its SHA-256. Without it the receipt identifies the extracted bundle by its
+complete manifest hash. A complete `taarof.bundle.v1` manifest must bind agent,
+Taarof CLI and app hashes to the requested clean source, app build ID and agent
+build ID. The harness checks package/install equality and the installed agent's
+own `--build-info`; a missing or mismatched binding fails rather than inheriting
+the app's source claim. Existing receipt files are never overwritten.
+
+Optionally add `--runtime-pid PID` to observe an explicitly selected own-user
+`taarof-app` process. The harness checks executable hash and PID lifetime; it
+reads no process arguments, environment, HTTP tokens or runtime socket state.
+A different running hash is recorded as different, and no runtime PID means
+`not_observed`. File parity never establishes attended application behavior.
+
+The automated checks cover hostile metadata, quoted cwd/session IDs, private
+fixture exclusion, external timeout isolation, manifest disabling and local
+new/resume with an isolated empty Taarof runtime root. This last check proves
+independence from Taarof; it does **not** claim the operator's desktop was stopped.
+Real provider new/resume, live tmux attach, remote degradation, operator
+stop/restart, independent exact-head review and external gate receipts remain
+separate requirements. Even a passing smoke emits
+`release_status: pending_attended_proof`.
+
+For a graphical/container release rehearsal, prepare the candidate using the
+supported `testing/kasm/container-run.sh` or
+`testing/e2e-gui/container-run.sh` and packaging install scripts. Run this harness
+inside that same prepared environment against the installed prefix. Never use
+`docker compose run` to build the candidate.

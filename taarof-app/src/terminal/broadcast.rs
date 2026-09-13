@@ -678,14 +678,11 @@ pub(crate) fn capture_grid_rows(
 
 // ── Shell-integration command blocks (OSC 133) ───────────────────────────────
 //
-// Transport is OSC 133 semantic prompt markers, which the pinned VTE
-// (vte4 0.10, feature v0_78) parses natively and surfaces as the built-in
-// `vte.shell.precmd` termprop. The app records the cursor row on each prompt
-// marker into `PaneLeaf::command_marks`; the pure helpers below turn those rows
-// into an exact "previous command output" range and drive prompt-to-prompt
-// scroll jumps. No separate `vte.ext.taarof.prompt` fallback termprop is added:
-// on this VTE OSC 133 is always surfaced, so a second channel would be unused
-// dead code. When no integration is sourced the mark buffer is empty and copy
+// The helper emits standard OSC 133 plus VTE's explicit
+// OSC 666;vte.shell.precmd! signal. The app records a cursor row for that
+// termprop in PaneLeaf::command_marks. OSC 133 alone is not sufficient.
+
+// When no integration is sourced the mark buffer is empty and copy
 // falls back to the unchanged last-N-lines capture.
 
 /// Inclusive row bounds of the last command's output, given recorded prompt
@@ -833,8 +830,8 @@ fn agent_display_name(agent: Option<&str>) -> String {
 
 /// Pure resolver shared by Copy Last Agent Message and Relay last message.
 /// It returns byte-identical source markdown when available, otherwise carries
-/// the detected agent and a user-facing explanation for the recent-output
-/// fallback.
+/// the detected agent and a user-facing explanation of why no transcript
+/// message was available.
 pub(crate) fn resolve_last_agent_message(
     transcript: Option<&crate::agents::TranscriptState>,
     detected_agent: Option<&str>,
@@ -889,48 +886,59 @@ pub(crate) fn last_agent_message_for_pane(
     resolve_last_agent_message(st.pane_transcripts.get(&(tab_id, pane_id)), detected_agent)
 }
 
-/// Outcome of `copy_last_message_for_pane`: whether the pristine transcript
-/// markdown was copied, or the recent-output fallback ran (with its row count).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LastMessageCopy {
-    Transcript,
-    RecentOutput {
-        rows: u32,
-        agent: String,
-        reason: String,
-    },
+/// User-facing message for a Copy Last Agent Message that copied nothing.
+/// The action never substitutes visible rows for a transcript message: the
+/// clipboard keeps whatever it held, and the toast names the action that does
+/// copy the visible rows (Copy Recent Output) with its live shortcut when one
+/// is installed.
+pub(crate) fn last_message_unavailable_message(
+    agent: &str,
+    reason: &str,
+    recent_output_shortcut: Option<&str>,
+) -> String {
+    match recent_output_shortcut {
+        Some(shortcut) => format!(
+            "{agent}: {reason}. Nothing was copied; use Copy Recent Output ({shortcut}) for the \
+             visible rows."
+        ),
+        None => format!(
+            "{agent}: {reason}. Nothing was copied; use Copy Recent Output for the visible rows."
+        ),
+    }
 }
 
-/// Copy a pane's last agent message as raw markdown when a transcript exists;
-/// otherwise fall back to the recent-output capture. Mirrors the
-/// short-borrow-then-drop discipline of `copy_recent_output_for_pane`: the
-/// state borrow inside `last_agent_message_for_pane` drops before the clipboard
-/// write here.
+/// Copy a pane's last agent message as raw markdown when a transcript exists.
+/// When no transcript matches, nothing is copied and the error names the
+/// Copy Recent Output action instead, so the shortcut always means one thing.
+/// Mirrors the short-borrow-then-drop discipline of
+/// `copy_recent_output_for_pane`: the state borrow inside
+/// `last_agent_message_for_pane` drops before the clipboard write here.
 pub(crate) fn copy_last_message_for_pane(
     state: &Rc<RefCell<AppState>>,
     tab_id: u32,
     pane_id: u32,
-) -> Result<LastMessageCopy, String> {
+) -> Result<(), String> {
     match last_agent_message_for_pane(state, tab_id, pane_id) {
         LastAgentMessageResolution::Transcript(text) => {
             set_clipboard_text(&text)?;
             record_clipboard_copy(&text);
-            Ok(LastMessageCopy::Transcript)
+            Ok(())
         }
         LastAgentMessageResolution::Unavailable { agent, reason } => {
-            let rows = copy_recent_output_for_pane(state, tab_id, pane_id)?;
-            Ok(LastMessageCopy::RecentOutput {
-                rows,
-                agent,
-                reason,
-            })
+            let shortcut =
+                crate::keybindings::label_for(crate::keybindings::Action::CopyRecentOutput);
+            Err(last_message_unavailable_message(
+                &agent,
+                &reason,
+                shortcut.as_deref(),
+            ))
         }
     }
 }
 
 pub(crate) fn copy_last_message_from_active_pane(
     state: &Rc<RefCell<AppState>>,
-) -> Result<LastMessageCopy, String> {
+) -> Result<(), String> {
     let (tab_id, pane_id) = {
         let st = state.borrow();
         let tab = st
@@ -1060,9 +1068,9 @@ pub(super) fn connect_broadcast_input(terminal: &vte::Terminal, state: &Rc<RefCe
 #[cfg(test)]
 mod tests {
     use super::{
-        build_send_to_pane_payload, command_output_bounds, next_prompt_mark,
-        resolve_last_agent_message, set_clipboard_text, ClipboardRing, LastAgentMessageResolution,
-        PromptJump, SendToPaneMode,
+        build_send_to_pane_payload, command_output_bounds, last_message_unavailable_message,
+        next_prompt_mark, resolve_last_agent_message, set_clipboard_text, ClipboardRing,
+        LastAgentMessageResolution, PromptJump, SendToPaneMode,
     };
 
     #[test]
@@ -1089,8 +1097,36 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_last_message_falls_back_to_recent_output() {
-        // No transcript carries agent-specific fallback provenance.
+    fn test_last_message_unavailable_message_names_copy_recent_output() {
+        // P-002: when no transcript matches, the action copies nothing and the
+        // toast must say so and name the action that copies the visible rows,
+        // with its live shortcut when one is installed.
+        let with_shortcut = last_message_unavailable_message(
+            "Codex",
+            "no unambiguous native transcript matched this pane's identity and process metadata",
+            Some("Ctrl+Shift+O"),
+        );
+        assert_eq!(
+            with_shortcut,
+            "Codex: no unambiguous native transcript matched this pane's identity and process \
+             metadata. Nothing was copied; use Copy Recent Output (Ctrl+Shift+O) for the \
+             visible rows."
+        );
+        let without_shortcut = last_message_unavailable_message(
+            "Agent",
+            "no running agent was detected in this pane",
+            None,
+        );
+        assert_eq!(
+            without_shortcut,
+            "Agent: no running agent was detected in this pane. Nothing was copied; use Copy \
+             Recent Output for the visible rows."
+        );
+    }
+
+    #[test]
+    fn test_copy_last_message_reports_unavailable_instead_of_guessing() {
+        // No transcript carries agent-specific provenance for the toast.
         assert_eq!(
             resolve_last_agent_message(None, Some("codex")),
             LastAgentMessageResolution::Unavailable {

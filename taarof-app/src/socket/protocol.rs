@@ -43,6 +43,29 @@ pub(super) enum SocketMessage {
         text: Option<String>,
         source: Option<String>,
     },
+    /// Submit one prompt to an exact pane and establish an event boundary.
+    /// The prompt is never copied into events, diagnostics, or turn state.
+    #[serde(rename = "prompt-agent")]
+    PromptAgent {
+        tab: String,
+        pane: u32,
+        prompt: String,
+    },
+    /// Wait for post-boundary agent evidence for a token returned by
+    /// `prompt-agent`, then capture bounded logical pane output.
+    #[serde(rename = "wait-agent-turn")]
+    WaitAgentTurn {
+        turn_token: String,
+        #[serde(default)]
+        timeout_seconds: Option<f64>,
+        #[serde(default)]
+        scrollback: Option<u32>,
+        #[serde(default)]
+        max_output_bytes: Option<usize>,
+    },
+    /// Cancel an active or not-yet-waited turn token.
+    #[serde(rename = "cancel-agent-turn")]
+    CancelAgentTurn { turn_token: String },
     /// Bootstrap explicit stable reporting context for a manually-bound pane.
     #[serde(rename = "work-context")]
     WorkContext { tab: Option<String>, pane: u32 },
@@ -117,6 +140,8 @@ pub(super) enum SocketMessage {
         direction: Option<String>,
         command: Option<String>,
         working_dir: Option<String>,
+        #[serde(default)]
+        idempotency_key: Option<String>,
     },
     #[serde(rename = "get-text")]
     GetText {
@@ -144,6 +169,8 @@ pub(super) enum SocketMessage {
     #[serde(rename = "attach-session")]
     AttachSession {
         session_name: String,
+        #[serde(default)]
+        expected_agent: Option<agent_session_core::AttachTarget>,
         #[serde(default)]
         host: Option<String>,
         #[serde(default)]
@@ -173,7 +200,10 @@ pub(super) enum SocketMessage {
         filters: crate::history::HistoryFilters,
     },
     #[serde(rename = "query-agent-sessions")]
-    QueryAgentSessions,
+    QueryAgentSessions {
+        #[serde(default)]
+        schema: crate::agent_sessions::SessionSchema,
+    },
     #[serde(rename = "agent-workspace")]
     AgentWorkspace {
         branch: String,
@@ -207,6 +237,8 @@ pub(super) enum SocketMessage {
 pub(super) struct SocketResponse {
     pub(super) ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) workspace_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) pane_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) tab_id: Option<u32>,
@@ -220,6 +252,7 @@ impl SocketResponse {
     pub(super) fn ok() -> Self {
         Self {
             ok: true,
+            workspace_id: None,
             pane_id: None,
             tab_id: None,
             error: None,
@@ -230,6 +263,7 @@ impl SocketResponse {
     pub(super) fn ok_with_pane(pane_id: u32) -> Self {
         Self {
             ok: true,
+            workspace_id: None,
             pane_id: Some(pane_id),
             tab_id: None,
             error: None,
@@ -240,6 +274,7 @@ impl SocketResponse {
     pub(super) fn ok_with_tab(tab_id: u32) -> Self {
         Self {
             ok: true,
+            workspace_id: None,
             pane_id: None,
             tab_id: Some(tab_id),
             error: None,
@@ -250,6 +285,7 @@ impl SocketResponse {
     pub(super) fn ok_with_data(data: serde_json::Value) -> Self {
         Self {
             ok: true,
+            workspace_id: None,
             pane_id: None,
             tab_id: None,
             error: None,
@@ -257,9 +293,21 @@ impl SocketResponse {
         }
     }
 
+    pub(super) fn ok_with_target(workspace_id: u32, tab_id: u32, pane_id: u32) -> Self {
+        Self {
+            ok: true,
+            workspace_id: Some(workspace_id),
+            pane_id: Some(pane_id),
+            tab_id: Some(tab_id),
+            error: None,
+            data: None,
+        }
+    }
+
     pub(super) fn err(msg: impl Into<String>) -> Self {
         Self {
             ok: false,
+            workspace_id: None,
             pane_id: None,
             tab_id: None,
             error: Some(msg.into()),
@@ -292,7 +340,7 @@ pub(super) fn socket_message_is_read_only(msg: &SocketMessage) -> bool {
             | SocketMessage::QueryState
             | SocketMessage::QueryEvents { .. }
             | SocketMessage::QueryHistory { .. }
-            | SocketMessage::QueryAgentSessions
+            | SocketMessage::QueryAgentSessions { .. }
             | SocketMessage::PairingPending
     )
 }
@@ -301,6 +349,9 @@ pub(super) fn socket_message_action(msg: &SocketMessage) -> &'static str {
     match msg {
         SocketMessage::Notify { .. } => "notify",
         SocketMessage::AgentStatus { .. } => "agent-status",
+        SocketMessage::PromptAgent { .. } => "prompt-agent",
+        SocketMessage::WaitAgentTurn { .. } => "wait-agent-turn",
+        SocketMessage::CancelAgentTurn { .. } => "cancel-agent-turn",
         SocketMessage::WorkContext { .. } => "work-context",
         SocketMessage::WorkReport { .. } => "work-report",
         SocketMessage::OpenPane { .. } => "open-pane",
@@ -328,12 +379,57 @@ pub(super) fn socket_message_action(msg: &SocketMessage) -> &'static str {
         SocketMessage::QueryState => "query-state",
         SocketMessage::QueryEvents { .. } => "query-events",
         SocketMessage::QueryHistory { .. } => "query-history",
-        SocketMessage::QueryAgentSessions => "query-agent-sessions",
+        SocketMessage::QueryAgentSessions { .. } => "query-agent-sessions",
         SocketMessage::AgentWorkspace { .. } => "agent-workspace",
         SocketMessage::PairingOffer => "pairing-offer",
         SocketMessage::PairingPending => "pairing-pending",
         SocketMessage::PairingConfirm { .. } => "pairing-confirm",
         SocketMessage::PairingReject { .. } => "pairing-reject",
         SocketMessage::DeviceRevoke { .. } => "device-revoke",
+    }
+}
+
+#[cfg(test)]
+mod agent_session_schema_tests {
+    use super::*;
+    use crate::agent_sessions::{snapshot_value, AgentSessionsSnapshot, SessionSchema};
+    #[test]
+    fn socket_agent_sessions_schema_defaults_and_v2_projection() {
+        for (request, schema) in [
+            (r#"{"action":"query-agent-sessions"}"#, SessionSchema::V1),
+            (
+                r#"{"action":"query-agent-sessions","schema":"agent.sessions.v2"}"#,
+                SessionSchema::V2,
+            ),
+        ] {
+            let message: SocketMessage = serde_json::from_str(request).unwrap();
+            assert!(
+                matches!(message, SocketMessage::QueryAgentSessions { schema: actual } if actual == schema)
+            );
+            let value = snapshot_value(
+                AgentSessionsSnapshot {
+                    schema: "taarof.agent-sessions.v1",
+                    generated_at_unix_ms: 42,
+                    providers: vec![],
+                    sessions: vec![],
+                    remote_hosts: vec![],
+                },
+                schema,
+            )
+            .unwrap();
+            assert_eq!(
+                value["schema"],
+                if schema == SessionSchema::V1 {
+                    "taarof.agent-sessions.v1"
+                } else {
+                    "agent.sessions.v2"
+                }
+            );
+            assert_eq!(value["generated_at_unix_ms"], 42);
+        }
+        assert!(serde_json::from_str::<SocketMessage>(
+            r#"{"action":"query-agent-sessions","schema":"unknown"}"#
+        )
+        .is_err());
     }
 }

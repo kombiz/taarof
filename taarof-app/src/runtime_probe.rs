@@ -149,12 +149,9 @@ pub(crate) fn runtime_probe_truth_for_state(
     let mut pane_pids = Vec::new();
     for tab in state.all_tabs() {
         tab_pids.push((tab.id, tab.panes.collect_pids()));
-        pane_pids.extend(
-            tab.panes
-                .leaves()
-                .into_iter()
-                .filter_map(|leaf| leaf.shell_pid.map(|pid| (tab.id, leaf.pane_id, pid))),
-        );
+        pane_pids.extend(tab.panes.leaves().into_iter().filter_map(|leaf| {
+            pane_process_root(leaf, now_ms).map(|pid| (tab.id, leaf.pane_id, pid))
+        }));
     }
     runtime_probe_truth(
         state.runtime_probe.as_ref(),
@@ -163,6 +160,43 @@ pub(crate) fn runtime_probe_truth_for_state(
         now_ms,
         ttl_ms,
     )
+}
+
+/// Use the local tmux pane shell, never its attach-client PID, only while the
+/// same-user tmux probe is healthy and current. Remote PIDs are not local /proc.
+pub(crate) fn pane_process_root(leaf: &crate::pane::PaneLeaf, now_ms: u64) -> Option<i32> {
+    local_pane_process_root(leaf.shell_pid, leaf.tmux_backing.as_ref(), now_ms)
+}
+fn local_pane_process_root(
+    shell_pid: Option<i32>,
+    backing: Option<&crate::pane::TmuxBacking>,
+    now_ms: u64,
+) -> Option<i32> {
+    let shell_pid = shell_pid.filter(|pid| *pid > 0)?;
+    backing
+        .and_then(|backing| fresh_local_tmux_pid(backing, now_ms))
+        .or(Some(shell_pid))
+}
+
+/// Shared metadata authority for process-root selection and Attach projection.
+pub(crate) fn fresh_local_tmux_pid(backing: &crate::pane::TmuxBacking, now_ms: u64) -> Option<i32> {
+    if backing.target != crate::tmux::TmuxTarget::Local {
+        return None;
+    }
+    let probe = &backing.pane_info;
+    let fresh = probe
+        .observed_at_unix_ms
+        .and_then(|at| now_ms.checked_sub(at))
+        .is_some_and(|age| age <= crate::tmux::TMUX_METADATA_TTL_MS);
+    (probe.state == ProbeState::Ok && fresh)
+        .then(|| {
+            probe
+                .value
+                .as_ref()
+                .filter(|info| info.pid > 0)
+                .map(|info| info.pid)
+        })
+        .flatten()
 }
 
 pub(crate) fn runtime_process_truth_is_fresh(state: &crate::AppState) -> bool {
@@ -177,6 +211,10 @@ pub(crate) trait RuntimeProbeSource {
     fn probe_process_root(&self, pid: i32) -> Result<(Vec<i32>, Option<String>), String> {
         Ok((self.child_pids(pid), self.process_comm(pid)))
     }
+    /// None means executable identity is unproven; never fall back to comm.
+    fn verified_executable_name(&self, _pid: i32) -> Option<String> {
+        None
+    }
     fn child_pids(&self, pid: i32) -> Vec<i32>;
     fn process_comm(&self, pid: i32) -> Option<String>;
     fn process_cmdline(&self, pid: i32) -> Option<Vec<String>>;
@@ -189,6 +227,31 @@ pub(crate) trait RuntimeProbeSource {
 pub(crate) struct ProcProbeSource;
 
 impl RuntimeProbeSource for ProcProbeSource {
+    fn verified_executable_name(&self, pid: i32) -> Option<String> {
+        let executable = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        // Native launchers can resolve to versioned filenames. A named argv[0]
+        // is usable only when its actual file resolves to this process's exe.
+        let argv = agents::get_process_cmdline(pid)?;
+        if let Some(invocation) = argv.first() {
+            let candidates: Vec<_> = if invocation.starts_with('/') {
+                vec![std::path::PathBuf::from(invocation)]
+            } else if !invocation.contains('/') {
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                    .map(|p| p.join(invocation))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if candidates
+                .iter()
+                .any(|path| std::fs::canonicalize(path).is_ok_and(|path| path == executable))
+            {
+                return Some(invocation.clone());
+            }
+        }
+        executable.into_os_string().into_string().ok()
+    }
+
     fn probe_process_root(&self, pid: i32) -> Result<(Vec<i32>, Option<String>), String> {
         agents::try_get_root_process_facts(pid)
     }
@@ -227,6 +290,8 @@ pub(crate) struct RuntimeProbeSnapshot {
     pub pane_pids: BTreeMap<PaneKey, i32>,
     pub pane_process_states: HashMap<PaneKey, PaneProcessState>,
     pub pane_agents: HashMap<PaneKey, AgentStatus>,
+    /// Strict executable + explicit session identity; advisory matches never enter.
+    pub pane_exact_agents: HashMap<PaneKey, AgentStatus>,
     pub tab_agents: HashMap<u32, AgentStatus>,
     pub tab_ports: HashMap<u32, Vec<u16>>,
     pub process_probe: ProbeState,
@@ -236,6 +301,18 @@ pub(crate) struct RuntimeProbeSnapshot {
 }
 
 impl RuntimeProbeSnapshot {
+    pub(crate) fn retain_tabs(&mut self, live: &HashSet<u32>) {
+        self.tab_pids.retain(|tab, _| live.contains(tab));
+        self.pane_pids.retain(|(tab, _), _| live.contains(tab));
+        self.pane_process_states
+            .retain(|(tab, _), _| live.contains(tab));
+        self.pane_agents.retain(|(tab, _), _| live.contains(tab));
+        self.pane_exact_agents
+            .retain(|(tab, _), _| live.contains(tab));
+        self.tab_agents.retain(|tab, _| live.contains(tab));
+        self.tab_ports.retain(|tab, _| live.contains(tab));
+    }
+
     pub(crate) fn build<S: RuntimeProbeSource + ?Sized>(
         source: &S,
         now_ms: u64,
@@ -253,6 +330,7 @@ impl RuntimeProbeSnapshot {
         }
         let mut pane_process_states = HashMap::new();
         let mut pane_agents = HashMap::new();
+        let mut pane_exact_agents = HashMap::new();
 
         for (tab_id, pane_id, pid) in pane_pids {
             pane_process_states.insert(
@@ -263,6 +341,9 @@ impl RuntimeProbeSnapshot {
                 (*tab_id, *pane_id),
                 cache.agent_status_for_root(source, *pid),
             );
+            if let Some(status) = cache.exact_agent_status_for_root(source, *pid) {
+                pane_exact_agents.insert((*tab_id, *pane_id), status);
+            }
         }
 
         let mut tab_agents = HashMap::new();
@@ -314,6 +395,7 @@ impl RuntimeProbeSnapshot {
             pane_pids: pane_pid_key(pane_pids),
             pane_process_states,
             pane_agents,
+            pane_exact_agents,
             tab_agents,
             tab_ports,
             process_probe,
@@ -338,6 +420,7 @@ impl RuntimeProbeSnapshot {
             pane_pids: pane_pid_key(pane_pids),
             pane_process_states: HashMap::new(),
             pane_agents: HashMap::new(),
+            pane_exact_agents: HashMap::new(),
             tab_agents: HashMap::new(),
             tab_ports: HashMap::new(),
             process_probe: ProbeState::Error,
@@ -349,6 +432,7 @@ impl RuntimeProbeSnapshot {
 
     pub(crate) fn reconcile(mut self, previous: Option<&Self>) -> Self {
         if !matches!(self.process_probe, ProbeState::Ok) {
+            self.pane_exact_agents.clear();
             if let Some(previous) = previous.filter(|previous| {
                 previous.process_observed_at_unix_ms.is_some()
                     && (self
@@ -432,6 +516,7 @@ impl RuntimeProbeSnapshot {
             && self.pane_pids == other.pane_pids
             && self.tab_agents == other.tab_agents
             && self.pane_agents == other.pane_agents
+            && self.pane_exact_agents == other.pane_exact_agents
             && self.tab_ports == other.tab_ports
             && self.process_probe == other.process_probe
             && self.ports_probe == other.ports_probe
@@ -927,6 +1012,33 @@ impl ProcessTreeCache {
         None
     }
 
+    fn exact_agent_status_for_root<S: RuntimeProbeSource + ?Sized>(
+        &mut self,
+        source: &S,
+        root: i32,
+    ) -> Option<AgentStatus> {
+        let tree = self.collect_agent_tree(source, root);
+        if tree.len() >= AGENT_SCAN_MAX_PROCESSES {
+            return None;
+        }
+        let cwd = self.cwd(source, root);
+        let facts = tree
+            .into_iter()
+            .map(|pid| {
+                (
+                    pid,
+                    source.verified_executable_name(pid),
+                    self.cmdline(source, pid),
+                )
+            })
+            .collect::<Vec<_>>();
+        let exact = agents::detect_exact_agent_in_process_facts(cwd.as_deref(), &facts)?;
+        // A native tool nested under an interpreted agent is not the pane
+        // owner. Advisory evidence may veto a conflicting owner; it can never
+        // supply the executable/session proof required above.
+        (self.agent_status_for_root(source, root) == exact).then_some(exact)
+    }
+
     fn agent_status_for_root<S: RuntimeProbeSource + ?Sized>(
         &mut self,
         source: &S,
@@ -992,6 +1104,7 @@ mod tests {
     struct FakeProbeSource {
         children: HashMap<i32, Vec<i32>>,
         comm: HashMap<i32, String>,
+        executables: HashMap<i32, String>,
         cmdline: HashMap<i32, Vec<String>>,
         cwd: HashMap<i32, String>,
         socket_inodes: HashMap<i32, Vec<u64>>,
@@ -1044,6 +1157,10 @@ mod tests {
     }
 
     impl RuntimeProbeSource for FakeProbeSource {
+        fn verified_executable_name(&self, pid: i32) -> Option<String> {
+            self.executables.get(&pid).cloned()
+        }
+
         fn probe_process_root(&self, pid: i32) -> Result<(Vec<i32>, Option<String>), String> {
             if let Some(error) = &self.process_error {
                 return Err(error.clone());
@@ -1133,6 +1250,177 @@ mod tests {
             &[(1, vec![20, 30, 40])],
             &[(1, 7, 20), (1, 8, 30), (1, 9, 40)],
         )
+    }
+
+    #[test]
+    fn exact_attach_local_tmux_root_requires_fresh_positive_local_evidence() {
+        let mut backing = crate::pane::TmuxBacking {
+            session_name: "fixture".into(),
+            target: crate::tmux::TmuxTarget::Local,
+            pane_info: crate::probe::ProbeSnapshot {
+                state: ProbeState::Ok,
+                value: Some(crate::tmux::TmuxPaneInfo {
+                    current_command: "codex".into(),
+                    cwd: "/synthetic".into(),
+                    pid: 77,
+                    width: 80,
+                    height: 24,
+                }),
+                observed_at_unix_ms: Some(1_000),
+                checked_at_unix_ms: Some(1_000),
+                error: None,
+            },
+        };
+        assert_eq!(
+            local_pane_process_root(Some(10), Some(&backing), 1_001),
+            Some(77)
+        );
+        // A healthy five-second metadata cycle must not switch to the tmux
+        // client after the independent three-second process-cache TTL.
+        for now_ms in [4_001, 5_999, 6_000] {
+            let root = local_pane_process_root(Some(10), Some(&backing), now_ms).unwrap();
+            assert_eq!(root, 77);
+            let snapshot = RuntimeProbeSnapshot::build(
+                &FakeProbeSource::default(),
+                now_ms - 1,
+                &[(1, vec![10])],
+                &[(1, 7, 77)],
+            );
+            assert!(snapshot.is_fresh_for(&[(1, vec![10])], &[(1, 7, root)], now_ms, PROBE_TTL_MS));
+        }
+        assert_eq!(
+            local_pane_process_root(Some(10), Some(&backing), 11_001),
+            Some(10)
+        );
+        assert_eq!(
+            local_pane_process_root(Some(10), Some(&backing), 999),
+            Some(10)
+        );
+        for state in [ProbeState::Stale, ProbeState::Error, ProbeState::Unknown] {
+            backing.pane_info.state = state;
+            assert_eq!(
+                local_pane_process_root(Some(10), Some(&backing), 1_001),
+                Some(10)
+            );
+            assert_eq!(fresh_local_tmux_pid(&backing, 1_001), None);
+        }
+        backing.pane_info.state = ProbeState::Ok;
+        assert_eq!(fresh_local_tmux_pid(&backing, 11_000), Some(77));
+        assert_eq!(fresh_local_tmux_pid(&backing, 11_001), None);
+        assert_eq!(fresh_local_tmux_pid(&backing, 999), None);
+        assert_eq!(local_pane_process_root(None, Some(&backing), 1_001), None);
+        backing.pane_info.observed_at_unix_ms = None;
+        assert_eq!(fresh_local_tmux_pid(&backing, 1_001), None);
+        backing.pane_info.observed_at_unix_ms = Some(1_000);
+        backing.target = crate::tmux::TmuxTarget::Remote {
+            ssh_target: "fixture.ts".into(),
+        };
+        assert_eq!(
+            local_pane_process_root(Some(10), Some(&backing), 1_001),
+            Some(10)
+        );
+        backing.target = crate::tmux::TmuxTarget::Local;
+        backing.pane_info.value.as_mut().unwrap().pid = 0;
+        assert_eq!(
+            local_pane_process_root(Some(10), Some(&backing), 1_001),
+            Some(10)
+        );
+        let source = FakeProbeSource::default();
+        let snapshot = RuntimeProbeSnapshot::build(&source, 1_000, &[(1, vec![10])], &[(1, 7, 77)]);
+        assert!(!snapshot.is_fresh_for(&[(1, vec![10])], &[(1, 7, 88)], 1_001, PROBE_TTL_MS));
+    }
+
+    #[test]
+    fn exact_attach_identity_rejects_broad_titles_and_wrapper_arguments() {
+        for (executable, args) in [
+            ("/synthetic/notcodex", argv(&["notcodex", "resume", "same"])),
+            (
+                "/synthetic/echo",
+                argv(&["echo", "codex", "resume", "same"]),
+            ),
+            (
+                "/synthetic/runner",
+                argv(&["runner", "--", "codex", "resume", "same"]),
+            ),
+        ] {
+            let mut source = FakeProbeSource::default();
+            source.comm.insert(10, "codex".into());
+            source.executables.insert(10, executable.into());
+            source.cmdline.insert(10, args);
+            let snapshot =
+                RuntimeProbeSnapshot::build(&source, 1_000, &[(1, vec![10])], &[(1, 7, 10)]);
+            assert!(
+                snapshot.pane_agents[&(1, 7)].running,
+                "advisory detection remains available"
+            );
+            assert!(snapshot.pane_exact_agents.is_empty());
+        }
+    }
+
+    #[test]
+    fn exact_attach_identity_requires_one_explicit_provider_owner_and_fresh_probe() {
+        let mut source = FakeProbeSource::default();
+        source.executables.insert(10, "/synthetic/codex".into());
+        source
+            .cmdline
+            .insert(10, argv(&["codex", "resume", "exact-id"]));
+        let snapshot = RuntimeProbeSnapshot::build(&source, 1_000, &[(1, vec![10])], &[(1, 7, 10)]);
+        assert_eq!(
+            snapshot.pane_exact_agents[&(1, 7)].session_id.as_deref(),
+            Some("exact-id")
+        );
+        let failed = RuntimeProbeSnapshot::worker_failure(
+            1_001,
+            &[(1, vec![10])],
+            &[(1, 7, 10)],
+            RuntimeProbeWorkerFailure::Panicked,
+        )
+        .reconcile(Some(&snapshot));
+        assert!(failed.pane_exact_agents.is_empty());
+        source.children.insert(10, vec![11]);
+        source.executables.insert(11, "/synthetic/claude".into());
+        source
+            .cmdline
+            .insert(11, argv(&["claude", "--resume", "second-id"]));
+        let ambiguous =
+            RuntimeProbeSnapshot::build(&source, 1_002, &[(1, vec![10])], &[(1, 7, 10)]);
+        assert!(ambiguous.pane_exact_agents.is_empty());
+        source.children.clear();
+        for args in [
+            argv(&["codex", "exec", "resume", "payload"]),
+            argv(&["codex", "resume", "id", "--last"]),
+            argv(&["codex", "resume", "id", "--session", "other"]),
+            argv(&["codex", "--", "resume", "payload"]),
+        ] {
+            source.cmdline.insert(10, args);
+            assert!(
+                RuntimeProbeSnapshot::build(&source, 1_003, &[(1, vec![10])], &[(1, 7, 10)])
+                    .pane_exact_agents
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn exact_attach_identity_never_promotes_a_tool_beneath_an_interpreted_owner() {
+        let mut source = FakeProbeSource::default();
+        source.children.insert(10, vec![11]);
+        source.executables.insert(10, "/synthetic/node".into());
+        source.executables.insert(11, "/synthetic/codex".into());
+        source.comm.insert(10, "node".into());
+        source.comm.insert(11, "codex".into());
+        source
+            .cmdline
+            .insert(10, argv(&["node", "/synthetic/pi", "--session", "owner"]));
+        source
+            .cmdline
+            .insert(11, argv(&["codex", "resume", "tool"]));
+        let snapshot = RuntimeProbeSnapshot::build(&source, 1_000, &[(1, vec![10])], &[(1, 7, 10)]);
+        assert_eq!(
+            snapshot.pane_agents[&(1, 7)].agent_name.as_deref(),
+            Some("pi")
+        );
+        assert!(snapshot.pane_exact_agents.is_empty());
     }
 
     #[test]

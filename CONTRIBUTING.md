@@ -4,11 +4,21 @@ Thanks for taking the time to improve `taarof`. This is an early public release,
 so the contribution process is intentionally lightweight: small, focused issues
 and pull requests are the easiest to review.
 
+## Product and experiment
+
+The desktop product is `taarof-app/` with its `taarof-web/` browser client.
+The installed `taarof` command is the Python client in `taarof-cli/taarof`.
+`examples/taarof` is a separate experimental Zellij/SSH launcher with the
+same filename. It uses the [experimental WASM sidebar](wasm-sidebar/README.md),
+not GTK. Neither experiment is installed by the desktop packaging scripts.
+Keep their identities distinct when reporting bugs or changing installation docs.
+
 ## Development setup
 
 `taarof` is a Linux desktop app built with Rust, GTK4/libadwaita/VTE, and a
 Vite-based web client.
 
+Install Bash, Zsh and Fish for the real-shell integration checks.
 Install the system packages for your distribution, then install the Rust and
 Node toolchains. If you use `mise`, run:
 

@@ -1,0 +1,7 @@
+schema = 1
+id = "synthetic"
+display_name = "Synthetic"
+# Replace the script path with the absolute path to this checkout's adapter.py.
+command = ["/usr/bin/python3", "/absolute/path/to/examples/agent-provider-adapter/adapter.py"]
+enabled = false
+capabilities = ["new", "resume"]

@@ -1,0 +1,46 @@
+services:
+  taarof-desktop:
+    build:
+      context: .
+      # Docker daemons can be configured with a bridge-gateway DNS address
+      # even when no resolver is listening there. Build through the host
+      # network so pacman/rustup do not inherit that broken bridge resolver.
+      network: host
+    # Runtime cargo/npm commands still use the service network. Give them
+    # explicit resolvers instead of inheriting a daemon-wide bridge override.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    shm_size: '512m'
+    ports:
+      # noVNC desktop from host: http://127.0.0.1:6901/
+      - "127.0.0.1:6901:3000"
+      # Optional secondary webtop service port.
+      - "127.0.0.1:6902:3001"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:3000/"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: Etc/UTC
+      TITLE: taarof-testing
+      RUSTUP_HOME: /usr/local/rustup
+      CARGO_HOME: /usr/local/cargo
+      PATH: /usr/local/cargo/bin:/lsiopy/bin:/command:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      # Keep container builds out of the bind-mounted host tree. The container's
+      # rustc differs from the host's, so a shared target/ thrashes both caches
+      # and can leave a container-built binary where install-local.sh expects a
+      # host build. The named volume below persists this cache across runs.
+      CARGO_TARGET_DIR: /container-target
+    volumes:
+      # Mount this repo as the container user's working checkout.
+      - ../../:/config/taarof:rw
+      - taarof-container-target:/container-target
+    security_opt:
+      - seccomp:unconfined
+
+volumes:
+  taarof-container-target:
