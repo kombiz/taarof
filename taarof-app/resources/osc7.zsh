@@ -12,8 +12,9 @@ autoload -Uz add-zsh-hook
 
 __taarof_osc7() {
   # URL-encode the path (spaces, unicode, etc.)
+  local LC_ALL=C
   local encoded_path=""
-  local c
+  local c i
   for (( i=1; i<=${#PWD}; i++ )); do
     c="${PWD[i]}"
     case "$c" in

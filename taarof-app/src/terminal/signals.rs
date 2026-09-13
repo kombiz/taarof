@@ -21,6 +21,27 @@ const NOISY_TERMPROPS: &[&str] = &[
 const OUTPUT_SCAN_DEBOUNCE: Duration = Duration::from_millis(350);
 const OUTPUT_SCAN_MAX_LINES: usize = 48;
 
+fn emit_agent_activity_transition(state: &Rc<RefCell<AppState>>, tab_id: u32, pane_id: u32) {
+    let evidence = state.borrow().find_tab(tab_id).map(|(_, tab)| {
+        (
+            tab.pane_lifecycle(pane_id),
+            tab.pane_agent_activity(pane_id)
+                .and_then(|activity| activity.source.clone()),
+        )
+    });
+    if let Some((lifecycle, source)) = evidence {
+        crate::runtime::RuntimeHandle::from_shared_state(state.clone()).emit_event(
+            "agent_activity_changed",
+            serde_json::json!({
+                "tab_id": tab_id,
+                "pane_id": pane_id,
+                "state": crate::agents::turn_lifecycle_label(lifecycle),
+                "source": source,
+            }),
+        );
+    }
+}
+
 pub(super) fn connect_pane_focus_tracking(
     terminal: &vte::Terminal,
     state: &Rc<RefCell<AppState>>,
@@ -237,23 +258,28 @@ fn schedule_termprop_done_clear(
     done_at: std::time::Instant,
 ) {
     glib::timeout_add_local_once(crate::workspace::DONE_ACTIVITY_VISIBILITY, move || {
-        let should_refresh = {
+        let (should_refresh, lifecycle_changed) = {
             let mut st = state.borrow_mut();
             let Some(tab) = st.find_tab_mut(tab_id) else {
                 return;
             };
-            tab.clear_pane_agent_activity_if(pane_id, |activity| {
+            let before = tab.pane_lifecycle(pane_id);
+            let changed = tab.clear_pane_agent_activity_if(pane_id, |activity| {
                 matches!(activity.state, crate::workspace::AgentActivityState::Done)
                     && matches!(
                         activity.origin,
                         crate::workspace::AgentActivityOrigin::Termprop
                     )
                     && activity.updated_at == done_at
-            })
+            });
+            (changed, before != tab.pane_lifecycle(pane_id))
         };
 
         if should_refresh {
             crate::sidebar::refresh_tab_row(&tab_list, &state, tab_id);
+        }
+        if lifecycle_changed {
+            emit_agent_activity_transition(&state, tab_id, pane_id);
         }
     });
 }
@@ -277,15 +303,16 @@ fn sync_agent_activity_from_termprops(
     }
 
     let mut clear_at = None;
-    let should_refresh = {
+    let (should_refresh, lifecycle_changed) = {
         let mut st = state.borrow_mut();
         let active_tab_id = st.active_ws().map_or(0, |ws| ws.active_tab);
         let Some(tab) = st.find_tab_mut(tab_id) else {
             return;
         };
 
+        let before = tab.pane_lifecycle(pane_id);
         let fallback_source = tab.agent_name.clone();
-        match parsed_state {
+        let changed = match parsed_state {
             Some(crate::workspace::AgentActivityState::Idle) | None => {
                 tab.clear_pane_agent_activity(pane_id)
             }
@@ -402,12 +429,16 @@ fn sync_agent_activity_from_termprops(
                 }
                 true
             }
-        }
+        };
+        (changed, before != tab.pane_lifecycle(pane_id))
     };
 
     if should_refresh {
         crate::sidebar::refresh_tab_row(tab_list, state, tab_id);
         crate::dashboard::refresh_dashboard_if_open(state, term_stack);
+    }
+    if lifecycle_changed {
+        emit_agent_activity_transition(state, tab_id, pane_id);
     }
 
     if let Some(done_at) = clear_at {
@@ -428,11 +459,12 @@ fn labeled_pane_notification(
     crate::agents::format_agent_notification(source, multi_pane.then_some(pane_id), summary)
 }
 
-/// VTE's built-in termprop for an OSC 133;A (prompt-start) semantic marker.
+/// VTE's built-in prompt signal, emitted with OSC 666;vte.shell.precmd! ST.
 const SHELL_PRECMD_TERMPROP: &str = "vte.shell.precmd";
 
-/// Record a prompt-marker cursor row whenever VTE parses an OSC 133;A sequence,
-/// which it surfaces as the built-in `vte.shell.precmd` termprop. These marks
+/// Record a prompt-marker cursor row on the explicit `vte.shell.precmd` signal.
+/// The shell helper emits this alongside OSC 133; OSC 133 alone is insufficient.
+/// These marks
 /// power exact command-block copy and jump-to-prompt scrolling. The prop is a
 /// VTE built-in (no `install_termprop` needed) and is already in
 /// `NOISY_TERMPROPS`, so `connect_notifications` never raises a notification for
@@ -633,18 +665,22 @@ fn update_output_scanned_activity(
     let scanned_activity = sample_recent_terminal_output(terminal)
         .and_then(|text| crate::agents::scan_output_signal(&text));
 
-    let should_refresh = {
+    let (should_refresh, lifecycle_changed) = {
         let mut st = state.borrow_mut();
         let Some(tab) = st.find_tab_mut(tab_id) else {
             return;
         };
-
-        apply_scanned_output_activity(tab, pane_id, scanned_activity)
+        let before = tab.pane_lifecycle(pane_id);
+        let changed = apply_scanned_output_activity(tab, pane_id, scanned_activity);
+        (changed, before != tab.pane_lifecycle(pane_id))
     };
 
     if should_refresh {
         crate::sidebar::refresh_tab_row(tab_list, state, tab_id);
         crate::dashboard::refresh_dashboard_if_open(state, term_stack);
+    }
+    if lifecycle_changed {
+        emit_agent_activity_transition(state, tab_id, pane_id);
     }
 }
 

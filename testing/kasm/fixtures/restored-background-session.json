@@ -1,0 +1,50 @@
+{
+  "version": 2,
+  "session_name": "restored-close-regression",
+  "workspaces": [
+    {
+      "id": 1,
+      "name": "default",
+      "tabs": [
+        {
+          "name": "Active",
+          "cwd": "/tmp",
+          "panes": {
+            "type": "leaf",
+            "cwd": "/tmp"
+          }
+        },
+        {
+          "name": "Restored-Target",
+          "cwd": "/tmp",
+          "panes": {
+            "type": "leaf",
+            "cwd": "/tmp"
+          }
+        },
+        {
+          "name": "Restored-Sibling",
+          "cwd": "/tmp",
+          "panes": {
+            "type": "split",
+            "direction": "vertical",
+            "ratio": 0.5,
+            "first": {
+              "type": "leaf",
+              "cwd": "/tmp"
+            },
+            "second": {
+              "type": "leaf",
+              "cwd": "/tmp"
+            }
+          }
+        }
+      ],
+      "active_tab_index": 0
+    }
+  ],
+  "active_workspace_index": 0,
+  "window_width": 1200,
+  "window_height": 800,
+  "background_section_collapsed": true
+}

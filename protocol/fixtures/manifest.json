@@ -1,6 +1,11 @@
 {
   "positive": [
     {
+      "name": "input_delivery_results",
+      "type": "terminal_frames",
+      "file": "positive/terminal-input-results.json"
+    },
+    {
       "name": "negotiate_request",
       "type": "negotiation",
       "file": "positive/negotiate-request.json"

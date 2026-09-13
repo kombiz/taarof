@@ -452,7 +452,52 @@ configured or backing live tmux panes — from those hosts over SSH.
 {"action":"query-agent-sessions"}
 ```
 
-Response schema: `taarof.agent-sessions.v1`
+Default response schema: `taarof.agent-sessions.v1` (unchanged).
+
+Opt into the additive shared contract with
+`{"action":"query-agent-sessions","schema":"agent.sessions.v2"}` or
+`GET /api/v1/agent-sessions?schema=agent.sessions.v2`. Unknown schema names are
+rejected (HTTP 400). Both versions use the same cached discovery and retain the
+existing socket and HTTP trust boundaries.
+
+V2 returns `schema`, `generated_at_unix_ms`, `providers`, `sessions`, and
+`remote_hosts`. Each session has a structured `stable_ref` containing
+`provider_id`, canonical `host_identity`, and the opaque `session_id`. Host DNS
+case and a final dot normalize; callers must supply canonical host identity,
+not a display alias. Taarof uses the local kernel hostname and its existing
+configured SSH destination (preserving remote username case). SSH aliases are
+not resolved: different configured destinations remain distinct. Renaming a
+display label or moving cwd does not change
+identity. Only exact stable refs deduplicate; active records sort first, then
+newest update time. V1's historical cwd-based live hint is preserved for v1 but
+does not become exact live authority in v2.
+
+Render only the v2 `display` fields (`provider`, `session_id`, `host`, `title`,
+`cwd`, optional `repo_root`), bounded to 256 Unicode scalar values with terminal
+escapes, controls, line breaks, and bidi controls removed. Provider/host warnings,
+errors, and live-binding labels receive the same treatment. `stable_ref` and
+structured action arguments are machine data, not safe UI labels. V2 titles use
+provider/session metadata, because legacy titles can contain prompt excerpts;
+legacy v1 titles remain unchanged.
+
+V2 also includes `state`, `source`, `confidence`, timestamps, `warnings`, an
+optional exact `live_binding`, and `actions`. Each action carries `kind`,
+`transport`, `program`, `argv`, `cwd`, optional structured `remote` destination,
+and `confirmation`. Remote plans require the existing explicit SSH target;
+a host display label alone never authorizes a remote action. Degraded remote
+source warnings stay visible. Resume plans require confirmation; this task adds
+no executor or attach implementation.
+
+The `agent-session-core` path dependency owns the existing local parsers,
+provider status, discovery cache, normalization, and planning. It has no GTK,
+VTE, application-state, HTTP, or Unix-socket dependency. Its built-in registry
+exposes versioned metadata and discovery/planning traits. Copilot retains its
+existing history-unavailable status. The legacy `resume_command` is copy/display
+metadata only: automatic restoration passes structured argv to the existing
+spawn seam; manual resume encodes structured words into the already-running
+idle shell without reading or parsing that metadata.
+
+The following tables describe the default **v1** payload.
 
 Top-level fields:
 
@@ -661,6 +706,20 @@ guessing. In that case, call `list-detached` first and retry with either
 `host` is a human-facing label and `ssh_target` is the exact remote tmux target.
 Prefer `ssh_target` when automating remote reattach flows.
 
+The launcher can instead supply `expected_agent`, copied unchanged from a v2
+Attach action's `attach` object. This guards an **already live pane**: Taarof
+rechecks fresh process identity, full host/provider/session identity, workspace,
+tab, pane, and tmux target before focusing that pane through its typed attach
+handler. A disappeared, changed, or duplicate identity fails with a refresh
+error. It never silently creates a replacement provider process. The top-level
+`session_name` and `ssh_target` must match the guarded object; `host` is omitted.
+Headless runtimes reject this desktop-only operation.
+
+Socket v2 catalogs advertise Attach only for fresh exact per-pane identities
+with a tmux backing. Cwd/recency hints are labelled inferred and never authorize
+Attach. Local provider-history relaunch remains Resume. HTTP v2 stays an
+observation surface and does not advertise these guarded socket Attach plans.
+
 ## HTTP API (opt-in)
 
 The HTTP API is token-gated local automation, not a second implementation of
@@ -732,6 +791,10 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7800/api/v1/state
 | POST | `/api/v1/control/switch-tab` | Yes + control gate | Focus a tab |
 | POST | `/api/v1/control/create-tab` | Yes + control gate | Create a terminal tab |
 | POST | `/api/v1/control/split-pane` | Yes + control gate | Split a tab and optionally run a command in the new pane |
+
+The raw PTY WebSocket reconstructs a bounded terminal checkpoint; see
+[checkpoint coverage and renderer checks](terminal-checkpoints.md) for supported
+semantics and known limits.
 
 The read-only REST endpoints return the same JSON shapes as the Unix socket
 `query-state`, `query-events`, `query-history`, and `query-agent-sessions` messages, wrapped in
@@ -853,13 +916,18 @@ Request bodies:
 ```
 
 ```json
-{"tab":"server","direction":"horizontal","command":"cargo test","working_dir":"/tmp/user/project"}
+{"tab":"server","direction":"horizontal","command":"cargo test","working_dir":"/tmp/user/project","idempotency_key":"build-split-42"}
 ```
 
 Successful requests return `{"ok": true, "data": ...}` where `data` is the
 typed socket command response: `send-keys`, `run-in-pane`, and `switch-tab`
 return `{"ok":true}`; `create-tab` also returns `tab_id`; and `split-pane`
-also returns `pane_id`. The OpenAPI operation schema is authoritative for each
+also returns the exact `workspace_id`, `tab_id`, and `pane_id`. A bounded
+`idempotency_key` (1–128 ASCII letters, digits, `-`, `_`, `.`, or `:`) makes
+retries return the original target; reuse for different inputs is rejected.
+Records expire after ten minutes, are capped at 256 per running process, and
+store only a request fingerprint and target IDs—not commands or environment.
+The OpenAPI operation schema is authoritative for each
 route. Accepted actions emit an `http_control_action`
 event containing only audit metadata such as action name, requested tab target,
 pane ID, and response tab/pane IDs. The event payload does not include typed
@@ -875,6 +943,70 @@ The HTTP control routes and browser control WebSocket are covered by
 `http_control_` tests for disabled mode, auth failure, loopback-only enablement,
 bridge dispatch, runtime error response bodies, input-frame forwarding, and
 resize-frame handling.
+
+### Prompting one agent turn over the Unix socket
+
+The privileged same-user socket exposes a two-phase agent-turn operation. It
+is intentionally not an HTTP route. First submit a prompt to an exact tab and
+pane:
+
+```json
+{"action":"prompt-agent","tab":"12","pane":4,"prompt":"Run the focused tests."}
+```
+
+Prompts are single-line UTF-8 text; newline, carriage-return, and NUL bytes are
+rejected so a payload cannot submit early or add a second Enter. On successful
+delivery, the response immediately includes a `turn_token`, the
+post-submission event `boundary_seq`, and the pane's `pre_state`. Prompt text is
+sent through the existing `send-keys` path but is never copied into events,
+diagnostics, or the in-process turn registry.
+
+For tmux-backed panes, the existing `send-keys` adapter necessarily places the
+text in the short-lived local `tmux` process argv, so same-user `/proc` access
+remains inside this privileged local control surface's trust boundary. Then
+wait using the token:
+
+```json
+{"action":"wait-agent-turn","turn_token":"…","timeout_seconds":120,"scrollback":1000,"max_output_bytes":65536}
+```
+
+The wait observes only `agent_activity_changed` events after its boundary for
+that exact tab and pane; it does not poll terminal text. A matching `done`,
+`waiting-input`, or `errored` transition completes the wait. `idle` completes
+only after a post-boundary `running` transition. The response contains both
+transition evidence and a bounded UTF-8 tail captured through the existing
+logical-line `get-text` path, including original/returned byte counts and
+explicit truncation metadata. Missing provider attribution is reported as
+`degraded-generic` evidence rather than inferred.
+
+When the exact pane is bound to a Claude Code or Codex structured transcript,
+`evidence.native_turn` may additionally contain `provider`, `id`, and
+`observed_at_unix_ms`. Claude uses the most recent non-meta user record UUID
+that opens the turn; Codex uses the rollout `turn_id` when present. This
+identity is returned
+only when it belongs to the same detected provider process/session, differs
+from the identity seen before the prompt, and was observed inside the
+post-prompt window. An ID first exposed on a completion record is accepted;
+data that is still missing or delayed when the generic transition completes,
+malformed, stale, unknown-provider, or session-mismatched leaves `native_turn`
+as `null`. It never changes the provider-neutral completion outcome.
+Provider/process detection must already identify the exact pane when the prompt
+is submitted; a binding that appears only afterward intentionally falls back to
+the generic token for that turn.
+
+Typed outcomes include `completed`, `waiting-input`, `errored`, `timeout`,
+`cancelled`, `pane-exited`, and `event-ring-overflow`. A pending token can be
+cancelled with `{"action":"cancel-agent-turn","turn_token":"…"}`. Tokens are
+process-local, expire after 15 minutes, and permit only one active waiter.
+
+The CLI combines both phases by default:
+
+```bash
+taarof prompt-agent --tab 12 --pane 4 --prompt 'Run the focused tests.'
+```
+
+Use `--no-wait` to receive the token immediately, followed by
+`taarof wait-agent-turn TOKEN` or `taarof cancel-agent-turn TOKEN`.
 
 The same Axum service also serves the browser client at `/`. For local startup,
 open:
@@ -973,6 +1105,67 @@ capture fails terminally, taarof sends an error frame and then closes the socket
 ```json
 {"type":"error","pane_id":7,"error":"command exited with status ..."}
 ```
+
+### Broker PTY output delivery
+
+Each broker pane admits at most four native receivers and sixteen raw WebSocket
+observers. Native queues retain at most 4 MiB and 512 entries each (at most 8 KiB
+per entry), including initial replay. A full native queue backpressures that
+pane's child without holding the broker state lock. Native bytes stay ordered;
+queries, resize and other panes remain usable. A native attachment is registered
+before the product starts reading its child. A later native attachment whose
+initial history was evicted fails explicitly instead of receiving a suffix.
+
+Raw WebSocket observers retain coalesced notifications, then read at most 64 KiB
+and eight replay frames per batch. Falling behind the existing 4 MiB replay
+window triggers an explicit checkpoint reset. Every socket send has a two-second
+deadline; a stalled send disconnects and releases its observer slot. More than
+sixteen observers receives `observer_limit`. A checkpoint that exceeds the
+conservative 256 KiB reconstruction budget fails with `checkpoint_limit` before
+copying or serializing the model. Resize can make a later checkpoint exceed
+that budget. Native output and replay continue unchanged.
+
+Natural child exit drains queued output and waits for VTE's consumed-output EOF
+before automatic pane cleanup. The direct child is reaped while that drain is
+pending; descendants retaining the PTY can delay EOF. Explicit pane close cancels
+pending delivery immediately and reaps off the GTK thread. A reader or conduit
+failure is reported and terminates the failed attachment instead of waiting for
+an EOF that can no longer arrive. Admitted web input outcomes still drain after
+final output before the connection closes.
+
+These are per-pane subscriber limits, not a bound on total application RSS or
+terminal-model retention. See [checkpoint memory limits](terminal-checkpoints.md#subscriber-memory-accounting)
+for copies, metadata and the separate pathological combining-text limitation.
+
+### Broker PTY input completion
+
+The broker-owned `/api/v1/tabs/{tab_id}/panes/{pane_id}/pty/ws` route requires
+bearer authentication, the loopback bind, and `[http_control].enabled = true`.
+It starts with a checkpoint and uses the terminal-frame protocol. GTK validates
+pane identity, epoch, grant and deadline, then admits input without waiting for
+the child. One FIFO writer per pane handles native VTE-encoded input and web
+input. It holds at most 16 queued jobs plus one active job, each at most 65,536
+bytes; each WebSocket also permits at most 16 pending input completions.
+Saturation is rejected explicitly. Native input applies backpressure on its
+relay thread, preserving VTE encoding and keeping GTK responsive.
+
+An input `ack` means all bytes were accepted by PTY writes, not that the child
+consumed or acted on them. Input acknowledgements and errors carry an optional
+`input_result` object; resize acknowledgements and output cursors keep their
+existing meaning. For example:
+
+```json
+{"input_seq":"1","requested_bytes":65536,"written_bytes":11776,"status":"deadline_expired"}
+```
+
+The decimal `input_seq` is echoed when supplied. Terminal statuses are
+`delivered`, `cancelled`, `deadline_expired`, `closed`, `write_failed`, or
+`rejected` (never admitted). Partial delivery is reported explicitly. The signed
+deadline bounds admission and delivery, with a maximum five-second server wait.
+A terminal outcome cancels the unwritten remainder; those bytes cannot be sent
+later when the child resumes reading. Disconnect cancels pending input, and pane
+closure stops its writer. Already accepted bytes cannot be recalled. A timeout
+before GTK admission releases the pending slot and prevents delayed dispatch.
 
 ### WebSocket pane control
 
@@ -1382,3 +1575,10 @@ the `replace` fallback, and HTTPS remote attachment.
 
 The unsafe non-loopback HTTP escape hatch remains diagnostics-only. Do not use
 it as a supported control deployment path.
+
+Exact launcher Attach currently requires a local native executable with a
+verifiable provider signature and canonical resume argv whose ID exists in
+provider history. Additional flags, resume names, and prefixes cannot authorize
+Attach. Interpreter
+wrappers, title-only detection, and remote process IDs remain observation-only;
+remote cached provider history can still offer Resume after a healthy refresh.

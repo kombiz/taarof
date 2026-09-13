@@ -7,8 +7,9 @@
 //! deterministic) child processes over a real PTY, so they run headlessly
 //! without GTK.
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
+use taarof_app::pty_broker::NativeSubscription;
 
 use taarof_app::pty_broker::{PtyBroker, SpawnSpec};
 
@@ -16,7 +17,7 @@ use taarof_app::pty_broker::{PtyBroker, SpawnSpec};
 /// the child exits, so `recv` reports `Disconnected` and the loop ends. A
 /// timeout is a test failure, not a normal exit, so a hung child cannot wedge
 /// the suite.
-fn drain_to_eof(rx: Receiver<Vec<u8>>) -> Vec<u8> {
+fn drain_to_eof(rx: NativeSubscription) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
         match rx.recv_timeout(Duration::from_secs(10)) {
@@ -47,7 +48,7 @@ fn fake_child_fans_identical_ordered_bytes_to_presentation_replay_and_model() {
     let pane = spawn_sh(&format!("printf '{marker}'"), 80, 24);
 
     // Subscribe as the "local presentation" consumer would.
-    let rx = pane.subscribe();
+    let rx = pane.subscribe().expect("native subscription");
 
     // Collect everything the presentation subscriber sees.
     let presentation = drain_to_eof(rx);
@@ -76,7 +77,7 @@ fn fake_child_fans_identical_ordered_bytes_to_presentation_replay_and_model() {
 
     // The state model is fed the same bytes, so its projection must reflect the
     // marker on the first row.
-    let visible = pane.with_model(|model| model.projection().visible_text.join("\n"));
+    let visible = pane.with_model(|model| model.projection().unwrap().visible_text.join("\n"));
     assert!(
         visible.contains(marker),
         "state model must reflect the same bytes; visible text was {visible:?}"
@@ -102,7 +103,10 @@ fn pty_child_does_not_receive_ambient_or_explicit_infisical_tokens() {
     })
     .expect("broker should spawn the token-boundary probe");
 
-    let output = String::from_utf8_lossy(&drain_to_eof(pane.subscribe())).into_owned();
+    let output = String::from_utf8_lossy(&drain_to_eof(
+        pane.subscribe().expect("native subscription"),
+    ))
+    .into_owned();
     assert!(
         output.contains("TOKENS_ABSENT"),
         "PTY child must not receive ambient Infisical tokens; saw {output:?}"
@@ -115,7 +119,7 @@ fn write_input_reaches_child_over_the_pty() {
     // The child reads one line from its PTY stdin and echoes it back with a
     // recognizable prefix. This exercises `write_input` end to end.
     let pane = spawn_sh("IFS= read -r line; printf 'GOT:%s\\n' \"$line\"", 80, 24);
-    let rx = pane.subscribe();
+    let rx = pane.subscribe().expect("native subscription");
 
     pane.write_input(b"hello-input\n")
         .expect("write_input should deliver bytes to the PTY master");
@@ -132,7 +136,7 @@ fn spawn_applies_initial_window_size_and_resize_updates_the_model() {
     // `stty size` prints "rows cols" for its controlling tty, proving the
     // broker's initial winsize propagated to the child PTY.
     let pane = spawn_sh("stty size", 80, 24);
-    let rx = pane.subscribe();
+    let rx = pane.subscribe().expect("native subscription");
     let output = String::from_utf8_lossy(&drain_to_eof(rx)).into_owned();
     assert!(
         output.contains("24 80"),
@@ -145,7 +149,7 @@ fn spawn_applies_initial_window_size_and_resize_updates_the_model() {
         .resize(120, 40)
         .expect("resize should succeed on a live PTY");
     let (cols, rows) = long_lived.with_model(|model| {
-        let projection = model.projection();
+        let projection = model.projection().unwrap();
         (projection.cols, projection.rows)
     });
     assert_eq!(
@@ -156,7 +160,7 @@ fn spawn_applies_initial_window_size_and_resize_updates_the_model() {
     long_lived
         .write_input(b"\n")
         .expect("unblock the child so it exits cleanly");
-    drain_to_eof(long_lived.subscribe());
+    drain_to_eof(long_lived.subscribe().expect("native subscription"));
 }
 
 /// Poll the broker's non-blocking exit code (the exact call the GTK exit poller
@@ -181,4 +185,46 @@ fn signal_killed_child_surfaces_128_plus_signal_not_success() {
     let pane = spawn_sh("kill -9 $$", 80, 24);
     let code = wait_for_exit_code(&pane);
     assert_eq!(code, 137, "SIGKILL child must surface 128+9, got {code}");
+}
+
+#[test]
+fn combining_overflow_preserves_exact_native_and_replay_bytes_but_refuses_checkpoint() {
+    let pane = PtyBroker::spawn(SpawnSpec {
+        argv: vec!["python3".into(), "-c".into(),
+            "import os\nb = b'a' + b'\\xcc\\x81' * 262144\nwhile b:\n n = os.write(1, b); b = b[n:]".into()],
+        cwd: None,
+        env: vec![],
+        cols: 4,
+        rows: 2,
+    }).unwrap();
+    let native = drain_to_eof(pane.subscribe().unwrap());
+    let expected = [b"a".as_slice(), "\u{301}".repeat(262144).as_bytes()].concat();
+    assert_eq!(
+        native, expected,
+        "native delivery must be byte-identical despite model overflow"
+    );
+    let replay = pane.with_replay(|window| {
+        window
+            .frames()
+            .iter()
+            .flat_map(|frame| frame.payload.iter().copied())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        replay, expected,
+        "replay is not model text and must never be truncated"
+    );
+    let cursor = pane.with_replay(|window| window.latest_seq());
+    let error = pane.bounded_checkpoint(256 * 1024).unwrap_err();
+    assert!(error
+        .get_ref()
+        .unwrap()
+        .is::<taarof_app::pty_broker::screen::ModelDegraded>());
+    assert!(
+        pane.checkpoint().is_err(),
+        "unbudgeted caller must also refuse degraded state"
+    );
+    assert_eq!(pane.with_replay(|window| window.latest_seq()), cursor);
+    assert!(pane.with_model(|model| model.retained_text_bytes().unwrap()) <= 16 * 1024);
+    assert!(pane.wait().unwrap().success());
 }

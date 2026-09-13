@@ -75,6 +75,41 @@ pub(crate) fn detached_session_command_key(
     (target.clone(), session_name.to_string())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DetachedFinishNotification {
+    summary: String,
+    body: String,
+}
+
+fn detached_finish_notification(session: &DetachedSession) -> DetachedFinishNotification {
+    let command = session
+        .last_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .and_then(|command| command.rsplit('/').next())
+        .unwrap_or("Command");
+    let command = command
+        .chars()
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + &command[first.len_utf8()..])
+        .unwrap_or_else(|| "Command".to_string());
+    let workspace = session.workspace.trim();
+    let summary = if workspace.is_empty() {
+        format!("{command} finished")
+    } else {
+        format!("{command} finished — {workspace}")
+    };
+    let session_name = session
+        .session_name
+        .strip_prefix("taarof--")
+        .unwrap_or(&session.session_name);
+    DetachedFinishNotification {
+        summary,
+        body: format!("Session {session_name} · {}", session.host),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionStatus {
     Running,
@@ -1395,16 +1430,10 @@ pub fn check_and_notify_finished(
                 ds.finished = true;
                 newly_finished.push(ds.session_name.clone());
 
-                let summary = format!(
-                    "taarof: {} finished",
-                    ds.session_name
-                        .strip_prefix("taarof--")
-                        .unwrap_or(&ds.session_name)
-                );
-                let body = format!("on {}", ds.host);
+                let notification = detached_finish_notification(ds);
                 if let Err(e) = notify_rust::Notification::new()
-                    .summary(&summary)
-                    .body(&body)
+                    .summary(&notification.summary)
+                    .body(&notification.body)
                     .icon("utilities-terminal")
                     .timeout(notify_rust::Timeout::Milliseconds(5000))
                     .show()
@@ -1921,6 +1950,23 @@ mod tests {
         let finished = check_and_notify_finished(&mut detached, &cmds);
         assert_eq!(finished, vec!["taarof--default--t3--0"]);
         assert!(detached[0].finished);
+    }
+
+    #[test]
+    fn detached_finish_notification_names_command_workspace_session_and_host() {
+        let detached = DetachedSession {
+            session_name: "taarof--default--t3--0".into(),
+            host: "c1-box".into(),
+            workspace: "LM-HQ".into(),
+            target: TmuxTarget::Local,
+            detached_at: Instant::now(),
+            last_command: Some("/usr/bin/codex".into()),
+            finished: true,
+        };
+
+        let notification = detached_finish_notification(&detached);
+        assert_eq!(notification.summary, "Codex finished — LM-HQ");
+        assert_eq!(notification.body, "Session default--t3--0 · c1-box");
     }
 
     #[test]

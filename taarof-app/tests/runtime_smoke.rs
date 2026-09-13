@@ -814,12 +814,22 @@ fn http_pty_adapter_streams_checkpoint_and_acks_input_over_real_server() {
                     HttpBridgeRequest::DispatchPtyInput {
                         guard,
                         payload,
+                        cancelled,
+                        admission_lock,
                         reply,
                         ..
                     } => {
+                        let _admission = admission_lock.lock().unwrap();
+                        if reply.is_closed() {
+                            continue;
+                        }
                         let result = if guard.expected_epoch == pane_bg.epoch().to_string() {
                             pane_bg
-                                .write_input(&payload)
+                                .submit_input(
+                                    payload,
+                                    Instant::now() + Duration::from_secs(5),
+                                    cancelled,
+                                )
                                 .map_err(|error| error.to_string())
                         } else {
                             Err("epoch changed".to_string())

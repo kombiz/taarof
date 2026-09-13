@@ -19,12 +19,16 @@
     "src/panePtyFrames.ts",
     "src/panePtyFrames.test.ts",
     "src/terminalLinks.test.ts",
+    "src/terminalBufferText.test.ts",
     "src/terminalOsc8Activation.test.ts",
     "src/terminalLinkDisambiguation.test.ts",
     "src/api.test.ts",
     "src/runtimeProbe.test.ts",
+    "src/agentActivity.test.ts",
     "src/components/MonitorView.helpers.test.ts",
-    "src/components/AgentsView.helpers.test.ts"
-    ,"src/components/HistoryView.helpers.test.ts"
+    "src/components/AgentsView.helpers.test.ts",
+    "src/components/HistoryView.helpers.test.ts",
+    "src/components/PaneStage.helpers.test.ts",
+    "src/components/PaneTerminal.lifecycle.test.ts"
   ]
 }

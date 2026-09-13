@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# taarof — agent workspace launcher for multi-agent AI development
+# EXPERIMENTAL: Zellij/SSH launcher, not the installed GTK app Python CLI.
+# The supported CLI is taarof-cli/taarof. See wasm-sidebar/README.md.
 # Usage:
 #   taarof <session> host1 host2 ...  → widescreen fleet view (up to 3 hosts per tab)
 #   taarof <session>                  → local workspace in current directory
@@ -17,7 +18,8 @@ ALERTS_LOG="${DATA_HOME}/agent-terminal/alerts.log"
 
 usage() {
     cat <<'EOF'
-taarof — agent workspace launcher
+EXPERIMENTAL: Zellij/SSH workspace launcher (examples/taarof)
+The installed GTK app CLI is taarof-cli/taarof. Do not replace it with this file.
 
 Usage:
   taarof [--cwd <path>] <session>                         Local workspace

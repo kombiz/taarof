@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Fixture paths are isolated from the caller's Cargo build configuration.
+unset CARGO_TARGET_DIR
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 fixture="$(mktemp -d)"

@@ -82,7 +82,7 @@ impl AgentLifecycle {
         match self {
             Self::Working => "🟢 WORKING",
             Self::WaitingInput => "🟡 WAITING",
-            Self::Done => "✅ DONE",
+            Self::Done => "✓ TURN ENDED",
             Self::Errored => "🔴 ERRORED",
             Self::Idle => "💤 IDLE",
         }

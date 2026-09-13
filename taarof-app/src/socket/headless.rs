@@ -235,6 +235,11 @@ pub(super) fn handle_headless_smoke_socket_message(
             handle_headless_detach_pane(state, tab.as_ref(), pane)
         }
         SocketMessage::AttachSession {
+            expected_agent: Some(_),
+            ..
+        } => SocketResponse::err("Exact live attach requires a running desktop pane."),
+        SocketMessage::AttachSession {
+            expected_agent: None,
             session_name,
             host,
             ssh_target,

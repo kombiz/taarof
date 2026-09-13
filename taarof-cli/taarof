@@ -2066,6 +2066,61 @@ def cmd_open_pane(args: argparse.Namespace) -> Any:
     return socket_send(msg, session=args.session)
 
 
+def cmd_split_pane(args: argparse.Namespace) -> Any:
+    msg: dict[str, Any] = {"action": "split-pane"}
+    _optional(msg, "tab", args.tab)
+    _optional(msg, "direction", args.direction)
+    _optional(msg, "command", args.command)
+    _optional(msg, "working_dir", args.cwd)
+    _optional(msg, "idempotency_key", args.idempotency_key)
+    return socket_send(msg, session=args.session)
+
+
+def cmd_prompt_agent(args: argparse.Namespace) -> Any:
+    if args.prompt_file:
+        try:
+            prompt = Path(args.prompt_file).read_text(encoding="utf-8").removesuffix("\n")
+        except OSError as err:
+            raise SystemExit(f"failed to read --prompt-file {args.prompt_file}: {err}")
+    elif args.stdin:
+        prompt = sys.stdin.read().removesuffix("\n")
+    else:
+        prompt = args.prompt
+    submitted = socket_send({
+        "action": "prompt-agent",
+        "tab": args.tab,
+        "pane": args.pane,
+        "prompt": prompt,
+    }, session=args.session)
+    if not submitted.get("ok") or args.no_wait:
+        return submitted
+    token = (submitted.get("data") or {}).get("turn_token")
+    if not token:
+        return submitted
+    wait: dict[str, Any] = {"action": "wait-agent-turn", "turn_token": token}
+    _optional(wait, "timeout_seconds", args.timeout)
+    _optional(wait, "scrollback", args.scrollback)
+    _optional(wait, "max_output_bytes", args.max_output_bytes)
+    socket_timeout = (args.timeout if args.timeout is not None else 120.0) + 5.0
+    return socket_send(wait, session=args.session, timeout=socket_timeout)
+
+
+def cmd_wait_agent_turn(args: argparse.Namespace) -> Any:
+    msg: dict[str, Any] = {"action": "wait-agent-turn", "turn_token": args.turn_token}
+    _optional(msg, "timeout_seconds", args.timeout)
+    _optional(msg, "scrollback", args.scrollback)
+    _optional(msg, "max_output_bytes", args.max_output_bytes)
+    socket_timeout = (args.timeout if args.timeout is not None else 120.0) + 5.0
+    return socket_send(msg, session=args.session, timeout=socket_timeout)
+
+
+def cmd_cancel_agent_turn(args: argparse.Namespace) -> Any:
+    return socket_send(
+        {"action": "cancel-agent-turn", "turn_token": args.turn_token},
+        session=args.session,
+    )
+
+
 def cmd_close_pane(args: argparse.Namespace) -> Any:
     msg = {"action": "close-pane", "pane": args.pane}
     _optional(msg, "tab", args.tab)
@@ -2984,6 +3039,44 @@ def _cfg_open_pane(s: argparse.ArgumentParser) -> None:
     s.set_defaults(func=cmd_open_pane)
 
 
+def _cfg_split_pane(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--tab")
+    s.add_argument("--direction", choices=["vertical", "horizontal"])
+    s.add_argument("--command")
+    s.add_argument("--cwd")
+    s.add_argument("--idempotency-key")
+    s.set_defaults(func=cmd_split_pane)
+
+
+def _add_agent_turn_wait_options(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--timeout", type=float, help="Wait timeout in seconds (default: 120).")
+    s.add_argument("--scrollback", type=int, help="Logical scrollback lines to capture.")
+    s.add_argument("--max-output-bytes", type=int, help="Maximum returned output bytes.")
+
+
+def _cfg_prompt_agent(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--tab", required=True, help="Exact tab id or resolvable tab target.")
+    s.add_argument("--pane", required=True, type=int, help="Exact pane id.")
+    source = s.add_mutually_exclusive_group(required=True)
+    source.add_argument("--prompt")
+    source.add_argument("--prompt-file")
+    source.add_argument("--stdin", action="store_true")
+    s.add_argument("--no-wait", action="store_true", help="Return the turn token immediately.")
+    _add_agent_turn_wait_options(s)
+    s.set_defaults(func=cmd_prompt_agent)
+
+
+def _cfg_wait_agent_turn(s: argparse.ArgumentParser) -> None:
+    s.add_argument("turn_token")
+    _add_agent_turn_wait_options(s)
+    s.set_defaults(func=cmd_wait_agent_turn)
+
+
+def _cfg_cancel_agent_turn(s: argparse.ArgumentParser) -> None:
+    s.add_argument("turn_token")
+    s.set_defaults(func=cmd_cancel_agent_turn)
+
+
 def _cfg_close_pane(s: argparse.ArgumentParser) -> None:
     s.add_argument("--tab")
     s.add_argument("--pane", type=int, required=True)
@@ -3209,6 +3302,13 @@ def build_parser() -> argparse.ArgumentParser:
     _cfg_send_keys(sub.add_parser("send-keys", help="Raw key input (use for Ctrl-C, TUI, etc)."))
     _cfg_run(sub.add_parser("run", help="Shell command + newline (safer than send-keys)."))
     _cfg_open_pane(sub.add_parser("open-pane"))
+    _cfg_split_pane(sub.add_parser("split-pane", help="Atomically split and optionally launch a command."))
+    _cfg_prompt_agent(sub.add_parser(
+        "prompt-agent", help="Prompt one exact agent pane and wait for evidenced completion."))
+    _cfg_wait_agent_turn(sub.add_parser(
+        "wait-agent-turn", help="Wait using a token returned by prompt-agent --no-wait."))
+    _cfg_cancel_agent_turn(sub.add_parser(
+        "cancel-agent-turn", help="Cancel a pending agent turn wait."))
     _cfg_close_pane(sub.add_parser("close-pane"))
     _cfg_create_tab(sub.add_parser("create-tab"))
     _cfg_close_tab(sub.add_parser("close-tab"))
@@ -3270,6 +3370,7 @@ def build_parser() -> argparse.ArgumentParser:
                       "pane_cmd")
     _cfg_run(pane_sub.add_parser("run", help="alias of run"))
     _cfg_open_pane(pane_sub.add_parser("open", help="alias of open-pane"))
+    _cfg_split_pane(pane_sub.add_parser("split", help="alias of split-pane"))
     _cfg_close_pane(pane_sub.add_parser("close", help="alias of close-pane"))
     _cfg_send_keys(pane_sub.add_parser("send-keys", help="alias of send-keys"))
     _cfg_get_text(pane_sub.add_parser("get-text", help="alias of get-text"))

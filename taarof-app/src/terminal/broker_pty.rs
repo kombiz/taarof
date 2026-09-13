@@ -20,9 +20,8 @@
 //! Resize is forwarded from VTE's grid size into [`BrokeredPane::resize`]; child
 //! exit is observed by polling the broker from the main loop (see `process`).
 
-use std::ffi::CStr;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -41,6 +40,9 @@ pub(crate) struct BrokerHandle {
     pane: Arc<BrokeredPane>,
     exited: Arc<AtomicBool>,
     relays: Vec<JoinHandle<()>>,
+    presentation_eof: std::rc::Rc<std::cell::Cell<bool>>,
+    presentation_failed: Arc<AtomicBool>,
+    eof_handler: Option<(glib::WeakRef<vte::Terminal>, glib::SignalHandlerId)>,
     last_cols: std::cell::Cell<u16>,
     last_rows: std::cell::Cell<u16>,
     #[cfg(test)]
@@ -51,6 +53,13 @@ impl BrokerHandle {
     /// The broker-owned child PTY.
     pub(crate) fn pane(&self) -> &Arc<BrokeredPane> {
         &self.pane
+    }
+
+    /// VTE emits EOF only after consuming the conduit tail. Automatic child
+    /// cleanup must wait for this, rather than mistaking an empty relay queue
+    /// for bytes already rendered. Explicit handle drop bypasses this gate.
+    pub(crate) fn ready_for_exit_cleanup(&self) -> bool {
+        self.presentation_eof.get() || self.presentation_failed.load(Ordering::Acquire)
     }
 
     /// The spawned child's process id.
@@ -76,6 +85,11 @@ impl BrokerHandle {
 
 impl Drop for BrokerHandle {
     fn drop(&mut self) {
+        if let Some((terminal, handler)) = self.eof_handler.take() {
+            if let Some(terminal) = terminal.upgrade() {
+                terminal.disconnect(handler);
+            }
+        }
         // Pane handles are dropped from GTK callbacks, so teardown must never
         // wait for a child or relay on the caller. Signal cancellation first,
         // then move every potentially blocking operation to a reaper thread.
@@ -147,22 +161,37 @@ fn reaper_thread_name(child_pid: u32) -> String {
 pub(crate) fn attach_broker(terminal: &vte::Terminal, spec: SpawnSpec) -> io::Result<BrokerHandle> {
     let cols = spec.cols;
     let rows = spec.rows;
-    let pane = Arc::new(PtyBroker::spawn(spec)?);
+    let (pane, rx) = PtyBroker::spawn_with_native(spec)?;
+    let pane = Arc::new(pane);
 
     let (conduit_master, conduit_slave) = open_conduit_pty(cols, rows)?;
     let conduit_slave = Arc::new(conduit_slave);
 
     let pty = vte::Pty::foreign_sync(conduit_master, gio::Cancellable::NONE)
         .map_err(|error| io::Error::other(format!("vte foreign pty attach failed: {error}")))?;
+    let presentation_eof = std::rc::Rc::new(std::cell::Cell::new(false));
+    let completed = presentation_eof.clone();
+    let presentation_failed = Arc::new(AtomicBool::new(false));
+    let delivery_finished = Arc::new(AtomicBool::new(false));
+    let drained = delivery_finished.clone();
+    let eof_handler = terminal.connect_eof(move |terminal| {
+        // A queued EOF from the previous attachment must not complete this
+        // generation. VTE unsets its current PTY after processing its tail;
+        // this generation's relay must also have finished before accepting EOF.
+        if terminal.pty().is_none() && drained.load(Ordering::Acquire) {
+            completed.set(true);
+        }
+    });
     terminal.set_pty(Some(&pty));
 
     let exited = Arc::new(AtomicBool::new(false));
 
     // Output relay: child output -> conduit slave (VTE renders it).
     let output_relay = {
-        let rx = pane.subscribe();
         let slave = Arc::clone(&conduit_slave);
         let exited = Arc::clone(&exited);
+        let pane = Arc::clone(&pane);
+        let failed = presentation_failed.clone();
         std::thread::spawn(move || {
             let fd = slave.as_raw_fd();
             while !exited.load(Ordering::SeqCst) {
@@ -170,7 +199,15 @@ pub(crate) fn attach_broker(terminal: &vte::Terminal, spec: SpawnSpec) -> io::Re
                     OUTPUT_POLL_TIMEOUT_MS as u64,
                 )) {
                     Ok(chunk) => {
-                        if write_all_fd_until_cancelled(fd, &chunk, &exited).is_err() {
+                        if let Err(error) = write_all_fd_until_cancelled(fd, &chunk, &exited) {
+                            if !exited.load(Ordering::SeqCst) {
+                                failed.store(true, Ordering::Release);
+                                eprintln!(
+                                    "taarof: native output conduit failed: {:?}",
+                                    error.kind()
+                                );
+                                pane.shutdown();
+                            }
                             break;
                         }
                     }
@@ -178,6 +215,13 @@ pub(crate) fn attach_broker(terminal: &vte::Terminal, spec: SpawnSpec) -> io::Re
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
+            if pane.output_error().is_some() {
+                failed.store(true, Ordering::Release);
+                // A failed reader cannot leave a live child behind a closed
+                // presentation. This relay is already off the GTK thread.
+                pane.shutdown();
+            }
+            delivery_finished.store(true, Ordering::Release);
             // Any output-relay exit cancels the input side as well. During
             // teardown this may happen before the child has finished reaping.
             exited.store(true, Ordering::SeqCst);
@@ -239,6 +283,9 @@ pub(crate) fn attach_broker(terminal: &vte::Terminal, spec: SpawnSpec) -> io::Re
     };
 
     Ok(BrokerHandle {
+        presentation_eof,
+        presentation_failed,
+        eof_handler: Some((terminal.downgrade(), eof_handler)),
         pane,
         exited,
         relays: vec![output_relay, input_relay],
@@ -252,30 +299,17 @@ pub(crate) fn attach_broker(terminal: &vte::Terminal, spec: SpawnSpec) -> io::Re
 /// Allocate the conduit PTY and put its slave in raw mode so it is a transparent
 /// byte pipe (no echo, no CR/LF cooking) between the broker and VTE's master.
 fn open_conduit_pty(cols: u16, rows: u16) -> io::Result<(OwnedFd, OwnedFd)> {
-    let master_raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
-    if master_raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let master = unsafe { OwnedFd::from_raw_fd(master_raw) };
-    if unsafe { libc::grantpt(master_raw) } < 0 || unsafe { libc::unlockpt(master_raw) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let name_ptr = unsafe { libc::ptsname(master_raw) };
-    if name_ptr.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    let name = unsafe { CStr::from_ptr(name_ptr) }.to_owned();
-    let slave_raw = unsafe { libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
-    if slave_raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
+    let (master, slave) = crate::pty_broker::unix_pty::allocate_pty()?;
+    let master_raw = master.as_raw_fd();
+    let slave_raw = slave.as_raw_fd();
 
     let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
-    if unsafe { libc::tcgetattr(slave_raw, &mut termios) } == 0 {
-        unsafe { libc::cfmakeraw(&mut termios) };
-        unsafe { libc::tcsetattr(slave_raw, libc::TCSANOW, &termios) };
+    if unsafe { libc::tcgetattr(slave_raw, &mut termios) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { libc::cfmakeraw(&mut termios) };
+    if unsafe { libc::tcsetattr(slave_raw, libc::TCSANOW, &termios) } < 0 {
+        return Err(io::Error::last_os_error());
     }
     set_fd_nonblocking(slave_raw)?;
 
@@ -409,16 +443,133 @@ fn write_all_fd(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        open_conduit_pty, reaper_thread_name, write_all_fd, write_all_fd_until_cancelled,
-        BrokerHandle,
+        attach_broker, open_conduit_pty, reaper_thread_name, write_all_fd,
+        write_all_fd_until_cancelled, BrokerHandle,
     };
     use crate::pty_broker::{PtyBroker, SpawnSpec};
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
+    use vte::prelude::*;
 
     static CONDUIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    #[ignore = "requires an owned disposable GTK/VTE display; run explicitly in Kasm"]
+    fn gtk_reused_terminal_ignores_stale_eof_until_its_own_relay_drains() {
+        gtk::init().expect("owned GTK display");
+        let terminal = vte::Terminal::new();
+        let window = gtk::Window::builder()
+            .default_width(640)
+            .default_height(240)
+            .build();
+        window.set_child(Some(&terminal));
+        window.present();
+        let spin = |check: &dyn Fn() -> bool| {
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while !check() {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "GTK completion timed out"
+                );
+                while glib::MainContext::default().pending() {
+                    glib::MainContext::default().iteration(false);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let spec = |script: &str| SpawnSpec {
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            cwd: None,
+            env: vec![],
+            cols: 80,
+            rows: 24,
+        };
+        let old = attach_broker(&terminal, spec("printf OLD_FINAL")).unwrap();
+        spin(&|| old.ready_for_exit_cleanup());
+        assert_eq!(old.pane().try_exit_code(), Some(0));
+        // Match product respawn ordering: attach new PTY to the same terminal
+        // before the old handle is replaced/dropped.
+        let fresh = attach_broker(
+            &terminal,
+            spec("stty -echo; printf READY; IFS= read -r line; printf FINAL_SENTINEL"),
+        )
+        .unwrap();
+        terminal.emit_by_name::<()>("eof", &[]);
+        assert!(
+            !fresh.ready_for_exit_cleanup(),
+            "old EOF must not complete the new generation"
+        );
+        drop(old);
+        spin(&|| {
+            fresh.pane().with_model(|model| {
+                model
+                    .projection()
+                    .unwrap()
+                    .visible_text
+                    .join("")
+                    .contains("READY")
+            })
+        });
+        fresh.pane().write_input(b"go\n").unwrap();
+        spin(&|| fresh.ready_for_exit_cleanup());
+        assert!(terminal
+            .text_range_format(
+                vte::Format::Text,
+                0,
+                0,
+                terminal.cursor_position().1 + 1,
+                -1
+            )
+            .0
+            .unwrap_or_default()
+            .contains("FINAL_SENTINEL"));
+        assert_eq!(fresh.pane().try_exit_code(), Some(0));
+        drop(fresh);
+        let descendant = attach_broker(
+            &terminal,
+            spec("trap '' HUP; (sleep 0.4; printf DESCENDANT_FINAL) & exit 7"),
+        )
+        .unwrap();
+        spin(&|| descendant.pane().try_exit_code().is_some());
+        assert_eq!(descendant.pane().try_exit_code(), Some(7));
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", descendant.child_pid())).exists(),
+            "direct child must already be reaped"
+        );
+        assert!(
+            !descendant.ready_for_exit_cleanup(),
+            "descendant still retains the PTY tail"
+        );
+        spin(&|| descendant.ready_for_exit_cleanup());
+        assert!(terminal
+            .text_range_format(
+                vte::Format::Text,
+                0,
+                0,
+                terminal.cursor_position().1 + 1,
+                -1
+            )
+            .0
+            .unwrap_or_default()
+            .contains("DESCENDANT_FINAL"));
+        drop(descendant);
+        window.close();
+    }
+
+    #[test]
+    fn conduit_descriptors_are_close_on_exec() {
+        let (master, slave) = open_conduit_pty(80, 24).expect("conduit");
+        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+            assert!(fd > 2);
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                libc::FD_CLOEXEC,
+                "conduit fd {fd} must not survive exec"
+            );
+        }
+    }
 
     fn fill_conduit_without_reading_master(fd: libc::c_int) {
         let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -479,17 +630,19 @@ mod tests {
             })
             .expect("test child should spawn"),
         );
-        let handle = BrokerHandle {
-            pane,
-            exited: Arc::new(AtomicBool::new(false)),
-            relays: vec![relay],
-            last_cols: std::cell::Cell::new(80),
-            last_rows: std::cell::Cell::new(24),
-            teardown_complete: None,
-        };
-
         let (dropped_tx, dropped_rx) = mpsc::channel();
         let drop_thread = std::thread::spawn(move || {
+            let handle = BrokerHandle {
+                presentation_eof: Default::default(),
+                presentation_failed: Default::default(),
+                eof_handler: None,
+                pane,
+                exited: Arc::new(AtomicBool::new(false)),
+                relays: vec![relay],
+                last_cols: std::cell::Cell::new(80),
+                last_rows: std::cell::Cell::new(24),
+                teardown_complete: None,
+            };
             drop(handle);
             dropped_tx.send(()).expect("test should be listening");
         });
@@ -596,6 +749,9 @@ mod tests {
         );
         let (teardown_tx, teardown_rx) = mpsc::channel();
         let handle = BrokerHandle {
+            presentation_eof: Default::default(),
+            presentation_failed: Default::default(),
+            eof_handler: None,
             pane,
             exited,
             relays: vec![relay],

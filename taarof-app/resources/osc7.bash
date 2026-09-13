@@ -5,7 +5,15 @@
 #   echo 'source /path/to/osc7.bash' >> ~/.bashrc
 
 __taarof_osc7() {
-  printf '\e]7;file://%s%s\e\\' "${HOSTNAME}" "${PWD}"
+  local LC_ALL=C encoded_path="" c i
+  for (( i=0; i<${#PWD}; i++ )); do
+    c="${PWD:i:1}"
+    case "$c" in
+      [a-zA-Z0-9/_.-]) encoded_path+="$c" ;;
+      *) printf -v c '%%%02X' "'$c"; encoded_path+="$c" ;;
+    esac
+  done
+  printf '\e]7;file://%s%s\e\\' "${HOSTNAME}" "$encoded_path"
 }
 
 __taarof_git_branch() {
@@ -28,4 +36,12 @@ __taarof_prompt_state() {
   __taarof_title
 }
 
-PROMPT_COMMAND="__taarof_prompt_state${PROMPT_COMMAND:+;${PROMPT_COMMAND}}"
+# Preserve scalar and array prompt hooks, and make repeated source idempotent.
+if [[ ${__TAAROF_OSC7_BASH:-} != 1 ]]; then
+  if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a "* ]]; then
+    PROMPT_COMMAND=(__taarof_prompt_state "${PROMPT_COMMAND[@]}")
+  else
+    PROMPT_COMMAND="__taarof_prompt_state${PROMPT_COMMAND:+;${PROMPT_COMMAND}}"
+  fi
+  __TAAROF_OSC7_BASH=1
+fi

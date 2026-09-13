@@ -6,6 +6,16 @@ terminals, split panes, session restore, agent-aware activity indicators,
 optional tmux-backed panes, and an optional local HTTP API with a paired
 `taarof-web/` browser client.
 
+The installed `taarof` command comes from `taarof-cli/taarof`, the Python
+client for the desktop app. `examples/taarof` is a separate experimental
+Zellij/SSH launcher with the same filename; do not install it over the CLI.
+Its [WASM sidebar](wasm-sidebar/README.md) has its own build and is not part
+of the desktop bundle.
+
+![taarof desktop with agent-aware sidebar and Agents dock](docs/media/assets/hero.png)
+
+![creating an agent worktree workspace, watching it work, and seeing when it needs input](docs/media/assets/agent-worktree.gif)
+
 ## Highlights
 
 - Tabs and split panes with keyboard navigation
@@ -51,6 +61,7 @@ Start from a local checkout of this repo:
 
 ```bash
 cargo build --release --manifest-path taarof-app/Cargo.toml
+cargo build --release --manifest-path agent-launcher/Cargo.toml
 (cd taarof-web && npm ci && npm run build)
 bash packaging/linux/install-local.sh
 ~/.local/bin/taarof-app
@@ -188,84 +199,16 @@ This project is dual-licensed under either `MIT` or `Apache-2.0`, at your option
 
 ## CWD Tracking Setup
 
-taarof tracks the current working directory via [OSC 7](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html) escape sequences. For remote SSH repos, it also reads a small git-branch marker from the terminal title. Your shell needs to send these on local and remote machines:
+Taarof reads OSC 7 directory reports and VTE `OSC 666` prompt signals from
+Bash, Zsh and Fish. The helpers also emit standard OSC 133 shell markers. Installers provide helpers under `<prefix>/share/taarof/shell` without
+editing your startup files. Source checkouts provide `taarof-app/resources/osc7.*`
+and `examples/taarof-shell-integration.*`.
 
-### zsh (~/.zshrc)
-
-```zsh
-autoload -Uz add-zsh-hook
-
-__taarof_osc7() {
-  local encoded_path=""
-  local c
-  for (( i=1; i<=${#PWD}; i++ )); do
-    c="${PWD[i]}"
-    case "$c" in
-      [a-zA-Z0-9/_.-]) encoded_path+="$c" ;;
-      *) encoded_path+=$(printf '%%%02X' "'$c") ;;
-    esac
-  done
-  printf '\e]7;file://%s%s\e\\' "${HOST:-${HOSTNAME}}" "$encoded_path"
-}
-
-__taarof_git_branch() {
-  git symbolic-ref --quiet --short HEAD 2>/dev/null \
-    || git rev-parse --short HEAD 2>/dev/null
-}
-
-__taarof_title() {
-  local host="${HOST:-${HOSTNAME}}"
-  local title="${USER}@${host}:${PWD}"
-  local branch
-  branch="$(__taarof_git_branch)"
-  if [[ -n "$branch" ]]; then
-    title="${title} [taarof-git:${branch}]"
-  fi
-  printf '\e]2;%s\a' "$title"
-}
-
-__taarof_prompt_state() {
-  __taarof_osc7
-  __taarof_title
-}
-
-add-zsh-hook precmd __taarof_prompt_state
-__taarof_prompt_state
-```
-
-### bash (~/.bashrc)
-
-```bash
-__taarof_osc7() {
-  printf '\e]7;file://%s%s\e\\' "${HOSTNAME}" "${PWD}"
-}
-
-__taarof_git_branch() {
-  git symbolic-ref --quiet --short HEAD 2>/dev/null \
-    || git rev-parse --short HEAD 2>/dev/null
-}
-
-__taarof_title() {
-  local title="${USER}@${HOSTNAME}:${PWD}"
-  local branch
-  branch="$(__taarof_git_branch)"
-  if [[ -n "$branch" ]]; then
-    title="${title} [taarof-git:${branch}]"
-  fi
-  printf '\e]2;%s\a' "$title"
-}
-
-__taarof_prompt_state() {
-  __taarof_osc7
-  __taarof_title
-}
-
-PROMPT_COMMAND="__taarof_prompt_state${PROMPT_COMMAND:+;${PROMPT_COMMAND}}"
-```
-
-**Deploy to remote servers too** — when you SSH into a machine that sends OSC 7 plus the `taarof-git:` title suffix, taarof will show both `hostname:~/path` and the remote branch.
-
-Pre-made scripts are also available at `taarof-app/resources/osc7.zsh` and `taarof-app/resources/osc7.bash`.
+Follow [the shell setup instructions](docs/setup.md#3-install-shell-integration-locally)
+for the two source lines for your shell and the remote-copy procedure. Helpers
+encode spaces and Unicode in CWD reports and preserve existing prompt hooks.
+Bash and Zsh additionally report git branches in the terminal title. Install the
+helpers on remote hosts too so SSH panes can report their remote directories.
 
 ## How It Works (Not a Ghostty Plugin)
 
@@ -751,7 +694,6 @@ Contributions are welcome. Start with the
 [contribution guide](CONTRIBUTING.md), and please follow the
 [code of conduct](CODE_OF_CONDUCT.md) when participating.
 
-
 ## Architecture
 
 | Module | Ownership |
@@ -768,3 +710,37 @@ Contributions are welcome. Start with the
 
 The module table above is the source tour for this tree; the fuller
 data-flow material lives in the private development history.
+
+### Standalone agent launcher
+
+The installer also ships `agent`. It discovers local provider history without a
+running Taarof process. When available, the same-user private Unix socket adds
+fresh live identities and cached remote history. `agent --session NAME --json`
+selects a named runtime (or use `TAAROF_SESSION` / `TAAROF_SOCK`). A missing or
+unresponsive runtime reports a diagnostic and preserves local results.
+`agent --attach '<stable-ref JSON>'` focuses an exact live tmux-backed pane;
+`--resume` starts a provider from history. Remote Resume uses the configured SSH
+destination, quoted structured program/argv/cwd, and a TTY. Stale or failed
+remote records remain visible with their actions disabled.
+`agent --json` returns the `agent.sessions.v2` catalog;
+`agent providers` and `agent doctor` return versioned provider inventories and
+per-provider history diagnostics without starting provider processes.
+
+Start a provider with `agent --new codex`. To resume exactly, pass the JSON
+`stable_ref` object from the catalog as one quoted argument to `agent --resume`,
+or use an exact session ID that is unique across the catalog. Ambiguous IDs,
+unavailable executables and missing working directories fail without launching.
+The provider replaces the launcher in the terminal and retains its ordinary
+signals and exit status. Model, approval, sandbox and account settings come from
+the provider's own configuration.
+
+Run bare `agent` for the keyboard picker. It shows New providers, then sessions
+from the current repository and its linked worktrees, then other sessions.
+Each group is ordered by your last sent message, newest first, with local times.
+Ctrl+S cycles repository-first, global time order and Active/Recent groups.
+Type to search; use arrows and Enter
+to select, Tab to change host scope, Ctrl+P to cycle providers, Ctrl+N to focus
+New, Ctrl+R to refresh, `?` for help and Esc to cancel. Ctrl+F appears only for
+declared fork actions. `agent --new` and `agent --resume` open the corresponding
+selection view. The picker requires a terminal; explicit targets and `--json`
+remain scriptable. See [setup](docs/setup.md#keyboard-session-picker) for details.

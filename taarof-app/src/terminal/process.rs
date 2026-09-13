@@ -71,13 +71,13 @@ pub(super) fn spawn_terminal_process_with_callback(
     let fallback_dir = default_spawn_dir();
     let spawn_cwd = cwd.unwrap_or(&fallback_dir).to_string();
 
-    std::env::set_var("VTE_VERSION", "8203");
-
     let (cols, rows) = broker_grid_size(terminal);
     let spec = crate::pty_broker::SpawnSpec {
         argv: argv_owned,
         cwd: Some(std::path::PathBuf::from(spawn_cwd)),
-        env: Vec::new(),
+        // Preserve shell compatibility without mutating the threaded parent's
+        // environment. The broker applies these through the child sanitizer.
+        env: vec![("VTE_VERSION".into(), "8203".into())],
         cols,
         rows,
     };
@@ -212,7 +212,13 @@ pub(super) fn connect_child_exit_cleanup(
             let Some(handle) = leaf.broker.as_ref() else {
                 return glib::ControlFlow::Break;
             };
-            handle.pane().try_exit_code()
+            // Reap the direct child even if a descendant still owns its PTY.
+            // Only UI cleanup waits for presentation EOF; try_wait caches the
+            // status for the next tick after the final tail has been consumed.
+            handle
+                .pane()
+                .try_exit_code()
+                .filter(|_| handle.ready_for_exit_cleanup())
         };
         let Some(exit_code) = exit_code else {
             return glib::ControlFlow::Continue;

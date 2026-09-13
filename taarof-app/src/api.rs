@@ -766,15 +766,14 @@ fn collect_live_pane_agents(
 fn collect_runtime_probe_pids(state: &AppState) -> (RuntimeTabPidList, RuntimePanePidList) {
     let mut tab_pids = Vec::new();
     let mut pane_pids = Vec::new();
+    let now_ms = crate::events::unix_time_ms();
     for workspace in &state.workspaces {
         for tab in &workspace.tabs {
             tab_pids.push((tab.id, tab.panes.collect_pids()));
-            pane_pids.extend(
-                tab.panes
-                    .leaves()
-                    .into_iter()
-                    .filter_map(|leaf| leaf.shell_pid.map(|pid| (tab.id, leaf.pane_id, pid))),
-            );
+            pane_pids.extend(tab.panes.leaves().into_iter().filter_map(|leaf| {
+                crate::runtime_probe::pane_process_root(leaf, now_ms)
+                    .map(|pid| (tab.id, leaf.pane_id, pid))
+            }));
         }
     }
     (tab_pids, pane_pids)

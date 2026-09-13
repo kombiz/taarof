@@ -118,7 +118,9 @@ pub enum HttpBridgeRequest {
         pane_id: u32,
         guard: PtyDispatchGuard,
         payload: Vec<u8>,
-        reply: oneshot::Sender<Result<(), String>>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        admission_lock: Arc<std::sync::Mutex<()>>,
+        reply: oneshot::Sender<Result<crate::pty_broker::InputReceipt, String>>,
     },
     DispatchPtyResize {
         tab_id: u32,
@@ -154,9 +156,7 @@ struct HttpState {
     agent_session_catalog: Arc<crate::agent_sessions::AgentSessionCatalog>,
     event_broadcast: broadcast::Sender<Value>,
     web_asset_candidates: Arc<Vec<PathBuf>>,
-    pane_snapshotter: Arc<PaneSnapshotter>,
     pane_attach_slots: Arc<Semaphore>,
-    pane_snapshot_slots: Arc<Semaphore>,
     pane_attach_hub: Arc<PaneAttachHub>,
     history_reader: crate::history::HistoryReader,
 }
@@ -192,6 +192,7 @@ pub enum HttpControlAction {
         direction: Option<String>,
         command: Option<String>,
         working_dir: Option<String>,
+        idempotency_key: Option<String>,
     },
 }
 
@@ -545,6 +546,7 @@ struct SplitPaneRequest {
     direction: Option<String>,
     command: Option<String>,
     working_dir: Option<String>,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1053,19 +1055,34 @@ async fn control_split_pane(
             direction: payload.direction,
             command: payload.command,
             working_dir: payload.working_dir,
+            idempotency_key: payload.idempotency_key,
         },
     )
     .await
 }
 
+#[derive(Default, Deserialize)]
+struct AgentSessionsQuery {
+    #[serde(default)]
+    schema: Option<String>,
+}
+
 async fn get_agent_sessions(
     State(state): State<HttpState>,
     headers: HeaderMap,
+    Query(params): Query<AgentSessionsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     check_auth(&headers, &state.auth_token)?;
+    let schema = params
+        .schema
+        .map(|schema| serde_json::from_value(Value::String(schema)))
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .unwrap_or_default();
     let live_bindings = query_agent_bindings(&state).await?;
     let snapshot = state.agent_session_catalog.snapshot(live_bindings).await;
-    let data = serde_json::to_value(snapshot).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let data = crate::agent_sessions::snapshot_value(snapshot, schema)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(json!({ "ok": true, "data": data })))
 }
 
@@ -1275,9 +1292,7 @@ fn build_router_with_web_asset_candidates_catalog_dirty_and_history(
         agent_session_catalog,
         event_broadcast,
         web_asset_candidates: Arc::new(web_asset_candidates),
-        pane_snapshotter,
         pane_attach_slots: Arc::new(Semaphore::new(HTTP_PANE_ATTACH_MAX_CONNECTIONS)),
-        pane_snapshot_slots,
         pane_attach_hub,
         history_reader,
     };
@@ -1645,9 +1660,7 @@ mod tests {
             ),
             event_broadcast: event_tx,
             web_asset_candidates: Arc::new(Vec::new()),
-            pane_snapshotter,
             pane_attach_slots: Arc::new(Semaphore::new(HTTP_PANE_ATTACH_MAX_CONNECTIONS)),
-            pane_snapshot_slots,
             pane_attach_hub,
             history_reader: crate::history::HistoryReader::disabled(),
         }
@@ -1679,9 +1692,7 @@ mod tests {
             ),
             event_broadcast: event_tx,
             web_asset_candidates: Arc::new(web_asset_candidates),
-            pane_snapshotter,
             pane_attach_slots: Arc::new(Semaphore::new(HTTP_PANE_ATTACH_MAX_CONNECTIONS)),
-            pane_snapshot_slots,
             pane_attach_hub,
             history_reader: crate::history::HistoryReader::disabled(),
         }
@@ -2011,6 +2022,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_attach_seed_reaches_changed_then_idle_output_on_both_routes() {
+        for control in [false, true] {
+            for target in [vte_attach_target(1, 7), tmux_attach_target(1, 7)] {
+                let dirty = Arc::new(PaneDirtyRegistry::default());
+                let count = Arc::new(AtomicUsize::new(0));
+                let snapshotter: Arc<PaneSnapshotter> = {
+                    let count = Arc::clone(&count);
+                    let dirty = Arc::clone(&dirty);
+                    Arc::new(move |target, _preserve_ansi| {
+                        let call = count.fetch_add(1, Ordering::SeqCst);
+                        let dirty = Arc::clone(&dirty);
+                        Box::pin(async move {
+                            // The display changes after A is captured and stays B.
+                            // A hub must observe the generation change during its
+                            // seed capture, rather than baseline a second capture
+                            // which the route then silently discards.
+                            if call == 0 {
+                                dirty.mark_dirty(target.tab_id, target.pane_id);
+                            }
+                            Ok(PaneSnapshot {
+                                output: if call == 0 { "A" } else { "B" }.into(),
+                                width: 80,
+                                height: 24,
+                            })
+                        })
+                    })
+                };
+                let (bridge, rx) = mpsc::channel(16);
+                spawn_pane_attach_responder(
+                    rx,
+                    Vec::new(),
+                    PaneAttachLookup::Attachable(target.clone()),
+                );
+                let mut state = test_http_state(
+                    "fixture",
+                    bridge.clone(),
+                    Arc::clone(&snapshotter),
+                    Duration::from_millis(10),
+                );
+                state.control_enabled = control;
+                state.pane_attach_hub = test_pane_attach_hub(
+                    bridge,
+                    snapshotter,
+                    dirty,
+                    Duration::from_millis(10),
+                    Duration::from_secs(60),
+                );
+                let (addr, server) = spawn_ws_test_server(state).await;
+                let mut socket = if control {
+                    connect_pane_control_socket(addr, 1, 7, "fixture").await
+                } else {
+                    connect_pane_attach_socket(addr, 7, "fixture").await
+                };
+                let mut rendered = String::new();
+                let result = tokio::time::timeout(Duration::from_millis(300), async {
+                    while rendered != "B" {
+                        let frame: Value = serde_json::from_str(
+                            &socket.next().await.unwrap().unwrap().into_text().unwrap(),
+                        )
+                        .unwrap();
+                        match frame["type"].as_str().unwrap() {
+                            "snapshot" => {
+                                rendered = String::from_utf8(
+                                    base64::engine::general_purpose::STANDARD
+                                        .decode(frame["payload"].as_str().unwrap())
+                                        .unwrap(),
+                                )
+                                .unwrap()
+                            }
+                            "replace" => rendered = frame["payload"].as_str().unwrap().to_string(),
+                            "delta" => rendered.push_str(frame["payload"].as_str().unwrap()),
+                            kind => panic!("unexpected seed frame {kind}"),
+                        }
+                    }
+                })
+                .await;
+                assert!(result.is_ok(), "{target:?} control={control}: client remained {rendered:?} after output stopped");
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(80), socket.next())
+                        .await
+                        .is_err(),
+                    "idle output must not flicker"
+                );
+                if matches!(target.kind, PaneAttachKind::Vte) {
+                    assert_eq!(count.load(Ordering::SeqCst), 2);
+                }
+                let _ = socket.close(None).await;
+                server.abort();
+                let _ = server.await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_attach_seed_reused_hub_does_not_recapture_on_either_route() {
+        for control in [false, true] {
+            for target in [vte_attach_target(1, 7), tmux_attach_target(1, 7)] {
+                let count = Arc::new(AtomicUsize::new(0));
+                let snapshotter: Arc<PaneSnapshotter> = {
+                    let count = Arc::clone(&count);
+                    Arc::new(move |_, _| {
+                        let call = count.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async move {
+                            Ok(PaneSnapshot {
+                                output: if call == 0 {
+                                    "B"
+                                } else {
+                                    "unowned stale capture"
+                                }
+                                .into(),
+                                width: 80,
+                                height: 24,
+                            })
+                        })
+                    })
+                };
+                let (bridge, rx) = mpsc::channel(16);
+                spawn_pane_attach_responder(
+                    rx,
+                    Vec::new(),
+                    PaneAttachLookup::Attachable(target.clone()),
+                );
+                let mut state =
+                    test_http_state("fixture", bridge, snapshotter, Duration::from_secs(60));
+                state.control_enabled = control;
+                let warm = state.pane_attach_hub.subscribe(target).await.unwrap();
+                let (addr, server) = spawn_ws_test_server(state).await;
+                let mut socket = if control {
+                    connect_pane_control_socket(addr, 1, 7, "fixture").await
+                } else {
+                    connect_pane_attach_socket(addr, 7, "fixture").await
+                };
+                let frame = tokio::time::timeout(Duration::from_millis(300), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap();
+                let frame: Value = serde_json::from_str(&frame).unwrap();
+                assert_eq!(frame["type"], "snapshot");
+                assert_eq!(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(frame["payload"].as_str().unwrap())
+                        .unwrap(),
+                    b"B"
+                );
+                assert_eq!(
+                    count.load(Ordering::SeqCst),
+                    1,
+                    "joining a seeded source must not capture again"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(60), socket.next())
+                        .await
+                        .is_err()
+                );
+                let _ = socket.close(None).await;
+                drop(warm);
+                server.abort();
+                let _ = server.await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn pane_attach_hub_shares_one_source_across_clients() {
         let target = vte_attach_target(1, 7);
         let key = PaneKey::from(&target);
@@ -2020,7 +2197,7 @@ mod tests {
             vec![
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
                         output: "ready".into(),
                         width: 80,
@@ -2029,7 +2206,7 @@ mod tests {
                 },
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
                         output: "updated".into(),
                         width: 80,
@@ -2086,7 +2263,7 @@ mod tests {
             vec![
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
                         output: "ready".into(),
                         width: 80,
@@ -2095,7 +2272,7 @@ mod tests {
                 },
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
                         output: "ready\nnext".into(),
                         width: 80,
@@ -2148,7 +2325,7 @@ mod tests {
             vec![
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
                         output: "ready".into(),
                         width: 80,
@@ -2157,7 +2334,7 @@ mod tests {
                 },
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
                         output: "updated".into(),
                         width: 80,
@@ -2166,7 +2343,7 @@ mod tests {
                 },
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
                         output: "updated".into(),
                         width: 80,
@@ -2227,7 +2404,7 @@ mod tests {
         let snapshotter = counting_scripted_snapshotter(
             vec![ExpectedSnapshotCall {
                 target: target.clone(),
-                preserve_ansi: false,
+                preserve_ansi: true,
                 snapshot: PaneSnapshot {
                     output: "ready".into(),
                     width: 80,
@@ -2278,7 +2455,7 @@ mod tests {
         let snapshotter = scripted_snapshotter(vec![
             ExpectedSnapshotCall {
                 target: target.clone(),
-                preserve_ansi: false,
+                preserve_ansi: true,
                 snapshot: PaneSnapshot {
                     output: "ready".into(),
                     width: 80,
@@ -2287,7 +2464,7 @@ mod tests {
             },
             ExpectedSnapshotCall {
                 target: target.clone(),
-                preserve_ansi: false,
+                preserve_ansi: true,
                 snapshot: PaneSnapshot {
                     output: "updated".into(),
                     width: 80,
@@ -2497,7 +2674,7 @@ mod tests {
                 },
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
                         output: "ready".into(),
                         width: 80,
@@ -2603,7 +2780,7 @@ mod tests {
                 },
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
                         output: "ready".into(),
                         width: 80,
@@ -2725,7 +2902,7 @@ mod tests {
                 },
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
                         output: "ready".into(),
                         width: 80,
@@ -3692,6 +3869,51 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn agent_sessions_schema_negotiation_preserves_v1_and_exposes_v2() {
+        for (query, expected) in [
+            ("", "taarof.agent-sessions.v1"),
+            (
+                "?schema=taarof.agent-sessions.v1",
+                "taarof.agent-sessions.v1",
+            ),
+            ("?schema=agent.sessions.v2", "agent.sessions.v2"),
+        ] {
+            let (app, rx) = test_router("secret");
+            spawn_state_responder(rx);
+            let response = app
+                .oneshot(
+                    Request::get(format!("/api/v1/agent-sessions{query}"))
+                        .header("authorization", "Bearer secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(payload["data"]["schema"], expected);
+            assert_eq!(payload["data"]["sessions"], json!([]));
+            if expected == "taarof.agent-sessions.v1" {
+                assert!(payload["data"].get("remote_hosts").is_none());
+                assert_eq!(payload["data"].as_object().unwrap().len(), 4);
+            }
+        }
+        let (app, rx) = test_router("secret");
+        spawn_state_responder(rx);
+        let response = app
+            .oneshot(
+                Request::get("/api/v1/agent-sessions?schema=unknown")
+                    .header("authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     fn control_request(path: &str, token: Option<&str>, payload: Value) -> Request<Body> {
         let mut builder = Request::post(path).header(CONTENT_TYPE, "application/json");
         if let Some(token) = token {
@@ -3799,6 +4021,7 @@ mod tests {
                 direction: Some("horizontal".to_string()),
                 command: Some("htop".to_string()),
                 working_dir: Some("/srv".to_string()),
+                idempotency_key: Some("request-1".to_string()),
             },
         ];
 
@@ -3857,6 +4080,7 @@ mod tests {
                     "direction": "horizontal",
                     "command": "htop",
                     "working_dir": "/srv",
+                    "idempotency_key": "request-1",
                 }),
             ),
         ];
@@ -4372,9 +4596,7 @@ mod tests {
             ),
             event_broadcast: event_tx,
             web_asset_candidates: Arc::new(candidates),
-            pane_snapshotter,
             pane_attach_slots: Arc::new(Semaphore::new(HTTP_PANE_ATTACH_MAX_CONNECTIONS)),
-            pane_snapshot_slots,
             pane_attach_hub,
             history_reader: crate::history::HistoryReader::disabled(),
         };
@@ -4481,9 +4703,7 @@ mod tests {
             ),
             event_broadcast: event_tx,
             web_asset_candidates: Arc::new(vec![dist_dir]),
-            pane_snapshotter,
             pane_attach_slots: Arc::new(Semaphore::new(HTTP_PANE_ATTACH_MAX_CONNECTIONS)),
-            pane_snapshot_slots,
             pane_attach_hub,
             history_reader: crate::history::HistoryReader::disabled(),
         };
@@ -4916,7 +5136,7 @@ mod tests {
                 },
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
                         output: "Vault CLI loaded. ☕\nworkstation:sample-project main ? }".into(),
                         width: 120,
@@ -4993,18 +5213,18 @@ mod tests {
                 },
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
-                        output: "\u{2500}\u{2500}\u{2500}".into(),
+                        output: "\u{1b}(0qqq\u{1b}(B".into(),
                         width: 80,
                         height: 24,
                     },
                 },
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
-                        output: "\u{2500}\u{2500}\u{2500}".into(),
+                        output: "\u{1b}(0qqq\u{1b}(B".into(),
                         width: 80,
                         height: 24,
                     },
@@ -5125,17 +5345,8 @@ mod tests {
                     },
                 },
                 ExpectedSnapshotCall {
-                    target: initial_target.clone(),
-                    preserve_ansi: false,
-                    snapshot: PaneSnapshot {
-                        output: "session-a".into(),
-                        width: 80,
-                        height: 24,
-                    },
-                },
-                ExpectedSnapshotCall {
                     target: replacement_target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
                         output: "session-b".into(),
                         width: 120,
@@ -5209,16 +5420,7 @@ mod tests {
                 },
                 ExpectedSnapshotCall {
                     target: target.clone(),
-                    preserve_ansi: false,
-                    snapshot: PaneSnapshot {
-                        output: "ready".into(),
-                        width: 80,
-                        height: 24,
-                    },
-                },
-                ExpectedSnapshotCall {
-                    target: target.clone(),
-                    preserve_ansi: false,
+                    preserve_ansi: true,
                     snapshot: PaneSnapshot {
                         output: "ready again".into(),
                         width: 80,

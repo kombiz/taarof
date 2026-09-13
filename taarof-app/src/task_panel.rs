@@ -466,6 +466,34 @@ fn build_agent_activity_row(
         activity.set_wrap(true);
         content.append(&activity);
     }
+    if !card.children.is_empty() {
+        let children = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        children.add_css_class("agent-headless-children");
+        for child in &card.children {
+            let child_row = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+            child_row.add_css_class("agent-headless-child");
+            child_row.add_css_class(child.state.css_class());
+            let marker = gtk::Label::new(Some("↳"));
+            marker.add_css_class("agent-headless-marker");
+            child_row.append(&marker);
+            let label = gtk::Label::new(Some(&child.label));
+            label.add_css_class("agent-headless-label");
+            label.set_halign(gtk::Align::Start);
+            label.set_hexpand(true);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            label.set_tooltip_text(Some(&format!(
+                "Headless {} subagent · inherits pane {}",
+                child.provider, child.pane_id
+            )));
+            child_row.append(&label);
+            let child_state = gtk::Label::new(Some(child.state.ui_label()));
+            child_state.add_css_class("agent-headless-state");
+            child_state.add_css_class(child.state.css_class());
+            child_row.append(&child_state);
+            children.append(&child_row);
+        }
+        content.append(&children);
+    }
     button.set_child(Some(&content));
 
     let state = state.clone();
@@ -4840,6 +4868,7 @@ mod tests {
             tab_pids: std::collections::BTreeMap::new(),
             pane_pids: std::collections::BTreeMap::new(),
             pane_process_states: HashMap::new(),
+            pane_exact_agents: std::collections::HashMap::new(),
             pane_agents: HashMap::from([(
                 (tab_id, pane_id),
                 crate::agents::AgentStatus {
@@ -4895,6 +4924,7 @@ mod tests {
             tab_pids: std::collections::BTreeMap::new(),
             pane_pids: std::collections::BTreeMap::new(),
             pane_process_states: HashMap::new(),
+            pane_exact_agents: std::collections::HashMap::new(),
             pane_agents: HashMap::from([(
                 (tab_id, pane_id),
                 crate::agents::AgentStatus {

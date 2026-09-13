@@ -57,7 +57,7 @@ impl Drop for RuntimeProbeCompletionGuard {
                 .runtime_probe
                 .as_ref()
                 .is_none_or(|previous| !previous.renders_same_as(&snapshot));
-            state.runtime_probe = Some(snapshot);
+            state.install_runtime_probe(snapshot);
             changed
         };
         self.runtime.emit_event(
@@ -129,14 +129,13 @@ pub(crate) fn update_agent_indicators(
         let st = state.borrow();
         let mut tab_pids = Vec::new();
         let mut pane_pids = Vec::new();
+        let now_ms = crate::events::unix_time_ms();
         for tab in st.all_tabs() {
             let pids = tab.panes.collect_pids();
-            pane_pids.extend(
-                tab.panes
-                    .leaves()
-                    .into_iter()
-                    .filter_map(|leaf| leaf.shell_pid.map(|pid| (tab.id, leaf.pane_id, pid))),
-            );
+            pane_pids.extend(tab.panes.leaves().into_iter().filter_map(|leaf| {
+                crate::runtime_probe::pane_process_root(leaf, now_ms)
+                    .map(|pid| (tab.id, leaf.pane_id, pid))
+            }));
             tab_pids.push((tab.id, pids));
         }
         (tab_pids, pane_pids)
@@ -459,7 +458,7 @@ pub(crate) fn update_agent_indicators(
             }
 
             let dashboard_dirty = !pending_events.is_empty();
-            st.runtime_probe = Some(snapshot);
+            st.install_runtime_probe(snapshot);
             let dirty = snapshot_changed || rows_dirty || dashboard_dirty;
             (dirty, dashboard_dirty, pending_events, probe_failures)
         };
@@ -508,6 +507,7 @@ pub(crate) fn update_pane_transcripts(
     runtime: &RuntimeHandle,
     tracker: &Arc<crate::agents::TranscriptTracker>,
     in_flight: &crate::runtime_probe::ProbeInFlight,
+    tab_list: &gtk::Box,
 ) {
     // Coalesce: drop this tick if a previous poll is still running.
     let guard = match in_flight.try_begin() {
@@ -525,32 +525,43 @@ pub(crate) fn update_pane_transcripts(
     };
     // Nothing to poll and nothing to clear: skip the worker entirely. The guard
     // drops here, freeing the next tick.
-    if bindings.is_empty() && transcripts_empty {
+    if bindings.is_empty() && transcripts_empty && !tracker.has_tracked_panes() {
         return;
     }
 
     let tracker = tracker.clone();
     let runtime = runtime.clone();
+    let tab_list = tab_list.clone();
 
     glib::spawn_future_local(async move {
         // Hold the guard for the whole poll; it clears on drop even if the
         // future is cancelled or the worker errors.
         let _guard = guard;
 
-        let result = match gio::spawn_blocking(move || tracker.sync_and_poll(&bindings)).await {
+        let mut result = match gio::spawn_blocking(move || tracker.sync_and_poll(&bindings)).await {
             Ok(result) => result,
             Err(_) => return,
         };
 
         // Apply results and collect events under one borrow, then drop it before
         // emitting (emit_event re-borrows the shared state mutably).
-        let events = {
+        let ui_dirty = !result.removed.is_empty() || !result.ticks.is_empty();
+        let (events, transition_events) = {
             let mut st = state.borrow_mut();
+            result.retain_tabs(&st.all_tabs().map(|tab| tab.id).collect());
+            let mut transition_events = Vec::new();
             for key in result.removed {
                 st.pane_transcripts.remove(&key);
                 // An unbound pane has no native turn to speak for it any more.
                 if let Some(tab) = st.find_tab_mut(key.0) {
+                    let before = tab.pane_lifecycle(key.1);
                     tab.clear_pane_turn(key.1);
+                    let after = tab.pane_lifecycle(key.1);
+                    if let Some(payload) = crate::events::agent_activity_transition_payload(
+                        key.0, key.1, before, after, None,
+                    ) {
+                        transition_events.push(payload);
+                    }
                 }
             }
             let mut events = Vec::new();
@@ -563,7 +574,19 @@ pub(crate) fn update_pane_transcripts(
                 // already stale on arrival and cannot fake live work.
                 let turn = tick.state.turn;
                 if let Some(tab) = st.find_tab_mut(tick.key.0) {
+                    let before = tab.pane_lifecycle(tick.key.1);
                     tab.set_pane_turn(tick.key.1, turn);
+                    let after = tab.pane_lifecycle(tick.key.1);
+                    if let Some(mut payload) = crate::events::agent_activity_transition_payload(
+                        tick.key.0,
+                        tick.key.1,
+                        before,
+                        after,
+                        Some(&tick.state.agent),
+                    ) {
+                        payload["native_turn"] = serde_json::json!(tick.state.native_turn_id);
+                        transition_events.push(payload);
+                    }
                 }
                 let previous = st.pane_transcripts.get(&tick.key);
                 // The tracker marks first discovery and agent-session switches
@@ -645,11 +668,17 @@ pub(crate) fn update_pane_transcripts(
                 }
                 st.pane_transcripts.insert(tick.key, tick.state);
             }
-            events
+            (events, transition_events)
         };
 
+        for payload in transition_events {
+            runtime.emit_event("agent_activity_changed", payload);
+        }
         for payload in events {
             runtime.emit_event("agent_message", payload);
+        }
+        if ui_dirty {
+            crate::sidebar::refresh_all_tab_rows(&tab_list, &state);
         }
     });
 }

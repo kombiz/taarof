@@ -636,19 +636,8 @@ impl AppState {
     }
 
     pub fn remove_workspace(&mut self, ws_id: u32) {
-        let removed_tab_ids: Vec<u32> = self
-            .workspaces
-            .iter()
-            .filter(|ws| ws.id == ws_id)
-            .flat_map(|ws| ws.tabs.iter().map(|tab| tab.id))
-            .collect();
         self.workspaces.retain(|ws| ws.id != ws_id);
-        self.headless_panes
-            .retain(|(tab_id, _), _| !removed_tab_ids.contains(tab_id));
-        self.pending_tab_restores
-            .retain(|tab_id, _| !removed_tab_ids.contains(tab_id));
-        self.pending_socket_notifications
-            .retain(|tab_id, _| !removed_tab_ids.contains(tab_id));
+        self.prune_tab_owned_facts();
         self.sanitize_navigation_state();
     }
 
@@ -709,14 +698,6 @@ impl AppState {
     }
 
     pub fn remove_tab(&mut self, tab_id: u32) {
-        self.dismiss_restored_legend(tab_id);
-        self.pending_tab_restores.remove(&tab_id);
-        self.pending_socket_notifications.remove(&tab_id);
-        self.discovery_binary_paths.remove(&tab_id);
-        self.task_discovery_snapshots.remove(&tab_id);
-        self.revealed_task_tabs.remove(&tab_id);
-        self.headless_panes
-            .retain(|(existing_tab_id, _), _| *existing_tab_id != tab_id);
         for ws in &mut self.workspaces {
             ws.tabs.retain(|t| t.id != tab_id);
             if ws.last_active_tab == Some(tab_id) {
@@ -726,7 +707,41 @@ impl AppState {
         if self.workspaces.len() > 1 {
             self.workspaces.retain(|w| !w.tabs.is_empty());
         }
+        self.prune_tab_owned_facts();
         self.sanitize_navigation_state();
+    }
+
+    /// Tab membership is the authority for every tab-owned cache. Keep one
+    /// removal transition for direct tab close, workspace close and restore.
+    fn prune_tab_owned_facts(&mut self) {
+        let live: HashSet<u32> = self.all_tabs().map(|tab| tab.id).collect();
+        self.headless_panes.retain(|(tab, _), _| live.contains(tab));
+        self.pending_tab_restores
+            .retain(|tab, _| live.contains(tab));
+        self.pending_socket_notifications
+            .retain(|tab, _| live.contains(tab));
+        self.restored_legends.retain(|tab, _| live.contains(tab));
+        self.discovery_binary_paths
+            .retain(|tab, _| live.contains(tab));
+        self.task_discovery_snapshots
+            .retain(|tab, _| live.contains(tab));
+        self.revealed_task_tabs.retain(|tab| live.contains(tab));
+        self.pane_transcripts
+            .retain(|(tab, _), _| live.contains(tab));
+        self.pane_dirty.retain_tabs(&live);
+        if let Some(snapshot) = &mut self.runtime_probe {
+            snapshot.retain_tabs(&live);
+        }
+    }
+
+    /// A worker can finish after its source tab was closed. Filter at delivery
+    /// too, so completion/cancellation cannot recreate an orphan probe cache.
+    pub(crate) fn install_runtime_probe(
+        &mut self,
+        mut snapshot: crate::runtime_probe::RuntimeProbeSnapshot,
+    ) {
+        snapshot.retain_tabs(&self.all_tabs().map(|tab| tab.id).collect());
+        self.runtime_probe = Some(snapshot);
     }
 
     pub(crate) fn set_socket_notification(&mut self, tab_id: u32, message: String) {
@@ -1030,8 +1045,7 @@ impl RuntimeHandle {
         let mut state = self.state.borrow_mut();
         state.workspaces.clear();
         state.active_workspace = 0;
-        state.headless_panes.clear();
-        state.pending_tab_restores.clear();
+        state.prune_tab_owned_facts();
         state.detached_sessions.clear();
         state.selected_dashboard_view = None;
         state.reset_navigation_history();
@@ -1556,6 +1570,181 @@ mod tests {
                 .and_then(|pane| pane.location_state.cwd.as_deref()),
             Some(expected_cwd.as_str())
         );
+    }
+
+    fn seed_tab_owned_facts(state: &mut AppState, tab: u32, pane: u32) {
+        state
+            .pending_socket_notifications
+            .insert(tab, "inert notification".into());
+        state
+            .discovery_binary_paths
+            .insert(tab, "/inert/mise".into());
+        state.task_discovery_snapshots.insert(
+            tab,
+            crate::task_launch::TaskDiscoverySnapshot::from_tasks(
+                crate::mise::DiscoveryTarget::Local {
+                    cwd: "/inert".into(),
+                    binary_path: None,
+                },
+                &[],
+            ),
+        );
+        state.revealed_task_tabs.insert(tab);
+        state.restored_legends.insert(
+            tab,
+            crate::session::RestoredTabLegend {
+                tab_id: tab,
+                items: vec![],
+            },
+        );
+        state.pending_tab_restores.insert(
+            tab,
+            crate::session::PendingTabRestore {
+                saved: crate::session::SavedPaneNode::Leaf {
+                    work_origin: None,
+                    cwd: None,
+                    ssh_command: None,
+                    tmux_session: None,
+                    tmux_host: None,
+                    current_task: None,
+                    agent_session: None,
+                },
+                cwd: None,
+                show_restore_legend: false,
+            },
+        );
+        state
+            .pane_transcripts
+            .insert((tab, pane), Default::default());
+        let probe = state.runtime_probe.get_or_insert_with(|| {
+            crate::runtime_probe::RuntimeProbeSnapshot::worker_failure(
+                1,
+                &[],
+                &[],
+                crate::runtime_probe::RuntimeProbeWorkerFailure::Panicked,
+            )
+        });
+        probe.tab_pids.insert(tab, vec![42]);
+        probe.pane_pids.insert((tab, pane), 42);
+        probe
+            .pane_process_states
+            .insert((tab, pane), Default::default());
+        probe.pane_agents.insert((tab, pane), Default::default());
+        probe.tab_agents.insert(tab, Default::default());
+        probe.tab_ports.insert(tab, vec![8080]);
+    }
+
+    fn tab_owned_fact_counts(state: &AppState) -> Vec<usize> {
+        let mut counts = vec![
+            state.headless_panes.len(),
+            state.pending_tab_restores.len(),
+            state.pending_socket_notifications.len(),
+            state.restored_legends.len(),
+            state.discovery_binary_paths.len(),
+            state.task_discovery_snapshots.len(),
+            state.revealed_task_tabs.len(),
+            state.pane_transcripts.len(),
+        ];
+        if let Some(probe) = &state.runtime_probe {
+            counts.extend([
+                probe.tab_pids.len(),
+                probe.pane_pids.len(),
+                probe.pane_process_states.len(),
+                probe.pane_agents.len(),
+                probe.tab_agents.len(),
+                probe.tab_ports.len(),
+            ]);
+        }
+        counts
+    }
+
+    #[test]
+    fn tab_cleanup_churn_reclaims_every_owned_fact_and_preserves_sibling() {
+        let mut state = AppState::new();
+        let stable_ws = state.active_workspace;
+        let (stable_tab, stable_pane) =
+            crate::seed_headless_terminal_tab(&mut state, stable_ws, "stable", Default::default())
+                .unwrap();
+        seed_tab_owned_facts(&mut state, stable_tab, stable_pane);
+        let stable_signal = state.pane_dirty.signal_for(crate::http::PaneKey {
+            tab_id: stable_tab,
+            pane_id: stable_pane,
+        });
+        let baseline = tab_owned_fact_counts(&state);
+        for n in 0..32 {
+            let ws = state.create_workspace("churn", None);
+            let (tab, pane) =
+                crate::seed_headless_terminal_tab(&mut state, ws, "churn", Default::default())
+                    .unwrap();
+            seed_tab_owned_facts(&mut state, tab, pane);
+            let signal = state.pane_dirty.signal_for(crate::http::PaneKey {
+                tab_id: tab,
+                pane_id: pane,
+            });
+            let late_probe = state.runtime_probe.as_ref().unwrap().clone();
+            if n % 2 == 0 {
+                state.remove_workspace(ws);
+            } else {
+                state.remove_tab(tab);
+            }
+            assert_eq!(
+                tab_owned_fact_counts(&state),
+                baseline,
+                "tab-owned caches must return to baseline at iteration {n}"
+            );
+            assert!(
+                !state.pane_dirty.mark_dirty(tab, pane),
+                "late output callbacks must not recreate removed entries"
+            );
+            state.install_runtime_probe(late_probe);
+            assert_eq!(
+                tab_owned_fact_counts(&state),
+                baseline,
+                "a late worker probe cannot recreate closed-tab facts"
+            );
+            assert_eq!(
+                std::sync::Arc::strong_count(&signal),
+                1,
+                "registry must release the removed pane signal"
+            );
+            assert_eq!(
+                std::sync::Arc::strong_count(&stable_signal),
+                2,
+                "sibling registry entry must remain"
+            );
+            assert!(state.find_tab(stable_tab).is_some());
+            assert!(
+                state.pending_tab_restores.contains_key(&stable_tab),
+                "unrelated lazy restore remains pending"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_cleanup_restore_reset_uses_the_same_ownership_transition() {
+        let runtime = RuntimeHandle::new();
+        let shared = runtime.shared_state();
+        let signal = {
+            let mut state = shared.borrow_mut();
+            let ws = state.active_workspace;
+            let (tab, pane) = crate::seed_headless_terminal_tab(
+                &mut state,
+                ws,
+                "restore-reset",
+                Default::default(),
+            )
+            .unwrap();
+            seed_tab_owned_facts(&mut state, tab, pane);
+            state.pane_dirty.signal_for(crate::http::PaneKey {
+                tab_id: tab,
+                pane_id: pane,
+            })
+        };
+        runtime.clear_for_session_restore();
+        assert!(tab_owned_fact_counts(&shared.borrow())
+            .iter()
+            .all(|count| *count == 0));
+        assert_eq!(std::sync::Arc::strong_count(&signal), 1);
     }
 
     #[test]
