@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - kmux
 
 # Fork pull requests only need to read this repository. Keep the default token
 # deliberately narrow for every CI job.

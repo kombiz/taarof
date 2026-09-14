@@ -247,7 +247,8 @@ until the unvalidated areas above have been exercised.
 
 ## Release steps
 
-1. Merge the release-ready pull request after the `CI` workflow is green.
+1. After review and explicit authorization, promote the release-ready changes
+   from `kmux` to `main` after the `CI` workflow is green.
 2. Run the pre-release checks locally on a Linux machine.
 3. Complete a manual release-readiness sign-off and update the section above
    with the current validation date, scope, and known issues.
