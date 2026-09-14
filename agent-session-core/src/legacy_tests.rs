@@ -42,6 +42,37 @@ fn codex_discovery_reads_session_meta() {
 }
 
 #[test]
+fn claude_discovery_skips_jsonl_without_session_metadata() {
+    let dir = unique_temp_dir("claude-non-transcripts");
+    let project = dir.join("projects/-tmp-project");
+    let workflow = project.join("session-abc/subagents/workflows/wf_1");
+    fs::create_dir_all(&workflow).expect("claude workflow dir should exist");
+    fs::write(
+        project.join("session-abc.jsonl"),
+        "{\"type\":\"user\",\"sessionId\":\"session-abc\",\"cwd\":\"/tmp/project\",\"message\":{\"role\":\"user\",\"content\":\"Fix issue 6\"}}\n",
+    )
+    .expect("claude transcript should write");
+    // Claude Code keeps non-transcript JSONL beside real sessions: workflow
+    // journals carry no session metadata and bridge stubs carry no cwd.
+    fs::write(
+        workflow.join("journal.jsonl"),
+        "{\"type\":\"launched\"}\n{\"type\":\"started\"}\n",
+    )
+    .expect("claude workflow journal should write");
+    fs::write(
+        project.join("bridge.jsonl"),
+        "{\"type\":\"bridge-session\",\"sessionId\":\"bridge\"}\n",
+    )
+    .expect("claude bridge stub should write");
+
+    let (status, sessions) = discover_claude_sessions(Some(dir.join("projects").as_path()), 10);
+    assert!(status.ok, "non-transcript JSONL must not fail the provider");
+    assert!(status.error.is_none());
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "session-abc");
+}
+
+#[test]
 fn pi_discovery_prefers_session_map() {
     let dir = unique_temp_dir("pi");
     let sessions_dir = dir.join(".pi/agent/sessions/workspace");
