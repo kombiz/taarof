@@ -34,15 +34,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use serde_json::Value;
 
-use crate::agents::{PaneTurn, TurnMarker};
+use crate::agents::{AgentLifecycle, HeadlessAgentEvidence, PaneTurn, TurnMarker};
 use crate::AppState;
 
 /// Cap on retained tool calls / touched files per pane, drained from the front
 /// on overflow so a long-lived pane cannot grow these vectors without bound.
 const MAX_TOOL_CALLS: usize = 20;
 const MAX_FILES: usize = 20;
+const MAX_CHILD_AGENTS: usize = 32;
 const MAX_SESSION_START_SKEW_MS: u64 = 5 * 60 * 1_000;
 const TRANSCRIPT_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
 
@@ -94,6 +96,15 @@ pub(crate) struct TouchedFile {
     pub at_unix_ms: u64,
 }
 
+/// Provider-native identity for the currently folded turn. This is additive
+/// correlation evidence: the generic pane/event boundary remains authoritative.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub(crate) struct ProviderNativeTurnId {
+    pub provider: String,
+    pub id: String,
+    pub observed_at_unix_ms: u64,
+}
+
 /// Rolling ground-truth summary of one pane's agent conversation, folded from
 /// the on-disk transcript.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -119,6 +130,247 @@ pub(crate) struct TranscriptState {
     /// record's own timestamp. This is the trustworthy native evidence the
     /// canonical state machine uses; see [`crate::agents::lifecycle`].
     pub turn: PaneTurn,
+    /// Native turn identity when the bound provider exposes one. Cleared at a
+    /// new turn boundary if that boundary does not carry a valid identity.
+    pub native_turn_id: Option<ProviderNativeTurnId>,
+    /// Headless child agents folded from provider-native structured evidence.
+    /// They inherit this transcript's real pane only during shared projection.
+    pub child_agents: Vec<HeadlessAgentEvidence>,
+}
+
+fn parent_agent_id(state: &TranscriptState, provider: &str) -> String {
+    format!("{provider}:{}", state.session_id)
+}
+
+fn child_label(block: &Value) -> String {
+    block
+        .pointer("/input/name")
+        .or_else(|| block.pointer("/input/description"))
+        .or_else(|| block.pointer("/input/subagent_type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("subagent")
+        .chars()
+        .take(80)
+        .collect()
+}
+
+fn child_activity(block: &Value) -> String {
+    block
+        .pointer("/input/description")
+        .or_else(|| block.pointer("/input/prompt"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("working")
+        .chars()
+        .take(160)
+        .collect()
+}
+
+fn upsert_child_agent(state: &mut TranscriptState, child: HeadlessAgentEvidence) {
+    if let Some(existing) = state
+        .child_agents
+        .iter_mut()
+        .find(|existing| existing.stable_id == child.stable_id)
+    {
+        *existing = child;
+        return;
+    }
+    push_capped(&mut state.child_agents, child, MAX_CHILD_AGENTS);
+}
+
+fn complete_child_agent(
+    state: &mut TranscriptState,
+    provider: &str,
+    native_id: &str,
+    errored: bool,
+    at_unix_ms: u64,
+) {
+    let stable_id = format!("{provider}:{native_id}");
+    let Some(child) = state
+        .child_agents
+        .iter_mut()
+        .find(|child| child.stable_id == stable_id)
+    else {
+        return;
+    };
+    child.state = if errored {
+        AgentLifecycle::Errored
+    } else {
+        AgentLifecycle::Done
+    };
+    child.activity = if errored { "errored" } else { "completed" }.to_string();
+    child.updated_at_unix_ms = at_unix_ms;
+}
+
+fn fold_claude_child_agents(value: &Value, state: &mut TranscriptState, now: u64) {
+    let at = record_timestamp_unix_ms(value).unwrap_or(now);
+    let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) else {
+        return;
+    };
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_use")
+                if matches!(
+                    block.get("name").and_then(Value::as_str),
+                    Some("Task" | "Agent")
+                ) =>
+            {
+                let Some(native_id) = block.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let stable_id = format!("claude:{native_id}");
+                upsert_child_agent(
+                    state,
+                    HeadlessAgentEvidence {
+                        stable_id,
+                        parent_id: parent_agent_id(state, "claude"),
+                        provider: "claude".to_string(),
+                        label: child_label(block),
+                        state: AgentLifecycle::Working,
+                        activity: child_activity(block),
+                        updated_at_unix_ms: at,
+                    },
+                );
+            }
+            Some("tool_result") => {
+                let Some(native_id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let errored = block
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                complete_child_agent(state, "claude", native_id, errored, at);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn codex_child_message(value: &Value) -> Option<(&str, &str)> {
+    let text = value
+        .pointer("/payload/content/0/text")
+        .and_then(Value::as_str)?;
+    let message_type = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Message Type: "))?;
+    let task_name = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Task name: "))?;
+    Some((message_type.trim(), task_name.trim()))
+}
+
+fn fold_codex_child_agents(value: &Value, state: &mut TranscriptState, now: u64) {
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return;
+    }
+    let at = record_timestamp_unix_ms(value).unwrap_or(now);
+    match value.pointer("/payload/type").and_then(Value::as_str) {
+        Some("function_call")
+            if value.pointer("/payload/name").and_then(Value::as_str) == Some("spawn_agent") =>
+        {
+            let Some(call_id) = value.pointer("/payload/call_id").and_then(Value::as_str) else {
+                return;
+            };
+            let Some(arguments) = value
+                .pointer("/payload/arguments")
+                .and_then(Value::as_str)
+                .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+            else {
+                return;
+            };
+            let Some(task_name) = arguments.get("task_name").and_then(Value::as_str) else {
+                return;
+            };
+            let activity = arguments
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .unwrap_or("working")
+                .chars()
+                .take(160)
+                .collect();
+            upsert_child_agent(
+                state,
+                HeadlessAgentEvidence {
+                    stable_id: format!("codex:{call_id}"),
+                    parent_id: parent_agent_id(state, "codex"),
+                    provider: "codex".to_string(),
+                    label: task_name.chars().take(80).collect(),
+                    state: AgentLifecycle::Working,
+                    activity,
+                    updated_at_unix_ms: at,
+                },
+            );
+        }
+        Some("function_call_output") => {
+            let Some(call_id) = value.pointer("/payload/call_id").and_then(Value::as_str) else {
+                return;
+            };
+            let pending_id = format!("codex:{call_id}");
+            let pending_index = state
+                .child_agents
+                .iter()
+                .position(|child| child.stable_id == pending_id);
+            let task_name = value
+                .pointer("/payload/output")
+                .and_then(Value::as_str)
+                .and_then(|output| serde_json::from_str::<Value>(output).ok())
+                .and_then(|output| {
+                    output
+                        .get("task_name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+            let Some(task_name) = task_name else {
+                if let Some(pending) = pending_index {
+                    state.child_agents.remove(pending);
+                }
+                return;
+            };
+            let canonical_id = format!("codex:{task_name}");
+            let canonical_index = state
+                .child_agents
+                .iter()
+                .position(|child| child.stable_id == canonical_id);
+            match (canonical_index, pending_index) {
+                (Some(canonical), Some(pending)) => {
+                    state.child_agents[canonical].updated_at_unix_ms = at;
+                    state.child_agents.remove(pending);
+                }
+                (None, Some(pending)) => {
+                    state.child_agents[pending].stable_id = canonical_id;
+                    state.child_agents[pending].updated_at_unix_ms = at;
+                }
+                _ => {}
+            }
+        }
+        Some("agent_message") => {
+            let Some((message_type, task_name)) = codex_child_message(value) else {
+                return;
+            };
+            match message_type {
+                "FINAL_ANSWER" => complete_child_agent(state, "codex", task_name, false, at),
+                "MESSAGE" => {
+                    let stable_id = format!("codex:{task_name}");
+                    if let Some(child) = state
+                        .child_agents
+                        .iter_mut()
+                        .find(|child| child.stable_id == stable_id)
+                    {
+                        child.activity = "updated".to_string();
+                        child.updated_at_unix_ms = at;
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Lossless change set produced while folding one transcript poll. Rolling UI
@@ -534,6 +786,45 @@ fn apply_turn_marker(
     state.turn = PaneTurn::new(marker.phase(), at);
 }
 
+fn bounded_native_id(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    (!value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control))
+        .then(|| value.to_string())
+}
+
+fn apply_native_turn_id(
+    state: &mut TranscriptState,
+    value: &Value,
+    marker: Option<TurnMarker>,
+    provider: &str,
+    fold_at_unix_ms: u64,
+) {
+    let Some(marker) = marker else {
+        return;
+    };
+    if marker == TurnMarker::Started
+        && !matches!(state.turn.phase, crate::agents::TurnPhase::Active)
+    {
+        // Never let a previous turn's native identity bleed into a new turn
+        // whose provider record is missing or malformed.
+        state.native_turn_id = None;
+    }
+    let candidate = match provider {
+        "claude" if marker == TurnMarker::Started => {
+            bounded_native_id(value.get("uuid").and_then(Value::as_str))
+        }
+        "codex" => bounded_native_id(value.pointer("/payload/turn_id").and_then(Value::as_str)),
+        _ => None,
+    };
+    if let Some(id) = candidate {
+        state.native_turn_id = Some(ProviderNativeTurnId {
+            provider: provider.to_string(),
+            id,
+            observed_at_unix_ms: record_timestamp_unix_ms(value).unwrap_or(fold_at_unix_ms),
+        });
+    }
+}
+
 /// Claude Code: `assistant` records carry a `stop_reason`. Only a genuine
 /// end-of-response closes the turn — `tool_use`, an explicit `null` (the
 /// record is still streaming), and a missing field all leave it open. `user`
@@ -843,6 +1134,17 @@ fn binding_process_start(binding: &PaneTranscriptBinding) -> Option<u64> {
     })
 }
 
+fn binding_agent_cwd(binding: &PaneTranscriptBinding) -> Option<String> {
+    binding.cwd.clone().or_else(|| {
+        let shell_pid = binding.shell_pid?;
+        let agent_pid = find_agent_process_pid(shell_pid, &binding.agent)?;
+        fs::read_link(format!("/proc/{agent_pid}/cwd"))
+            .ok()?
+            .to_str()
+            .map(str::to_owned)
+    })
+}
+
 /// Map a cwd to Claude Code's project-directory name. Claude replaces every `/`
 /// and `.` with `-` (verified on-disk against
 /// `~/.claude/projects/-home-developer-...`).
@@ -967,7 +1269,10 @@ impl TranscriptAdapter for ClaudeTranscriptAdapter {
             let Ok(value) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
-            apply_turn_marker(state, &value, claude_turn_marker(&value), now);
+            let marker = claude_turn_marker(&value);
+            fold_claude_child_agents(&value, state, now);
+            apply_native_turn_id(state, &value, marker, "claude", now);
+            apply_turn_marker(state, &value, marker, now);
             if value.get("type").and_then(Value::as_str) != Some("assistant") {
                 continue;
             }
@@ -1132,7 +1437,16 @@ fn mangle_pi_cwd(cwd: &str) -> String {
     format!("--{encoded}--")
 }
 
-/// Codex adapter over `~/.codex/sessions/**/rollout-*.jsonl`.
+// Inject environment paths so discovery can be regression-tested without
+// changing the process-wide environment during parallel tests.
+fn codex_sessions_root(codex_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    codex_home
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| home.map(|home| home.join(".codex")))
+        .map(|home| home.join("sessions"))
+}
+
+/// Codex adapter over `$CODEX_HOME/sessions` (default `~/.codex/sessions`).
 pub(crate) struct CodexTranscriptAdapter {
     sessions_root: Option<PathBuf>,
     candidates: NativeCandidateCache,
@@ -1141,7 +1455,10 @@ pub(crate) struct CodexTranscriptAdapter {
 impl Default for CodexTranscriptAdapter {
     fn default() -> Self {
         Self {
-            sessions_root: dirs::home_dir().map(|home| home.join(".codex/sessions")),
+            sessions_root: codex_sessions_root(
+                std::env::var_os("CODEX_HOME").map(PathBuf::from),
+                dirs::home_dir(),
+            ),
             candidates: NativeCandidateCache::default(),
         }
     }
@@ -1184,7 +1501,10 @@ impl TranscriptAdapter for CodexTranscriptAdapter {
             let Ok(value) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
-            apply_turn_marker(state, &value, codex_turn_marker(&value), now);
+            let marker = codex_turn_marker(&value);
+            fold_codex_child_agents(&value, state, now);
+            apply_native_turn_id(state, &value, marker, "codex", now);
+            apply_turn_marker(state, &value, marker, now);
             if value.get("type").and_then(Value::as_str) != Some("response_item") {
                 continue;
             }
@@ -1471,6 +1791,14 @@ pub(crate) struct TranscriptPollResult {
     pub removed: Vec<PaneTranscriptKey>,
 }
 
+impl TranscriptPollResult {
+    /// Results collected before a tab close must not repopulate its mirror or
+    /// emit activity for that deleted tab when the worker reaches GTK again.
+    pub(crate) fn retain_tabs(&mut self, live: &HashSet<u32>) {
+        self.ticks.retain(|tick| live.contains(&tick.key.0));
+    }
+}
+
 /// Owns per-pane tailers and the set of adapters. All disk IO happens in
 /// [`sync_and_poll`], which is meant to run inside a blocking worker.
 ///
@@ -1481,6 +1809,15 @@ pub(crate) struct TranscriptTracker {
 }
 
 impl TranscriptTracker {
+    /// Never wait on worker IO from GTK. A busy tracker requires another poll;
+    /// an empty mirror alone does not prove the worker has released its tails.
+    pub(crate) fn has_tracked_panes(&self) -> bool {
+        self.inner
+            .try_lock()
+            .map(|inner| !inner.is_empty())
+            .unwrap_or(true)
+    }
+
     pub(crate) fn with_default_adapters() -> Self {
         Self::with_adapters(vec![
             Box::new(ClaudeTranscriptAdapter::default()),
@@ -1505,6 +1842,10 @@ impl TranscriptTracker {
         let binding_process_starts: HashMap<PaneTranscriptKey, Option<u64>> = bindings
             .iter()
             .map(|binding| (binding.key, binding_process_start(binding)))
+            .collect();
+        let binding_cwds: HashMap<PaneTranscriptKey, Option<String>> = bindings
+            .iter()
+            .map(|binding| (binding.key, binding_agent_cwd(binding)))
             .collect();
         let mut inner = self.inner.lock().expect("transcript tracker lock poisoned");
         let mut ticks = Vec::new();
@@ -1557,7 +1898,9 @@ impl TranscriptTracker {
                 Entry::Vacant(entry) => {
                     let Some(resolved) = adapter.resolve_path(
                         binding.session_id.as_deref(),
-                        binding.cwd.as_deref(),
+                        binding_cwds
+                            .get(&binding.key)
+                            .and_then(|cwd| cwd.as_deref()),
                         binding_process_starts.get(&binding.key).copied().flatten(),
                     ) else {
                         // Unresolvable session: insert nothing, degrade silently.
@@ -2506,6 +2849,13 @@ mod tests {
         assert_eq!(result.ticks[0].new_messages, 0);
         assert!(result.ticks[0].work_events.is_empty());
         assert_eq!(result.ticks[0].state.last_message.as_deref(), Some("Hello"));
+        assert!(tracker.has_tracked_panes());
+        let mut late = result;
+        late.retain_tabs(&HashSet::new());
+        assert!(
+            late.ticks.is_empty(),
+            "a late completion must not recreate a removed tab mirror"
+        );
 
         // A second poll with no new bytes yields no ticks (change-gated).
         let result = tracker.sync_and_poll(std::slice::from_ref(&binding));
@@ -2565,6 +2915,10 @@ mod tests {
         let result = tracker.sync_and_poll(&[]);
         assert!(result.ticks.is_empty());
         assert_eq!(result.removed, vec![(3, 4)]);
+        assert!(
+            !tracker.has_tracked_panes(),
+            "empty reconciliation releases worker tails"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2845,6 +3199,35 @@ mod tests {
     }
 
     #[test]
+    fn claude_native_turn_id_follows_non_meta_user_uuid_and_clears_on_malformed_next_turn() {
+        let adapter = ClaudeTranscriptAdapter::with_projects_root(PathBuf::from("/nonexistent"));
+        let first = serde_json::json!({
+            "type": "user", "timestamp": T0, "uuid": "claude-turn-1",
+            "message": {"role": "user", "content": "first"}
+        });
+        let completed = serde_json::json!({
+            "type": "assistant", "timestamp": T1,
+            "message": {"role": "assistant", "stop_reason": "end_turn", "content": []}
+        });
+        let mut state = fold(&adapter, &[first, completed]);
+        assert_eq!(
+            state.native_turn_id,
+            Some(ProviderNativeTurnId {
+                provider: "claude".into(),
+                id: "claude-turn-1".into(),
+                observed_at_unix_ms: at(T0),
+            })
+        );
+
+        let malformed_next = serde_json::json!({
+            "type": "user", "timestamp": T2, "uuid": "\n",
+            "message": {"role": "user", "content": "second"}
+        });
+        adapter.ingest_lines(&[malformed_next.to_string()], &mut state);
+        assert_eq!(state.native_turn_id, None);
+    }
+
+    #[test]
     fn claude_turn_evidence_ignores_meta_records_sidechains_and_flags_api_errors() {
         let adapter = ClaudeTranscriptAdapter::with_projects_root(PathBuf::from("/nonexistent"));
         let completed = serde_json::json!({
@@ -2876,6 +3259,40 @@ mod tests {
             fold(&adapter, &[api_error]).turn,
             PaneTurn::new(TurnPhase::Errored, at(T2))
         );
+    }
+
+    #[test]
+    fn codex_custom_home_discovers_current_format_working_turn() {
+        let root = unique_temp_dir("codex-home");
+        let custom = root.join("custom");
+        let sessions = custom.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let meta = serde_json::json!({"type":"session_meta","payload":{
+            "id":"inert-custom-session", "cwd":"/inert/project", "timestamp":T0
+        }});
+        let started = serde_json::json!({"type":"event_msg","timestamp":T1,
+            "payload":{"type":"task_started","turn_id":"inert-turn"}});
+        let file = sessions.join("rollout-inert.jsonl");
+        fs::write(&file, format!("{meta}\n{started}\n")).unwrap();
+        let adapter = CodexTranscriptAdapter::with_sessions_root(
+            codex_sessions_root(Some(custom), Some(root.join("user"))).unwrap(),
+        );
+        let resolved = adapter
+            .resolve_path(Some("inert-custom-session"), Some("/inert/project"), None)
+            .expect("explicit Codex home must be discoverable");
+        assert_eq!(resolved.path, file);
+        let mut state = TranscriptState::default();
+        adapter.ingest_lines(&[meta.to_string(), started.to_string()], &mut state);
+        assert_eq!(
+            super::super::lifecycle::resolve(None, Some(state.turn), at(T1)),
+            super::super::lifecycle::AgentLifecycle::Working
+        );
+        // Replayed historical activity must never become fresh merely by reading it.
+        assert_eq!(
+            super::super::lifecycle::resolve(None, Some(state.turn), at(T1) + 301_000),
+            super::super::lifecycle::AgentLifecycle::Idle
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2915,6 +3332,91 @@ mod tests {
             fold(&adapter, &[started, errored]).turn,
             PaneTurn::new(TurnPhase::Errored, at(T2))
         );
+    }
+
+    #[test]
+    fn codex_native_turn_id_accepts_started_or_delayed_completion_identity() {
+        let adapter = CodexTranscriptAdapter::with_sessions_root(PathBuf::from("/nonexistent"));
+        let started = serde_json::json!({
+            "type": "event_msg", "timestamp": T0,
+            "payload": {"type": "task_started", "turn_id": "codex-turn-1"}
+        });
+        let state = fold(&adapter, &[started]);
+        assert_eq!(
+            state
+                .native_turn_id
+                .as_ref()
+                .map(|native| native.id.as_str()),
+            Some("codex-turn-1")
+        );
+
+        let duplicate_user_message = serde_json::json!({
+            "type": "event_msg", "timestamp": T1,
+            "payload": {"type": "user_message", "message": "hello"}
+        });
+        assert_eq!(
+            fold(
+                &adapter,
+                &[
+                    serde_json::json!({
+                        "type": "event_msg", "timestamp": T0,
+                        "payload": {"type": "task_started", "turn_id": "codex-turn-1"}
+                    }),
+                    duplicate_user_message,
+                ]
+            )
+            .native_turn_id
+            .as_ref()
+            .map(|native| native.id.as_str()),
+            Some("codex-turn-1")
+        );
+
+        let missing = serde_json::json!({
+            "type": "event_msg", "timestamp": T1, "payload": {"type": "task_started"}
+        });
+        let delayed = serde_json::json!({
+            "type": "event_msg", "timestamp": T2,
+            "payload": {"type": "task_complete", "turn_id": "codex-turn-2"}
+        });
+        let state = fold(&adapter, &[missing, delayed]);
+        assert_eq!(
+            state.native_turn_id,
+            Some(ProviderNativeTurnId {
+                provider: "codex".into(),
+                id: "codex-turn-2".into(),
+                observed_at_unix_ms: at(T2),
+            })
+        );
+
+        let mut stale_state = fold(
+            &adapter,
+            &[
+                serde_json::json!({
+                    "type": "event_msg", "timestamp": T0,
+                    "payload": {"type": "task_started", "turn_id": "codex-stale"}
+                }),
+                serde_json::json!({
+                    "type": "event_msg", "timestamp": T1,
+                    "payload": {"type": "task_complete", "turn_id": "codex-stale"}
+                }),
+            ],
+        );
+        let next_without_id = serde_json::json!({
+            "type": "event_msg", "timestamp": T2,
+            "payload": {"type": "user_message", "message": "next"}
+        });
+        adapter.ingest_lines(&[next_without_id.to_string()], &mut stale_state);
+        assert_eq!(stale_state.native_turn_id, None);
+    }
+
+    #[test]
+    fn unsupported_provider_keeps_native_turn_identity_absent() {
+        let adapter = PiTranscriptAdapter::with_sessions_root(PathBuf::from("/nonexistent"));
+        let prompt = serde_json::json!({
+            "type": "message", "timestamp": T0, "uuid": "pi-turn",
+            "message": {"role": "user", "content": "hello"}
+        });
+        assert_eq!(fold(&adapter, &[prompt]).native_turn_id, None);
     }
 
     #[test]
@@ -3397,5 +3899,173 @@ mod tests {
 
         assert!(result.ticks.is_empty());
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn assert_child_agent_conformance(
+        adapter: &dyn TranscriptAdapter,
+        provider: &str,
+        start: Vec<String>,
+        complete: String,
+    ) -> Vec<String> {
+        let mut state = TranscriptState {
+            agent: provider.into(),
+            session_id: "parent-session".into(),
+            ..Default::default()
+        };
+        adapter.ingest_lines(&start, &mut state);
+        let stable_ids: Vec<String> = state
+            .child_agents
+            .iter()
+            .map(|child| child.stable_id.clone())
+            .collect();
+        assert_eq!(stable_ids.len(), 2);
+        assert_ne!(stable_ids[0], stable_ids[1]);
+        assert!(state.child_agents.iter().all(|child| {
+            child.provider == provider
+                && child.parent_id == format!("{provider}:parent-session")
+                && child.state == AgentLifecycle::Working
+        }));
+
+        adapter.ingest_lines(&start, &mut state);
+        assert_eq!(state.child_agents.len(), 2, "replay must deduplicate");
+        assert_eq!(
+            state
+                .child_agents
+                .iter()
+                .map(|child| child.stable_id.clone())
+                .collect::<Vec<_>>(),
+            stable_ids
+        );
+
+        adapter.ingest_lines(&[complete], &mut state);
+        assert_eq!(state.child_agents[0].state, AgentLifecycle::Done);
+        assert_eq!(state.child_agents[1].state, AgentLifecycle::Working);
+        stable_ids
+    }
+
+    #[test]
+    fn claude_and_codex_child_agents_share_one_reconciliation_contract() {
+        let claude = ClaudeTranscriptAdapter::default();
+        let claude_start = serde_json::json!({
+            "type": "assistant", "timestamp": T0,
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tool-a", "name": "Agent",
+                 "input": {"name": "researcher", "description": "inspect parser"}},
+                {"type": "tool_use", "id": "tool-b", "name": "Task",
+                "input": {"name": "researcher", "description": "inspect UI"}}
+            ]}
+        });
+        let claude_complete = serde_json::json!({
+            "type": "user", "timestamp": T1,
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tool-a", "content": "done"}
+            ]}
+        });
+        assert_child_agent_conformance(
+            &claude,
+            "claude",
+            vec![claude_start.to_string()],
+            claude_complete.to_string(),
+        );
+
+        let codex = CodexTranscriptAdapter::default();
+        let codex_start = vec![
+            serde_json::json!({
+                "type": "response_item", "timestamp": T0,
+                "payload": {"type": "function_call", "name": "spawn_agent",
+                    "call_id": "call-a", "arguments": serde_json::json!({
+                        "task_name": "research_a", "message": "inspect parser"
+                    }).to_string()}
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "response_item", "timestamp": T0,
+                "payload": {"type": "function_call_output", "call_id": "call-a",
+                    "output": serde_json::json!({"task_name": "/root/research_a"}).to_string()}
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "response_item", "timestamp": T0,
+                "payload": {"type": "function_call", "name": "spawn_agent",
+                    "call_id": "call-b", "arguments": serde_json::json!({
+                        "task_name": "research_b", "message": "inspect UI"
+                    }).to_string()}
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "response_item", "timestamp": T0,
+                "payload": {"type": "function_call_output", "call_id": "call-b",
+                    "output": serde_json::json!({"task_name": "/root/research_b"}).to_string()}
+            })
+            .to_string(),
+        ];
+        let codex_complete = serde_json::json!({
+            "type": "response_item", "timestamp": T1,
+            "payload": {"type": "agent_message", "author": "/root/research_a",
+                "recipient": "/root", "content": [{
+                "type": "input_text",
+                "text": "Message Type: FINAL_ANSWER\nTask name: /root/research_a\nSender: worker\nPayload:\ndone"
+            }]}
+        });
+        let first_ids = assert_child_agent_conformance(
+            &codex,
+            "codex",
+            codex_start.clone(),
+            codex_complete.to_string(),
+        );
+
+        let mut resumed = TranscriptState {
+            agent: "codex".into(),
+            session_id: "parent-session".into(),
+            ..Default::default()
+        };
+        codex.ingest_lines(&codex_start, &mut resumed);
+        assert_eq!(
+            resumed
+                .child_agents
+                .iter()
+                .map(|child| child.stable_id.clone())
+                .collect::<Vec<_>>(),
+            first_ids,
+            "parent resume must replay to the same canonical identities"
+        );
+    }
+
+    #[test]
+    fn changed_codex_child_records_degrade_to_parent_only() {
+        let adapter = CodexTranscriptAdapter::default();
+        let mut state = TranscriptState {
+            agent: "codex".into(),
+            session_id: "parent-session".into(),
+            ..Default::default()
+        };
+        let unsupported = serde_json::json!({
+            "type": "response_item", "timestamp": T0,
+            "payload": {"type": "function_call", "name": "spawn_agent_v2",
+                "call_id": "changed", "arguments": "not-json"}
+        });
+        let failed_call = serde_json::json!({
+            "type": "response_item", "timestamp": T0,
+            "payload": {"type": "function_call", "name": "spawn_agent",
+                "call_id": "failed", "arguments": serde_json::json!({
+                    "task_name": "never_started", "message": "cannot start"
+                }).to_string()}
+        });
+        let failed_output = serde_json::json!({
+            "type": "response_item", "timestamp": T1,
+            "payload": {"type": "function_call_output", "call_id": "failed",
+                "output": "collab spawn failed: agent thread limit reached"}
+        });
+        adapter.ingest_lines(
+            &[
+                unsupported.to_string(),
+                failed_call.to_string(),
+                failed_output.to_string(),
+            ],
+            &mut state,
+        );
+        assert!(state.child_agents.is_empty());
+        assert_eq!(state.agent, "codex");
+        assert_eq!(state.session_id, "parent-session");
     }
 }

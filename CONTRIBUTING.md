@@ -4,11 +4,21 @@ Thanks for taking the time to improve `taarof`. This is an early public release,
 so the contribution process is intentionally lightweight: small, focused issues
 and pull requests are the easiest to review.
 
+## Product and experiment
+
+The desktop product is `taarof-app/` with its `taarof-web/` browser client.
+The installed `taarof` command is the Python client in `taarof-cli/taarof`.
+`examples/taarof` is a separate experimental Zellij/SSH launcher with the
+same filename. It uses the [experimental WASM sidebar](wasm-sidebar/README.md),
+not GTK. Neither experiment is installed by the desktop packaging scripts.
+Keep their identities distinct when reporting bugs or changing installation docs.
+
 ## Development setup
 
 `taarof` is a Linux desktop app built with Rust, GTK4/libadwaita/VTE, and a
 Vite-based web client.
 
+Install Bash, Zsh and Fish for the real-shell integration checks.
 Install the system packages for your distribution, then install the Rust and
 Node toolchains. If you use `mise`, run:
 
@@ -54,6 +64,10 @@ For security-sensitive reports, use `SECURITY.md` instead of a public issue.
 
 ## Pull requests
 
+- Create task branches from `origin/kmux` in dedicated worktrees and target pull
+  requests to `kmux`.
+- Promotion from `kmux` to `main` requires review and explicit authorization;
+  `main` remains the GitHub default branch.
 - Keep PRs focused on one behavior change, bug fix, or documentation topic.
 - Open an issue first for large design changes or changes to the local trust
   model.

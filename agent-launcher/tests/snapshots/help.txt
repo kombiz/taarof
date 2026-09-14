@@ -1,0 +1,27 @@
+agent sessions
+Search:
+Provider: all   Scope: Local   Sort: Repository
+┌Sessions─────────────────────────────────────────────┐┌Keys─────────────────────────────────────────────────┐
+│  New                                                ││Enter: run declared default action                   │
+│  New fixture                                        ││Up / Down: move selection                            │
+│  Last sent (newest first)                           ││Type: fuzzy search; Backspace: edit                  │
+│> unknown · Active · fixture · fixture live · local.t││Tab: local / all hosts / active only                 │
+│  unknown · fixture · fixture recent · local.ts      ││Ctrl+N: focus New rows                               │
+│                                                     ││Ctrl+P: cycle provider filter                        │
+│                                                     ││Ctrl+R: refresh catalog                              │
+│                                                     ││Ctrl+S: repository / time / active groups            │
+│                                                     ││Last sent: your latest message; local time           │
+│                                                     ││Unknown: no reliable message time available          │
+│                                                     ││?: toggle this help                                  │
+│                                                     ││Esc / Ctrl+C: cancel                                 │
+│                                                     ││Ctrl+F: fork selected session                        │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+└─────────────────────────────────────────────────────┘└─────────────────────────────────────────────────────┘
+Enter select  Ctrl+N new  Ctrl+P provider  Ctrl+R refresh  Ctrl+S sort  Tab scope  ? help  Esc cancel  Ctrl+F

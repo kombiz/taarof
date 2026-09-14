@@ -1,0 +1,27 @@
+agent sessions
+Search:
+Provider: all   Scope: Local   Sort: Repository
+┌Sessions─────────────────────────────────────────────┐┌Metadata / actions───────────────────────────────────┐
+│  New                                                ││Last sent: unknown                                   │
+│  New fixture                                        ││Provider: fixture                                    │
+│  Last sent (newest first)                           ││Session: live                                        │
+│> unknown · Active · fixture · fixture live · local.t││Title: fixture live                                  │
+│  unknown · fixture · fixture recent · local.ts      ││Host: local.ts                                       │
+│                                                     ││Directory: /tmp/project                              │
+│                                                     ││Repository: /tmp/project                             │
+│                                                     ││Confidence: ExactLiveBinding                         │
+│                                                     ││Source: LocalHistory                                 │
+│                                                     ││Attach: focus or reconnect to the existing live      │
+│                                                     ││process                                              │
+│                                                     ││Resume: relaunch the provider using its saved history│
+│                                                     ││Fork: create a separate session from saved history   │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+│                                                     ││                                                     │
+└─────────────────────────────────────────────────────┘└─────────────────────────────────────────────────────┘
+Enter select  Ctrl+N new  Ctrl+P provider  Ctrl+R refresh  Ctrl+S sort  Tab scope  ? help  Esc cancel  Ctrl+F

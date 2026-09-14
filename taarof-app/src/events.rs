@@ -24,6 +24,79 @@ pub struct EventRecord {
     pub payload: serde_json::Value,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AgentTurnTransition {
+    pub seq: u64,
+    pub ts_unix_ms: u64,
+    pub state: String,
+    pub source: Option<String>,
+    pub evidence_quality: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_turn: Option<crate::agents::ProviderNativeTurnId>,
+}
+
+pub(crate) fn agent_activity_transition_payload(
+    tab_id: u32,
+    pane_id: u32,
+    before: crate::agents::AgentLifecycle,
+    after: crate::agents::AgentLifecycle,
+    source: Option<&str>,
+) -> Option<serde_json::Value> {
+    (before != after).then(|| {
+        serde_json::json!({
+            "tab_id": tab_id,
+            "pane_id": pane_id,
+            "state": crate::agents::turn_lifecycle_label(after),
+            "source": source,
+        })
+    })
+}
+
+/// Return matching post-boundary state evidence for one exact pane. Callers
+/// retain their own state machine (for example, whether running was observed),
+/// while this predicate prevents stale and unrelated events from satisfying a
+/// wait.
+pub fn agent_turn_transition(
+    event: &EventRecord,
+    boundary_seq: u64,
+    tab_id: u32,
+    pane_id: u32,
+) -> Option<AgentTurnTransition> {
+    if event.seq <= boundary_seq || event.event_type != "agent_activity_changed" {
+        return None;
+    }
+    if event.payload.get("tab_id")?.as_u64()? != u64::from(tab_id)
+        || event.payload.get("pane_id")?.as_u64()? != u64::from(pane_id)
+    {
+        return None;
+    }
+    let state = event.payload.get("state")?.as_str()?;
+    if !matches!(
+        state,
+        "running" | "done" | "waiting-input" | "errored" | "idle"
+    ) {
+        return None;
+    }
+    let source = event
+        .payload
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let native_turn = event
+        .payload
+        .get("native_turn")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    Some(AgentTurnTransition {
+        seq: event.seq,
+        ts_unix_ms: event.ts_unix_ms,
+        state: state.to_string(),
+        evidence_quality: crate::agents::turn_evidence_quality(source.as_deref()).to_string(),
+        source,
+        native_turn,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct EventQuery {
     pub events: Vec<EventRecord>,
@@ -362,7 +435,8 @@ impl EventRecord {
 #[cfg(test)]
 mod tests {
     use super::{
-        EventStore, CURSOR_GAP_ACTIVE_WINDOW_MS, DROP_RATE_BUCKET_MS, DROP_RATE_WINDOW_MS,
+        agent_activity_transition_payload, agent_turn_transition, EventRecord, EventStore,
+        CURSOR_GAP_ACTIVE_WINDOW_MS, DROP_RATE_BUCKET_MS, DROP_RATE_WINDOW_MS,
         DROP_WINDOW_MAX_BUCKETS, MAX_EVENT_LIMIT,
     };
     use serde_json::json;
@@ -642,5 +716,68 @@ mod tests {
         assert_eq!(query.gap_to, None);
         assert!(!query.resnapshot_required);
         assert_eq!(store.retention_health().cursor_gaps_total, 0);
+    }
+
+    #[test]
+    fn agent_turn_evidence_requires_post_boundary_exact_pane_activity() {
+        let event = EventRecord {
+            seq: 8,
+            ts_unix_ms: 123,
+            event_type: "agent_activity_changed".into(),
+            payload: json!({
+                "tab_id": 3, "pane_id": 5, "state": "done", "source": "codex",
+                "native_turn": {
+                    "provider": "codex", "id": "turn-1", "observed_at_unix_ms": 120
+                }
+            }),
+        };
+        assert!(agent_turn_transition(&event, 8, 3, 5).is_none());
+        assert!(agent_turn_transition(&event, 7, 4, 5).is_none());
+        assert!(agent_turn_transition(&event, 7, 3, 6).is_none());
+
+        let evidence = agent_turn_transition(&event, 7, 3, 5).expect("matching evidence");
+        assert_eq!(evidence.state, "done");
+        assert_eq!(evidence.evidence_quality, "provider-attributed");
+        assert_eq!(evidence.native_turn.unwrap().id, "turn-1");
+    }
+
+    #[test]
+    fn agent_turn_evidence_marks_missing_provider_as_degraded() {
+        let event = EventRecord {
+            seq: 9,
+            ts_unix_ms: 124,
+            event_type: "agent_activity_changed".into(),
+            payload: json!({"tab_id": 3, "pane_id": 5, "state": "waiting-input"}),
+        };
+        let evidence = agent_turn_transition(&event, 8, 3, 5).expect("matching evidence");
+        assert_eq!(evidence.state, "waiting-input");
+        assert_eq!(evidence.evidence_quality, "degraded-generic");
+    }
+
+    #[test]
+    fn lifecycle_transition_payload_emits_once_only_when_resolved_state_changes() {
+        use crate::agents::AgentLifecycle;
+        assert!(agent_activity_transition_payload(
+            3,
+            5,
+            AgentLifecycle::Working,
+            AgentLifecycle::Working,
+            Some("codex")
+        )
+        .is_none());
+        let payload = agent_activity_transition_payload(
+            3,
+            5,
+            AgentLifecycle::Working,
+            AgentLifecycle::Done,
+            Some("codex"),
+        )
+        .expect("changed lifecycle emits");
+        assert_eq!(
+            payload,
+            json!({
+                "tab_id": 3, "pane_id": 5, "state": "done", "source": "codex"
+            })
+        );
     }
 }

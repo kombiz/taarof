@@ -1096,3 +1096,119 @@ mod tests {
         assert_eq!(status.agent_name.as_deref(), Some("helper"));
     }
 }
+
+/// Attach authority is separate from advisory process-name detection. Callers
+/// supply OS-verified executable names, never comm/title or wrapper arguments.
+/// Multiple provider processes (even with one ID) leave ownership ambiguous.
+pub(crate) fn detect_exact_agent_in_process_facts(
+    cwd: Option<&str>,
+    processes: &[ProcessFact],
+) -> Option<AgentStatus> {
+    let signatures = merged_agent_signatures_for_cwd(cwd);
+    let mut owners = Vec::new();
+    for (_, executable, cmdline) in processes {
+        let Some(executable) = executable else {
+            continue;
+        };
+        let name = command_basename(executable);
+        let matched: Vec<_> = signatures
+            .iter()
+            .filter(|signature| {
+                signature
+                    .patterns
+                    .iter()
+                    .any(|pattern| command_basename(pattern) == name)
+            })
+            .collect();
+        if matched.len() > 1 {
+            return None;
+        }
+        if let Some(signature) = matched.first() {
+            let id = cmdline
+                .as_deref()
+                .and_then(|argv| extract_exact_session_id(&signature.name, argv));
+            owners.push(AgentStatus {
+                agent_name: Some(signature.name.clone()),
+                session_id: id,
+                running: true,
+            });
+        }
+    }
+    if owners.len() != 1 {
+        return None;
+    }
+    owners.pop().filter(|owner| owner.session_id.is_some())
+}
+fn extract_exact_session_id(agent: &str, argv: &[String]) -> Option<String> {
+    // Reuse the provider's structured resume syntax, not a second name table.
+    const ID: &str = "__agent_identity__";
+    let provider = agent_session_core::legacy::normalize_agent_name(agent);
+    let plan = agent_session_core::plan_resume(&provider, Default::default(), ID);
+    let flag = plan.argv.first()?;
+    let args: Vec<_> = argv
+        .iter()
+        .skip(1)
+        .take_while(|arg| arg.as_str() != "--")
+        .collect();
+    // Provider "last/continue" selectors or competing identity flags are not
+    // evidence for the explicit ID shown in the launcher.
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--last" | "--latest" | "--continue"))
+    {
+        return None;
+    }
+    let expected_flag = flag.strip_suffix(ID).unwrap_or(flag).trim_end_matches('=');
+    if args.iter().any(|arg| {
+        ["--resume", "--session", "-S"].iter().any(|selector| {
+            (arg.as_str() == *selector || arg.starts_with(&format!("{selector}=")))
+                && *selector != expected_flag
+        })
+    }) {
+        return None;
+    }
+    let mut ids = Vec::new();
+    if flag == "resume" {
+        if args.first().is_some_and(|arg| arg.as_str() == "resume") {
+            ids.push(args.get(1)?.as_str());
+        }
+    } else if flag.starts_with('-') {
+        if let Some(prefix) = flag.strip_suffix(ID) {
+            ids.extend(args.iter().filter_map(|arg| arg.strip_prefix(prefix)));
+        } else {
+            for (i, arg) in args.iter().enumerate() {
+                if arg.as_str() == flag {
+                    ids.push(args.get(i + 1)?.as_str());
+                } else if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
+                    ids.push(value);
+                }
+            }
+        }
+    }
+    if ids.len() != 1 || ids[0].is_empty() || ids[0].starts_with('-') || ids[0].contains('\0') {
+        return None;
+    }
+    // Only the canonical launcher resume argv proves this selector. Extra
+    // flags may fork or override identity; prompts and aliases are not proof.
+    if argv.get(1..)? != agent_session_core::plan_resume(&provider, Default::default(), ids[0]).argv
+    {
+        return None;
+    }
+    Some(ids[0].to_string())
+}
+
+#[cfg(test)]
+mod exact_identity_tests {
+    use super::*;
+    #[test]
+    fn fork_override_and_extra_arguments_are_not_exact_resume_identity() {
+        for args in [
+            vec!["claude", "--resume", "old-id", "--fork-session"],
+            vec!["claude", "--resume", "old-id", "--session-id", "new-id"],
+            vec!["claude", "--resume", "old-id", "--", "prompt"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            assert_eq!(extract_exact_session_id("claude", &args), None);
+        }
+    }
+}

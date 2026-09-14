@@ -12,8 +12,38 @@ mod transcript;
 
 #[cfg(test)]
 use crate::workspace::AgentActivity;
-#[cfg(test)]
 use crate::workspace::AgentActivityState;
+
+/// Classify whether an agent-state transition carries provider attribution.
+/// Generic prompt waits still accept unattributed post-boundary evidence, but
+/// surface it honestly as degraded instead of inventing provider certainty.
+pub(crate) fn turn_evidence_quality(source: Option<&str>) -> &'static str {
+    if source.is_some_and(|source| !source.trim().is_empty()) {
+        "provider-attributed"
+    } else {
+        "degraded-generic"
+    }
+}
+
+pub(crate) fn turn_state_label(state: AgentActivityState) -> &'static str {
+    match state {
+        AgentActivityState::Idle => "idle",
+        AgentActivityState::Running => "running",
+        AgentActivityState::WaitingInput => "waiting-input",
+        AgentActivityState::Errored => "errored",
+        AgentActivityState::Done => "done",
+    }
+}
+
+pub(crate) fn turn_lifecycle_label(state: AgentLifecycle) -> &'static str {
+    match state {
+        AgentLifecycle::Idle => "idle",
+        AgentLifecycle::Working => "running",
+        AgentLifecycle::WaitingInput => "waiting-input",
+        AgentLifecycle::Errored => "errored",
+        AgentLifecycle::Done => "done",
+    }
+}
 
 pub(crate) use lifecycle::{
     resolve as resolve_agent_lifecycle, strongest as strongest_agent_lifecycle, AgentLifecycle,
@@ -24,14 +54,43 @@ pub use output::{
 };
 pub use scanner::format_ports_label;
 pub(crate) use scanner::{
-    detect_agent_in_process_facts, get_child_pids, get_process_cmdline, get_process_comm,
-    get_process_cwd, get_socket_inodes, is_ssh_process, try_build_listen_table,
-    try_get_root_process_facts, ListenTableProbe, ProcessFact,
+    detect_agent_in_process_facts, detect_exact_agent_in_process_facts, get_child_pids,
+    get_process_cmdline, get_process_comm, get_process_cwd, get_socket_inodes, is_ssh_process,
+    try_build_listen_table, try_get_root_process_facts, ListenTableProbe, ProcessFact,
 };
 pub(crate) use transcript::{
-    collect_transcript_bindings, resolve_touched_file_path, FileOp, TranscriptState,
-    TranscriptTracker, TranscriptWorkEvent,
+    collect_transcript_bindings, resolve_touched_file_path, FileOp, ProviderNativeTurnId,
+    TranscriptState, TranscriptTracker, TranscriptWorkEvent,
 };
+
+/// Provider-neutral evidence for a headless child agent discovered inside a
+/// parent agent's native transcript. It deliberately carries no synthetic pane
+/// identity: projection supplies the real owning tab/pane from the binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeadlessAgentEvidence {
+    pub stable_id: String,
+    pub parent_id: String,
+    pub provider: String,
+    pub label: String,
+    pub state: AgentLifecycle,
+    pub activity: String,
+    pub updated_at_unix_ms: u64,
+}
+
+/// One agent instance ready for a UI surface. Headless children inherit their
+/// parent's real location and are never panes or independent focus targets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentInstance {
+    pub stable_id: String,
+    pub parent_id: Option<String>,
+    pub provider: String,
+    pub label: String,
+    pub state: AgentLifecycle,
+    pub activity: String,
+    pub tab_id: u32,
+    pub pane_id: u32,
+    pub headless: bool,
+}
 // Named only by tests (production code iterates `recent_files` without naming
 // the element type); gate the re-export so non-test builds don't see it unused.
 #[cfg(test)]

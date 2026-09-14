@@ -13,10 +13,10 @@ default = ["history", "opencode-history"]
 # allows opt-in in CI release-mode builds that need the integration tests.
 harness = []
 # OpenCode session-history adapter; links the system libsqlite3 by default.
-opencode-history = ["dep:rusqlite"]
+opencode-history = ["dep:rusqlite", "agent-session-core/opencode-history"]
 history = ["dep:rusqlite"]
 # Packaging/portability: vendor SQLite into the binary for self-contained bundles.
-bundled-sqlite = ["history", "opencode-history", "rusqlite/bundled"]
+bundled-sqlite = ["history", "opencode-history", "rusqlite/bundled", "agent-session-core/bundled-sqlite"]
 
 [dependencies]
 gtk = { version = "0.11", package = "gtk4", features = ["v4_6"] }
@@ -43,6 +43,7 @@ subtle = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
 axum = { version = "0.8", features = ["ws"] }
 fs2 = "0.4.3"
+agent-session-core = { version = "0.1.0", path = "../agent-session-core", default-features = false }
 
 [dev-dependencies]
 futures-util = "0.3"

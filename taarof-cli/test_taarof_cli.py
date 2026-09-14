@@ -354,6 +354,97 @@ class GroupedCommandTests(unittest.TestCase):
         self.assertEqual(calls[0], {"action": "run-in-pane", "pane": 1, "command": "ls"})
         self.assertEqual(calls[0], calls[1])
 
+    def test_pane_split_matches_flat_payload_and_maps_idempotency_key(self) -> None:
+        cli = load_cli_module()
+        calls = []
+
+        def fake_socket_send(message, session=None):
+            calls.append(message)
+            return {"ok": True, "workspace_id": 1, "tab_id": 2, "pane_id": 3}
+
+        with (
+            patch.object(cli, "socket_send", fake_socket_send),
+            patch.object(cli, "_emit"),
+        ):
+            args = [
+                "--tab", "current", "--direction", "horizontal",
+                "--command", "cargo test", "--cwd", "/repo",
+                "--idempotency-key", "build:42",
+            ]
+            self.assertEqual(cli.main(["split-pane", *args]), 0)
+            self.assertEqual(cli.main(["pane", "split", *args]), 0)
+
+        expected = {
+            "action": "split-pane",
+            "tab": "current",
+            "direction": "horizontal",
+            "command": "cargo test",
+            "working_dir": "/repo",
+            "idempotency_key": "build:42",
+        }
+        self.assertEqual(calls, [expected, expected])
+
+    def test_split_pane_omits_unspecified_optional_fields(self) -> None:
+        cli = load_cli_module()
+        calls = []
+        with (
+            patch.object(cli, "socket_send", lambda message, session=None: calls.append(message) or {"ok": True}),
+            patch.object(cli, "_emit"),
+        ):
+            self.assertEqual(cli.main(["split-pane"]), 0)
+        self.assertEqual(calls, [{"action": "split-pane"}])
+
+    def test_prompt_agent_submits_then_waits_with_returned_token(self) -> None:
+        cli = load_cli_module()
+        calls = []
+
+        def fake_socket_send(message, session=None, timeout=10.0):
+            calls.append((message, timeout))
+            if message["action"] == "prompt-agent":
+                return {"ok": True, "data": {"turn_token": "turn-1"}}
+            return {"ok": True, "data": {"outcome": "completed"}}
+
+        with patch.object(cli, "socket_send", fake_socket_send), patch.object(cli, "_emit"):
+            self.assertEqual(cli.main([
+                "prompt-agent", "--tab", "12", "--pane", "4",
+                "--prompt", "run tests", "--timeout", "3",
+                "--max-output-bytes", "2048",
+            ]), 0)
+
+        self.assertEqual(calls[0], ({
+            "action": "prompt-agent", "tab": "12", "pane": 4, "prompt": "run tests",
+        }, 10.0))
+        self.assertEqual(calls[1], ({
+            "action": "wait-agent-turn", "turn_token": "turn-1",
+            "timeout_seconds": 3.0, "max_output_bytes": 2048,
+        }, 8.0))
+
+    def test_prompt_agent_no_wait_returns_before_wait_request(self) -> None:
+        cli = load_cli_module()
+        calls = []
+        with (
+            patch.object(cli, "socket_send", lambda message, session=None: calls.append(message) or {
+                "ok": True, "data": {"turn_token": "turn-2"}}),
+            patch.object(cli, "_emit"),
+        ):
+            self.assertEqual(cli.main([
+                "prompt-agent", "--tab", "12", "--pane", "4",
+                "--prompt", "hello", "--no-wait",
+            ]), 0)
+        self.assertEqual(calls, [{
+            "action": "prompt-agent", "tab": "12", "pane": 4, "prompt": "hello",
+        }])
+
+    def test_cancel_agent_turn_maps_token(self) -> None:
+        cli = load_cli_module()
+        calls = []
+        with (
+            patch.object(cli, "socket_send", lambda message, session=None: calls.append(message) or {"ok": True}),
+            patch.object(cli, "_emit"),
+        ):
+            self.assertEqual(cli.main(["cancel-agent-turn", "turn-3"]), 0)
+        self.assertEqual(calls, [{"action": "cancel-agent-turn", "turn_token": "turn-3"}])
+
     def test_grouped_help_is_reachable(self) -> None:
         cli = load_cli_module()
         parser = cli.build_parser()
@@ -1277,15 +1368,25 @@ class WorkReportingTests(unittest.TestCase):
             .read_text(encoding="utf-8").splitlines()
             if line.startswith("taarof work-report ")
         ]
+        # The instruction entrypoints link to progressively disclosed command
+        # docs. Verify that route and the actual reference, rather than requiring
+        # every entrypoint to duplicate the command bodies.
+        reference = skill.parent / "reference" / "agent-integration.md"
+        self.assertIn("agent-skills/legacy-app/SKILL.md", claude.read_text(encoding="utf-8"))
+        self.assertIn("reference/agent-integration.md", skill.read_text(encoding="utf-8"))
+        reference_commands = [
+            shlex.split(line) for line in reference.read_text(encoding="utf-8").splitlines()
+            if line.startswith("taarof work-report ")
+        ]
+        self.assertTrue(fixture_commands)
         for command in fixture_commands:
-            self.assertIn(command, claude.read_text(encoding="utf-8"))
-            self.assertIn(command, skill.read_text(encoding="utf-8"))
+            self.assertIn(shlex.split(command), reference_commands)
         safe_discovery = 'taarof --session "$SESSION" list-tabs --pretty'
         safe_eval = (
             'eval "$(taarof --session "$SESSION" work-context '
             '--tab "$NUMERIC_TAB_ID" --pane "$NUMERIC_PANE_ID" --shell)"'
         )
-        for document in (claude, skill, root / "fixtures" / "agent-work-report.sh"):
+        for document in (reference, root / "fixtures" / "agent-work-report.sh"):
             contents = document.read_text(encoding="utf-8")
             self.assertIn(safe_discovery, contents)
             self.assertIn(safe_eval, contents)

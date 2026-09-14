@@ -126,6 +126,18 @@ impl ReplayWindow {
     }
 
     pub fn resume(&self, epoch: BrokerEpoch, ack_seq: OutputSeq) -> ResumeDecision {
+        self.resume_limited(epoch, ack_seq, usize::MAX, usize::MAX)
+    }
+
+    /// Copy only one bounded batch. A frame too large for the caller's budget
+    /// requires checkpoint recovery instead of an empty successful replay.
+    pub fn resume_limited(
+        &self,
+        epoch: BrokerEpoch,
+        ack_seq: OutputSeq,
+        max_bytes: usize,
+        max_frames: usize,
+    ) -> ResumeDecision {
         if epoch != self.epoch {
             return ResumeDecision::WrongEpoch {
                 requested_epoch: epoch,
@@ -172,15 +184,33 @@ impl ReplayWindow {
             };
         }
 
+        let mut bytes = 0;
+        let frames: Vec<_> = self
+            .frames
+            .iter()
+            .filter(|frame| frame.seq > ack_seq)
+            .take(max_frames)
+            .take_while(|frame| {
+                if frame.len() > max_bytes.saturating_sub(bytes) {
+                    return false;
+                }
+                bytes += frame.len();
+                true
+            })
+            .cloned()
+            .collect();
+        if frames.is_empty() {
+            return ResumeDecision::ReplayGap {
+                epoch: self.epoch,
+                requested_seq: ack_seq,
+                oldest_retained_seq: self.oldest_retained_seq(),
+                latest_seq: self.latest_seq,
+            };
+        }
         ResumeDecision::Replay {
             epoch: self.epoch,
             ack_seq,
-            frames: self
-                .frames
-                .iter()
-                .filter(|frame| frame.seq > ack_seq)
-                .cloned()
-                .collect(),
+            frames,
         }
     }
 
@@ -208,5 +238,41 @@ impl ReplayWindow {
         if let Some(frame) = self.frames.pop_front() {
             self.total_bytes = self.total_bytes.saturating_sub(frame.len());
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_batch_tests {
+    use super::*;
+    #[test]
+    fn resume_batches_bound_both_bytes_and_frame_count_without_skipping() {
+        let epoch = BrokerEpoch::from_bytes([3; 16]);
+        let mut replay = ReplayWindow::new(epoch);
+        for byte in b"ABCDE" {
+            replay.push(SystemTime::now(), [*byte; 3]).unwrap();
+        }
+        let mut cursor = OutputSeq::zero();
+        let mut bytes = Vec::new();
+        while cursor < replay.latest_seq() {
+            let ResumeDecision::Replay { frames, .. } = replay.resume_limited(epoch, cursor, 7, 2)
+            else {
+                panic!("retained cursor must replay");
+            };
+            assert!(frames.len() <= 2);
+            assert!(frames.iter().map(|frame| frame.len()).sum::<usize>() <= 7);
+            for frame in frames {
+                cursor = frame.seq;
+                bytes.extend(frame.payload);
+            }
+        }
+        assert_eq!(bytes, b"AAABBBCCCDDDEEE");
+        assert!(matches!(
+            replay.resume_limited(epoch, OutputSeq::zero(), 2, 2),
+            ResumeDecision::ReplayGap { .. }
+        ));
+        assert!(matches!(
+            replay.resume_limited(epoch, OutputSeq::zero(), 7, 0),
+            ResumeDecision::ReplayGap { .. }
+        ));
     }
 }

@@ -488,3 +488,20 @@ IDs.
   palette, the `Ctrl+Shift+T` shortcut, or the socket API.
 - Workspace tmux mode affects future plain tabs and split inheritance. Existing
   tmux-backed panes keep their own tmux sessions either way.
+
+## Standalone agent launcher
+
+`agent` can query the selected private Taarof runtime for exact live bindings.
+An Attach action focuses the existing tmux-backed agent pane after revalidating
+its full provider, host, session, workspace, tab, pane, and tmux destination.
+Resume relaunches from provider history. Inferred cwd hints, ambiguous identities,
+and stale process observations never authorize Attach. Remote history uses the
+configured SSH target and a TTY; stale remote discovery disables Resume until a
+healthy refresh. See [the attended checklist](../testing/e2e-gui/agent-launcher-enrichment-checklist.md).
+
+Exact launcher Attach currently requires a local native executable with a
+verifiable provider signature and canonical resume argv whose ID exists in
+provider history. Additional flags, resume names, and prefixes cannot authorize
+Attach. Interpreter
+wrappers, title-only detection, and remote process IDs remain observation-only;
+remote cached provider history can still offer Resume after a healthy refresh.

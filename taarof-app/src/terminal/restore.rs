@@ -1489,6 +1489,11 @@ fn restored_leaf_spawn(
             let cwd = spawn_cwd.as_deref()?;
             Some(AgentResumeOffer {
                 agent_name: saved.agent_name.clone(),
+                action: agent_session_core::plan_resume(
+                    &saved.agent_name,
+                    cwd.into(),
+                    &saved.session_id,
+                ),
                 command: crate::agent_sessions::build_resume_command(
                     &saved.agent_name,
                     cwd,
@@ -1499,17 +1504,9 @@ fn restored_leaf_spawn(
         let spawn_cmd = auto_resume_agents
             .then_some(agent_resume.as_ref())
             .flatten()
-            .map(|offer| agent_resume_argv(&offer.command));
+            .map(|offer| offer.argv());
         (spawn_cwd, spawn_cmd, None, agent_resume)
     }
-}
-
-fn agent_resume_argv(command: &str) -> Vec<String> {
-    vec![
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
-        "-c".to_string(),
-        command.to_string(),
-    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1537,7 +1534,35 @@ impl SessionRestoreResumePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentResumeOffer {
     pub agent_name: String,
+    /// Display/copy metadata only. Never an execution input.
     pub command: String,
+    pub action: agent_session_core::ActionPlan,
+}
+
+impl AgentResumeOffer {
+    fn argv(&self) -> Vec<String> {
+        std::iter::once(self.action.program.clone())
+            .chain(self.action.argv.clone())
+            .collect()
+    }
+
+    /// A restored idle pane already owns a shell. Encode structured words at
+    /// that boundary; never read the compatibility command. Automatic restore
+    /// bypasses the shell entirely and passes `argv()` to the spawn seam.
+    pub(crate) fn shell_input(&self) -> String {
+        let escape = agent_session_core::legacy::shell_escape;
+        let words = self
+            .argv()
+            .iter()
+            .map(|word| escape(word))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "cd {} && {}",
+            escape(&self.action.cwd.to_string_lossy()),
+            words
+        )
+    }
 }
 
 /// A single leaf's planned spawn, produced without touching GTK. Mirrors what
@@ -1793,7 +1818,7 @@ mod agent_resume_tests {
     }
 
     #[test]
-    fn auto_resume_runs_offer_through_shell() {
+    fn auto_resume_executes_structured_argv() {
         let plan = plan_restored_spawns(&leaf(Some(codex_session())), true);
         let offer = plan[0]
             .agent_resume
@@ -1803,8 +1828,21 @@ mod agent_resume_tests {
             .spawn_cmd
             .as_ref()
             .expect("auto resume should supply a command");
-        assert_eq!(argv.get(1).map(String::as_str), Some("-c"));
-        assert_eq!(argv.get(2), Some(&offer.command));
+        assert_eq!(argv, &["codex", "resume", "session-123"]);
+        assert!(!argv.contains(&offer.command));
+    }
+
+    #[test]
+    fn manual_resume_ignores_compatibility_command() {
+        let plan = plan_restored_spawns(&leaf(Some(codex_session())), false);
+        let mut offer = plan[0].agent_resume.clone().unwrap();
+        offer.command = "must never execute this metadata".into();
+        offer.action.argv = vec!["resume".into(), "id with 'quotes'".into()];
+        assert_eq!(offer.argv(), ["codex", "resume", "id with 'quotes'"]);
+        assert_eq!(
+            offer.shell_input(),
+            "cd '/repo with spaces' && codex resume 'id with '\"'\"'quotes'\"'\"''"
+        );
     }
 
     #[test]

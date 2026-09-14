@@ -9,12 +9,13 @@ use std::os::unix::{
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc as tokio_mpsc;
 use vte::prelude::*;
 
@@ -55,6 +56,353 @@ pub(crate) use self::registry::refresh_registry_identity;
 use self::runtime_dir::{runtime_dir_resolution, socket_path_in, validate_socket_path_length};
 
 const SOCKET_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const SPLIT_IDEMPOTENCY_MAX_KEY_BYTES: usize = 128;
+const SPLIT_IDEMPOTENCY_MAX_RECORDS: usize = 256;
+const SPLIT_IDEMPOTENCY_TTL: Duration = Duration::from_secs(10 * 60);
+const AGENT_TURN_MAX_RECORDS: usize = 128;
+const AGENT_TURN_TTL: Duration = Duration::from_secs(15 * 60);
+const AGENT_TURN_DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+const AGENT_TURN_MAX_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const AGENT_TURN_DEFAULT_OUTPUT_BYTES: usize = 64 * 1024;
+const AGENT_TURN_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+const AGENT_PROMPT_MAX_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct SplitTarget {
+    workspace_id: u32,
+    tab_id: u32,
+    pane_id: u32,
+}
+
+enum SplitIdempotencyState {
+    InFlight {
+        fingerprint: [u8; 32],
+        created_at: Instant,
+    },
+    Completed {
+        fingerprint: [u8; 32],
+        created_at: Instant,
+        target: SplitTarget,
+    },
+}
+
+thread_local! {
+    static SPLIT_IDEMPOTENCY: RefCell<HashMap<String, SplitIdempotencyState>> = RefCell::new(HashMap::new());
+    static AGENT_TURNS: RefCell<HashMap<String, PendingAgentTurn>> = RefCell::new(HashMap::new());
+}
+
+#[derive(Clone)]
+struct PendingAgentTurn {
+    tab_id: u32,
+    pane_id: u32,
+    boundary_seq: u64,
+    pre_state: Option<String>,
+    created_at: Instant,
+    wait_started_at: Option<Instant>,
+    cursor_seq: u64,
+    saw_running: bool,
+    running_evidence: Option<crate::events::AgentTurnTransition>,
+    cancelled: bool,
+    prompted_at_unix_ms: u64,
+    provider: Option<String>,
+    provider_session_id: Option<String>,
+    provider_shell_pid: Option<i32>,
+    transcript_session_id: Option<String>,
+    pre_native_turn_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NativeTurnBoundary {
+    provider: Option<String>,
+    provider_session_id: Option<String>,
+    provider_shell_pid: Option<i32>,
+    transcript_session_id: Option<String>,
+    native_turn_id: Option<agents::ProviderNativeTurnId>,
+}
+
+fn native_turn_boundary(state: &AppState, tab_id: u32, pane_id: u32) -> NativeTurnBoundary {
+    let binding = agents::collect_transcript_bindings(state)
+        .into_iter()
+        .find(|binding| binding.key == (tab_id, pane_id));
+    let Some(binding) = binding else {
+        return NativeTurnBoundary::default();
+    };
+    let transcript = state
+        .pane_transcripts
+        .get(&(tab_id, pane_id))
+        .filter(|transcript| transcript.agent == binding.agent)
+        .filter(|transcript| {
+            binding
+                .session_id
+                .as_ref()
+                .is_none_or(|session_id| transcript.session_id == *session_id)
+        });
+    NativeTurnBoundary {
+        provider: Some(binding.agent),
+        provider_session_id: binding.session_id,
+        provider_shell_pid: binding.shell_pid,
+        transcript_session_id: transcript.map(|transcript| transcript.session_id.clone()),
+        native_turn_id: transcript
+            .and_then(|transcript| transcript.native_turn_id.as_ref())
+            .cloned(),
+    }
+}
+
+fn correlate_native_turn(
+    turn: &PendingAgentTurn,
+    current: &NativeTurnBoundary,
+    evidence: Option<&agents::ProviderNativeTurnId>,
+) -> Option<agents::ProviderNativeTurnId> {
+    let provider = turn.provider.as_deref()?;
+    if !matches!(provider, "claude" | "codex")
+        || current.provider.as_deref() != Some(provider)
+        || current.provider_shell_pid != turn.provider_shell_pid
+        || current.provider_session_id != turn.provider_session_id
+        || turn
+            .transcript_session_id
+            .as_ref()
+            .is_some_and(|session_id| current.transcript_session_id.as_ref() != Some(session_id))
+    {
+        return None;
+    }
+    let native = evidence?;
+    (native.provider == provider
+        && native.observed_at_unix_ms >= turn.prompted_at_unix_ms
+        && turn.pre_native_turn_id.as_ref() != Some(&native.id))
+    .then(|| native.clone())
+}
+
+fn correlated_native_turn_id(
+    state: &AppState,
+    turn: &PendingAgentTurn,
+    terminal_evidence: Option<&crate::events::AgentTurnTransition>,
+) -> Option<agents::ProviderNativeTurnId> {
+    let evidence = terminal_evidence
+        .and_then(|transition| transition.native_turn.as_ref())
+        .or_else(|| {
+            turn.running_evidence
+                .as_ref()
+                .and_then(|transition| transition.native_turn.as_ref())
+        });
+    correlate_native_turn(
+        turn,
+        &native_turn_boundary(state, turn.tab_id, turn.pane_id),
+        evidence,
+    )
+}
+
+fn validate_agent_prompt(prompt: &str) -> Result<&str, String> {
+    if prompt.trim().is_empty() {
+        return Err("prompt cannot be empty".to_string());
+    }
+    if prompt.len() > AGENT_PROMPT_MAX_BYTES {
+        return Err(format!("prompt exceeds {AGENT_PROMPT_MAX_BYTES} bytes"));
+    }
+    if prompt.contains(['\0', '\r', '\n']) {
+        return Err(
+            "prompt must be a single line without NUL, carriage-return, or newline bytes"
+                .to_string(),
+        );
+    }
+    Ok(prompt)
+}
+
+fn validate_agent_turn_timeout(timeout_seconds: Option<f64>) -> Result<Duration, String> {
+    let seconds = timeout_seconds.unwrap_or(AGENT_TURN_DEFAULT_TIMEOUT.as_secs_f64());
+    if !seconds.is_finite() || seconds < 0.1 || seconds > AGENT_TURN_MAX_TIMEOUT.as_secs_f64() {
+        return Err(format!(
+            "timeout_seconds must be between 0.1 and {}",
+            AGENT_TURN_MAX_TIMEOUT.as_secs()
+        ));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn validate_agent_turn_output_limit(limit: Option<usize>) -> Result<usize, String> {
+    let limit = limit.unwrap_or(AGENT_TURN_DEFAULT_OUTPUT_BYTES);
+    if !(1..=AGENT_TURN_MAX_OUTPUT_BYTES).contains(&limit) {
+        return Err(format!(
+            "max_output_bytes must be between 1 and {AGENT_TURN_MAX_OUTPUT_BYTES}"
+        ));
+    }
+    Ok(limit)
+}
+
+struct SplitReservation {
+    key: String,
+    fingerprint: [u8; 32],
+    armed: bool,
+}
+
+impl Drop for SplitReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        SPLIT_IDEMPOTENCY.with(|records| {
+            let mut records = records.borrow_mut();
+            if matches!(
+                records.get(&self.key),
+                Some(SplitIdempotencyState::InFlight { fingerprint, .. })
+                    if *fingerprint == self.fingerprint
+            ) {
+                records.remove(&self.key);
+            }
+        });
+    }
+}
+
+fn validate_split_idempotency_key(key: &str) -> Result<&str, String> {
+    if key.is_empty() || key.len() > SPLIT_IDEMPOTENCY_MAX_KEY_BYTES {
+        return Err(format!(
+            "idempotency_key must be 1..={SPLIT_IDEMPOTENCY_MAX_KEY_BYTES} bytes"
+        ));
+    }
+    if !key
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(
+            "idempotency_key must contain only ASCII letters, digits, '-', '_', '.', or ':'"
+                .to_string(),
+        );
+    }
+    Ok(key)
+}
+
+fn split_request_fingerprint(
+    tab_id: u32,
+    direction: SplitDirection,
+    command: Option<&str>,
+    working_dir: Option<&str>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(tab_id.to_le_bytes());
+    hasher.update([match direction {
+        SplitDirection::Vertical => 0_u8,
+        SplitDirection::Horizontal => 1_u8,
+    }]);
+    for value in [command, working_dir] {
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                hasher.update(value.len().to_le_bytes());
+                hasher.update(value.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    hasher.finalize().into()
+}
+
+fn idempotent_split(
+    key: Option<&str>,
+    fingerprint: [u8; 32],
+    target_exists: impl Fn(SplitTarget) -> bool,
+    create: impl FnOnce() -> Result<SplitTarget, String>,
+) -> SocketResponse {
+    let Some(key) = key else {
+        return create().map_or_else(SocketResponse::err, |target| {
+            SocketResponse::ok_with_target(target.workspace_id, target.tab_id, target.pane_id)
+        });
+    };
+    let key = match validate_split_idempotency_key(key) {
+        Ok(key) => key.to_string(),
+        Err(error) => return SocketResponse::err(error),
+    };
+    let now = Instant::now();
+    let replay = SPLIT_IDEMPOTENCY.with(|records| {
+        let mut records = records.borrow_mut();
+        records.retain(|_, state| {
+            let created_at = match state {
+                SplitIdempotencyState::InFlight { created_at, .. }
+                | SplitIdempotencyState::Completed { created_at, .. } => created_at,
+            };
+            now.duration_since(*created_at) <= SPLIT_IDEMPOTENCY_TTL
+        });
+        match records.get(&key) {
+            Some(SplitIdempotencyState::InFlight {
+                fingerprint: prior, ..
+            }) if *prior == fingerprint => Some(SocketResponse::err(
+                "split-pane request is still in progress",
+            )),
+            Some(SplitIdempotencyState::Completed {
+                fingerprint: prior,
+                target,
+                ..
+            }) if *prior == fingerprint => {
+                if target_exists(*target) {
+                    Some(SocketResponse::ok_with_target(
+                        target.workspace_id,
+                        target.tab_id,
+                        target.pane_id,
+                    ))
+                } else {
+                    Some(SocketResponse::err(
+                        "original split-pane target no longer exists",
+                    ))
+                }
+            }
+            Some(_) => Some(SocketResponse::err(
+                "idempotency_key was already used for a different split-pane request",
+            )),
+            None => {
+                if records.len() >= SPLIT_IDEMPOTENCY_MAX_RECORDS {
+                    if let Some(oldest) = records
+                        .iter()
+                        .filter_map(|(key, state)| match state {
+                            SplitIdempotencyState::Completed { created_at, .. } => {
+                                Some((key, *created_at))
+                            }
+                            SplitIdempotencyState::InFlight { .. } => None,
+                        })
+                        .min_by_key(|(_, created_at)| *created_at)
+                        .map(|(key, _)| key.clone())
+                    {
+                        records.remove(&oldest);
+                    } else {
+                        return Some(SocketResponse::err(
+                            "split-pane idempotency registry is full; retry later",
+                        ));
+                    }
+                }
+                records.insert(
+                    key.clone(),
+                    SplitIdempotencyState::InFlight {
+                        fingerprint,
+                        created_at: now,
+                    },
+                );
+                None
+            }
+        }
+    });
+    if let Some(response) = replay {
+        return response;
+    }
+    let mut reservation = SplitReservation {
+        key: key.clone(),
+        fingerprint,
+        armed: true,
+    };
+    match create() {
+        Ok(target) => {
+            SPLIT_IDEMPOTENCY.with(|records| {
+                records.borrow_mut().insert(
+                    key,
+                    SplitIdempotencyState::Completed {
+                        fingerprint,
+                        created_at: Instant::now(),
+                        target,
+                    },
+                );
+            });
+            reservation.armed = false;
+            SocketResponse::ok_with_target(target.workspace_id, target.tab_id, target.pane_id)
+        }
+        Err(error) => SocketResponse::err(error),
+    }
+}
 
 pub(crate) type BeforeTabRemovalObserver = Rc<dyn Fn(&AppState, u32)>;
 
@@ -286,6 +634,7 @@ fn dispatch_socket_message(
 
     let msg = match msg {
         SocketMessage::AttachSession {
+            expected_agent,
             session_name,
             host,
             ssh_target,
@@ -293,11 +642,48 @@ fn dispatch_socket_message(
             record_socket_message_event(
                 state,
                 &SocketMessage::AttachSession {
+                    expected_agent: expected_agent.clone(),
                     session_name: session_name.clone(),
                     host: host.clone(),
                     ssh_target: ssh_target.clone(),
                 },
             );
+            if let Some(target) = expected_agent {
+                if target.session_name != session_name
+                    || target.ssh_target != ssh_target
+                    || host.is_some()
+                {
+                    let _ = response_tx.send(SocketResponse::err(
+                        "Attach selector does not match exact live target.",
+                    ));
+                    return;
+                }
+                let state = state.clone();
+                let tab_list = tab_list.clone();
+                let term_stack = term_stack.clone();
+                let window = window.clone();
+                glib::spawn_future_local(async move {
+                    let result = verify_live_attach(&state, &target).await.and_then(|()| {
+                        if !crate::sidebar::focus_agent_pane(
+                            &state,
+                            &tab_list,
+                            &term_stack,
+                            target.tab_id,
+                            target.pane_id,
+                        ) {
+                            return Err("Live pane vanished; refresh the catalog.".into());
+                        }
+                        window.present();
+                        Ok(())
+                    });
+                    let response = match result {
+                        Ok(()) => SocketResponse::ok(),
+                        Err(error) => SocketResponse::err(error),
+                    };
+                    let _ = response_tx.send(response);
+                });
+                return;
+            }
             let detached = {
                 let st = state.borrow();
                 resolve_detached_session_for_attach(
@@ -345,6 +731,54 @@ fn dispatch_socket_message(
                 pane,
                 response_tx,
             );
+            return;
+        }
+        SocketMessage::PromptAgent { tab, pane, prompt } => {
+            record_socket_message_event(
+                state,
+                &SocketMessage::PromptAgent {
+                    tab: tab.clone(),
+                    pane,
+                    prompt: String::new(),
+                },
+            );
+            dispatch_prompt_agent_socket(state, window, &tab, pane, prompt, response_tx);
+            return;
+        }
+        SocketMessage::WaitAgentTurn {
+            turn_token,
+            timeout_seconds,
+            scrollback,
+            max_output_bytes,
+        } => {
+            record_socket_message_event(
+                state,
+                &SocketMessage::WaitAgentTurn {
+                    turn_token: String::new(),
+                    timeout_seconds,
+                    scrollback,
+                    max_output_bytes,
+                },
+            );
+            dispatch_wait_agent_turn(
+                state,
+                turn_token,
+                timeout_seconds,
+                scrollback,
+                max_output_bytes,
+                response_tx,
+            );
+            return;
+        }
+        SocketMessage::CancelAgentTurn { turn_token } => {
+            record_socket_message_event(
+                state,
+                &SocketMessage::CancelAgentTurn {
+                    turn_token: String::new(),
+                },
+            );
+            let response = cancel_agent_turn(&turn_token);
+            let _ = response_tx.send(response);
             return;
         }
         SocketMessage::SendKeys { tab, pane, keys } => {
@@ -844,6 +1278,450 @@ fn dispatch_send_keys_socket(
         None => {
             reply.send(SocketResponse::err("target pane no longer exists"));
         }
+    }
+}
+
+fn pane_agent_state_label(state: &AppState, tab_id: u32, pane_id: u32) -> Option<String> {
+    state
+        .find_tab(tab_id)
+        .and_then(|(_, tab)| tab.pane_agent_activity.get(&pane_id))
+        .map(|activity| agents::turn_state_label(activity.state).to_string())
+}
+
+fn cleanup_agent_turns(now: Instant) {
+    AGENT_TURNS.with(|turns| {
+        turns.borrow_mut().retain(|_, turn| {
+            turn.wait_started_at.is_some()
+                || now.saturating_duration_since(turn.created_at) <= AGENT_TURN_TTL
+        });
+    });
+}
+
+fn dispatch_prompt_agent_socket(
+    state: &Rc<RefCell<AppState>>,
+    window: &adw::ApplicationWindow,
+    tab_target: &String,
+    pane_id: u32,
+    prompt: String,
+    response_tx: mpsc::Sender<SocketResponse>,
+) {
+    let prompt = match validate_agent_prompt(&prompt) {
+        Ok(prompt) => prompt.to_string(),
+        Err(error) => {
+            let _ = response_tx.send(SocketResponse::err(error));
+            return;
+        }
+    };
+    let tab_id = match resolve_tab_id_for_target(state, Some(tab_target)) {
+        Ok(tab_id) => tab_id,
+        Err(error) => {
+            let _ = response_tx.send(SocketResponse::err(error));
+            return;
+        }
+    };
+    let prompted_at_unix_ms = crate::events::unix_time_ms();
+    let (workspace_id, pre_state, native_boundary) = {
+        let st = state.borrow();
+        let Some((workspace, tab)) = st.find_tab(tab_id) else {
+            let _ = response_tx.send(SocketResponse::err("tab not found"));
+            return;
+        };
+        if tab.panes.leaf(pane_id).is_none() {
+            let _ = response_tx.send(SocketResponse::err("pane not found"));
+            return;
+        }
+        (
+            workspace.id,
+            pane_agent_state_label(&st, tab_id, pane_id),
+            native_turn_boundary(&st, tab_id, pane_id),
+        )
+    };
+    cleanup_agent_turns(Instant::now());
+    let capacity_available = AGENT_TURNS.with(|turns| {
+        let mut turns = turns.borrow_mut();
+        if turns.len() >= AGENT_TURN_MAX_RECORDS {
+            let evictable = turns
+                .iter()
+                .filter(|(_, turn)| turn.wait_started_at.is_none())
+                .min_by_key(|(_, turn)| turn.created_at)
+                .map(|(token, _)| token.clone());
+            if let Some(token) = evictable {
+                turns.remove(&token);
+            }
+        }
+        turns.len() < AGENT_TURN_MAX_RECORDS
+    });
+    if !capacity_available {
+        let _ = response_tx.send(SocketResponse::err(
+            "agent turn registry is full; retry after an active wait finishes",
+        ));
+        return;
+    }
+
+    let turn_token = match new_pairing_id() {
+        Ok(token) => token,
+        Err(error) => {
+            let _ = response_tx.send(SocketResponse::err(error));
+            return;
+        }
+    };
+    let submitted_seq = RuntimeHandle::from_shared_state(state.clone()).emit_event(
+        "agent_prompt_submitted",
+        serde_json::json!({
+            "turn_token": turn_token,
+            "workspace_id": workspace_id,
+            "tab_id": tab_id,
+            "pane_id": pane_id,
+            "pre_state": pre_state,
+        }),
+    );
+    AGENT_TURNS.with(|turns| {
+        turns.borrow_mut().insert(
+            turn_token.clone(),
+            PendingAgentTurn {
+                tab_id,
+                pane_id,
+                boundary_seq: submitted_seq,
+                pre_state: pre_state.clone(),
+                created_at: Instant::now(),
+                wait_started_at: None,
+                cursor_seq: submitted_seq,
+                saw_running: false,
+                running_evidence: None,
+                cancelled: false,
+                prompted_at_unix_ms,
+                provider: native_boundary.provider,
+                provider_session_id: native_boundary.provider_session_id,
+                provider_shell_pid: native_boundary.provider_shell_pid,
+                transcript_session_id: native_boundary.transcript_session_id,
+                pre_native_turn_id: native_boundary.native_turn_id.map(|native| native.id),
+            },
+        );
+    });
+
+    let (send_tx, send_rx) = mpsc::channel();
+    dispatch_send_keys_socket(
+        state,
+        window,
+        Some(&tab_id.to_string()),
+        pane_id,
+        format!("{prompt}\n"),
+        ControlDispatchReply::new(send_tx, None),
+    );
+    glib::spawn_future_local(async move {
+        let send_response = gio::spawn_blocking(move || send_rx.recv()).await;
+        let response = match send_response {
+            Ok(Ok(response)) if response.ok => {
+                let mut response = SocketResponse::ok_with_data(serde_json::json!({
+                    "turn_token": turn_token,
+                    "boundary_seq": submitted_seq,
+                    "pre_state": pre_state,
+                    "status": "submitted",
+                }));
+                response.workspace_id = Some(workspace_id);
+                response.tab_id = Some(tab_id);
+                response.pane_id = Some(pane_id);
+                response
+            }
+            Ok(Ok(response)) => {
+                AGENT_TURNS.with(|turns| {
+                    turns.borrow_mut().remove(&turn_token);
+                });
+                response
+            }
+            Ok(Err(_)) | Err(_) => {
+                AGENT_TURNS.with(|turns| {
+                    turns.borrow_mut().remove(&turn_token);
+                });
+                SocketResponse::err("prompt delivery response channel closed")
+            }
+        };
+        if response_tx.send(response).is_err() {
+            AGENT_TURNS.with(|turns| {
+                turns.borrow_mut().remove(&turn_token);
+            });
+        }
+    });
+}
+
+fn truncate_utf8_tail(text: &str, max_bytes: usize) -> (&str, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+    let mut start = text.len() - max_bytes;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    (&text[start..], true)
+}
+
+fn bounded_agent_output(
+    text: &str,
+    rows: Option<i64>,
+    capture_error: Option<String>,
+    max_output_bytes: usize,
+) -> serde_json::Value {
+    let original_bytes = text.len();
+    let (bounded, truncated) = truncate_utf8_tail(text, max_output_bytes);
+    serde_json::json!({
+        "text": bounded,
+        "logical_lines": true,
+        "rows": rows,
+        "original_bytes": original_bytes,
+        "returned_bytes": bounded.len(),
+        "max_bytes": max_output_bytes,
+        "truncated": truncated,
+        "truncation": if truncated { "tail" } else { "none" },
+        "capture_error": capture_error,
+    })
+}
+
+fn agent_turn_stop_outcome(
+    turn: &PendingAgentTurn,
+    timeout: Duration,
+    pane_exists: bool,
+    event_gap: bool,
+) -> Option<&'static str> {
+    if turn.cancelled {
+        Some("cancelled")
+    } else if turn
+        .wait_started_at
+        .is_some_and(|started| started.elapsed() >= timeout)
+    {
+        Some("timeout")
+    } else if !pane_exists {
+        Some("pane-exited")
+    } else if event_gap {
+        Some("event-ring-overflow")
+    } else {
+        None
+    }
+}
+
+fn apply_agent_turn_events(
+    turn: &mut PendingAgentTurn,
+    events: &[crate::events::EventRecord],
+    next_seq: u64,
+) -> Option<crate::events::AgentTurnTransition> {
+    let mut terminal = None;
+    for event in events {
+        let Some(evidence) = crate::events::agent_turn_transition(
+            event,
+            turn.boundary_seq,
+            turn.tab_id,
+            turn.pane_id,
+        ) else {
+            continue;
+        };
+        match evidence.state.as_str() {
+            "running" => {
+                turn.saw_running = true;
+                turn.running_evidence = Some(evidence);
+            }
+            "done" | "errored" => terminal = Some(evidence),
+            "waiting-input"
+                if turn.saw_running || evidence.evidence_quality == "provider-attributed" =>
+            {
+                terminal = Some(evidence)
+            }
+            "idle" if turn.saw_running => terminal = Some(evidence),
+            _ => {}
+        }
+        if terminal.is_some() {
+            break;
+        }
+    }
+    turn.cursor_seq = next_seq;
+    terminal
+}
+
+fn agent_turn_response(
+    state: &Rc<RefCell<AppState>>,
+    token: &str,
+    turn: &PendingAgentTurn,
+    outcome: &str,
+    terminal_evidence: Option<&crate::events::AgentTurnTransition>,
+    scrollback: u32,
+    max_output_bytes: usize,
+) -> SocketResponse {
+    let tab_target = turn.tab_id.to_string();
+    let capture = handle_get_text(state, Some(&tab_target), turn.pane_id, scrollback, true);
+    let (text, rows, capture_error) = if capture.ok {
+        let data = capture.data.unwrap_or_default();
+        (
+            data.get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            data.get("rows").and_then(serde_json::Value::as_i64),
+            None,
+        )
+    } else {
+        (String::new(), None, capture.error)
+    };
+    let output = bounded_agent_output(&text, rows, capture_error, max_output_bytes);
+    let native_turn = correlated_native_turn_id(&state.borrow(), turn, terminal_evidence);
+    let mut response = SocketResponse::ok_with_data(serde_json::json!({
+        "turn_token": token,
+        "outcome": outcome,
+        "boundary_seq": turn.boundary_seq,
+        "pre_state": turn.pre_state,
+        "saw_running": turn.saw_running,
+        "evidence": {
+            "running": turn.running_evidence,
+            "terminal": terminal_evidence,
+            "native_turn": native_turn,
+        },
+        "output": output,
+    }));
+    if let Some((workspace, _)) = state.borrow().find_tab(turn.tab_id) {
+        response.workspace_id = Some(workspace.id);
+    }
+    response.tab_id = Some(turn.tab_id);
+    response.pane_id = Some(turn.pane_id);
+    response
+}
+
+fn finish_agent_turn(
+    token: &str,
+    response_tx: &mpsc::Sender<SocketResponse>,
+    response: SocketResponse,
+) -> glib::ControlFlow {
+    AGENT_TURNS.with(|turns| {
+        turns.borrow_mut().remove(token);
+    });
+    let _ = response_tx.send(response);
+    glib::ControlFlow::Break
+}
+
+fn dispatch_wait_agent_turn(
+    state: &Rc<RefCell<AppState>>,
+    turn_token: String,
+    timeout_seconds: Option<f64>,
+    scrollback: Option<u32>,
+    max_output_bytes: Option<usize>,
+    response_tx: mpsc::Sender<SocketResponse>,
+) {
+    let timeout = match validate_agent_turn_timeout(timeout_seconds) {
+        Ok(timeout) => timeout,
+        Err(error) => {
+            let _ = response_tx.send(SocketResponse::err(error));
+            return;
+        }
+    };
+    let scrollback = match validate_get_text_scrollback(scrollback.unwrap_or(1_000)) {
+        Ok(scrollback) => scrollback,
+        Err(error) => {
+            let _ = response_tx.send(SocketResponse::err(error));
+            return;
+        }
+    };
+    let max_output_bytes = match validate_agent_turn_output_limit(max_output_bytes) {
+        Ok(limit) => limit,
+        Err(error) => {
+            let _ = response_tx.send(SocketResponse::err(error));
+            return;
+        }
+    };
+    let started = AGENT_TURNS.with(|turns| {
+        let mut turns = turns.borrow_mut();
+        let Some(turn) = turns.get_mut(&turn_token) else {
+            return Err("unknown or expired turn_token".to_string());
+        };
+        if turn.wait_started_at.is_some() {
+            return Err("turn_token already has an active wait".to_string());
+        }
+        turn.wait_started_at = Some(Instant::now());
+        Ok(())
+    });
+    if let Err(error) = started {
+        let _ = response_tx.send(SocketResponse::err(error));
+        return;
+    }
+
+    let state = state.clone();
+    glib::timeout_add_local(Duration::from_millis(25), move || {
+        let Some(mut turn) = AGENT_TURNS.with(|turns| turns.borrow().get(&turn_token).cloned())
+        else {
+            let _ = response_tx.send(SocketResponse::err("turn_token expired while waiting"));
+            return glib::ControlFlow::Break;
+        };
+        let pane_exists = state
+            .borrow()
+            .find_tab(turn.tab_id)
+            .is_some_and(|(_, tab)| tab.panes.leaf(turn.pane_id).is_some());
+        let query = state
+            .borrow()
+            .event_store
+            .query(Some(turn.cursor_seq), Some(crate::events::MAX_EVENT_LIMIT));
+        if query.gap {
+            let response = agent_turn_response(
+                &state,
+                &turn_token,
+                &turn,
+                "event-ring-overflow",
+                None,
+                scrollback,
+                max_output_bytes,
+            );
+            return finish_agent_turn(&turn_token, &response_tx, response);
+        }
+        let terminal = apply_agent_turn_events(&mut turn, &query.events, query.next_seq);
+        AGENT_TURNS.with(|turns| {
+            if let Some(stored) = turns.borrow_mut().get_mut(&turn_token) {
+                *stored = turn.clone();
+            }
+        });
+        if let Some(evidence) = terminal.as_ref() {
+            let outcome = match evidence.state.as_str() {
+                "waiting-input" => "waiting-input",
+                "errored" => "errored",
+                "done" | "idle" => "completed",
+                _ => unreachable!("only terminal agent states reach this branch"),
+            };
+            let response = agent_turn_response(
+                &state,
+                &turn_token,
+                &turn,
+                outcome,
+                Some(evidence),
+                scrollback,
+                max_output_bytes,
+            );
+            return finish_agent_turn(&turn_token, &response_tx, response);
+        }
+        if let Some(outcome) = agent_turn_stop_outcome(&turn, timeout, pane_exists, false) {
+            let response = agent_turn_response(
+                &state,
+                &turn_token,
+                &turn,
+                outcome,
+                None,
+                scrollback,
+                max_output_bytes,
+            );
+            return finish_agent_turn(&turn_token, &response_tx, response);
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+fn cancel_agent_turn(turn_token: &str) -> SocketResponse {
+    let cancelled = AGENT_TURNS.with(|turns| {
+        let mut turns = turns.borrow_mut();
+        let Some(turn) = turns.get_mut(turn_token) else {
+            return false;
+        };
+        turn.cancelled = true;
+        true
+    });
+    if cancelled {
+        SocketResponse::ok_with_data(serde_json::json!({
+            "turn_token": turn_token,
+            "status": "cancellation-requested",
+        }))
+    } else {
+        SocketResponse::err("unknown or expired turn_token")
     }
 }
 
@@ -1409,11 +2287,13 @@ fn http_control_action_to_socket_message(action: crate::http::HttpControlAction)
             direction,
             command,
             working_dir,
+            idempotency_key,
         } => SocketMessage::SplitPane {
             tab,
             direction,
             command,
             working_dir,
+            idempotency_key,
         },
     }
 }
@@ -1578,7 +2458,7 @@ fn record_socket_message_event(state: &Rc<RefCell<AppState>>, msg: &SocketMessag
         SocketMessage::QueryState
             | SocketMessage::QueryEvents { .. }
             | SocketMessage::QueryHistory { .. }
-            | SocketMessage::QueryAgentSessions
+            | SocketMessage::QueryAgentSessions { .. }
             | SocketMessage::ListTabs
     ) {
         return;
@@ -1623,6 +2503,13 @@ fn handle_socket_message(
                 source: source.as_deref(),
             },
         ),
+        SocketMessage::PromptAgent { .. } => {
+            SocketResponse::err("prompt-agent must use asynchronous socket dispatch")
+        }
+        SocketMessage::WaitAgentTurn { .. } => {
+            SocketResponse::err("wait-agent-turn must use asynchronous socket dispatch")
+        }
+        SocketMessage::CancelAgentTurn { turn_token } => cancel_agent_turn(&turn_token),
         SocketMessage::WorkContext { tab, pane } => {
             handle_work_context_message(state, tab.as_ref(), pane)
         }
@@ -1719,6 +2606,7 @@ fn handle_socket_message(
             direction,
             command,
             working_dir,
+            idempotency_key,
         } => handle_split_pane(
             state,
             term_stack,
@@ -1728,6 +2616,7 @@ fn handle_socket_message(
             direction.as_deref(),
             command.as_deref(),
             working_dir.as_deref(),
+            idempotency_key.as_deref(),
         ),
         SocketMessage::GetText {
             tab,
@@ -1777,6 +2666,7 @@ fn handle_socket_message(
             session_name: _,
             host: _,
             ssh_target: _,
+            expected_agent: _,
         } => SocketResponse::err("attach-session must use asynchronous socket dispatch"),
         SocketMessage::ListDetached => {
             let st = state.borrow();
@@ -1826,7 +2716,7 @@ fn handle_socket_message(
         SocketMessage::QueryHistory { .. } => {
             SocketResponse::err("query-history must be handled by the socket listener thread")
         }
-        SocketMessage::QueryAgentSessions => handle_query_agent_sessions(state),
+        SocketMessage::QueryAgentSessions { schema } => handle_query_agent_sessions(state, schema),
         SocketMessage::AgentWorkspace {
             branch,
             command,
@@ -2522,6 +3412,7 @@ fn handle_split_pane(
     direction: Option<&str>,
     command: Option<&str>,
     working_dir: Option<&str>,
+    idempotency_key: Option<&str>,
 ) -> SocketResponse {
     let tab_id = match resolve_tab_id_for_target(state, tab_target) {
         Ok(tab_id) => tab_id,
@@ -2546,20 +3437,42 @@ fn handle_split_pane(
         }
         None => None,
     };
+    let workspace_id = match state.borrow().find_tab(tab_id) {
+        Some((workspace, _)) => workspace.id,
+        None => return SocketResponse::err("tab not found"),
+    };
+    let fingerprint = split_request_fingerprint(tab_id, split_direction, command, working_dir);
     let runtime = RuntimeHandle::from_shared_state(state.clone());
-    match terminal::open_split_pane(
-        &runtime,
-        term_stack,
-        tab_list,
-        window,
-        tab_id,
-        split_direction,
-        command_argv,
-        working_dir,
-    ) {
-        Some(pane_id) => SocketResponse::ok_with_pane(pane_id),
-        None => SocketResponse::err("failed to split pane"),
-    }
+    idempotent_split(
+        idempotency_key,
+        fingerprint,
+        |target| {
+            state
+                .borrow()
+                .find_tab(target.tab_id)
+                .is_some_and(|(workspace, tab)| {
+                    workspace.id == target.workspace_id && tab.panes.leaf(target.pane_id).is_some()
+                })
+        },
+        || {
+            terminal::open_split_pane(
+                &runtime,
+                term_stack,
+                tab_list,
+                window,
+                tab_id,
+                split_direction,
+                command_argv,
+                working_dir,
+            )
+            .map(|pane_id| SplitTarget {
+                workspace_id,
+                tab_id,
+                pane_id,
+            })
+            .ok_or_else(|| "failed to split pane".to_string())
+        },
+    )
 }
 
 fn handle_run_in_pane(
@@ -3540,13 +4453,103 @@ fn handle_query_events(
     ))
 }
 
-fn handle_query_agent_sessions(state: &Rc<RefCell<AppState>>) -> SocketResponse {
+/// Reprobe the selected process tree off GTK immediately before the mutation.
+/// The cached catalog can identify a candidate, but cannot prove it still lives.
+async fn verify_live_attach(
+    state: &Rc<RefCell<AppState>>,
+    target: &agent_session_core::AttachTarget,
+) -> Result<(), String> {
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map_err(|_| "Local host identity unavailable.".to_string())?;
+    let root = {
+        let st = state.borrow();
+        let live = crate::agent_sessions::build_live_session_evidence(&st, hostname.trim());
+        agent_session_core::validate_live_attach(target, &live)?;
+        st.runtime_probe
+            .as_ref()
+            .and_then(|s| s.pane_pids.get(&(target.tab_id, target.pane_id)))
+            .copied()
+            .ok_or("Live process root unavailable.")?
+    };
+    let tab_id = target.tab_id;
+    let pane_id = target.pane_id;
+    let started = std::time::Instant::now();
+    let reference = target.stable_ref.clone();
+    let canonical_host = hostname.trim().to_owned();
+    let (probe, known_history) = gio::spawn_blocking(move || {
+        let snapshot = crate::agent_sessions::default_catalog().snapshot_blocking(Vec::new());
+        let catalog = agent_session_core::SessionCatalog::from_discovery(
+            crate::agent_sessions::AgentSessionDiscovery {
+                providers: snapshot.providers,
+                sessions: snapshot.sessions,
+                remote_hosts: snapshot.remote_hosts,
+            },
+            &canonical_host,
+        );
+        let known = catalog
+            .sessions
+            .iter()
+            .any(|row| row.stable_ref == reference);
+        let probe = crate::runtime_probe::RuntimeProbeSnapshot::build(
+            &crate::runtime_probe::ProcProbeSource,
+            crate::events::unix_time_ms(),
+            &[],
+            &[(tab_id, pane_id, root)],
+        );
+        (probe, known)
+    })
+    .await
+    .map_err(|_| "Live identity check failed.".to_string())?;
+    if started.elapsed() >= std::time::Duration::from_secs(1) {
+        return Err("Live identity check timed out; refresh the catalog.".into());
+    }
+    if !known_history {
+        return Err(
+            "Resume selector is not an exact provider history ID; Attach is unavailable.".into(),
+        );
+    }
+    let exact = probe.pane_exact_agents.get(&(tab_id, pane_id));
+    if probe.process_probe != crate::probe::ProbeState::Ok
+        || !exact.is_some_and(|agent| {
+            agent.running
+                && agent
+                    .agent_name
+                    .as_deref()
+                    .map(agent_session_core::legacy::normalize_agent_name)
+                    .as_deref()
+                    == Some(target.stable_ref.provider_id.as_str())
+                && agent.session_id.as_deref() == Some(target.stable_ref.session_id.as_str())
+        })
+    {
+        return Err("Live agent vanished or changed; refresh the catalog.".into());
+    }
+    // GTK may have processed a workspace/pane mutation while the worker ran.
+    let st = state.borrow();
+    let live = crate::agent_sessions::build_live_session_evidence(&st, hostname.trim());
+    agent_session_core::validate_live_attach(target, &live)?;
+    if st
+        .runtime_probe
+        .as_ref()
+        .and_then(|s| s.pane_pids.get(&(tab_id, pane_id)))
+        != Some(&root)
+    {
+        return Err("Live process root changed; refresh the catalog.".into());
+    }
+    Ok(())
+}
+
+fn handle_query_agent_sessions(
+    state: &Rc<RefCell<AppState>>,
+    schema: crate::agent_sessions::SessionSchema,
+) -> SocketResponse {
     let live_bindings = {
         let st = state.borrow();
         crate::agent_sessions::build_live_agent_bindings(&st)
     };
     let snapshot = crate::agent_sessions::default_catalog().snapshot_blocking(live_bindings);
-    match serde_json::to_value(snapshot) {
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+    let live = crate::agent_sessions::build_live_session_evidence(&state.borrow(), hostname.trim());
+    match crate::agent_sessions::snapshot_value_with_live(snapshot, schema, Some(&live)) {
         Ok(data) => SocketResponse::ok_with_data(data),
         Err(error) => SocketResponse::err(format!(
             "could not serialize agent session snapshot: {error}"
@@ -3637,25 +4640,31 @@ fn write_json_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        alert_event_payload, apply_notify_state, bind_socket_listener, cleanup_socket,
+        agent_turn_stop_outcome, alert_event_payload, apply_agent_turn_events, apply_notify_state,
+        bind_socket_listener, bounded_agent_output, cancel_agent_turn, cleanup_socket,
         cleanup_stale_socket_registry_file, clear_tab_attention, close_tab_plan,
-        detached_session_list_payload, dispatch_notify_message, dispatch_socket_message,
-        ensure_agent_worktree, handle_device_revoke, handle_list_tabs, handle_pairing_confirm,
-        handle_pairing_offer, handle_pairing_pending, handle_pairing_reject, handle_query_events,
-        handle_query_state, handle_socket_connection, preferred_agent_workspace_tab_id,
-        prepare_tab_close, process_exists, record_socket_message_event, registry_path_in,
-        resolve_agent_status_pane_target, resolve_agent_workspace_repo_path,
-        resolve_detached_session_for_attach, resolve_tab_id_for_target_in_state,
-        resolve_workspace_id_for_target_in_state, retarget_tab_attention_to_remaining_activity,
-        route_agent_workspace_socket_message, run_socket_handler_safely, select_runtime_dir,
-        socket_message_action, socket_message_is_read_only, socket_path_in,
-        spawn_socket_dispatch_router, spawn_socket_listener_thread, validate_agent_status_source,
-        validate_get_text_scrollback, validate_runtime_dir, validate_runtime_dir_attributes,
-        validate_socket_command_input, validate_socket_path_length, CloseTabPlan, RuntimeDirIssue,
-        SocketActivityState, SocketDispatchContext, SocketMessage, SocketRegistry, SocketResponse,
-        AGENT_WORKSPACE_TEST_DELAY_FINISHED, AGENT_WORKSPACE_TEST_DELAY_MS,
-        AGENT_WORKSPACE_TEST_DELAY_STARTED, AGENT_WORKSPACE_TEST_WORKTREE_CREATED,
-        SOCKET_MAX_CAPTURE_SCROLLBACK_LINES,
+        correlate_native_turn, detached_session_list_payload, dispatch_notify_message,
+        dispatch_socket_message, ensure_agent_worktree, handle_device_revoke, handle_list_tabs,
+        handle_pairing_confirm, handle_pairing_offer, handle_pairing_pending,
+        handle_pairing_reject, handle_query_events, handle_query_state, handle_socket_connection,
+        idempotent_split, preferred_agent_workspace_tab_id, prepare_tab_close, process_exists,
+        record_socket_message_event, registry_path_in, resolve_agent_status_pane_target,
+        resolve_agent_workspace_repo_path, resolve_detached_session_for_attach,
+        resolve_tab_id_for_target_in_state, resolve_workspace_id_for_target_in_state,
+        retarget_tab_attention_to_remaining_activity, route_agent_workspace_socket_message,
+        run_socket_handler_safely, select_runtime_dir, socket_message_action,
+        socket_message_is_read_only, socket_path_in, spawn_socket_dispatch_router,
+        spawn_socket_listener_thread, truncate_utf8_tail, validate_agent_prompt,
+        validate_agent_status_source, validate_agent_turn_output_limit,
+        validate_agent_turn_timeout, validate_get_text_scrollback, validate_runtime_dir,
+        validate_runtime_dir_attributes, validate_socket_command_input,
+        validate_socket_path_length, validate_split_idempotency_key, CloseTabPlan,
+        NativeTurnBoundary, PendingAgentTurn, RuntimeDirIssue, SocketActivityState,
+        SocketDispatchContext, SocketMessage, SocketRegistry, SocketResponse,
+        SplitIdempotencyState, SplitTarget, AGENT_TURNS, AGENT_WORKSPACE_TEST_DELAY_FINISHED,
+        AGENT_WORKSPACE_TEST_DELAY_MS, AGENT_WORKSPACE_TEST_DELAY_STARTED,
+        AGENT_WORKSPACE_TEST_WORKTREE_CREATED, SOCKET_MAX_CAPTURE_SCROLLBACK_LINES,
+        SPLIT_IDEMPOTENCY, SPLIT_IDEMPOTENCY_MAX_RECORDS, SPLIT_IDEMPOTENCY_TTL,
     };
     use crate::{
         palette::{ensure_worktree_workspace_state, WorktreeWorkspaceState},
@@ -3677,6 +4686,7 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         mpsc, Mutex,
     };
+    use std::time::Instant;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc as tokio_mpsc;
 
@@ -3694,6 +4704,224 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir should be created");
         dir
+    }
+
+    fn pending_agent_turn() -> PendingAgentTurn {
+        PendingAgentTurn {
+            tab_id: 3,
+            pane_id: 5,
+            boundary_seq: 10,
+            pre_state: Some("idle".into()),
+            created_at: Instant::now(),
+            wait_started_at: None,
+            cursor_seq: 10,
+            saw_running: false,
+            running_evidence: None,
+            cancelled: false,
+            prompted_at_unix_ms: 0,
+            provider: None,
+            provider_session_id: None,
+            provider_shell_pid: None,
+            transcript_session_id: None,
+            pre_native_turn_id: None,
+        }
+    }
+
+    fn agent_event(seq: u64, tab: u32, pane: u32, state: &str) -> crate::events::EventRecord {
+        crate::events::EventRecord {
+            seq,
+            ts_unix_ms: seq * 100,
+            event_type: "agent_activity_changed".into(),
+            payload: serde_json::json!({
+                "tab_id": tab,
+                "pane_id": pane,
+                "state": state,
+                "source": "test-provider",
+            }),
+        }
+    }
+
+    #[test]
+    fn agent_turn_requires_running_before_idle_but_accepts_done() {
+        let mut turn = pending_agent_turn();
+        let stale_done = agent_event(10, 3, 5, "done");
+        let unrelated = agent_event(11, 3, 6, "done");
+        let premature_idle = agent_event(12, 3, 5, "idle");
+        assert!(
+            apply_agent_turn_events(&mut turn, &[stale_done, unrelated, premature_idle], 12,)
+                .is_none()
+        );
+
+        let running = agent_event(13, 3, 5, "running");
+        let done = agent_event(14, 3, 5, "done");
+        let terminal = apply_agent_turn_events(&mut turn, &[running, done], 14)
+            .expect("post-running done completes the turn");
+        assert!(turn.saw_running);
+        assert_eq!(terminal.state, "done");
+        assert_eq!(turn.cursor_seq, 14);
+    }
+
+    #[test]
+    fn agent_turn_waiting_input_is_a_typed_terminal_transition() {
+        let mut turn = pending_agent_turn();
+        let waiting = agent_event(11, 3, 5, "waiting-input");
+        let terminal = apply_agent_turn_events(&mut turn, &[waiting], 11)
+            .expect("waiting input completes the wait");
+        assert_eq!(terminal.state, "waiting-input");
+        assert!(!turn.saw_running);
+    }
+
+    #[test]
+    fn degraded_waiting_input_requires_post_boundary_running() {
+        let mut turn = pending_agent_turn();
+        let mut waiting = agent_event(11, 3, 5, "waiting-input");
+        waiting.payload.as_object_mut().unwrap().remove("source");
+        assert!(apply_agent_turn_events(&mut turn, &[waiting.clone()], 11).is_none());
+
+        let running = agent_event(12, 3, 5, "running");
+        assert!(apply_agent_turn_events(&mut turn, &[running], 12).is_none());
+        let mut later_waiting = waiting;
+        later_waiting.seq = 13;
+        assert_eq!(
+            apply_agent_turn_events(&mut turn, &[later_waiting], 13)
+                .expect("degraded waiting follows running")
+                .state,
+            "waiting-input"
+        );
+    }
+
+    #[test]
+    fn agent_turn_validation_and_output_bounds_are_strict() {
+        assert!(validate_agent_prompt("hello").is_ok());
+        assert!(validate_agent_prompt("  ").is_err());
+        assert!(validate_agent_prompt("bad\rprompt").is_err());
+        assert!(validate_agent_turn_timeout(Some(0.01)).is_err());
+        assert!(validate_agent_turn_timeout(Some(1.0)).is_ok());
+        assert!(validate_agent_turn_output_limit(Some(0)).is_err());
+
+        let (tail, truncated) = truncate_utf8_tail("ab😀cd", 5);
+        assert_eq!(tail, "cd");
+        assert!(truncated);
+
+        let output = bounded_agent_output("abcdef", Some(2), None, 3);
+        assert_eq!(output["text"], "def");
+        assert_eq!(output["original_bytes"], 6);
+        assert_eq!(output["returned_bytes"], 3);
+        assert_eq!(output["truncated"], true);
+        assert_eq!(output["truncation"], "tail");
+        assert_eq!(output["logical_lines"], true);
+    }
+
+    #[test]
+    fn agent_turn_stop_conditions_return_typed_outcomes() {
+        let mut turn = pending_agent_turn();
+        assert_eq!(
+            agent_turn_stop_outcome(&turn, Duration::from_secs(1), true, false),
+            None
+        );
+
+        turn.cancelled = true;
+        assert_eq!(
+            agent_turn_stop_outcome(&turn, Duration::from_secs(1), true, false),
+            Some("cancelled")
+        );
+        turn.cancelled = false;
+        turn.wait_started_at = Some(Instant::now() - Duration::from_secs(2));
+        assert_eq!(
+            agent_turn_stop_outcome(&turn, Duration::from_secs(1), true, false),
+            Some("timeout")
+        );
+        turn.wait_started_at = Some(Instant::now());
+        assert_eq!(
+            agent_turn_stop_outcome(&turn, Duration::from_secs(1), false, false),
+            Some("pane-exited")
+        );
+        assert_eq!(
+            agent_turn_stop_outcome(&turn, Duration::from_secs(1), true, true),
+            Some("event-ring-overflow")
+        );
+    }
+
+    #[test]
+    fn agent_turn_cancellation_marks_token_without_removing_wait_state() {
+        AGENT_TURNS.with(|turns| {
+            turns.borrow_mut().clear();
+            turns
+                .borrow_mut()
+                .insert("cancel-me".into(), pending_agent_turn());
+        });
+        let response = cancel_agent_turn("cancel-me");
+        assert!(response.ok);
+        AGENT_TURNS.with(|turns| {
+            assert!(turns.borrow()["cancel-me"].cancelled);
+            turns.borrow_mut().clear();
+        });
+        assert!(!cancel_agent_turn("missing").ok);
+    }
+
+    #[test]
+    fn native_turn_correlation_rejects_stale_and_mismatched_session_evidence() {
+        let mut turn = pending_agent_turn();
+        turn.prompted_at_unix_ms = 1_000;
+        turn.provider = Some("codex".into());
+        turn.provider_session_id = Some("detected-session".into());
+        turn.provider_shell_pid = Some(42);
+        turn.transcript_session_id = Some("native-session".into());
+        turn.pre_native_turn_id = Some("old-turn".into());
+
+        let current = NativeTurnBoundary {
+            provider: Some("codex".into()),
+            provider_session_id: Some("detected-session".into()),
+            provider_shell_pid: Some(42),
+            transcript_session_id: Some("native-session".into()),
+            native_turn_id: Some(crate::agents::ProviderNativeTurnId {
+                provider: "codex".into(),
+                id: "new-turn".into(),
+                observed_at_unix_ms: 1_001,
+            }),
+        };
+        assert_eq!(
+            correlate_native_turn(&turn, &current, current.native_turn_id.as_ref())
+                .unwrap()
+                .id,
+            "new-turn"
+        );
+
+        let mut stale = current.clone();
+        stale.native_turn_id.as_mut().unwrap().observed_at_unix_ms = 999;
+        assert!(correlate_native_turn(&turn, &stale, stale.native_turn_id.as_ref()).is_none());
+        let mut old_id = current.clone();
+        old_id.native_turn_id.as_mut().unwrap().id = "old-turn".into();
+        assert!(correlate_native_turn(&turn, &old_id, old_id.native_turn_id.as_ref()).is_none());
+        let mut mismatched = current;
+        mismatched.transcript_session_id = Some("other-session".into());
+        assert!(
+            correlate_native_turn(&turn, &mismatched, mismatched.native_turn_id.as_ref()).is_none()
+        );
+    }
+
+    #[test]
+    fn native_turn_correlation_falls_back_for_unknown_or_missing_provider_data() {
+        let mut turn = pending_agent_turn();
+        turn.prompted_at_unix_ms = 1_000;
+        turn.provider = Some("pi".into());
+        let current = NativeTurnBoundary {
+            provider: Some("pi".into()),
+            native_turn_id: Some(crate::agents::ProviderNativeTurnId {
+                provider: "pi".into(),
+                id: "turn".into(),
+                observed_at_unix_ms: 1_001,
+            }),
+            ..Default::default()
+        };
+        assert!(correlate_native_turn(&turn, &current, current.native_turn_id.as_ref()).is_none());
+
+        turn.provider = Some("claude".into());
+        let missing = NativeTurnBoundary {
+            provider: Some("claude".into()),
+            ..Default::default()
+        };
+        assert!(correlate_native_turn(&turn, &missing, None).is_none());
     }
 
     fn send_socket_request_for_tests(
@@ -6902,7 +8130,9 @@ mod tests {
                 session_name,
                 host,
                 ssh_target,
+                expected_agent,
             } => {
+                assert!(expected_agent.is_none());
                 assert_eq!(session_name, "taarof-smoke");
                 assert_eq!(host.as_deref(), Some("ci-box"));
                 assert_eq!(ssh_target.as_deref(), Some("builder@ci-box"));
@@ -7182,5 +8412,222 @@ mod tests {
         let revoke = handle_device_revoke(&state, "ghost-device");
         assert!(!revoke.ok);
         assert_eq!(revoke.error.as_deref(), Some("no such device"));
+    }
+
+    #[test]
+    fn split_idempotency_replays_exact_target_without_recreating() {
+        SPLIT_IDEMPOTENCY.with(|records| records.borrow_mut().clear());
+        let calls = Cell::new(0);
+        let create = || {
+            calls.set(calls.get() + 1);
+            Ok(SplitTarget {
+                workspace_id: 7,
+                tab_id: 11,
+                pane_id: 13,
+            })
+        };
+        let first = idempotent_split(Some("retry-exact"), [41; 32], |_| true, create);
+        let replay = idempotent_split(Some("retry-exact"), [41; 32], |_| true, create);
+        assert!(first.ok && replay.ok);
+        assert_eq!(
+            (replay.workspace_id, replay.tab_id, replay.pane_id),
+            (Some(7), Some(11), Some(13))
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn split_idempotency_rejects_inflight_and_conflicting_reuse() {
+        SPLIT_IDEMPOTENCY.with(|records| {
+            records.borrow_mut().clear();
+            records.borrow_mut().insert(
+                "inflight".to_string(),
+                SplitIdempotencyState::InFlight {
+                    fingerprint: [9; 32],
+                    created_at: Instant::now(),
+                },
+            );
+        });
+        let inflight = idempotent_split(
+            Some("inflight"),
+            [9; 32],
+            |_| true,
+            || panic!("must not create"),
+        );
+        assert_eq!(
+            inflight.error.as_deref(),
+            Some("split-pane request is still in progress")
+        );
+        let conflict = idempotent_split(
+            Some("inflight"),
+            [10; 32],
+            |_| true,
+            || panic!("must not create"),
+        );
+        assert!(conflict
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("different")));
+    }
+
+    #[test]
+    fn split_idempotency_failure_removes_reservation_for_retry() {
+        SPLIT_IDEMPOTENCY.with(|records| records.borrow_mut().clear());
+        let failed = idempotent_split(
+            Some("retry-failure"),
+            [17; 32],
+            |_| true,
+            || Err("spawn failed".to_string()),
+        );
+        assert_eq!(failed.error.as_deref(), Some("spawn failed"));
+        let retried = idempotent_split(
+            Some("retry-failure"),
+            [17; 32],
+            |_| true,
+            || {
+                Ok(SplitTarget {
+                    workspace_id: 1,
+                    tab_id: 2,
+                    pane_id: 3,
+                })
+            },
+        );
+        assert!(retried.ok);
+        assert_eq!(
+            (retried.workspace_id, retried.tab_id, retried.pane_id),
+            (Some(1), Some(2), Some(3))
+        );
+    }
+
+    #[test]
+    fn split_idempotency_rejects_a_stale_completed_target() {
+        SPLIT_IDEMPOTENCY.with(|records| records.borrow_mut().clear());
+        let first = idempotent_split(
+            Some("stale-target"),
+            [23; 32],
+            |_| true,
+            || {
+                Ok(SplitTarget {
+                    workspace_id: 1,
+                    tab_id: 2,
+                    pane_id: 3,
+                })
+            },
+        );
+        assert!(first.ok);
+        let stale = idempotent_split(
+            Some("stale-target"),
+            [23; 32],
+            |_| false,
+            || panic!("must not create a replacement pane"),
+        );
+        assert_eq!(
+            stale.error.as_deref(),
+            Some("original split-pane target no longer exists")
+        );
+    }
+
+    #[test]
+    fn split_idempotency_panic_releases_the_reservation() {
+        SPLIT_IDEMPOTENCY.with(|records| records.borrow_mut().clear());
+        let panic = std::panic::catch_unwind(|| {
+            let _ = idempotent_split(
+                Some("panic-cleanup"),
+                [29; 32],
+                |_| true,
+                || panic!("synthetic split panic"),
+            );
+        });
+        assert!(panic.is_err());
+        let retried = idempotent_split(
+            Some("panic-cleanup"),
+            [29; 32],
+            |_| true,
+            || {
+                Ok(SplitTarget {
+                    workspace_id: 4,
+                    tab_id: 5,
+                    pane_id: 6,
+                })
+            },
+        );
+        assert!(retried.ok);
+    }
+
+    #[test]
+    fn split_pane_wire_format_is_backward_compatible_and_validates_keys() {
+        let without_key: SocketMessage = serde_json::from_str(
+            r#"{"action":"split-pane","tab":"current","direction":"vertical"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            without_key,
+            SocketMessage::SplitPane {
+                idempotency_key: None,
+                ..
+            }
+        ));
+        let with_key: SocketMessage =
+            serde_json::from_str(r#"{"action":"split-pane","idempotency_key":"build:42"}"#)
+                .unwrap();
+        assert!(
+            matches!(with_key, SocketMessage::SplitPane { idempotency_key: Some(key), .. } if key == "build:42")
+        );
+        assert!(validate_split_idempotency_key("").is_err());
+        assert!(validate_split_idempotency_key(&"x".repeat(129)).is_err());
+        assert!(validate_split_idempotency_key("not allowed").is_err());
+        assert!(validate_split_idempotency_key("non-ascii-é").is_err());
+    }
+
+    #[test]
+    fn split_idempotency_expires_old_records_and_bounds_capacity() {
+        SPLIT_IDEMPOTENCY.with(|records| {
+            let mut records = records.borrow_mut();
+            records.clear();
+            records.insert(
+                "expired".to_string(),
+                SplitIdempotencyState::Completed {
+                    fingerprint: [1; 32],
+                    created_at: Instant::now() - SPLIT_IDEMPOTENCY_TTL - Duration::from_secs(1),
+                    target: SplitTarget {
+                        workspace_id: 1,
+                        tab_id: 1,
+                        pane_id: 1,
+                    },
+                },
+            );
+            for index in 0..SPLIT_IDEMPOTENCY_MAX_RECORDS {
+                records.insert(
+                    format!("completed-{index}"),
+                    SplitIdempotencyState::Completed {
+                        fingerprint: [2; 32],
+                        created_at: Instant::now(),
+                        target: SplitTarget {
+                            workspace_id: 2,
+                            tab_id: 2,
+                            pane_id: index as u32 + 1,
+                        },
+                    },
+                );
+            }
+        });
+        let created = idempotent_split(
+            Some("capacity-new"),
+            [3; 32],
+            |_| true,
+            || {
+                Ok(SplitTarget {
+                    workspace_id: 3,
+                    tab_id: 3,
+                    pane_id: 3,
+                })
+            },
+        );
+        assert!(created.ok);
+        SPLIT_IDEMPOTENCY.with(|records| {
+            let records = records.borrow();
+            assert!(records.len() <= SPLIT_IDEMPOTENCY_MAX_RECORDS);
+            assert!(!records.contains_key("expired"));
+        });
     }
 }

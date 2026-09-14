@@ -2501,8 +2501,8 @@ fn show_tab_row_menu(
                     let command = leaf
                         .agent_resume
                         .take()
-                        .map(|resume| resume.command)
-                        .unwrap_or_else(|| offer.command.clone());
+                        .map(|resume| resume.shell_input())
+                        .unwrap_or_else(|| offer.shell_input());
                     Some((leaf.terminal.clone(), command))
                 })
             };
@@ -3857,11 +3857,12 @@ fn refresh_agent_child_rows(
             pane.agent_label, pane.title, pane.pane_id
         )));
 
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        let parent_row = gtk::Box::new(gtk::Orientation::Horizontal, 5);
         let badge = gtk::Label::new(Some(&pane.badge.short_label));
         badge.add_css_class("tab-agent-badge");
         badge.add_css_class(&format!("agent-badge-{}", pane.badge.color_token));
-        content.append(&badge);
+        parent_row.append(&badge);
 
         let labels = gtk::Box::new(gtk::Orientation::Vertical, 1);
         labels.set_hexpand(true);
@@ -3880,12 +3881,32 @@ fn refresh_agent_child_rows(
             activity.set_ellipsize(gtk::pango::EllipsizeMode::End);
             labels.append(&activity);
         }
-        content.append(&labels);
+        parent_row.append(&labels);
 
         let status = gtk::Label::new(Some(pane.state.ui_label()));
         status.add_css_class("tab-agent-child-state");
         status.add_css_class(pane.state.css_class());
-        content.append(&status);
+        parent_row.append(&status);
+        content.append(&parent_row);
+        for child in &pane.children {
+            let child_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            child_row.add_css_class("agent-headless-child");
+            child_row.add_css_class(child.state.css_class());
+            let marker = gtk::Label::new(Some("↳"));
+            marker.add_css_class("agent-headless-marker");
+            child_row.append(&marker);
+            let child_label = gtk::Label::new(Some(&child.label));
+            child_label.add_css_class("agent-headless-label");
+            child_label.set_halign(gtk::Align::Start);
+            child_label.set_hexpand(true);
+            child_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            child_row.append(&child_label);
+            let child_state = gtk::Label::new(Some(child.state.ui_label()));
+            child_state.add_css_class("agent-headless-state");
+            child_state.add_css_class(child.state.css_class());
+            child_row.append(&child_state);
+            content.append(&child_row);
+        }
         button.set_child(Some(&content));
 
         let state = state.clone();
@@ -6741,6 +6762,7 @@ mod tests {
                     context: "default".to_string(),
                     activity: "review requested".to_string(),
                     state: crate::agents::AgentLifecycle::WaitingInput,
+                    children: Vec::new(),
                 },
                 crate::agent_projection::AgentPaneProjection {
                     workspace_name: "default".to_string(),
@@ -6752,6 +6774,7 @@ mod tests {
                     context: "default".to_string(),
                     activity: "tests failed".to_string(),
                     state: crate::agents::AgentLifecycle::Errored,
+                    children: Vec::new(),
                 },
             ],
         );
@@ -7158,6 +7181,7 @@ mod tests {
                 context: "default".into(),
                 activity: activity.into(),
                 state,
+                children: Vec::new(),
             }
         };
         // Zero/one agent: no tooltip (single-agent tabs stay clean).

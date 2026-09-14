@@ -81,6 +81,7 @@ jobs:
       - name: Build taarof-app release binary
         run: |
           cargo build --release --features bundled-sqlite --manifest-path taarof-app/Cargo.toml
+          cargo build --release --manifest-path agent-launcher/Cargo.toml
           bash packaging/linux/emit-artifact-provenance.sh taarof-app/target/release/taarof-app
         env:
           TAAROF_REPRODUCIBLE_BUILD: "true"

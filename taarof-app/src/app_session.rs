@@ -447,6 +447,7 @@ mod tests {
             repo_root: None,
             started_at_unix_ms: None,
             updated_at_unix_ms,
+            last_user_message_at_unix_ms: None,
             status: "recent".into(),
             live_binding: None,
             resume_command: None,
@@ -521,6 +522,7 @@ mod tests {
             tab_pids: std::collections::BTreeMap::new(),
             pane_pids: std::collections::BTreeMap::new(),
             pane_process_states: std::collections::HashMap::new(),
+            pane_exact_agents: std::collections::HashMap::new(),
             pane_agents: std::collections::HashMap::from([(
                 (tab_id, pane_id),
                 crate::agents::AgentStatus {

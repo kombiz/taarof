@@ -7,7 +7,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use crate::agents::AgentStatus;
+use crate::agents::{AgentStatus, ListenTableProbe};
 use crate::runtime_probe::{RuntimeProbeSnapshot, RuntimeProbeSource};
 
 type TabPidList = Vec<(u32, Vec<i32>)>;
@@ -58,9 +58,9 @@ impl RuntimeProbeSource for SyntheticProbeSource {
         self.socket_inodes.get(&pid).cloned().unwrap_or_default()
     }
 
-    fn listen_table(&self) -> Result<HashMap<u64, u16>, String> {
+    fn listen_table(&self) -> ListenTableProbe {
         self.reads.set(self.reads.get() + 1);
-        Ok(self.listen_table.clone())
+        ListenTableProbe::Complete(self.listen_table.clone())
     }
 }
 

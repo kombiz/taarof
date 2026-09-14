@@ -1,3 +1,4 @@
+import { agentActivityPresentation } from "../agentActivity";
 import type { TaarofStateSnapshot } from "../types";
 import { runtimeProbePresentation } from "../runtimeProbe";
 
@@ -59,6 +60,7 @@ export function Sidebar({
             <div className="sidebar__workspaces">
               {snapshot.workspaces.map((workspace) => (
                 <button
+                  aria-pressed={workspace.id === selectedWorkspaceId}
                   className={
                     workspace.id === selectedWorkspaceId
                       ? "sidebar__workspace sidebar__workspace--selected"
@@ -97,6 +99,7 @@ export function Sidebar({
               <div className="sidebar__tabs">
                 {selectedWorkspace.tabs.map((tab) => (
                   <button
+                    aria-pressed={tab.tab_id === selectedTabId}
                     className={
                       tab.tab_id === selectedTabId
                         ? "sidebar__tab sidebar__tab--selected"
@@ -123,17 +126,19 @@ export function Sidebar({
                           dashboard
                         </span>
                       ) : null}
-                      {tab.agent_name ? (
-                        <span
-                          className={
-                            tab.agent_running
-                              ? "sidebar__badge sidebar__badge--active"
-                              : "sidebar__badge sidebar__badge--neutral"
-                          }
-                        >
-                          {tab.agent_running ? "agent" : tab.agent_name}
-                        </span>
-                      ) : null}
+                      {(tab.agents?.length ? tab.agents : tab.agent_name ? [{
+                        pane_id: tab.agent_pane_id ?? tab.focused_pane,
+                        agent_name: tab.agent_name,
+                      }] : []).map((agent) => {
+                        const activity = agentActivityPresentation(agent, snapshot.runtime_probe);
+                        return (
+                          <span key={agent.pane_id}
+                            className={`sidebar__badge agent-activity agent-activity--${activity.state}`}
+                            title={activity.detail}>
+                            {agent.agent_name ?? "Agent"} · {activity.label}
+                          </span>
+                        );
+                      })}
                       {tab.needs_attention ? (
                         <span className="sidebar__badge">alert</span>
                       ) : null}

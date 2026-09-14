@@ -1,9 +1,11 @@
 import {
   Component,
   Suspense,
+  useCallback,
   lazy,
   startTransition,
   useEffect,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -20,15 +22,13 @@ import {
   storeToken,
 } from "./auth";
 import { AgentsView } from "./components/AgentsView";
+import { selectPane, selectStage, selectTab, viewModeFromHash } from "./components/PaneStage.helpers";
 import { Sidebar } from "./components/Sidebar";
 import { TokenGate } from "./components/TokenGate";
 import type {
   AgentSessionsSnapshot,
   DashboardSnapshot,
-  PaneSnapshot,
   TaarofStateSnapshot,
-  TabSnapshot,
-  WorkspaceSnapshot,
 } from "./types";
 
 type ViewMode = "panes" | "monitor" | "agents" | "history";
@@ -127,63 +127,7 @@ function HistoryViewErrorFallback() {
 }
 
 function initialViewMode(): ViewMode {
-  if (window.location.hash === "#history") return "history";
-  return window.location.hash.startsWith("#agent-session=") ? "agents" : "monitor";
-}
-
-function preferredWorkspace(
-  snapshot: TaarofStateSnapshot | null,
-  selectedWorkspaceId: number | null,
-): WorkspaceSnapshot | null {
-  if (!snapshot || snapshot.workspaces.length === 0) {
-    return null;
-  }
-
-  return (
-    snapshot.workspaces.find((workspace) => workspace.id === selectedWorkspaceId) ??
-    snapshot.workspaces.find(
-      (workspace) => workspace.id === snapshot.active_workspace,
-    ) ??
-    snapshot.workspaces[0]
-  );
-}
-
-function preferredTab(
-  workspace: WorkspaceSnapshot | null,
-  selectedTabId: number | null,
-): TabSnapshot | null {
-  if (!workspace || workspace.tabs.length === 0) {
-    return null;
-  }
-
-  return (
-    workspace.tabs.find((tab) => tab.tab_id === selectedTabId) ??
-    workspace.tabs.find((tab) => tab.tab_id === workspace.active_tab) ??
-    workspace.tabs[0]
-  );
-}
-
-function activePane(tab: TabSnapshot | null): PaneSnapshot | null {
-  if (!tab || tab.panes.length === 0) {
-    return null;
-  }
-
-  return tab.panes.find((pane) => pane.pane_id === tab.focused_pane) ?? tab.panes[0];
-}
-
-function preferredPane(
-  tab: TabSnapshot | null,
-  selectedPaneId: number | null,
-): PaneSnapshot | null {
-  if (!tab || tab.panes.length === 0) {
-    return null;
-  }
-
-  return (
-    tab.panes.find((pane) => pane.pane_id === selectedPaneId) ??
-    activePane(tab) ??
-    tab.panes[0]
-  );
+  return viewModeFromHash(window.location.hash);
 }
 
 function selectedDashboard(snapshot: TaarofStateSnapshot | null): DashboardSnapshot | null {
@@ -207,10 +151,14 @@ export function App() {
   const [agentSessionsError, setAgentSessionsError] = useState<string | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
   const [isNavOpen, setIsNavOpen] = useState(false);
+  const navigationTriggerRef = useRef<HTMLButtonElement | null>(null);
 
-  const selectedWorkspace = preferredWorkspace(snapshot, selectedWorkspaceId);
-  const selectedTab = preferredTab(selectedWorkspace, selectedTabId);
-  const selectedPane = preferredPane(selectedTab, selectedPaneId);
+  const selectedStage = selectStage(snapshot, {
+    workspaceId: selectedWorkspaceId,
+    tabId: selectedTabId,
+    paneId: selectedPaneId,
+  });
+  const { workspace: selectedWorkspace, tab: selectedTab, pane: selectedPane } = selectedStage;
   const dashboard = selectedDashboard(snapshot);
   const agentJobs = snapshot?.agent_jobs ?? [];
 
@@ -364,6 +312,11 @@ export function App() {
     };
   }, [token]);
 
+  const closeNavigation = useCallback(() => {
+    setIsNavOpen(false);
+    window.requestAnimationFrame(() => navigationTriggerRef.current?.focus());
+  }, []);
+
   useEffect(() => {
     if (!isNavOpen) {
       return;
@@ -371,7 +324,7 @@ export function App() {
 
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
-        setIsNavOpen(false);
+        closeNavigation();
       }
     }
 
@@ -379,7 +332,7 @@ export function App() {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [isNavOpen]);
+  }, [closeNavigation, isNavOpen]);
 
   useEffect(() => {
     if (!snapshot) {
@@ -436,17 +389,10 @@ export function App() {
     setSelectedWorkspaceId(workspaceId);
     setIsNavOpen(false);
     const workspace = snapshot?.workspaces.find((candidate) => candidate.id === workspaceId);
-    const nextTab =
-      workspace?.tabs.find((tab) => tab.tab_id === workspace.active_tab) ??
-      workspace?.tabs[0] ??
-      null;
+    const nextTab = selectTab(workspace ?? null, null);
 
     setSelectedTabId(nextTab?.tab_id ?? null);
-    setSelectedPaneId(
-      nextTab?.panes.find((pane) => pane.pane_id === nextTab.focused_pane)?.pane_id ??
-        nextTab?.panes[0]?.pane_id ??
-        null,
-    );
+    setSelectedPaneId(selectPane(nextTab, null)?.pane_id ?? null);
   }
 
   function handleSelectTab(workspaceId: number, tabId: number) {
@@ -455,11 +401,7 @@ export function App() {
     setIsNavOpen(false);
     const workspace = snapshot?.workspaces.find((candidate) => candidate.id === workspaceId);
     const tab = workspace?.tabs.find((candidate) => candidate.tab_id === tabId);
-    setSelectedPaneId(
-      tab?.panes.find((pane) => pane.pane_id === tab.focused_pane)?.pane_id ??
-        tab?.panes[0]?.pane_id ??
-        null,
-    );
+    setSelectedPaneId(selectPane(tab ?? null, null)?.pane_id ?? null);
   }
 
   function handleSelectPane(paneId: number) {
@@ -481,12 +423,7 @@ export function App() {
     setIsNavOpen(false);
     const workspace = snapshot?.workspaces.find((candidate) => candidate.id === workspaceId);
     const tab = workspace?.tabs.find((candidate) => candidate.tab_id === tabId);
-    setSelectedPaneId(
-      paneId ??
-        tab?.panes.find((pane) => pane.pane_id === tab.focused_pane)?.pane_id ??
-        tab?.panes[0]?.pane_id ??
-        null,
-    );
+    setSelectedPaneId(selectPane(tab ?? null, paneId)?.pane_id ?? null);
   }
 
   const introMessage =
@@ -552,7 +489,7 @@ export function App() {
             ) ?? 0
           } panes`
       : selectedTab
-        ? `${selectedTab.name} · one pane visible at a time`
+        ? `${selectedTab.name} · visible panes stay mounted in one stage`
         : "Open the navigator to switch workspaces and tabs.";
 
   if (!token) {
@@ -561,6 +498,7 @@ export function App() {
 
   return (
     <div className={isNavOpen ? "app-shell app-shell--nav-open" : "app-shell"}>
+      <a className="skip-link" href="#workspace-stage">Skip to workspace stage</a>
       <Sidebar
         snapshot={snapshot}
         selectedWorkspaceId={selectedWorkspace?.id ?? null}
@@ -568,15 +506,15 @@ export function App() {
         onSelectWorkspace={handleSelectWorkspace}
         onSelectTab={handleSelectTab}
         isDrawerOpen={isNavOpen}
-        onClose={() => setIsNavOpen(false)}
+        onClose={closeNavigation}
       />
       <button
         aria-label="Close workspace navigator"
         className="app-shell__backdrop"
-        onClick={() => setIsNavOpen(false)}
+        onClick={closeNavigation}
         type="button"
       />
-      <main className="main-shell">
+      <main className="main-shell" id="workspace-stage" tabIndex={-1}>
         <header className="main-shell__header">
           <div className="main-shell__header-main">
             <button
@@ -584,6 +522,7 @@ export function App() {
               aria-label="Open workspace navigator"
               className="main-shell__menu-toggle"
               onClick={() => setIsNavOpen(true)}
+              ref={navigationTriggerRef}
               type="button"
             >
               Browse
@@ -594,51 +533,47 @@ export function App() {
             </div>
           </div>
           <div className="main-shell__actions">
-            <div className="main-shell__mode-switch" role="tablist" aria-label="View mode">
+            <div className="main-shell__mode-switch" aria-label="View mode">
               <button
-                aria-selected={viewMode === "panes"}
+                aria-pressed={viewMode === "panes"}
                 className={
                   viewMode === "panes"
                     ? "main-shell__mode-button main-shell__mode-button--selected"
                     : "main-shell__mode-button"
                 }
                 onClick={() => setViewMode("panes")}
-                role="tab"
                 type="button"
               >
-                Focus
+                Workspace
               </button>
               <button
-                aria-selected={viewMode === "monitor"}
+                aria-pressed={viewMode === "monitor"}
                 className={
                   viewMode === "monitor"
                     ? "main-shell__mode-button main-shell__mode-button--selected"
                     : "main-shell__mode-button"
                 }
                 onClick={() => setViewMode("monitor")}
-                role="tab"
                 type="button"
               >
-                Terminals
+                Monitor
               </button>
               <button
-                aria-selected={viewMode === "agents"}
+                aria-pressed={viewMode === "agents"}
                 className={
                   viewMode === "agents"
                     ? "main-shell__mode-button main-shell__mode-button--selected"
                     : "main-shell__mode-button"
                 }
                 onClick={() => setViewMode("agents")}
-                role="tab"
                 type="button"
               >
                 Agents
               </button>
               <button
-                aria-selected={viewMode === "history"}
+                aria-pressed={viewMode === "history"}
                 className={viewMode === "history" ? "main-shell__mode-button main-shell__mode-button--selected" : "main-shell__mode-button"}
                 onClick={() => setViewMode("history")}
-                role="tab"
                 type="button"
               >
                 History
@@ -665,7 +600,7 @@ export function App() {
           </button>
         </section>
 
-        <section className="main-shell__intro">
+        <section className="main-shell__intro" aria-live="polite">
           <p>{introMessage}</p>
           <p className="main-shell__mobile-note">
             {viewMode === "history"
@@ -674,7 +609,7 @@ export function App() {
               ? "Agents view stays read-only, uses the same bearer token, and only offers copyable resume commands plus jump-to-live navigation."
               : viewMode === "monitor"
                 ? "Terminals view shows every pane in one board and opens a bounded live-preview pool for attachable terminals."
-              : "Focus view starts in observe mode, still relies on the taarof bearer token, and can unlock local control only for the selected pane."}
+              : "Workspace stage keeps visible panes in observe mode, still relies on the taarof bearer token, and unlocks local control only for the selected pane."}
           </p>
         </section>
 
@@ -722,9 +657,9 @@ export function App() {
                 workspace={selectedWorkspace}
                 tab={selectedTab}
                 selectedPaneId={selectedPane?.pane_id ?? null}
-                pane={selectedPane}
                 onSelectPane={handleSelectPane}
                 onUnauthorized={handleUnauthorized}
+                refreshGeneration={refreshNonce}
               />
             </Suspense>
           </LazyTerminalViewBoundary>

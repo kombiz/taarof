@@ -26,6 +26,7 @@ mod pane;
 mod peek;
 #[cfg(feature = "harness")]
 pub mod performance;
+mod private_atomic_file;
 mod probe;
 mod project_config;
 mod projects;
@@ -1537,18 +1538,7 @@ fn install_search_palette_actions(
         let state = state.clone();
         action_copy_last_message.connect_activate(move |_, _| {
             match terminal::copy_last_message_from_active_pane(&state) {
-                Ok(terminal::LastMessageCopy::Transcript) => {
-                    show_toast("Copied last agent message");
-                }
-                Ok(terminal::LastMessageCopy::RecentOutput {
-                    rows,
-                    agent,
-                    reason,
-                }) => {
-                    show_toast(&format!(
-                        "{agent}: {reason}; copied {rows} recent lines instead"
-                    ));
-                }
+                Ok(()) => show_toast("Copied last agent message"),
                 Err(err) => show_error_toast(&err),
             }
         });
@@ -2720,11 +2710,17 @@ fn install_periodic_pollers(
     // piling up, and an empty-bindings early-out keeps the tick cheap at idle.
     {
         let runtime = runtime.clone();
+        let tab_list = tab_list.clone();
         let tracker =
             std::sync::Arc::new(crate::agents::TranscriptTracker::with_default_adapters());
         let transcript_in_flight = crate::runtime_probe::ProbeInFlight::default();
         glib::timeout_add_seconds_local(1, move || {
-            app_runtime::update_pane_transcripts(&runtime, &tracker, &transcript_in_flight);
+            app_runtime::update_pane_transcripts(
+                &runtime,
+                &tracker,
+                &transcript_in_flight,
+                &tab_list,
+            );
             glib::ControlFlow::Continue
         });
     }
@@ -2763,7 +2759,7 @@ fn install_periodic_pollers(
         let tab_list = tab_list.clone();
         let term_stack = term_stack.clone();
         let window = window.clone();
-        glib::timeout_add_seconds_local(5, move || {
+        glib::timeout_add_seconds_local(crate::tmux::TMUX_METADATA_POLL_SECONDS, move || {
             crate::terminal::poll_tmux_metadata(&state, &tab_list);
             crate::terminal::poll_dashboard_state(&state, &term_stack, &tab_list, &window);
             glib::ControlFlow::Continue
@@ -3515,12 +3511,22 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
                         pane_id,
                         guard,
                         payload,
+                        cancelled,
+                        admission_lock,
                         reply,
                     } => {
+                        let _admission = admission_lock.lock().unwrap();
+                        if reply.is_closed() {
+                            continue;
+                        }
                         let result = {
                             let st = state_for_http.borrow();
-                            http::dispatch_pty_input(&st, tab_id, pane_id, &guard, &payload)
+                            http::dispatch_pty_input(
+                                &st, tab_id, pane_id, &guard, payload, cancelled,
+                            )
                         };
+                        // Admission only: the async peer awaits actual delivery.
+                        // If it disconnected, dropping the receipt cancels input.
                         let _ = reply.send(result);
                     }
                     http::HttpBridgeRequest::DispatchPtyResize {

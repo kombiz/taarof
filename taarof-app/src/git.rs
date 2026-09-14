@@ -546,6 +546,7 @@ pub fn list_worktrees_checked(repo_root: &Path) -> Result<Vec<WorktreeInfo>, Str
                 Some(serde_json::json!({
                     "repo_root": repo_root.display().to_string(),
                     "status": out.status.to_string(),
+                    "exit_code": out.status.code(),
                     "stderr": error,
                 })),
             );
@@ -636,6 +637,7 @@ pub fn create_worktree(repo_root: &Path, branch_name: &str) -> Result<String, St
                 "branch_name": branch_name,
                 "worktree_path": worktree_path.display().to_string(),
                 "status": output.status.to_string(),
+                    "exit_code": output.status.code(),
                 "stderr": error,
             })),
         );
@@ -703,6 +705,7 @@ pub fn remove_worktree_from_repo(
                 "repo_root": repo_root.display().to_string(),
                 "worktree_path": worktree_path.display().to_string(),
                 "status": output.status.to_string(),
+                    "exit_code": output.status.code(),
                 "stderr": error,
             })),
         );
@@ -1078,61 +1081,75 @@ bare\n\
 
     #[test]
     fn test_git_async_delayed_git_does_not_block_main_context() {
-        let _glib_guard = crate::glib_main_context_test_guard();
-        let context = glib::MainContext::default();
-        let _acquire = context.acquire().expect("test owns the main context");
-        let gate = GitAsyncGate::default();
-        let heartbeat = std::rc::Rc::new(std::cell::Cell::new(0));
-        let socket_query = std::rc::Rc::new(std::cell::Cell::new(false));
-        let applied = std::rc::Rc::new(std::cell::Cell::new(false));
+        // Own all local futures on this thread even if an assertion fails;
+        // never leave thread-guarded callbacks on the process default context.
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let _acquire = context.acquire().expect("test owns its private context");
+                let gate = GitAsyncGate::default();
+                let heartbeat = std::rc::Rc::new(std::cell::Cell::new(false));
+                let socket_query = std::rc::Rc::new(std::cell::Cell::new(false));
+                let applied = std::rc::Rc::new(std::cell::Cell::new(false));
+                let worker_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (release, worker_release) = std::sync::mpsc::channel();
+                let heartbeat_task = heartbeat.clone();
+                context.spawn_local(async move {
+                    heartbeat_task.set(true);
+                });
+                let query_task = socket_query.clone();
+                context.spawn_local(async move {
+                    query_task.set(true);
+                });
+                let worker_started_task = worker_started.clone();
+                let applied_task = applied.clone();
+                assert!(matches!(
+                    gate.spawn(
+                        "delayed-discovery",
+                        move || {
+                            worker_started_task.store(true, std::sync::atomic::Ordering::Release);
+                            worker_release.recv_timeout(std::time::Duration::from_secs(5))
+                        },
+                        move |_| applied_task.set(true)
+                    ),
+                    GitAsyncSubmission::Started
+                ));
 
-        let heartbeat_for_idle = heartbeat.clone();
-        glib::idle_add_local_once(move || heartbeat_for_idle.set(heartbeat_for_idle.get() + 1));
-        let socket_query_for_idle = socket_query.clone();
-        glib::idle_add_local_once(move || socket_query_for_idle.set(true));
-
-        let applied_for_worker = applied.clone();
-        assert!(matches!(
-            gate.spawn(
-                "delayed-discovery",
-                || {
-                    std::thread::sleep(std::time::Duration::from_millis(80));
-                    Ok::<_, String>(())
-                },
-                move |_| applied_for_worker.set(true)
-            ),
-            GitAsyncSubmission::Started
-        ));
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
-        while std::time::Instant::now() < deadline && (!socket_query.get() || heartbeat.get() == 0)
-        {
-            context.iteration(false);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-
-        assert!(
-            socket_query.get(),
-            "another socket query should run while Git is delayed"
-        );
-        assert!(
-            heartbeat.get() > 0,
-            "GLib heartbeat should run while Git is delayed"
-        );
-        assert!(
-            !applied.get(),
-            "slow Git result must not apply before it finishes"
-        );
-
-        // Drain the worker before returning: GLib sources are process-global
-        // in tests, so leaving this future pending could make a later test
-        // finalize GTK-owned state on a different test thread.
-        let completion_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while std::time::Instant::now() < completion_deadline && !applied.get() {
-            context.iteration(false);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(applied.get(), "delayed Git work should eventually apply");
+                // A release barrier, not an 80ms sleep, keeps work unfinished while
+                // both independent UI callbacks run. Scheduling delay cannot make
+                // a correct asynchronous worker finish before this observation.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while std::time::Instant::now() < deadline
+                    && !(worker_started.load(std::sync::atomic::Ordering::Acquire)
+                        && heartbeat.get()
+                        && socket_query.get())
+                {
+                    context.iteration(false);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let responsive = worker_started.load(std::sync::atomic::Ordering::Acquire)
+                    && heartbeat.get()
+                    && socket_query.get();
+                let applied_before_release = applied.get();
+                // Release and drain before asserting, including on an observation
+                // failure. The private context remains a final cleanup boundary.
+                let _ = release.send(());
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while std::time::Instant::now() < deadline && !applied.get() {
+                    context.iteration(false);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert!(
+                    responsive,
+                    "UI callbacks must run while Git is held at the barrier"
+                );
+                assert!(
+                    !applied_before_release,
+                    "Git work must not apply before release"
+                );
+                assert!(applied.get(), "released Git work should eventually apply");
+            })
+            .expect("test owns the private main context");
     }
 
     #[test]

@@ -7,8 +7,10 @@ node = "lts"
 [tasks.setup]
 description = "Fetch/install dependencies for app + web client"
 run = [
+  "cargo fetch --manifest-path agent-launcher/Cargo.toml",
   "cargo fetch --manifest-path taarof-app/Cargo.toml",
   "npm --prefix taarof-web ci",
+  "npm --prefix taarof-web run build",
 ]
 
 [tasks.dev]
@@ -17,7 +19,10 @@ run = "cargo run --manifest-path taarof-app/Cargo.toml"
 
 [tasks.build]
 description = "Build the release binary"
-run = "cargo build --release --manifest-path taarof-app/Cargo.toml"
+run = [
+  "cargo build --release --manifest-path agent-launcher/Cargo.toml",
+  "cargo build --release --manifest-path taarof-app/Cargo.toml",
+]
 
 [tasks."web:build"]
 description = "Build the web client bundle"
@@ -29,6 +34,10 @@ run = [
 [tasks.lint]
 description = "Check Rust formatting and fail on clippy warnings"
 run = [
+  "cargo fmt --manifest-path agent-session-core/Cargo.toml --check",
+  "cargo clippy --manifest-path agent-session-core/Cargo.toml --all-targets --all-features -- -D warnings",
+  "cargo fmt --manifest-path agent-launcher/Cargo.toml --check",
+  "cargo clippy --manifest-path agent-launcher/Cargo.toml --all-targets -- -D warnings",
   "cargo fmt --manifest-path taarof-app/Cargo.toml --all --check",
   "cargo fmt --manifest-path wasm-sidebar/Cargo.toml --all --check",
   "cargo clippy --manifest-path taarof-app/Cargo.toml --all-targets -- -D warnings",
@@ -38,20 +47,29 @@ run = [
 description = "Compile-check the app and TypeScript client"
 run = [
   "cargo check --manifest-path taarof-app/Cargo.toml --all-targets",
+  "cargo check --manifest-path taarof-app/Cargo.toml --example performance_harness --features harness",
   "cargo check --manifest-path taarof-app/Cargo.toml --no-default-features",
   "npm --prefix taarof-web run build",
 ]
 
 [tasks.test]
+depends = ["web:build"]
 description = "Run app and web tests"
 run = [
+  "cargo test --manifest-path agent-session-core/Cargo.toml",
+  "cargo test --manifest-path agent-session-core/Cargo.toml --no-default-features",
+  "cargo test --manifest-path agent-launcher/Cargo.toml",
+  "python3 testing/test_bundle_provenance.py",
   "cargo test --manifest-path taarof-app/Cargo.toml",
+  "python3 taarof-cli/test_taarof_cli.py",
   "npm --prefix taarof-web test",
+  "python3 testing/test_http_contract_docs.py",
+  "python3 testing/test_shell_integration.py",
 ]
 
 [tasks."wasm:build"]
 description = "Build the experimental WASM sidebar"
-run = "cargo build --manifest-path wasm-sidebar/Cargo.toml --target wasm32-wasip1"
+run = 'cargo build --manifest-path wasm-sidebar/Cargo.toml --target wasm32-wasip1 --target-dir "${CARGO_TARGET_DIR:-wasm-sidebar/target}"'
 
 [tasks."package:validate"]
 description = "Validate the local Linux package and release tarball"
@@ -61,10 +79,10 @@ run = "bash packaging/linux/validate-local-install.sh"
 description = "Scan the release tree for vulnerable dependencies and leaked secrets"
 run = [
   "gitleaks dir --redact .",
-  "cargo audit --file taarof-app/Cargo.lock --target-os linux",
+  "cargo audit --file Cargo.lock --target-os linux",
   "cargo deny --manifest-path taarof-app/Cargo.toml check",
   "npm --prefix taarof-web audit --omit=dev",
-  "osv-scanner scan source -r taarof-app taarof-web",
+  "osv-scanner scan source --lockfile Cargo.lock --lockfile taarof-web/package-lock.json",
 ]
 
 [tasks.ci]

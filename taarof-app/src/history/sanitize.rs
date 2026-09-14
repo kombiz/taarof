@@ -1,7 +1,7 @@
 use super::{HistoryRecord, HistoryRecordDraft};
 use serde_json::{Map, Value};
 
-const MAX_SCALAR_STRING_BYTES: usize = 400;
+use crate::diagnostics::safe_text;
 
 pub(crate) const HISTORY_EVENT_ALLOWLIST: &[(&str, &[&str])] = &[
     ("session_started", &["session_name"]),
@@ -241,8 +241,15 @@ fn diagnostic_detail_allowlist(category: &str) -> &'static [&'static str] {
             "oldest_retained_seq",
         ],
         "history_backpressure" => &["dropped_total", "queue_capacity"],
-        "command_failure" => &["exit_code", "signal"],
-        "probe_failure" => &["state", "attempt"],
+        "command_failure" => &[
+            "exit_code",
+            "signal",
+            "status",
+            "failure_kind",
+            "message_redacted",
+            "timeout_secs",
+        ],
+        "probe_failure" => &["state", "attempt", "failure_kind", "message_redacted"],
         "lifecycle" => &["pid", "session_name"],
         _ => &[],
     }
@@ -306,22 +313,6 @@ fn safe_enum(value: &str, max: usize) -> Option<String> {
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':')))
     .then(|| value.to_string())
-}
-
-fn safe_text(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty()
-        || value.len() > MAX_SCALAR_STRING_BYTES
-        || value.chars().any(char::is_control)
-        || crate::work_reporting::looks_like_credential(value)
-        || crate::work_reporting::looks_like_uri_credential(value)
-        || crate::work_reporting::looks_like_terminal_output(value)
-        || crate::work_reporting::contains_high_entropy_token(value)
-    {
-        None
-    } else {
-        Some(value.to_string())
-    }
 }
 
 #[cfg(test)]

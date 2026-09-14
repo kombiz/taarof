@@ -2,6 +2,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
+/// Shared cadence for background tmux pane metadata and dashboard polling.
+pub(crate) const TMUX_METADATA_POLL_SECONDS: u32 = 5;
+/// Allow one scheduled refresh plus bounded scheduling/worker overlap. This is
+/// metadata freshness only; process evidence keeps its independent short TTL.
+pub(crate) const TMUX_METADATA_TTL_MS: u64 = TMUX_METADATA_POLL_SECONDS as u64 * 2_000;
+
 /// Overall deadline for one socket/HTTP tmux control mutation. The HTTP bridge
 /// derives its synchronous wait from this value so it cannot time out while a
 /// compliant tmux worker may still succeed.
@@ -644,6 +650,7 @@ fn run_tmux_command_sync_result(argv: &[String]) -> Result<String, String> {
                         Some(serde_json::json!({
                             "argv": argv,
                             "status": status.to_string(),
+                            "exit_code": status.code(),
                             "stderr": if trimmed_stderr.is_empty() {
                                 None::<String>
                             } else {

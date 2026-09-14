@@ -1,22 +1,27 @@
-#[cfg(feature = "opencode-history")]
-use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+// Local discovery and provider parsing live in the non-GTK core. This module
+// owns Taarof live/remote enrichment and the compatibility v1 projection.
+pub use agent_session_core::legacy::{
+    build_resume_command, most_recent_discovered_session, normalize_agent_name,
+    AgentSessionDiscovery, AgentSessionProviderStatus, AgentSessionRecord, AgentSessionsSnapshot,
+    DiscoveryRoots, LiveAgentBinding, RemoteHostStatus,
+};
+use agent_session_core::legacy::{
+    fallback_title, parse_claude_session, parse_codex_session, parse_pi_session, shell_escape,
+    unix_time_ms,
+};
 use serde_json::Value;
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::workspace::Tab;
 use crate::AppState;
 
 const AGENT_SESSION_SCAN_TTL: Duration = Duration::from_secs(20);
-const MAX_SESSIONS_PER_PROVIDER: usize = 50;
-const MAX_FILE_CANDIDATES: usize = 200;
-const MAX_SAMPLE_LINES: usize = 64;
 
 /// Newest record files enumerated per provider on a remote host.
 const REMOTE_MAX_FILES_PER_PROVIDER: usize = 20;
@@ -65,119 +70,13 @@ const REMOTE_BLOCK_END: &str = "##TAAROF-REMOTE-END";
 const REMOTE_BLOCK_STATS: &str = "##TAAROF-REMOTE-STATS";
 const REMOTE_CONTENT_PREFIX: char = '|';
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct AgentSessionProviderStatus {
-    pub name: String,
-    pub ok: bool,
-    pub history_available: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warning: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    pub session_count: usize,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct LiveAgentBinding {
-    pub agent: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-    pub workspace_id: u32,
-    pub workspace_name: String,
-    pub tab_id: u32,
-    pub tab_name: String,
-    pub pane_id: u32,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct AgentSessionRecord {
-    pub agent: String,
-    pub session_id: String,
-    pub title: String,
-    pub cwd: String,
-    /// Source host name for a record discovered over SSH. Absent — and so
-    /// absent from the serialized payload — for every local record.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repo_root: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub started_at_unix_ms: Option<u64>,
-    pub updated_at_unix_ms: u64,
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub live_binding: Option<LiveAgentBinding>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resume_command: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resume_unavailable_reason: Option<String>,
-}
-
-/// Per-host status for remote discovery. One entry per host taarof has a
-/// reason to probe, whether or not the last probe succeeded.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct RemoteHostStatus {
-    pub host: String,
-    pub ssh_target: String,
-    /// Whether the most recent probe of this host completed.
-    pub ok: bool,
-    /// Whether these records are degraded rather than merely cached: set when a
-    /// probe failed, when none has completed yet, or when the last good round
-    /// has aged past the freshness window (several missed refreshes). A healthy
-    /// host being refreshed on schedule reports `false`.
-    pub stale: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    pub session_count: usize,
-    /// Record lines that existed on the host but are not represented above:
-    /// over the per-line cap, or not valid JSON. Non-zero means this host is
-    /// under-reported.
-    pub dropped_lines: usize,
-    /// Record files whose per-file byte budget stopped the sample early.
-    pub truncated_files: usize,
-    /// Plain-language summary of any under-reporting, absent when none.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warning: Option<String>,
-    /// When the records below were observed, absent until a probe succeeds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observed_at_unix_ms: Option<u64>,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct AgentSessionsSnapshot {
-    pub schema: &'static str,
-    pub generated_at_unix_ms: u64,
-    pub providers: Vec<AgentSessionProviderStatus>,
-    pub sessions: Vec<AgentSessionRecord>,
-    /// Additive: omitted entirely when no remote host is configured or live,
-    /// so a local-only payload is byte-identical to the pre-EXAMPLE-178 schema.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub remote_hosts: Vec<RemoteHostStatus>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AgentSessionDiscovery {
-    pub providers: Vec<AgentSessionProviderStatus>,
-    pub sessions: Vec<AgentSessionRecord>,
-    pub remote_hosts: Vec<RemoteHostStatus>,
-}
-
-#[derive(Clone, Debug)]
-struct CachedDiscovery {
-    observed_at: Instant,
-    discovery: AgentSessionDiscovery,
-}
-
 pub trait AgentSessionScanner: Send + Sync {
     fn scan(&self) -> AgentSessionDiscovery;
 }
 
 pub struct AgentSessionCatalog {
     scanner: Arc<dyn AgentSessionScanner>,
-    ttl: Duration,
-    cache: Mutex<Option<CachedDiscovery>>,
+    cache: agent_session_core::DiscoveryCache,
 }
 
 impl AgentSessionCatalog {
@@ -188,8 +87,7 @@ impl AgentSessionCatalog {
     pub fn with_scanner_and_ttl(scanner: Arc<dyn AgentSessionScanner>, ttl: Duration) -> Self {
         Self {
             scanner,
-            ttl,
-            cache: Mutex::new(None),
+            cache: agent_session_core::DiscoveryCache::new(ttl),
         }
     }
 
@@ -223,26 +121,60 @@ impl AgentSessionCatalog {
     }
 
     fn cached_discovery(&self) -> Option<AgentSessionDiscovery> {
-        let cache = self
-            .cache
-            .lock()
-            .expect("agent session cache lock should hold");
-        cache
-            .as_ref()
-            .filter(|cached| cached.observed_at.elapsed() < self.ttl)
-            .map(|cached| cached.discovery.clone())
+        self.cache.get()
     }
 
     fn store_discovery(&self, discovery: AgentSessionDiscovery) {
-        let mut cache = self
-            .cache
-            .lock()
-            .expect("agent session cache lock should hold");
-        *cache = Some(CachedDiscovery {
-            observed_at: Instant::now(),
-            discovery,
-        });
+        self.cache.store(discovery);
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize, PartialEq, Eq)]
+pub enum SessionSchema {
+    #[default]
+    #[serde(rename = "taarof.agent-sessions.v1")]
+    V1,
+    #[serde(rename = "agent.sessions.v2")]
+    V2,
+}
+
+/// The transport adapter owns host resolution and v1/v2 wire projection.
+/// The same cached discovery serves both versions; querying v2 does not scan twice.
+pub fn snapshot_value(
+    snapshot: AgentSessionsSnapshot,
+    schema: SessionSchema,
+) -> Result<Value, String> {
+    snapshot_value_with_live(snapshot, schema, None)
+}
+
+pub fn snapshot_value_with_live(
+    snapshot: AgentSessionsSnapshot,
+    schema: SessionSchema,
+    live: Option<&[agent_session_core::LiveSessionEvidence]>,
+) -> Result<Value, String> {
+    if schema == SessionSchema::V1 {
+        return serde_json::to_value(snapshot).map_err(|error| error.to_string());
+    }
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map_err(|_| "canonical local hostname unavailable".to_string())?;
+    if host.trim().is_empty() {
+        return Err("canonical local hostname unavailable".into());
+    }
+    let generated_at = snapshot.generated_at_unix_ms;
+    let mut catalog = agent_session_core::SessionCatalog::from_discovery(
+        AgentSessionDiscovery {
+            providers: snapshot.providers,
+            sessions: snapshot.sessions,
+            remote_hosts: snapshot.remote_hosts,
+        },
+        host.trim(),
+    );
+    if let Some(live) = live {
+        agent_session_core::enrich_live(&mut catalog, live);
+    }
+    let mut value = serde_json::to_value(catalog).map_err(|error| error.to_string())?;
+    value["generated_at_unix_ms"] = generated_at.into();
+    Ok(value)
 }
 
 pub fn default_catalog() -> Arc<AgentSessionCatalog> {
@@ -260,32 +192,6 @@ pub fn default_catalog() -> Arc<AgentSessionCatalog> {
 /// worker can use the default catalog. Scanning those roots remains off GTK.
 pub fn initialize_default_catalog() -> Arc<AgentSessionCatalog> {
     default_catalog()
-}
-
-#[derive(Clone, Debug)]
-pub struct DiscoveryRoots {
-    claude_projects_dir: Option<PathBuf>,
-    codex_sessions_dir: Option<PathBuf>,
-    pi_sessions_dir: Option<PathBuf>,
-    pi_session_map_path: Option<PathBuf>,
-    kimi_session_index_path: Option<PathBuf>,
-    kimi_sessions_dir: Option<PathBuf>,
-    opencode_db_path: Option<PathBuf>,
-}
-
-impl DiscoveryRoots {
-    fn from_home(home: Option<PathBuf>) -> Self {
-        let home = home.unwrap_or_else(|| PathBuf::from("/"));
-        Self {
-            claude_projects_dir: Some(home.join(".claude/projects")),
-            codex_sessions_dir: Some(home.join(".codex/sessions")),
-            pi_sessions_dir: Some(home.join(".pi/agent/sessions")),
-            pi_session_map_path: Some(home.join(".pi/pi-acp/session-map.json")),
-            kimi_session_index_path: Some(home.join(".kimi-code/session_index.jsonl")),
-            kimi_sessions_dir: Some(home.join(".kimi-code/sessions")),
-            opencode_db_path: Some(home.join(".local/share/opencode/opencode.db")),
-        }
-    }
 }
 
 pub struct DefaultAgentSessionScanner {
@@ -314,57 +220,9 @@ impl DefaultAgentSessionScanner {
 
 impl AgentSessionScanner for DefaultAgentSessionScanner {
     fn scan(&self) -> AgentSessionDiscovery {
-        let mut providers = Vec::new();
-        let mut sessions = Vec::new();
-
-        let (claude_status, mut claude_sessions) = discover_claude_sessions(
-            self.roots.claude_projects_dir.as_deref(),
-            MAX_SESSIONS_PER_PROVIDER,
-        );
-        providers.push(claude_status);
-        sessions.append(&mut claude_sessions);
-
-        let (codex_status, mut codex_sessions) = discover_codex_sessions(
-            self.roots.codex_sessions_dir.as_deref(),
-            MAX_SESSIONS_PER_PROVIDER,
-        );
-        providers.push(codex_status);
-        sessions.append(&mut codex_sessions);
-
-        let (pi_status, mut pi_sessions) = discover_pi_sessions(
-            self.roots.pi_sessions_dir.as_deref(),
-            self.roots.pi_session_map_path.as_deref(),
-            MAX_SESSIONS_PER_PROVIDER,
-        );
-        providers.push(pi_status);
-        sessions.append(&mut pi_sessions);
-
-        let (kimi_status, mut kimi_sessions) = discover_kimi_sessions(
-            self.roots.kimi_session_index_path.as_deref(),
-            self.roots.kimi_sessions_dir.as_deref(),
-            MAX_SESSIONS_PER_PROVIDER,
-        );
-        providers.push(kimi_status);
-        sessions.append(&mut kimi_sessions);
-
-        let (opencode_status, mut opencode_sessions) = discover_opencode_sessions(
-            self.roots.opencode_db_path.as_deref(),
-            MAX_SESSIONS_PER_PROVIDER,
-        );
-        providers.push(opencode_status);
-        sessions.append(&mut opencode_sessions);
-
-        providers.push(AgentSessionProviderStatus {
-            name: "copilot".to_string(),
-            ok: true,
-            history_available: false,
-            warning: Some(
-                "Copilot history is unavailable on this host; only live Copilot tabs are shown."
-                    .to_string(),
-            ),
-            error: None,
-            session_count: 0,
-        });
+        let local = agent_session_core::BuiltinRegistry::new(self.roots.clone()).discover();
+        let providers = local.providers;
+        let mut sessions = local.sessions;
 
         // Remote sections are served from the probe's cache and never block
         // this scan: a slow or dead host degrades to a stale/error section
@@ -706,6 +564,7 @@ fn parse_remote_kimi_index(modified_at_unix_ms: u64, lines: &[Value]) -> Vec<Age
                 repo_root: None,
                 started_at_unix_ms: None,
                 updated_at_unix_ms: modified_at_unix_ms,
+                last_user_message_at_unix_ms: None,
                 status: "recent".to_string(),
                 live_binding: None,
                 resume_command: Some(build_resume_command("kimi", &cwd, &session_id)),
@@ -1130,6 +989,88 @@ where
     })
 }
 
+/// Only fresh per-pane process identity can authorize a launcher Attach.
+/// Legacy tab-level and cwd inference remain observation-only.
+pub fn build_live_session_evidence(
+    state: &AppState,
+    local_host: &str,
+) -> Vec<agent_session_core::LiveSessionEvidence> {
+    use agent_session_core::{LiveSessionEvidence, StableRef};
+    if !crate::runtime_probe::runtime_process_truth_is_fresh(state) {
+        return Vec::new();
+    }
+    let Some(snapshot) = state.runtime_probe.as_ref() else {
+        return Vec::new();
+    };
+    let mut live = Vec::new();
+    for workspace in &state.workspaces {
+        for tab in &workspace.tabs {
+            for leaf in tab.panes.leaves() {
+                // Remote tmux pane PIDs belong to another kernel. Until remote
+                // process identity is verified, cached history remains Resume-only.
+                if leaf
+                    .tmux_backing
+                    .as_ref()
+                    .is_some_and(|b| matches!(b.target, crate::tmux::TmuxTarget::Remote { .. }))
+                {
+                    continue;
+                }
+                let Some(status) = snapshot
+                    .pane_exact_agents
+                    .get(&(tab.id, leaf.pane_id))
+                    .filter(|s| s.running)
+                else {
+                    continue;
+                };
+                let Some(agent) = status.agent_name.as_deref().map(normalize_agent_name) else {
+                    continue;
+                };
+                let Some(id) = status.session_id.as_deref().filter(|id| !id.is_empty()) else {
+                    continue;
+                };
+                let ssh_target = leaf
+                    .tmux_backing
+                    .as_ref()
+                    .and_then(|b| b.target.ssh_target_string());
+                let cwd = live_pane_cwd(tab, workspace, leaf.pane_id);
+                live.push(LiveSessionEvidence {
+                    stable_ref: StableRef::new(
+                        &agent,
+                        ssh_target.as_deref().unwrap_or(local_host),
+                        id,
+                    ),
+                    cwd: cwd.as_deref().unwrap_or("/").into(),
+                    tmux_session: leaf
+                        .tmux_backing
+                        .as_ref()
+                        .filter(|b| {
+                            crate::runtime_probe::fresh_local_tmux_pid(
+                                b,
+                                crate::events::unix_time_ms(),
+                            )
+                            .is_some_and(|pid| {
+                                snapshot.pane_pids.get(&(tab.id, leaf.pane_id)) == Some(&pid)
+                            })
+                        })
+                        .map(|b| b.session_name.clone()),
+                    ssh_target,
+                    binding: LiveAgentBinding {
+                        agent,
+                        session_id: Some(id.into()),
+                        cwd,
+                        workspace_id: workspace.id,
+                        workspace_name: workspace.name.clone(),
+                        tab_id: tab.id,
+                        tab_name: tab.name.clone(),
+                        pane_id: leaf.pane_id,
+                    },
+                });
+            }
+        }
+    }
+    live
+}
+
 pub fn build_live_agent_bindings(state: &AppState) -> Vec<LiveAgentBinding> {
     publish_live_remote_ssh_targets(state);
     let mut bindings = Vec::new();
@@ -1315,711 +1256,6 @@ fn internal_scan_error(message: &str) -> AgentSessionDiscovery {
     }
 }
 
-fn discover_claude_sessions(
-    root: Option<&Path>,
-    limit: usize,
-) -> (AgentSessionProviderStatus, Vec<AgentSessionRecord>) {
-    discover_jsonl_provider(root, "claude", limit, parse_claude_session)
-}
-
-fn discover_codex_sessions(
-    root: Option<&Path>,
-    limit: usize,
-) -> (AgentSessionProviderStatus, Vec<AgentSessionRecord>) {
-    discover_jsonl_provider(root, "codex", limit, parse_codex_session)
-}
-
-fn discover_pi_sessions(
-    sessions_root: Option<&Path>,
-    session_map_path: Option<&Path>,
-    limit: usize,
-) -> (AgentSessionProviderStatus, Vec<AgentSessionRecord>) {
-    let mut paths = Vec::new();
-    if let Some(session_map_path) = session_map_path {
-        match read_pi_session_map(session_map_path) {
-            Ok(mapped_paths) => {
-                let mut seen = HashSet::new();
-                for path in mapped_paths {
-                    if seen.insert(path.clone()) {
-                        paths.push(path);
-                    }
-                }
-            }
-            Err(error) if error != "pi session map missing" => {
-                return (
-                    AgentSessionProviderStatus {
-                        name: "pi".to_string(),
-                        ok: false,
-                        history_available: false,
-                        warning: None,
-                        error: Some(error),
-                        session_count: 0,
-                    },
-                    Vec::new(),
-                );
-            }
-            Err(_) => {}
-        }
-    }
-
-    if paths.is_empty() {
-        if let Some(root) = sessions_root {
-            paths = collect_jsonl_candidates(root)
-                .into_iter()
-                .map(|candidate| candidate.path)
-                .take(limit)
-                .collect();
-        }
-    }
-
-    if paths.is_empty() {
-        return (
-            AgentSessionProviderStatus {
-                name: "pi".to_string(),
-                ok: true,
-                history_available: false,
-                warning: Some("No local Pi session store was found.".to_string()),
-                error: None,
-                session_count: 0,
-            },
-            Vec::new(),
-        );
-    }
-
-    let mut sessions = Vec::new();
-    for path in paths.into_iter().take(limit) {
-        let modified_at_unix_ms = file_modified_unix_ms(&path).unwrap_or_else(unix_time_ms);
-        if let Ok(lines) = read_jsonl_sample_lines(&path) {
-            if let Some(session) = parse_pi_session(&path, modified_at_unix_ms, &lines) {
-                sessions.push(session);
-            }
-        }
-    }
-    sessions.sort_by_key(|session| Reverse(session.updated_at_unix_ms));
-    sessions.truncate(limit);
-    (
-        AgentSessionProviderStatus {
-            name: "pi".to_string(),
-            ok: true,
-            history_available: true,
-            warning: None,
-            error: None,
-            session_count: sessions.len(),
-        },
-        sessions,
-    )
-}
-
-fn discover_kimi_sessions(
-    index_path: Option<&Path>,
-    sessions_root: Option<&Path>,
-    limit: usize,
-) -> (AgentSessionProviderStatus, Vec<AgentSessionRecord>) {
-    let Some(index_path) = index_path.filter(|path| path.exists()) else {
-        return (
-            AgentSessionProviderStatus {
-                name: "kimi".to_string(),
-                ok: true,
-                history_available: false,
-                warning: Some("No local Kimi session index was found.".to_string()),
-                error: None,
-                session_count: 0,
-            },
-            Vec::new(),
-        );
-    };
-
-    let file = match File::open(index_path) {
-        Ok(file) => file,
-        Err(error) => {
-            return (
-                AgentSessionProviderStatus {
-                    name: "kimi".to_string(),
-                    ok: false,
-                    history_available: false,
-                    warning: None,
-                    error: Some(format!("Could not read Kimi session index: {error}")),
-                    session_count: 0,
-                },
-                Vec::new(),
-            );
-        }
-    };
-
-    let mut sessions = BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-        .filter_map(|entry| {
-            let session_id = entry.get("sessionId")?.as_str()?.to_string();
-            let session_dir = PathBuf::from(entry.get("sessionDir")?.as_str()?);
-            let session_dir = if session_dir.is_absolute() {
-                session_dir
-            } else {
-                sessions_root?.join(session_dir)
-            };
-            let cwd = entry.get("workDir")?.as_str()?.to_string();
-            let updated_at_unix_ms = file_modified_unix_ms(&session_dir.join("state.json"))
-                .or_else(|| file_modified_unix_ms(&session_dir))
-                .unwrap_or_default();
-            Some(AgentSessionRecord {
-                agent: "kimi".to_string(),
-                session_id: session_id.clone(),
-                title: fallback_title("", "kimi", &session_id),
-                cwd: cwd.clone(),
-                host: None,
-                repo_root: find_repo_root_string(&cwd),
-                started_at_unix_ms: None,
-                updated_at_unix_ms,
-                status: "recent".to_string(),
-                live_binding: None,
-                resume_command: Some(build_resume_command("kimi", &cwd, &session_id)),
-                resume_unavailable_reason: None,
-            })
-        })
-        .collect::<Vec<_>>();
-    sessions.sort_by_key(|session| Reverse(session.updated_at_unix_ms));
-    sessions.truncate(limit);
-
-    (
-        AgentSessionProviderStatus {
-            name: "kimi".to_string(),
-            ok: true,
-            history_available: true,
-            warning: None,
-            error: None,
-            session_count: sessions.len(),
-        },
-        sessions,
-    )
-}
-
-#[cfg(feature = "opencode-history")]
-fn discover_opencode_sessions(
-    db_path: Option<&Path>,
-    limit: usize,
-) -> (AgentSessionProviderStatus, Vec<AgentSessionRecord>) {
-    let Some(db_path) = db_path.filter(|path| path.exists()) else {
-        return (
-            AgentSessionProviderStatus {
-                name: "opencode".to_string(),
-                ok: true,
-                history_available: false,
-                warning: Some("No local OpenCode session database was found.".to_string()),
-                error: None,
-                session_count: 0,
-            },
-            Vec::new(),
-        );
-    };
-
-    let connection = match Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-        Ok(connection) => connection,
-        Err(error) => {
-            return (
-                AgentSessionProviderStatus {
-                    name: "opencode".to_string(),
-                    ok: false,
-                    history_available: false,
-                    warning: None,
-                    error: Some(format!("Could not open OpenCode session database: {error}")),
-                    session_count: 0,
-                },
-                Vec::new(),
-            );
-        }
-    };
-
-    let mut statement = match connection.prepare(
-        "select id, directory, title, time_created, time_updated from session order by time_updated desc limit ?1",
-    ) {
-        Ok(statement) => statement,
-        Err(error) => {
-            return (
-                AgentSessionProviderStatus {
-                    name: "opencode".to_string(),
-                    ok: false,
-                    history_available: false,
-                    warning: None,
-                    error: Some(format!("Could not query OpenCode sessions: {error}")),
-                    session_count: 0,
-                },
-                Vec::new(),
-            );
-        }
-    };
-
-    let rows = statement.query_map([limit as i64], |row| {
-        let session_id: String = row.get(0)?;
-        let cwd: String = row.get(1)?;
-        let title: String = row.get(2)?;
-        let started_at_unix_ms: i64 = row.get(3)?;
-        let updated_at_unix_ms: i64 = row.get(4)?;
-        Ok(AgentSessionRecord {
-            agent: "opencode".to_string(),
-            session_id: session_id.clone(),
-            title: fallback_title(&title, "opencode", &session_id),
-            cwd: cwd.clone(),
-            host: None,
-            repo_root: find_repo_root_string(&cwd),
-            started_at_unix_ms: Some(started_at_unix_ms.max(0) as u64),
-            updated_at_unix_ms: updated_at_unix_ms.max(0) as u64,
-            status: "recent".to_string(),
-            live_binding: None,
-            resume_command: Some(build_resume_command("opencode", &cwd, &session_id)),
-            resume_unavailable_reason: None,
-        })
-    });
-
-    match rows {
-        Ok(rows) => {
-            let sessions: Vec<AgentSessionRecord> = rows.filter_map(Result::ok).collect();
-            (
-                AgentSessionProviderStatus {
-                    name: "opencode".to_string(),
-                    ok: true,
-                    history_available: true,
-                    warning: None,
-                    error: None,
-                    session_count: sessions.len(),
-                },
-                sessions,
-            )
-        }
-        Err(error) => (
-            AgentSessionProviderStatus {
-                name: "opencode".to_string(),
-                ok: false,
-                history_available: false,
-                warning: None,
-                error: Some(format!("Could not read OpenCode sessions: {error}")),
-                session_count: 0,
-            },
-            Vec::new(),
-        ),
-    }
-}
-
-#[cfg(not(feature = "opencode-history"))]
-fn discover_opencode_sessions(
-    _db_path: Option<&Path>,
-    _limit: usize,
-) -> (AgentSessionProviderStatus, Vec<AgentSessionRecord>) {
-    (
-        AgentSessionProviderStatus {
-            name: "opencode".to_string(),
-            ok: true,
-            history_available: false,
-            warning: Some("OpenCode history support was not compiled into this build.".to_string()),
-            error: None,
-            session_count: 0,
-        },
-        Vec::new(),
-    )
-}
-
-fn discover_jsonl_provider(
-    root: Option<&Path>,
-    provider: &str,
-    limit: usize,
-    parser: fn(&Path, u64, &[Value]) -> Option<AgentSessionRecord>,
-) -> (AgentSessionProviderStatus, Vec<AgentSessionRecord>) {
-    let Some(root) = root.filter(|path| path.exists()) else {
-        return (
-            AgentSessionProviderStatus {
-                name: provider.to_string(),
-                ok: true,
-                history_available: false,
-                warning: Some(format!("No local {} session store was found.", provider)),
-                error: None,
-                session_count: 0,
-            },
-            Vec::new(),
-        );
-    };
-
-    let candidates = collect_jsonl_candidates(root);
-    if candidates.is_empty() {
-        return (
-            AgentSessionProviderStatus {
-                name: provider.to_string(),
-                ok: true,
-                history_available: true,
-                warning: None,
-                error: None,
-                session_count: 0,
-            },
-            Vec::new(),
-        );
-    }
-
-    let mut sessions = Vec::new();
-    for candidate in candidates.into_iter().take(limit) {
-        let Ok(lines) = read_jsonl_sample_lines(&candidate.path) else {
-            continue;
-        };
-        if let Some(session) = parser(&candidate.path, candidate.modified_at_unix_ms, &lines) {
-            sessions.push(session);
-        }
-    }
-    sessions.sort_by_key(|session| Reverse(session.updated_at_unix_ms));
-    sessions.truncate(limit);
-    (
-        AgentSessionProviderStatus {
-            name: provider.to_string(),
-            ok: true,
-            history_available: true,
-            warning: None,
-            error: None,
-            session_count: sessions.len(),
-        },
-        sessions,
-    )
-}
-
-fn parse_claude_session(
-    _path: &Path,
-    modified_at_unix_ms: u64,
-    lines: &[Value],
-) -> Option<AgentSessionRecord> {
-    let session_id = first_string(lines, &["sessionId"])?;
-    let cwd = first_string(lines, &["cwd"])?;
-    let title =
-        first_user_message(lines).unwrap_or_else(|| fallback_title("", "claude", &session_id));
-    Some(AgentSessionRecord {
-        agent: "claude".to_string(),
-        session_id: session_id.clone(),
-        title,
-        cwd: cwd.clone(),
-        host: None,
-        repo_root: find_repo_root_string(&cwd),
-        started_at_unix_ms: Some(modified_at_unix_ms),
-        updated_at_unix_ms: modified_at_unix_ms,
-        status: "recent".to_string(),
-        live_binding: None,
-        resume_command: Some(build_resume_command("claude", &cwd, &session_id)),
-        resume_unavailable_reason: None,
-    })
-}
-
-fn parse_codex_session(
-    _path: &Path,
-    modified_at_unix_ms: u64,
-    lines: &[Value],
-) -> Option<AgentSessionRecord> {
-    let meta = lines
-        .iter()
-        .find(|value| value.get("type").and_then(Value::as_str) == Some("session_meta"))?;
-    let session_id = meta
-        .pointer("/payload/id")
-        .and_then(Value::as_str)?
-        .to_string();
-    let cwd = meta
-        .pointer("/payload/cwd")
-        .and_then(Value::as_str)?
-        .to_string();
-    let title = lines
-        .iter()
-        .find_map(codex_user_message)
-        .unwrap_or_else(|| fallback_title("", "codex", &session_id));
-    Some(AgentSessionRecord {
-        agent: "codex".to_string(),
-        session_id: session_id.clone(),
-        title,
-        cwd: cwd.clone(),
-        host: None,
-        repo_root: find_repo_root_string(&cwd),
-        started_at_unix_ms: Some(modified_at_unix_ms),
-        updated_at_unix_ms: modified_at_unix_ms,
-        status: "recent".to_string(),
-        live_binding: None,
-        resume_command: Some(build_resume_command("codex", &cwd, &session_id)),
-        resume_unavailable_reason: None,
-    })
-}
-
-fn parse_pi_session(
-    path: &Path,
-    modified_at_unix_ms: u64,
-    lines: &[Value],
-) -> Option<AgentSessionRecord> {
-    let session = lines
-        .iter()
-        .find(|value| value.get("type").and_then(Value::as_str) == Some("session"))?;
-    let session_id = session
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| session_id_from_filename(path))?;
-    let cwd = session.get("cwd").and_then(Value::as_str)?.to_string();
-    let title = pi_user_message(lines).unwrap_or_else(|| fallback_title("", "pi", &session_id));
-    Some(AgentSessionRecord {
-        agent: "pi".to_string(),
-        session_id: session_id.clone(),
-        title,
-        cwd: cwd.clone(),
-        host: None,
-        repo_root: find_repo_root_string(&cwd),
-        started_at_unix_ms: Some(modified_at_unix_ms),
-        updated_at_unix_ms: modified_at_unix_ms,
-        status: "recent".to_string(),
-        live_binding: None,
-        resume_command: Some(build_resume_command("pi", &cwd, &session_id)),
-        resume_unavailable_reason: None,
-    })
-}
-
-fn read_pi_session_map(path: &Path) -> Result<Vec<PathBuf>, String> {
-    if !path.exists() {
-        return Err("pi session map missing".to_string());
-    }
-    let content = fs::read_to_string(path)
-        .map_err(|error| format!("Could not read Pi session map: {error}"))?;
-    let parsed: Value = serde_json::from_str(&content)
-        .map_err(|error| format!("Could not parse Pi session map: {error}"))?;
-    let Some(sessions) = parsed.get("sessions").and_then(Value::as_object) else {
-        return Ok(Vec::new());
-    };
-    Ok(sessions
-        .values()
-        .filter_map(|entry| entry.get("sessionFile").and_then(Value::as_str))
-        .map(PathBuf::from)
-        .collect())
-}
-
-fn collect_jsonl_candidates(root: &Path) -> Vec<FileCandidate> {
-    let mut stack = vec![root.to_path_buf()];
-    let mut files = Vec::new();
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if file_type.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-            {
-                let modified_at_unix_ms = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|metadata| metadata_modified_unix_ms(&metadata))
-                    .unwrap_or_default();
-                files.push(FileCandidate {
-                    path,
-                    modified_at_unix_ms,
-                });
-            }
-        }
-    }
-    files.sort_by_key(|candidate| Reverse(candidate.modified_at_unix_ms));
-    files.truncate(MAX_FILE_CANDIDATES);
-    files
-}
-
-fn read_jsonl_sample_lines(path: &Path) -> Result<Vec<Value>, String> {
-    let file =
-        File::open(path).map_err(|error| format!("Could not open {}: {error}", path.display()))?;
-    let reader = BufReader::new(file);
-    Ok(reader
-        .lines()
-        .take(MAX_SAMPLE_LINES)
-        .filter_map(Result::ok)
-        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-        .collect())
-}
-
-fn first_string(lines: &[Value], keys: &[&str]) -> Option<String> {
-    lines.iter().find_map(|line| {
-        keys.iter()
-            .find_map(|key| line.get(*key).and_then(Value::as_str))
-            .map(str::to_string)
-    })
-}
-
-fn first_user_message(lines: &[Value]) -> Option<String> {
-    lines.iter().find_map(|line| {
-        let role = line.pointer("/message/role").and_then(Value::as_str);
-        if role != Some("user") && line.get("type").and_then(Value::as_str) != Some("user") {
-            return None;
-        }
-        extract_text_from_content(
-            line.get("message")
-                .and_then(|message| message.get("content")),
-        )
-        .or_else(|| {
-            line.pointer("/message/content")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-    })
-}
-
-fn codex_user_message(line: &Value) -> Option<String> {
-    if line.get("type").and_then(Value::as_str) != Some("response_item") {
-        return None;
-    }
-    if line.pointer("/payload/type").and_then(Value::as_str) != Some("message") {
-        return None;
-    }
-    if line.pointer("/payload/role").and_then(Value::as_str) != Some("user") {
-        return None;
-    }
-    extract_text_from_content(line.pointer("/payload/content"))
-}
-
-fn pi_user_message(lines: &[Value]) -> Option<String> {
-    lines.iter().find_map(|line| {
-        if line.get("type").and_then(Value::as_str) != Some("message") {
-            return None;
-        }
-        if line.pointer("/message/role").and_then(Value::as_str) != Some("user") {
-            return None;
-        }
-        extract_text_from_content(line.pointer("/message/content"))
-    })
-}
-
-fn extract_text_from_content(value: Option<&Value>) -> Option<String> {
-    let value = value?;
-    match value {
-        Value::String(text) => Some(compact_title(text)),
-        Value::Array(items) => items.iter().find_map(|item| {
-            item.get("text")
-                .and_then(Value::as_str)
-                .map(compact_title)
-                .filter(|text| !text.is_empty())
-        }),
-        _ => None,
-    }
-}
-
-fn compact_title(text: &str) -> String {
-    const MAX_LEN: usize = 72;
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= MAX_LEN {
-        compact
-    } else {
-        let prefix: String = compact.chars().take(MAX_LEN.saturating_sub(3)).collect();
-        format!("{prefix}...")
-    }
-}
-
-fn fallback_title(title: &str, provider: &str, session_id: &str) -> String {
-    let title = title.trim();
-    if !title.is_empty() {
-        return compact_title(title);
-    }
-    format!(
-        "{provider} {}",
-        session_id.chars().take(8).collect::<String>()
-    )
-}
-
-fn find_repo_root_string(cwd: &str) -> Option<String> {
-    find_repo_root(Path::new(cwd)).map(|path| path.to_string_lossy().into_owned())
-}
-
-fn find_repo_root(path: &Path) -> Option<PathBuf> {
-    path.ancestors()
-        .find(|ancestor| ancestor.join(".git").exists())
-        .map(Path::to_path_buf)
-}
-
-pub(crate) fn build_resume_command(provider: &str, cwd: &str, session_id: &str) -> String {
-    let escaped_cwd = shell_escape(cwd);
-    let escaped_session_id = shell_escape(session_id);
-    let command = match provider {
-        "claude" => format!("claude --resume {escaped_session_id}"),
-        "codex" => format!("codex resume {escaped_session_id}"),
-        "pi" => format!("pi --session {escaped_session_id}"),
-        "kimi" => format!("kimi --session {escaped_session_id}"),
-        "copilot" => format!("copilot --resume={escaped_session_id}"),
-        "opencode" => format!("opencode --session {escaped_session_id}"),
-        other => format!("{} {escaped_session_id}", shell_escape(other)),
-    };
-    format!("cd {escaped_cwd} && {command}")
-}
-
-fn shell_escape(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '-' | '_' | ':'))
-    {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-pub(crate) fn normalize_agent_name(raw: &str) -> String {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "claude code" | "claude-code" => "claude".to_string(),
-        "codex-cli" => "codex".to_string(),
-        "copilot-cli" | "copilot cli" => "copilot".to_string(),
-        "opencode" | "open code" => "opencode".to_string(),
-        "pii" | "pi" => "pi".to_string(),
-        other => other.to_string(),
-    }
-}
-
-pub(crate) fn most_recent_discovered_session<'a>(
-    discovery: &'a AgentSessionDiscovery,
-    agent: &str,
-    cwd: &str,
-) -> Option<&'a AgentSessionRecord> {
-    let agent = normalize_agent_name(agent);
-    discovery
-        .sessions
-        .iter()
-        // Callers resolve a *local* pane's session id. A remote host running
-        // the same agent under the same repo path is a routine collision, and
-        // binding a local pane to a remote session id would be silently wrong.
-        .filter(|record| record.host.is_none())
-        .filter(|record| normalize_agent_name(&record.agent) == agent && record.cwd == cwd)
-        .max_by_key(|record| record.updated_at_unix_ms)
-}
-
-fn session_id_from_filename(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    stem.rsplit_once('_')
-        .map(|(_, session_id)| session_id.to_string())
-        .or_else(|| Some(stem.to_string()))
-}
-
-fn file_modified_unix_ms(path: &Path) -> Option<u64> {
-    fs::metadata(path)
-        .ok()
-        .and_then(|metadata| metadata_modified_unix_ms(&metadata))
-}
-
-fn metadata_modified_unix_ms(metadata: &fs::Metadata) -> Option<u64> {
-    metadata.modified().ok().and_then(system_time_to_unix_ms)
-}
-
-fn system_time_to_unix_ms(time: SystemTime) -> Option<u64> {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_millis() as u64)
-}
-
-fn unix_time_ms() -> u64 {
-    system_time_to_unix_ms(SystemTime::now()).unwrap_or_default()
-}
-
-#[derive(Clone, Debug)]
-struct FileCandidate {
-    path: PathBuf,
-    modified_at_unix_ms: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2068,6 +1304,7 @@ mod tests {
                 repo_root: Some("/repo".to_string()),
                 started_at_unix_ms: Some(1),
                 updated_at_unix_ms: 2,
+                last_user_message_at_unix_ms: None,
                 status: "recent".to_string(),
                 live_binding: None,
                 resume_command: Some("codex resume session-123".to_string()),
@@ -2096,268 +1333,6 @@ mod tests {
                 .expect("live binding should exist")
                 .workspace_id,
             7
-        );
-    }
-
-    #[test]
-    fn codex_discovery_reads_session_meta() {
-        let dir = unique_temp_dir("codex");
-        let session_path = dir.join("sessions/2026/05/20");
-        fs::create_dir_all(&session_path).expect("codex session dir should exist");
-        let file_path = session_path.join("rollout-2026-05-20T00-00-00-session-123.jsonl");
-        fs::write(
-            &file_path,
-            "{\"timestamp\":\"2026-05-20T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"session-123\",\"cwd\":\"/tmp/project\"}}\n{\"timestamp\":\"2026-05-20T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Implement issue 133\"}]}}\n",
-        )
-        .expect("codex fixture should write");
-
-        let (status, sessions) = discover_codex_sessions(Some(dir.join("sessions").as_path()), 10);
-        assert!(status.ok);
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, "session-123");
-        assert_eq!(sessions[0].cwd, "/tmp/project");
-        assert_eq!(sessions[0].title, "Implement issue 133");
-    }
-
-    #[test]
-    fn pi_discovery_prefers_session_map() {
-        let dir = unique_temp_dir("pi");
-        let sessions_dir = dir.join(".pi/agent/sessions/workspace");
-        fs::create_dir_all(&sessions_dir).expect("pi session dir should exist");
-        let session_file = sessions_dir.join("2026-05-20T00-00-00-000Z_pi-session.jsonl");
-        fs::write(
-            &session_file,
-            "{\"type\":\"session\",\"id\":\"pi-session\",\"timestamp\":\"2026-05-20T00:00:00Z\",\"cwd\":\"/tmp/pi\"}\n{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Resume deploy work\"}]}}\n",
-        )
-        .expect("pi fixture should write");
-
-        let session_map_path = dir.join(".pi/pi-acp");
-        fs::create_dir_all(&session_map_path).expect("pi map dir should exist");
-        fs::write(
-            session_map_path.join("session-map.json"),
-            format!(
-                "{{\"version\":1,\"sessions\":{{\"pi-session\":{{\"sessionId\":\"pi-session\",\"cwd\":\"/tmp/pi\",\"sessionFile\":\"{}\",\"updatedAt\":\"2026-05-20T00:00:01Z\"}}}}}}",
-                session_file.display()
-            ),
-        )
-        .expect("pi session map should write");
-
-        let (status, sessions) = discover_pi_sessions(
-            Some(dir.join(".pi/agent/sessions").as_path()),
-            Some(dir.join(".pi/pi-acp/session-map.json").as_path()),
-            10,
-        );
-        assert!(status.ok);
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, "pi-session");
-        assert_eq!(sessions[0].title, "Resume deploy work");
-    }
-
-    #[test]
-    fn kimi_discovery_reads_index_and_builds_verified_resume_command() {
-        let dir = unique_temp_dir("kimi");
-        let sessions_dir = dir.join(".kimi-code/sessions");
-        let session_dir = sessions_dir.join("kimi-session");
-        fs::create_dir_all(&session_dir).expect("kimi session dir should exist");
-        fs::write(session_dir.join("state.json"), "{}").expect("kimi state should write");
-        let index_path = dir.join(".kimi-code/session_index.jsonl");
-        fs::write(
-            &index_path,
-            format!(
-                "{{\"sessionId\":\"kimi-session\",\"sessionDir\":\"{}\",\"workDir\":\"/tmp/kimi project\"}}\n",
-                session_dir.display()
-            ),
-        )
-        .expect("kimi index should write");
-
-        let (status, sessions) = discover_kimi_sessions(Some(&index_path), Some(&sessions_dir), 10);
-        assert!(status.ok);
-        assert!(status.history_available);
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, "kimi-session");
-        assert_eq!(sessions[0].cwd, "/tmp/kimi project");
-        assert_eq!(
-            sessions[0].resume_command.as_deref(),
-            Some("cd '/tmp/kimi project' && kimi --session kimi-session")
-        );
-        assert!(sessions[0].resume_unavailable_reason.is_none());
-    }
-
-    #[test]
-    fn most_recent_discovered_session_matches_normalized_agent_and_exact_cwd() {
-        let record =
-            |agent: &str, session_id: &str, cwd: &str, updated_at_unix_ms| AgentSessionRecord {
-                agent: agent.into(),
-                session_id: session_id.into(),
-                title: "session".into(),
-                cwd: cwd.into(),
-                host: None,
-                repo_root: None,
-                started_at_unix_ms: None,
-                updated_at_unix_ms,
-                status: "recent".into(),
-                live_binding: None,
-                resume_command: None,
-                resume_unavailable_reason: None,
-            };
-        let remote = |session_id: &str, cwd: &str, updated_at_unix_ms| AgentSessionRecord {
-            host: Some("gpu-box".into()),
-            ..record("codex", session_id, cwd, updated_at_unix_ms)
-        };
-        let discovery = AgentSessionDiscovery {
-            providers: Vec::new(),
-            sessions: vec![
-                record("codex", "old", "/repo", 1),
-                record("codex", "wrong-cwd", "/other", 3),
-                record("codex", "new", "/repo", 2),
-                // Same agent, same repo path, different host — the routine
-                // collision that must never bind to a local pane.
-                remote("remote-newest", "/repo", 99),
-            ],
-            remote_hosts: Vec::new(),
-        };
-
-        assert_eq!(
-            most_recent_discovered_session(&discovery, "codex-cli", "/repo")
-                .map(|session| session.session_id.as_str()),
-            Some("new"),
-            "a remote record must never resolve a local pane's session id"
-        );
-    }
-
-    #[test]
-    fn kimi_discovery_missing_index_is_degraded_not_failed() {
-        let dir = unique_temp_dir("kimi-missing");
-        let (status, sessions) = discover_kimi_sessions(
-            Some(&dir.join("missing.jsonl")),
-            Some(&dir.join("sessions")),
-            10,
-        );
-        assert!(status.ok);
-        assert!(!status.history_available);
-        assert!(status.warning.is_some());
-        assert!(status.error.is_none());
-        assert!(sessions.is_empty());
-    }
-
-    #[cfg(feature = "opencode-history")]
-    #[test]
-    fn opencode_discovery_reads_sqlite_rows() {
-        let dir = unique_temp_dir("opencode");
-        let db_path = dir.join("opencode.db");
-        let connection = Connection::open(&db_path).expect("sqlite db should open");
-        connection
-            .execute_batch(
-                "create table session (
-                    id text primary key,
-                    project_id text not null,
-                    slug text not null,
-                    directory text not null,
-                    title text not null,
-                    version text not null default '1',
-                    share_url text,
-                    summary_additions integer,
-                    summary_deletions integer,
-                    summary_files integer,
-                    summary_diffs text,
-                    revert text,
-                    permission text,
-                    time_created integer not null,
-                    time_updated integer not null,
-                    time_compacting integer,
-                    time_archived integer,
-                    workspace_id text,
-                    path text,
-                    agent text,
-                    model text,
-                    cost real default 0 not null,
-                    tokens_input integer default 0 not null,
-                    tokens_output integer default 0 not null,
-                    tokens_reasoning integer default 0 not null,
-                    tokens_cache_read integer default 0 not null,
-                    tokens_cache_write integer default 0 not null
-                );
-                insert into session (id, project_id, slug, directory, title, version, time_created, time_updated)
-                values ('ses_123', 'proj_1', 'steady-river', '/tmp/opencode', 'Issue 133', '1', 10, 20);",
-            )
-            .expect("opencode schema should write");
-
-        drop(connection);
-
-        let (status, sessions) = discover_opencode_sessions(Some(db_path.as_path()), 10);
-        assert!(status.ok);
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, "ses_123");
-        assert_eq!(sessions[0].title, "Issue 133");
-    }
-
-    #[cfg(feature = "opencode-history")]
-    #[test]
-    fn opencode_discovery_reports_degraded_when_db_missing() {
-        let dir = unique_temp_dir("opencode-missing");
-        let db_path = dir.join("opencode.db");
-
-        let (status, sessions) = discover_opencode_sessions(Some(db_path.as_path()), 10);
-
-        assert!(status.ok);
-        assert!(!status.history_available);
-        assert!(status.warning.is_some());
-        assert!(status.error.is_none());
-        assert_eq!(status.session_count, 0);
-        assert!(sessions.is_empty());
-    }
-
-    #[cfg(feature = "opencode-history")]
-    #[test]
-    fn opencode_discovery_reports_error_on_unreadable_db() {
-        let dir = unique_temp_dir("opencode-unreadable");
-        let db_path = dir.join("opencode.db");
-        fs::write(&db_path, b"this is not sqlite").expect("junk db should write");
-
-        let (status, sessions) = discover_opencode_sessions(Some(db_path.as_path()), 10);
-
-        assert!(!status.ok);
-        assert!(!status.history_available);
-        assert!(status.warning.is_none());
-        assert!(status.error.is_some());
-        assert_eq!(status.session_count, 0);
-        assert!(sessions.is_empty());
-    }
-
-    #[cfg(not(feature = "opencode-history"))]
-    #[test]
-    fn opencode_adapter_absent_reports_unavailable() {
-        let (status, sessions) = discover_opencode_sessions(None, 10);
-
-        assert!(status.ok);
-        assert!(!status.history_available);
-        assert_eq!(
-            status.warning.as_deref(),
-            Some("OpenCode history support was not compiled into this build.")
-        );
-        assert!(status.error.is_none());
-        assert_eq!(status.session_count, 0);
-        assert!(sessions.is_empty());
-    }
-
-    #[test]
-    fn compact_title_truncates_on_character_boundaries() {
-        let title = compact_title(&"🚀".repeat(80));
-
-        assert!(title.ends_with("..."));
-        assert_eq!(title.chars().count(), 72);
-    }
-
-    #[test]
-    fn shell_escape_handles_quotes() {
-        assert_eq!(
-            build_resume_command("claude", "/tmp/it's-here", "abc123"),
-            "cd '/tmp/it'\"'\"'s-here' && claude --resume abc123"
-        );
-        assert_eq!(
-            build_resume_command("custom; unsafe", "/tmp", "abc123"),
-            "cd /tmp && 'custom; unsafe' abc123",
-            "a persisted custom agent name must remain one shell word"
         );
     }
 
@@ -2723,6 +1698,7 @@ mod tests {
                     repo_root: None,
                     started_at_unix_ms: None,
                     updated_at_unix_ms: 5,
+                    last_user_message_at_unix_ms: None,
                     status: "recent".to_string(),
                     live_binding: None,
                     resume_command: Some(

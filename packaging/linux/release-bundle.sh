@@ -10,9 +10,10 @@ bundle_root="$out_dir/$artifact_name"
 tarball_path="$out_dir/$artifact_name.tar.gz"
 checksum_path="$tarball_path.sha256"
 
-binary_path="$repo_root/taarof-app/target/release/taarof-app"
+binary_path="${CARGO_TARGET_DIR:-$repo_root/taarof-app/target}/release/taarof-app"
 artifact_sidecar_path="$binary_path.provenance.json"
 cli_source_path="$repo_root/taarof-cli/taarof"
+agent_binary_path="${CARGO_TARGET_DIR:-$repo_root/taarof-app/target}/release/agent"
 web_dist_path="$repo_root/taarof-web/dist"
 
 # shellcheck source=packaging/linux/source-provenance.sh
@@ -50,9 +51,11 @@ else
 fi
 require_file "$artifact_sidecar_path"
 require_file "$cli_source_path"
+require_file "$agent_binary_path"
 require_file "$web_dist_path/index.html"
 require_file "$script_dir/install.sh"
 require_file "$script_dir/source-provenance.sh"
+require_file "$script_dir/bundle-provenance.py"
 require_file "$script_dir/emit-artifact-provenance.sh"
 require_file "$script_dir/$desktop_id.desktop"
 require_file "$script_dir/$desktop_id.metainfo.xml"
@@ -71,6 +74,13 @@ install -Dm755 "$binary_path" "$bundle_root/bin/taarof-app"
 install -Dm644 "$artifact_sidecar_path" "$bundle_root/share/taarof/install-manifest.json"
 install -Dm644 "$script_dir/source-provenance.sh" "$bundle_root/share/taarof/source-provenance.sh"
 install -Dm755 "$cli_source_path" "$bundle_root/bin/taarof"
+install -Dm755 "$agent_binary_path" "$bundle_root/bin/agent"
+install -Dm644 "$script_dir/bundle-provenance.py" "$bundle_root/share/taarof/bundle-provenance.py"
+python3 "$script_dir/bundle-provenance.py" create \
+    --source-root "$repo_root" --app "$bundle_root/bin/taarof-app" \
+    --app-sidecar "$bundle_root/share/taarof/install-manifest.json" \
+    --agent "$bundle_root/bin/agent" --cli "$bundle_root/bin/taarof" \
+    --output "$bundle_root/share/taarof/bundle-manifest.json"
 install -Dm755 "$script_dir/install.sh" "$bundle_root/install.sh"
 install -Dm644 "$script_dir/$desktop_id.desktop" "$bundle_root/share/applications/$desktop_id.desktop"
 install -Dm644 "$script_dir/$desktop_id.metainfo.xml" "$bundle_root/share/metainfo/$desktop_id.metainfo.xml"
@@ -87,6 +97,15 @@ if [[ -f "$repo_root/LICENSE-APACHE" ]]; then
 fi
 
 cp -a "$web_dist_path"/. "$bundle_root/share/taarof/web"/
+
+# Ship helpers without editing any user's startup files.
+for helper in osc7.bash osc7.zsh osc7.fish agent-status.bash agent-status.zsh; do
+    install -Dm644 "$repo_root/taarof-app/resources/$helper" "$bundle_root/share/taarof/shell/$helper"
+done
+for helper in taarof-shell-integration.sh taarof-shell-integration.fish; do
+    install -Dm644 "$repo_root/examples/$helper" "$bundle_root/share/taarof/shell/$helper"
+done
+
 
 if git -C "$repo_root" rev-parse --verify HEAD >/dev/null 2>&1; then
     source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "$repo_root" log -1 --format=%ct)}"

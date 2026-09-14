@@ -1,0 +1,3 @@
+[build]
+# Keep the desktop artifact path stable while shipped crates share one workspace.
+target-dir = "taarof-app/target"

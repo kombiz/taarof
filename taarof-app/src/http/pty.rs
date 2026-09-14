@@ -19,10 +19,10 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Notify;
 
 use crate::pty_broker::{
-    BrokerEpoch, BrokeredPane, CanonicalCheckpoint, OutputSeq, ResumeDecision,
+    BrokerEpoch, BrokeredPane, CanonicalCheckpoint, InputOutcome, InputReceipt, InputStatus,
+    OutputObserver, OutputSeq, ResumeDecision,
 };
 
 /// Server-sent `output` frames are capped at 256 KiB by the protocol; broker
@@ -34,9 +34,31 @@ const PTY_INPUT_FRAME_MAX_BYTES: usize = 65_536;
 /// Signed control frames whose deadline has already passed are rejected; this is
 /// the anti-replay bound the protocol common types describe.
 const PTY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-/// How often the blocking output pump wakes to re-check its shutdown flag. This
-/// bounds how long the pump can outlive a disconnected socket.
-const PTY_PUMP_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const PTY_SEND_DEADLINE: Duration = Duration::from_secs(2);
+const PTY_REPLAY_BATCH_BYTES: usize = 64 * 1024;
+const PTY_REPLAY_BATCH_FRAMES: usize = 8;
+const PTY_CHECKPOINT_MAX_BYTES: usize = 256 * 1024;
+
+/// Every send, including control results and close, has the same finite budget.
+/// Dropping a timed-out socket releases its observer and pending input receipts.
+struct PtySocket(axum::extract::ws::WebSocket, bool);
+impl PtySocket {
+    async fn send(&mut self, message: axum::extract::ws::Message) -> Result<(), ()> {
+        if self.1 {
+            return Err(());
+        }
+        let result = tokio::time::timeout(PTY_SEND_DEADLINE, self.0.send(message))
+            .await
+            .map_err(|_| ())
+            .and_then(|result| result.map_err(|_| ()));
+        self.1 = result.is_err();
+        result
+    }
+    async fn recv(&mut self) -> Option<Result<axum::extract::ws::Message, axum::Error>> {
+        self.0.recv().await
+    }
+}
+
 /// The single grant generation issued for the lifetime of one control-enabled
 /// connection. Grant rotation across devices is a later phase; for now every
 /// `input`/`resize` frame must carry this generation, and a mismatch is refused
@@ -88,8 +110,8 @@ pub(crate) fn resolve_pty_adapter_target(
                 };
                 let pane = Arc::clone(broker.pane());
                 let (cols, rows) = pane.with_model(|model| {
-                    let projection = model.projection();
-                    (projection.cols as u16, projection.rows as u16)
+                    let (cols, rows) = model.dimensions();
+                    (cols as u16, rows as u16)
                 });
                 return PtyAdapterResolution::Brokered(PtyAdapterHandle { pane, cols, rows });
             }
@@ -114,20 +136,27 @@ pub struct PtyDispatchGuard {
     pub deadline_ms: i64,
 }
 
-/// GTK-main-thread final dispatch of an `input` frame. Revalidates the grant,
-/// deadline, pane liveness, and epoch (input is never carried across epochs) at
-/// the point of dispatch, then writes to the PTY. Returns only after the bytes
-/// have reached the kernel, so the caller may `ack` afterward.
+/// GTK validates authority and admits work without PTY I/O. The receipt is
+/// completed by the bounded writer after kernel acceptance or cancellation.
 pub(crate) fn dispatch_pty_input(
     state: &crate::AppState,
     tab_id: u32,
     pane_id: u32,
     guard: &PtyDispatchGuard,
-    payload: &[u8],
-) -> Result<(), String> {
+    payload: Vec<u8>,
+    cancelled: Arc<AtomicBool>,
+) -> Result<InputReceipt, String> {
     let pane = revalidate_control_target(state, tab_id, pane_id, guard)?;
-    pane.write_input(payload)
-        .map_err(|error| format!("pty input dispatch failed: {error}"))
+    pane.submit_input(payload, input_deadline(guard.deadline_ms), cancelled)
+        .map_err(|error| format!("pty input admission failed: {error}"))
+}
+
+fn input_deadline(deadline_ms: i64) -> Instant {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    Instant::now() + Duration::from_millis(deadline_ms.saturating_sub(now).clamp(0, 5000) as u64)
 }
 
 /// GTK-main-thread final dispatch of a `resize` frame. Revalidates the grant,
@@ -209,14 +238,19 @@ async fn query_pty_adapter_resolution(
     await_bridge_reply(reply_rx).await
 }
 
-async fn dispatch_input_over_bridge(
+// Send synchronously before spawning the completion future, preserving frame
+// admission order even when async workers are scheduled in a different order.
+fn dispatch_input_over_bridge(
     state: &HttpState,
     tab_id: u32,
     pane_id: u32,
     guard: PtyDispatchGuard,
     payload: Vec<u8>,
-) -> Result<(), String> {
-    let (reply_tx, reply_rx) = oneshot::channel();
+    cancelled: Arc<AtomicBool>,
+) -> Result<InputAdmission, String> {
+    let (reply, receiver) = oneshot::channel();
+    let admission_lock = Arc::new(std::sync::Mutex::new(()));
+    let deadline = input_deadline(guard.deadline_ms);
     state
         .bridge
         .try_send(HttpBridgeRequest::DispatchPtyInput {
@@ -224,12 +258,60 @@ async fn dispatch_input_over_bridge(
             pane_id,
             guard,
             payload,
-            reply: reply_tx,
+            cancelled,
+            admission_lock: admission_lock.clone(),
+            reply,
         })
         .map_err(|_| "pty control bridge is unavailable".to_string())?;
-    await_bridge_reply(reply_rx)
-        .await
-        .map_err(|status| format!("pty control bridge failed with status {}", status.as_u16()))?
+    Ok(InputAdmission {
+        receiver,
+        admission_lock,
+        deadline,
+    })
+}
+
+struct InputAdmission {
+    receiver: oneshot::Receiver<Result<InputReceipt, String>>,
+    admission_lock: Arc<std::sync::Mutex<()>>,
+    deadline: Instant,
+}
+
+impl InputAdmission {
+    async fn wait(mut self) -> Result<InputOutcome, String> {
+        let result = tokio::select! {
+            result = &mut self.receiver => result.map_err(|_| "PTY admission bridge closed".to_string())?,
+            _ = tokio::time::sleep_until(self.deadline.into()) => {
+                // GTK holds this same short lock from its closed check through
+                // admission and reply. Closing here either prevents admission or
+                // retrieves its receipt; zero delivery is never guessed in a race.
+                let _admission = self.admission_lock.lock().unwrap();
+                self.receiver.close();
+                self.receiver.try_recv().map_err(|_| "PTY input deadline expired before admission".to_string())?
+            }
+        };
+        Ok(result?.wait().await)
+    }
+}
+
+struct PendingInputs {
+    cancelled: Arc<AtomicBool>,
+    completions: tokio::task::JoinSet<(Option<String>, usize, Result<InputOutcome, String>)>,
+}
+
+impl PendingInputs {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            completions: tokio::task::JoinSet::new(),
+        }
+    }
+}
+
+impl Drop for PendingInputs {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.completions.abort_all();
+    }
 }
 
 async fn dispatch_resize_over_bridge(
@@ -365,7 +447,7 @@ fn parse_requested_cursor(query: &PtyWebSocketQuery) -> Option<(BrokerEpoch, Out
 }
 
 async fn handle_pty_socket(
-    mut socket: axum::extract::ws::WebSocket,
+    socket: axum::extract::ws::WebSocket,
     state: HttpState,
     tab_id: u32,
     pane_id: u32,
@@ -375,6 +457,7 @@ async fn handle_pty_socket(
 ) {
     use axum::extract::ws::Message;
 
+    let mut socket = PtySocket(socket, false);
     let pane = handle.pane;
     let current_epoch = pane.epoch();
     let ctx = FrameContext {
@@ -389,19 +472,18 @@ async fn handle_pty_socket(
     // Register for output wakeups *before* computing the first cursor so live
     // output produced during attach still wakes the loop; the retained window is
     // read authoritatively via `resume` so nothing is missed or duplicated.
-    let subscription = pane.subscribe();
-    let notify = Arc::new(Notify::new());
-    let closed = Arc::new(AtomicBool::new(false));
-    // Signals the blocking output pump to stop and drop its broker subscription
-    // when this connection ends, so neither the pump thread nor the phantom
-    // subscriber outlive the socket.
-    let pump_shutdown = Arc::new(AtomicBool::new(false));
-    spawn_output_pump(
-        subscription,
-        Arc::clone(&notify),
-        Arc::clone(&closed),
-        Arc::clone(&pump_shutdown),
-    );
+    let mut subscription = match pane.observe_output() {
+        Ok(subscription) => subscription,
+        Err(_) => {
+            let _ = socket
+                .send(Message::text(
+                    ctx.error_frame("observer_limit", "pane observer limit reached")
+                        .to_string(),
+                ))
+                .await;
+            return;
+        }
+    };
 
     stream_pty_frames(
         &mut socket,
@@ -412,15 +494,11 @@ async fn handle_pty_socket(
         &ctx,
         started,
         requested_cursor,
-        &notify,
-        &closed,
+        &mut subscription,
     )
     .await;
 
-    // Stop the pump promptly on disconnect: it wakes within its poll interval,
-    // sees this flag, and drops the broker subscription (which the broker then
-    // prunes on its next read fan-out).
-    pump_shutdown.store(true, Ordering::Release);
+    drop(subscription);
     let _ = socket.send(Message::Close(None)).await;
 }
 
@@ -428,7 +506,7 @@ async fn handle_pty_socket(
 /// socket closes, the client errors, or the child exits.
 #[allow(clippy::too_many_arguments)] // Streaming loop threads its explicit connection state.
 async fn stream_pty_frames(
-    socket: &mut axum::extract::ws::WebSocket,
+    socket: &mut PtySocket,
     state: &HttpState,
     tab_id: u32,
     pane_id: u32,
@@ -436,12 +514,15 @@ async fn stream_pty_frames(
     ctx: &FrameContext,
     started: Instant,
     requested_cursor: Option<(BrokerEpoch, OutputSeq)>,
-    notify: &Arc<Notify>,
-    closed: &Arc<AtomicBool>,
+    observer: &mut OutputObserver,
 ) {
     use axum::extract::ws::Message;
 
     let current_epoch = pane.epoch();
+    let mut pending = PendingInputs::new();
+    let mut output_closed = false;
+    let mut source_closed = observer.closed();
+    let mut pending_output = true;
     let mut cursor = OutputSeq::zero();
     if send_initial_frames(socket, pane, ctx, requested_cursor, &mut cursor)
         .await
@@ -451,19 +532,40 @@ async fn stream_pty_frames(
     }
 
     loop {
+        // EOF can win the select before an already-admitted write's completion.
+        // Drain those bounded outcomes before closing, but admit no new work.
+        if output_closed && pending.completions.is_empty() {
+            if pane.output_error().is_some() {
+                let _ = socket
+                    .send(Message::text(
+                        ctx.error_frame(
+                            "pty_read_failed",
+                            "PTY output ended with a reader failure",
+                        )
+                        .to_string(),
+                    ))
+                    .await;
+            }
+            break;
+        }
         tokio::select! {
-            biased;
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(payload))) => {
+                        if source_closed || output_closed {
+                            if socket.send(Message::text(ctx.error_frame("pane_closed", "PTY has closed; no further input can be admitted").to_string())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                         if handle_client_frame(
                             socket,
                             state,
-                            tab_id,
-                            pane_id,
+                            (tab_id, pane_id),
                             pane,
                             ctx,
                             payload.as_str(),
+                            &mut pending,
                         )
                         .await
                         .is_err()
@@ -484,17 +586,30 @@ async fn stream_pty_frames(
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 }
             }
-            _ = notify.notified() => {
-                if flush_output(socket, pane, current_epoch, ctx, &mut cursor)
-                    .await
-                    .is_err()
-                {
-                    break;
+            completed = pending.completions.join_next(), if !pending.completions.is_empty() => {
+                if let Some(Ok((input_seq, requested, outcome))) = completed {
+                    let frame = ctx.input_result_frame(
+                        pane.with_replay(|window| window.latest_seq()), input_seq, requested, outcome);
+                    if socket.send(Message::text(frame.to_string())).await.is_err() { break; }
                 }
-                if closed.load(Ordering::Acquire) {
-                    // The child has exited and the final output has been flushed.
-                    break;
+            }
+            changed = observer.changed(), if !source_closed => {
+                source_closed = !changed || observer.closed();
+                pending_output = true;
+            }
+            _ = async {}, if pending_output => {
+                match flush_output(socket, pane, current_epoch, ctx, &mut cursor).await {
+                    Ok(more) => pending_output = more,
+                    Err(()) => break,
                 }
+                let (closed, remaining) = observer.remaining_after(cursor);
+                source_closed |= closed;
+                // EOF and its final cursor are one atomic observation. A final
+                // reader push between replay and this check requires another pass.
+                pending_output |= remaining;
+                // Retain admitted input outcomes after EOF, exactly as the
+                // input dispatcher requires. Only final output sets this flag.
+                output_closed = source_closed && !pending_output;
             }
             _ = tokio::time::sleep(PTY_HEARTBEAT_INTERVAL) => {
                 let monotonic_ms = started.elapsed().as_millis() as u64;
@@ -510,41 +625,8 @@ async fn stream_pty_frames(
     }
 }
 
-/// Bridge the broker's blocking subscriber channel into an async wakeup. Each
-/// output chunk (and the terminal EOF) notifies the streaming loop, which then
-/// reads the authoritative window via `resume`. The channel payloads themselves
-/// are ignored here — they exist only to wake the loop.
-///
-/// The channel `recv` is polled with a timeout so the pump can observe
-/// `shutdown` and exit promptly when the connection ends, dropping the broker
-/// subscription on the way out; without this the blocking thread and its phantom
-/// subscriber would linger for the child's remaining lifetime.
-fn spawn_output_pump(
-    subscription: std::sync::mpsc::Receiver<Vec<u8>>,
-    notify: Arc<Notify>,
-    closed: Arc<AtomicBool>,
-    shutdown: Arc<AtomicBool>,
-) {
-    use std::sync::mpsc::RecvTimeoutError;
-
-    tokio::task::spawn_blocking(move || loop {
-        if shutdown.load(Ordering::Acquire) {
-            break;
-        }
-        match subscription.recv_timeout(PTY_PUMP_POLL_INTERVAL) {
-            Ok(_) => notify.notify_one(),
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => {
-                closed.store(true, Ordering::Release);
-                notify.notify_one();
-                break;
-            }
-        }
-    });
-}
-
 async fn send_initial_frames(
-    socket: &mut axum::extract::ws::WebSocket,
+    socket: &mut PtySocket,
     pane: &Arc<BrokeredPane>,
     ctx: &FrameContext,
     requested_cursor: Option<(BrokerEpoch, OutputSeq)>,
@@ -552,7 +634,14 @@ async fn send_initial_frames(
 ) -> Result<(), ()> {
     match requested_cursor {
         Some((epoch, ack_seq)) => {
-            let decision = pane.with_replay(|window| window.resume(epoch, ack_seq));
+            let decision = pane.with_replay(|window| {
+                window.resume_limited(
+                    epoch,
+                    ack_seq,
+                    PTY_REPLAY_BATCH_BYTES,
+                    PTY_REPLAY_BATCH_FRAMES,
+                )
+            });
             match decision {
                 ResumeDecision::Replay { frames, .. } => {
                     // The requested cursor is still covered: resume in place with
@@ -581,21 +670,37 @@ async fn send_initial_frames(
     }
 }
 
-/// Send a checkpoint-first frame capturing the current canonical screen. The
-/// latest sequence is captured *before* the checkpoint so the cursor never runs
-/// ahead of the state the checkpoint represents: a chunk that lands between the
-/// two reads is then re-sent as output (a bounded, harmless overlap) rather than
-/// dropped.
+/// Send a checkpoint-first frame whose cursor and canonical screen come from
+/// one broker observation. Output arriving afterward is replayed once from that
+/// cursor; overlapping terminal bytes are not safe to apply a second time.
 async fn send_checkpoint(
-    socket: &mut axum::extract::ws::WebSocket,
+    socket: &mut PtySocket,
     pane: &Arc<BrokeredPane>,
     ctx: &FrameContext,
     cursor: &mut OutputSeq,
 ) -> Result<(), ()> {
     use axum::extract::ws::Message;
 
-    let latest = pane.with_replay(|window| window.latest_seq());
-    let checkpoint = pane.with_model(|model| model.checkpoint());
+    let (latest, checkpoint) = match pane.bounded_checkpoint(PTY_CHECKPOINT_MAX_BYTES) {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => {
+            let degraded = error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<crate::pty_broker::screen::ModelDegraded>());
+            let (code, message) = if degraded {
+                ("checkpoint_degraded", "terminal model contains overflowed cells; erase or overwrite them, or reset the terminal before retrying")
+            } else {
+                (
+                    "checkpoint_limit",
+                    "terminal checkpoint exceeds observer memory limit",
+                )
+            };
+            let _ = socket
+                .send(Message::text(ctx.error_frame(code, message).to_string()))
+                .await;
+            return Err(());
+        }
+    };
     let frame = ctx.checkpoint_frame(latest, &checkpoint);
     socket
         .send(Message::text(frame.to_string()))
@@ -606,34 +711,42 @@ async fn send_checkpoint(
 }
 
 async fn flush_output(
-    socket: &mut axum::extract::ws::WebSocket,
+    socket: &mut PtySocket,
     pane: &Arc<BrokeredPane>,
     current_epoch: BrokerEpoch,
     ctx: &FrameContext,
     cursor: &mut OutputSeq,
-) -> Result<(), ()> {
-    let decision = pane.with_replay(|window| window.resume(current_epoch, *cursor));
+) -> Result<bool, ()> {
+    let decision = pane.with_replay(|window| {
+        window.resume_limited(
+            current_epoch,
+            *cursor,
+            PTY_REPLAY_BATCH_BYTES,
+            PTY_REPLAY_BATCH_FRAMES,
+        )
+    });
     match decision {
         ResumeDecision::Replay { frames, .. } => {
             for frame in frames {
                 send_output_frame(socket, ctx, frame.seq, &frame.payload).await?;
                 *cursor = frame.seq;
             }
-            Ok(())
+            Ok(pane.with_replay(|window| window.latest_seq()) != *cursor)
         }
-        ResumeDecision::AlreadyAtLatest { .. } => Ok(()),
+        ResumeDecision::AlreadyAtLatest { .. } => Ok(false),
         ResumeDecision::ReplayGap { .. }
         | ResumeDecision::WrongEpoch { .. }
         | ResumeDecision::FutureCursor { .. } => {
             // The window evicted output faster than it could be streamed: emit a
             // fresh checkpoint instead of pretending the stream was continuous.
-            send_checkpoint(socket, pane, ctx, cursor).await
+            send_checkpoint(socket, pane, ctx, cursor).await?;
+            Ok(true)
         }
     }
 }
 
 async fn send_output_frame(
-    socket: &mut axum::extract::ws::WebSocket,
+    socket: &mut PtySocket,
     ctx: &FrameContext,
     seq: OutputSeq,
     payload: &[u8],
@@ -651,15 +764,16 @@ async fn send_output_frame(
 }
 
 async fn handle_client_frame(
-    socket: &mut axum::extract::ws::WebSocket,
+    socket: &mut PtySocket,
     state: &HttpState,
-    tab_id: u32,
-    pane_id: u32,
+    target: (u32, u32),
     pane: &Arc<BrokeredPane>,
     ctx: &FrameContext,
     payload: &str,
+    pending: &mut PendingInputs,
 ) -> Result<(), ()> {
     use axum::extract::ws::Message;
+    let (tab_id, pane_id) = target;
 
     let frame: ClientFrame = match serde_json::from_str(payload) {
         Ok(frame) => frame,
@@ -680,8 +794,23 @@ async fn handle_client_frame(
             grant_generation,
             deadline_ms,
             payload_base64,
-            ..
+            input_seq,
         } => {
+            if input_seq.as_ref().is_some_and(|seq| {
+                seq.len() > 20
+                    || seq.parse::<u64>().is_err()
+                    || !seq.bytes().all(|b| b.is_ascii_digit())
+                    || (seq.len() > 1 && seq.starts_with('0'))
+            }) {
+                socket
+                    .send(Message::text(
+                        ctx.error_frame("invalid_frame", "invalid input sequence")
+                            .to_string(),
+                    ))
+                    .await
+                    .map_err(|_| ())?;
+                return Ok(());
+            }
             let bytes = match validate_control_frame(
                 ctx,
                 &epoch,
@@ -702,26 +831,36 @@ async fn handle_client_frame(
                 grant_generation: PTY_GRANT_GENERATION,
                 deadline_ms,
             };
-            match dispatch_input_over_bridge(state, tab_id, pane_id, guard, bytes).await {
-                Ok(()) => {
-                    // Acknowledge only after the input reached the kernel; the
-                    // ack pins the output position observed post-dispatch.
-                    let ack_seq = pane.with_replay(|window| window.latest_seq());
-                    socket
-                        .send(Message::text(ctx.ack_frame(ack_seq).to_string()))
-                        .await
-                        .map_err(|_| ())
-                }
-                Err(message) => {
-                    let _ = socket
-                        .send(Message::text(
-                            ctx.error_frame("input_dispatch_failed", &message)
-                                .to_string(),
-                        ))
-                        .await;
-                    Ok(())
-                }
+            let requested = bytes.len();
+            if pending.completions.len() >= 16 {
+                let frame = ctx.input_result_frame(
+                    pane.with_replay(|window| window.latest_seq()),
+                    input_seq,
+                    requested,
+                    Err("too many pending input requests".into()),
+                );
+                socket
+                    .send(Message::text(frame.to_string()))
+                    .await
+                    .map_err(|_| ())?;
+                return Ok(());
             }
+            let admission = dispatch_input_over_bridge(
+                state,
+                tab_id,
+                pane_id,
+                guard,
+                bytes,
+                pending.cancelled.clone(),
+            );
+            pending.completions.spawn(async move {
+                let outcome = match admission {
+                    Ok(admission) => admission.wait().await,
+                    Err(error) => Err(error),
+                };
+                (input_seq, requested, outcome)
+            });
+            Ok(())
         }
         ClientFrame::Resize {
             epoch,
@@ -862,6 +1001,8 @@ enum ClientFrame {
         grant_generation: String,
         deadline_ms: i64,
         payload_base64: String,
+        #[serde(default)]
+        input_seq: Option<String>,
     },
     #[serde(rename = "resize")]
     Resize {
@@ -945,6 +1086,42 @@ impl FrameContext {
         Value::Object(map)
     }
 
+    fn input_result_frame(
+        &self,
+        output_seq: OutputSeq,
+        input_seq: Option<String>,
+        requested: usize,
+        outcome: Result<InputOutcome, String>,
+    ) -> Value {
+        let (mut frame, mut result) = match outcome {
+            Ok(outcome) => {
+                let frame = if outcome.status == InputStatus::Delivered {
+                    self.ack_frame(output_seq)
+                } else {
+                    self.error_frame(
+                        "input_dispatch_failed",
+                        &format!(
+                            "PTY input {:?}: {} of {} bytes accepted; remainder cancelled",
+                            outcome.status, outcome.written_bytes, outcome.requested_bytes
+                        ),
+                    )
+                };
+                (frame, json!(outcome))
+            }
+            Err(message) => (
+                self.error_frame("input_rejected", &message),
+                json!({
+                    "requested_bytes": requested, "written_bytes": 0, "status": "rejected",
+                }),
+            ),
+        };
+        if let Some(input_seq) = input_seq {
+            result["input_seq"] = json!(input_seq);
+        }
+        frame["input_result"] = result;
+        frame
+    }
+
     fn heartbeat_frame(&self, monotonic_ms: u64) -> Value {
         let mut map = self.base("heartbeat");
         map.insert("monotonic_ms".to_string(), json!(monotonic_ms));
@@ -967,7 +1144,7 @@ impl FrameContext {
 #[cfg(test)]
 mod tests {
     use super::super::{test_router_with_gates, BridgeReceiver, HttpBridgeRequest};
-    use super::{PtyAdapterHandle, PtyAdapterResolution};
+    use super::{input_deadline, PtyAdapterHandle, PtyAdapterResolution};
     use crate::pty_broker::{BrokeredPane, PtyBroker, SpawnSpec};
     use axum::Router;
     use base64::Engine as _;
@@ -977,6 +1154,63 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio_tungstenite::tungstenite;
+
+    #[tokio::test]
+    async fn unserviced_input_admission_expires_and_prevents_delayed_dispatch() {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        let admission_lock = Arc::new(std::sync::Mutex::new(()));
+        let admission = super::InputAdmission {
+            receiver,
+            admission_lock: admission_lock.clone(),
+            deadline: Instant::now() + Duration::from_millis(20),
+        };
+        let error = tokio::time::timeout(Duration::from_secs(1), admission.wait())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("deadline expired before admission"));
+        // The delayed GTK branch takes this lock before checking the sender.
+        // It cannot submit a job after the deadline returned a zero-byte rejection.
+        let _admission = admission_lock.lock().unwrap();
+        assert!(reply.is_closed());
+    }
+
+    #[tokio::test]
+    async fn admission_deadline_race_retains_exact_partial_delivery_receipt() {
+        let pane = spawn_broker("python3 -c 'import tty,time; tty.setraw(0); print(\"READY\",flush=True); time.sleep(30)'", 80, 24);
+        let start = Instant::now();
+        while !pane
+            .with_replay(|window| window.latest_seq() != crate::pty_broker::OutputSeq::zero())
+        {
+            assert!(start.elapsed() < Duration::from_secs(3));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let receipt = pane
+            .submit_input(
+                vec![b'x'; 65536],
+                Instant::now() + Duration::from_millis(100),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .unwrap();
+        while receipt.written_bytes() == 0 {
+            assert!(start.elapsed() < Duration::from_secs(3));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        assert!(reply.send(Ok(receipt)).is_ok());
+        let admission = super::InputAdmission {
+            receiver,
+            admission_lock: Arc::new(std::sync::Mutex::new(())),
+            deadline: Instant::now(),
+        };
+        let outcome = admission.wait().await.unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::pty_broker::InputStatus::DeadlineExpired
+        );
+        assert!(outcome.written_bytes > 0 && outcome.written_bytes < outcome.requested_bytes);
+        pane.shutdown();
+    }
 
     enum BridgeMode {
         Broker(Arc<BrokeredPane>),
@@ -1031,15 +1265,25 @@ mod tests {
                     HttpBridgeRequest::DispatchPtyInput {
                         guard,
                         payload,
+                        cancelled,
+                        admission_lock,
                         reply,
                         ..
                     } => {
+                        let _admission = admission_lock.lock().unwrap();
+                        if reply.is_closed() {
+                            continue;
+                        }
                         let result = match &mode {
                             BridgeMode::Broker(pane)
                                 if guard.expected_epoch == pane.epoch().to_string() =>
                             {
-                                pane.write_input(&payload)
-                                    .map_err(|error| error.to_string())
+                                pane.submit_input(
+                                    payload,
+                                    input_deadline(guard.deadline_ms),
+                                    cancelled,
+                                )
+                                .map_err(|error| error.to_string())
                             }
                             _ => Err("pane epoch changed since attach".to_string()),
                         };
@@ -1143,7 +1387,8 @@ mod tests {
     fn wait_until_model_contains(pane: &Arc<BrokeredPane>, needle: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let visible = pane.with_model(|model| model.projection().visible_text.join("\n"));
+            let visible =
+                pane.with_model(|model| model.projection().unwrap().visible_text.join("\n"));
             if visible.contains(needle) {
                 return;
             }
@@ -1277,7 +1522,7 @@ mod tests {
             let rows = frame["rows"].as_u64().unwrap() as usize;
             let mut reconstructed = crate::pty_broker::TerminalStateModel::new(cols, rows);
             reconstructed.feed(&ansi);
-            let visible = reconstructed.projection().visible_text.join("\n");
+            let visible = reconstructed.projection().unwrap().visible_text.join("\n");
             assert!(
                 visible.contains("CHECKPOINT-MARK"),
                 "the checkpoint must reconstruct the rendered screen, saw {visible:?}"
@@ -1329,6 +1574,303 @@ mod tests {
                 "the child must observe the dispatched input; output was {output:?}"
             );
         });
+    }
+
+    #[tokio::test]
+    async fn combining_overflow_refuses_web_checkpoint_and_reset_recovers() {
+        let pane = spawn_broker("stty -echo; printf a; python3 -c 'import os; os.write(1, bytes([204,129])*2048)'; IFS= read -r line; printf '\\033cRECOVERED'; IFS= read -r line", 40, 6);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pane.with_model(|model| model.has_degraded_cells()) {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (app, rx) = test_router_with_gates(true, true);
+        service_bridge(rx, BridgeMode::Broker(pane.clone()));
+        let addr = serve(app).await;
+        let url = format!("ws://{addr}/api/v1/tabs/1/panes/2/pty/ws?token=secret");
+        let mut socket = connect(&url).await.unwrap();
+        let refusal = next_frame(&mut socket).await;
+        assert_eq!(refusal["kind"], json!("error"));
+        assert_eq!(refusal["error"]["code"], json!("checkpoint_degraded"));
+        assert!(refusal.to_string().contains("erase or overwrite"));
+        assert!(refusal.get("checkpoint").is_none());
+        pane.write_input(b"reset\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pane.with_model(|model| model.has_degraded_cells()) {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut recovered = connect(&url).await.unwrap();
+        let checkpoint = next_frame(&mut recovered).await;
+        assert_eq!(checkpoint["kind"], json!("checkpoint"));
+        pane.shutdown();
+    }
+
+    #[tokio::test]
+    async fn natural_eof_sends_every_retained_final_output_byte_before_close() {
+        let pane = spawn_broker("stty -echo; printf READY; IFS= read -r line; head -c 2097152 /dev/zero; printf FINAL_SENTINEL", 80, 24);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pane.with_model(|model| {
+            model
+                .projection()
+                .unwrap()
+                .visible_text
+                .join("")
+                .contains("READY")
+        }) {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (app, rx) = test_router_with_gates(true, true);
+        service_bridge(rx, BridgeMode::Broker(pane.clone()));
+        let addr = serve(app).await;
+        let mut socket = connect(&format!(
+            "ws://{addr}/api/v1/tabs/1/panes/2/pty/ws?token=secret"
+        ))
+        .await
+        .unwrap();
+        let checkpoint = next_frame(&mut socket).await;
+        assert_eq!(checkpoint["kind"], "checkpoint");
+        socket
+            .send(tungstenite::Message::text(
+                input_frame(&pane.epoch().to_string(), b"go\n").to_string(),
+            ))
+            .await
+            .unwrap();
+        let mut output = Vec::new();
+        let mut acknowledged = false;
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap();
+            let Some(Ok(frame)) = frame else {
+                break;
+            };
+            if frame.is_close() {
+                break;
+            }
+            if !frame.is_text() {
+                continue;
+            }
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            match frame["kind"].as_str() {
+                Some("output") => output.extend(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(frame["payload_base64"].as_str().unwrap())
+                        .unwrap(),
+                ),
+                Some("ack") => acknowledged = true,
+                Some("checkpoint") => {
+                    panic!("fully retained final output must not require a gap reset")
+                }
+                _ => {}
+            }
+        }
+        assert!(acknowledged, "admitted input outcome survives EOF");
+        assert_eq!(output.len(), 2 * 1024 * 1024 + b"FINAL_SENTINEL".len());
+        assert!(output[..2 * 1024 * 1024].iter().all(|byte| *byte == 0));
+        assert_eq!(&output[2 * 1024 * 1024..], b"FINAL_SENTINEL");
+    }
+
+    #[tokio::test]
+    async fn eof_waits_for_already_admitted_input_outcome() {
+        let pane = spawn_broker("IFS= read -r line; printf 'ECHO:%s\\n' \"$line\"", 80, 24);
+        let (app, mut rx) = test_router_with_gates(true, true);
+        let exited = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (bridge_pane, bridge_exited, bridge_release) =
+            (pane.clone(), exited.clone(), release.clone());
+        tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                match request {
+                    HttpBridgeRequest::ResolvePtyAdapter { reply, .. } => {
+                        let _ = reply.send(PtyAdapterResolution::Brokered(PtyAdapterHandle {
+                            pane: bridge_pane.clone(),
+                            cols: 80,
+                            rows: 24,
+                        }));
+                    }
+                    HttpBridgeRequest::DispatchPtyInput {
+                        guard,
+                        payload,
+                        cancelled,
+                        admission_lock,
+                        reply,
+                        ..
+                    } => {
+                        let result = {
+                            let _admission = admission_lock.lock().unwrap();
+                            assert!(!reply.is_closed());
+                            bridge_pane
+                                .submit_input(payload, input_deadline(guard.deadline_ms), cancelled)
+                                .map_err(|error| error.to_string())
+                        };
+                        // Hold the completion receipt until the real child has
+                        // exited and the client has observed the EOF window.
+                        // This forces EOF ahead of completion, rather than
+                        // relying on which Tokio branch wins a scheduling race.
+                        let deadline = Instant::now() + Duration::from_secs(3);
+                        while bridge_pane.try_exit_code().is_none() {
+                            assert!(Instant::now() < deadline);
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        bridge_exited.notify_one();
+                        bridge_release.notified().await;
+                        let _ = reply.send(result);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let addr = serve(app).await;
+        let mut socket = connect(&format!(
+            "ws://{addr}/api/v1/tabs/1/panes/2/pty/ws?token=secret"
+        ))
+        .await
+        .unwrap();
+        let first = next_frame(&mut socket).await;
+        socket
+            .send(tungstenite::Message::text(
+                input_frame(first["epoch"].as_str().unwrap(), b"hello-input\n").to_string(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), exited.notified())
+            .await
+            .unwrap();
+        let mut output = Vec::new();
+        while let Ok(message) =
+            tokio::time::timeout(Duration::from_millis(100), socket.next()).await
+        {
+            let message = message
+                .expect("EOF must not discard a pending input outcome")
+                .unwrap();
+            assert!(
+                message.is_text(),
+                "EOF must not close before the input outcome"
+            );
+            let frame: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            assert_ne!(
+                frame["kind"],
+                json!("ack"),
+                "completion is still held by the barrier"
+            );
+            if frame["kind"] == "output" {
+                output.extend(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(frame["payload_base64"].as_str().unwrap())
+                        .unwrap(),
+                );
+            }
+        }
+        assert!(String::from_utf8_lossy(&output).contains("ECHO:hello-input"));
+        socket
+            .send(tungstenite::Message::text(
+                input_frame(
+                    first["epoch"].as_str().unwrap(),
+                    b"must not admit after EOF",
+                )
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let rejected = next_frame(&mut socket).await;
+        assert_eq!(rejected["error"]["code"], json!("pane_closed"));
+        release.notify_one();
+        let outcome = next_frame(&mut socket).await;
+        assert_eq!(outcome["kind"], json!("ack"));
+        assert_eq!(outcome["input_result"]["status"], json!("delivered"));
+        assert_eq!(outcome["input_result"]["written_bytes"], json!(12));
+    }
+
+    #[tokio::test]
+    async fn websocket_pending_admission_is_bounded_and_deadlines_release_slots() {
+        let pane = spawn_broker("sleep 30", 80, 24);
+        let (app, mut rx) = test_router_with_gates(true, true);
+        let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let held_bridge = held.clone();
+        let bridge_pane = pane.clone();
+        tokio::spawn(async move {
+            while let Some(request) = rx.recv().await {
+                match request {
+                    HttpBridgeRequest::ResolvePtyAdapter { reply, .. } => {
+                        let _ = reply.send(PtyAdapterResolution::Brokered(PtyAdapterHandle {
+                            pane: bridge_pane.clone(),
+                            cols: 80,
+                            rows: 24,
+                        }));
+                    }
+                    request @ HttpBridgeRequest::DispatchPtyInput { .. } => {
+                        held_bridge.lock().unwrap().push(request);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let addr = serve(app).await;
+        let mut socket = connect(&format!(
+            "ws://{addr}/api/v1/tabs/1/panes/2/pty/ws?token=secret"
+        ))
+        .await
+        .unwrap();
+        let checkpoint = next_frame(&mut socket).await;
+        let epoch = checkpoint["epoch"].as_str().unwrap();
+        for index in 0..20 {
+            let mut frame = input_frame(epoch, b"never admitted");
+            frame["input_seq"] = json!(index.to_string());
+            frame["deadline_ms"] = json!(now_ms() + 500);
+            socket
+                .send(tungstenite::Message::text(frame.to_string()))
+                .await
+                .unwrap();
+        }
+        let mut saturated = 0;
+        let mut expired = 0;
+        while saturated + expired < 20 {
+            let frame = next_frame(&mut socket).await;
+            if frame["input_result"].is_null() {
+                continue;
+            }
+            assert_eq!(frame["input_result"]["written_bytes"], json!(0));
+            assert_eq!(frame["input_result"]["status"], json!("rejected"));
+            let message = frame["error"]["message"].as_str().unwrap();
+            if message.contains("too many pending") {
+                saturated += 1;
+            } else {
+                assert!(message.contains("deadline expired before admission"));
+                expired += 1;
+            }
+        }
+        assert_eq!((saturated, expired), (4, 16));
+        {
+            let held = held.lock().unwrap();
+            assert_eq!(held.len(), 16);
+            for request in held.iter() {
+                let HttpBridgeRequest::DispatchPtyInput {
+                    reply,
+                    admission_lock,
+                    ..
+                } = request
+                else {
+                    unreachable!()
+                };
+                let _admission = admission_lock.lock().unwrap();
+                assert!(reply.is_closed(), "late GTK cannot admit expired input");
+            }
+        }
+        let mut frame = input_frame(epoch, b"slot available again");
+        frame["deadline_ms"] = json!(now_ms() + 50);
+        socket
+            .send(tungstenite::Message::text(frame.to_string()))
+            .await
+            .unwrap();
+        let frame = next_frame(&mut socket).await;
+        assert!(frame["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("deadline expired before admission"));
+        assert_eq!(held.lock().unwrap().len(), 17);
+        pane.shutdown();
     }
 
     #[test]

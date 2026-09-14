@@ -1,0 +1,9 @@
+[http]
+enabled = false
+
+[history]
+enabled = false
+
+[tasks]
+enabled = false
+pull_requests = false

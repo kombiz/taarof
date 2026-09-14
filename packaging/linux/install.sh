@@ -52,15 +52,23 @@ require_file() {
 
 require_file "$binary_source_path"
 require_file "$cli_source_path"
+require_file "$script_dir/bin/agent"
 require_file "$desktop_source_path"
 require_file "$metainfo_source_path"
 require_file "$icon_source_path"
 require_file "$web_source_dir/index.html"
 require_file "$manifest_source_path"
 require_cli_python
+require_file "$script_dir/share/taarof/bundle-manifest.json"
+require_file "$script_dir/share/taarof/bundle-provenance.py"
+python3 "$script_dir/share/taarof/bundle-provenance.py" verify \
+    --manifest "$script_dir/share/taarof/bundle-manifest.json" \
+    --app "$binary_source_path" --app-sidecar "$manifest_source_path" \
+    --agent "$script_dir/bin/agent" --cli "$cli_source_path"
 
 install -Dm755 "$binary_source_path" "$binary_install_path"
 install -Dm755 "$cli_source_path" "$cli_install_path"
+install -Dm755 "$script_dir/bin/agent" "$prefix/bin/agent"
 install -d "$(dirname "$desktop_install_path")" "$(dirname "$metainfo_install_path")" "$web_install_dir"
 sed \
     -e "s|^Exec=.*$|Exec=$(escape_sed_replacement "$binary_install_path")|" \
@@ -81,7 +89,17 @@ if ! command -v taarof_copy_artifact_provenance >/dev/null 2>&1; then
     echo "bundle provenance verifier missing" >&2
     exit 1
 fi
-taarof_copy_artifact_provenance "$manifest_source_path" "$binary_source_path" "$manifest_install_path" || true
+taarof_copy_artifact_provenance "$manifest_source_path" "$binary_source_path" "$manifest_install_path"
+python3 "$script_dir/share/taarof/bundle-provenance.py" verify \
+    --manifest "$script_dir/share/taarof/bundle-manifest.json" \
+    --app "$binary_install_path" --app-sidecar "$manifest_install_path" \
+    --agent "$prefix/bin/agent" --cli "$cli_install_path"
+install -Dm644 "$script_dir/share/taarof/bundle-manifest.json" "$prefix/share/taarof/bundle-manifest.json"
+
+# Explicit helper payload; never modify shell startup files.
+for helper in osc7.bash osc7.zsh osc7.fish agent-status.bash agent-status.zsh taarof-shell-integration.sh taarof-shell-integration.fish; do
+    install -Dm644 "$script_dir/share/taarof/shell/$helper" "$prefix/share/taarof/shell/$helper"
+done
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$prefix/share/applications" || true

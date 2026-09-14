@@ -258,14 +258,7 @@ fn save_store(path: &Path, store: &TemplateStore) -> io::Result<()> {
 
     let json = serde_json::to_string_pretty(store)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    write_atomically(path, &json)
-}
-
-fn write_atomically(path: &Path, content: &str) -> io::Result<()> {
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, content)?;
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+    crate::private_atomic_file::replace(path, &json)
 }
 
 fn upsert_template(templates: &mut Vec<TemplateRecord>, record: TemplateRecord) {
@@ -322,6 +315,21 @@ mod tests {
             }
             let _ = std::fs::remove_dir(&self.lock_dir);
         }
+    }
+
+    #[test]
+    fn private_atomic_save_replaces_public_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path();
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_store(&path, &TemplateStore::default()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        load_store(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     fn temp_path() -> PathBuf {

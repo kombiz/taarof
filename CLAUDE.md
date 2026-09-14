@@ -25,6 +25,13 @@ on disk.
 - Keep GTK state serialized on the main thread and spawn expensive work behind
   a channel.
 
+## Branch workflow
+
+Create task branches from `origin/kmux` in dedicated worktrees and target pull
+requests to `kmux`.
+Promote reviewed work from `kmux` to `main` only with explicit authorization.
+GitHub's default branch remains `main`.
+
 ## Gates
 
 Run `mise run ci` for the full contributor gate. Clippy treats warnings as

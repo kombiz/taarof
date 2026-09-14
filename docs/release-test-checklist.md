@@ -174,7 +174,7 @@ keyboard and UX validation pass.
 
 - [ ] Open the browser client on a phone-sized viewport and confirm the navigator becomes a drawer
 - [ ] Confirm workspace and tab switching remain usable on the small-screen layout
-- [ ] Confirm the mobile view keeps one pane visible at a time and pane switching remains tappable
+- [ ] Confirm the mobile terminal stage stacks up to four visible panes, keeps each pane usable, and makes overflow-pane switching tappable
 - [ ] Confirm the mobile view stays read-only by default
 - [ ] Confirm the bearer-token bootstrap flow still works after clearing mobile browser storage
 - [ ] Confirm older service-worker registrations are removed by the browser client
@@ -204,6 +204,18 @@ keyboard and UX validation pass.
 - [ ] Confirm wrapped plain `http(s)` URLs still show a pointer cursor and open with `Ctrl+Click` in the desktop app
 - [ ] Confirm wrapped plain `http(s)` URLs are clickable in the browser client terminal surface
 
+## Standalone agent picker
+
+- [ ] Run `cargo test --manifest-path agent-launcher/Cargo.toml`; retain headless
+      metadata/help snapshots and fake-provider PTY cleanup checks
+- [ ] In an isolated history root with fake providers, open bare `agent`,
+      `agent --new` and `agent --resume`; cancel each without a real provider launch
+- [ ] Check New/Active/Recent, text + provider + scope filters, every documented
+      key, declared Fork visibility and selection disappearance after refresh
+- [ ] Resize to a narrow terminal; confirm labels stay clipped and controls inert
+- [ ] Confirm preview metadata contains no prompt bodies, raw argv or environment
+      values, including when one provider reports degraded discovery
+
 ## Sign-off
 
 - [ ] Dispatch `Release` with `workflow_dispatch` from the candidate branch,
@@ -224,3 +236,25 @@ keyboard and UX validation pass.
 - [ ] Update `docs/release.md` with the latest validation date and scope
 - [ ] Attach or reference screenshots/logs for the release candidate
 - [ ] Record any unvalidated areas in the release notes
+
+## Launcher release receipt completion
+
+Keep the generated `agent.release-smoke.v1` receipt and an attended supplement.
+Do not convert these blank observations into PASS from automated checks:
+
+| Evidence | Record |
+| --- | --- |
+| Reviewed immutable source | Full SHA, independent reviewer and verdict |
+| Package | Archive SHA-256 or extracted bundle manifest hash; source/build bindings |
+| Installed commands | Separate agent, Taarof CLI and app hashes; agent build ID |
+| Running app | Explicit PID, lifetime, executable hash; installed parity or difference |
+| Automated gates | Exact-SHA CI, plan, packaging, public-export and headless GUI results |
+| Automated smoke | Receipt path and `automated_status`; synthetic fixtures only |
+| Claude / Codex / Pi / Kimi | For each available primary provider, attended new and saved-session resume; unavailable or account prerequisite if not possible |
+| Live tmux | Attended attach to an existing live process, with observed result |
+| Remote host | Attended unreachable/stale host observation while local rows remain usable |
+| Taarof down and return | Operator-authorized stop, local new/resume, restart and enrichment observations |
+| Closure | PASS only after every required observation is evidenced; otherwise list pending items |
+
+Run `testing/e2e-gui/run-agent-launcher-e2e.sh --help` for the automated receipt
+command. It never performs the attended actions above or edits provider accounts.
