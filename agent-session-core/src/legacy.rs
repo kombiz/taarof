@@ -483,6 +483,7 @@ fn discover_jsonl_provider(
 
     let mut sessions = Vec::new();
     let mut failure = None;
+    let mut missing_metadata = false;
     for candidate in candidates.into_iter().take(limit) {
         let lines = match read_jsonl_sample_lines(&candidate.path) {
             Ok(lines) => lines,
@@ -496,8 +497,13 @@ fn discover_jsonl_provider(
                 crate::message_time::last_user_message(&candidate.path, provider);
             sessions.push(session);
         } else {
-            failure = Some("Session history has no valid session metadata.".into());
+            missing_metadata = true;
         }
+    }
+    // A store also holds JSONL that is not a session transcript (Claude workflow
+    // journals, bridge stubs). Only a store with no admissible session is degraded.
+    if missing_metadata && sessions.is_empty() {
+        failure.get_or_insert_with(|| "Session history has no valid session metadata.".into());
     }
     sessions.sort_by_key(|session| Reverse(session.updated_at_unix_ms));
     sessions.truncate(limit);
