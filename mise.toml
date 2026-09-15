@@ -24,6 +24,14 @@ run = [
   "cargo build --release --manifest-path taarof-app/Cargo.toml",
 ]
 
+[tasks.install]
+description = "Build this checkout in release mode and install it under ~/.local"
+depends = ["build", "web:build"]
+run = [
+  'bash packaging/linux/emit-artifact-provenance.sh "${CARGO_TARGET_DIR:-taarof-app/target}/release/taarof-app"',
+  "bash packaging/linux/install-local.sh",
+]
+
 [tasks."web:build"]
 description = "Build the web client bundle"
 run = [
