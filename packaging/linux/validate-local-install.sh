@@ -49,6 +49,7 @@ release_out_dir="$(mktemp -d)"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/taarof-app/target}"
 cargo build --locked --release --manifest-path "$repo_root/agent-launcher/Cargo.toml"
 cargo build --locked --release --features bundled-sqlite --manifest-path "$repo_root/taarof-app/Cargo.toml"
+cargo build --locked --release --manifest-path "$repo_root/taarof-control-gateway/Cargo.toml"
 bash "$script_dir/emit-artifact-provenance.sh" "${CARGO_TARGET_DIR:-$repo_root/taarof-app/target}/release/taarof-app"
 (cd "$repo_root/taarof-web" && npm ci --include=dev && npm run build)
 bash "$script_dir/install-local.sh" "$prefix"
@@ -56,6 +57,14 @@ bash "$script_dir/install-local.sh" "$prefix"
 test -x "$binary_path"
 test -x "$cli_path"
 test -x "$prefix/bin/agent"
+test -x "$prefix/bin/taarof-control-gateway"
+test -f "$prefix/share/systemd/user/taarof-control-gateway.service"
+test -f "$prefix/share/taarof/caddy/taarof-control.caddy"
+test -f "$prefix/share/licenses/taarof-control-gateway/LICENSE"
+cmp "$repo_root/taarof-control-gateway/LICENSE" \
+    "$prefix/share/licenses/taarof-control-gateway/LICENSE"
+grep -Fx "ExecStart=$prefix/bin/taarof-control-gateway" \
+    "$prefix/share/systemd/user/taarof-control-gateway.service" >/dev/null
 for argument in --version --build-info --help providers; do
     HOME="$prefix" "$prefix/bin/agent" "$argument" >/dev/null
 done

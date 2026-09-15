@@ -1,4 +1,8 @@
-taarof is available under either of the following licenses, at your option:
+Except for the component noted below, taarof is available under either of the
+following licenses, at your option:
 
 1. Apache License, Version 2.0, in LICENSE-APACHE
 2. MIT license, in LICENSE-MIT
+
+`taarof-control-gateway/` is licensed separately under GPL-3.0-or-later. See
+`taarof-control-gateway/LICENSE` and its Cargo package metadata.

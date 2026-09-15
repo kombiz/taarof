@@ -176,6 +176,12 @@ fn installed_bundle_contains_agent_binary() {
         fixture.join("taarof-app/Cargo.toml"),
     )
     .unwrap();
+    std::fs::create_dir_all(fixture.join("taarof-control-gateway")).unwrap();
+    std::fs::copy(
+        repo.join("taarof-control-gateway/LICENSE"),
+        fixture.join("taarof-control-gateway/LICENSE"),
+    )
+    .unwrap();
     std::fs::copy(
         env!("CARGO_BIN_EXE_agent"),
         fixture.join("taarof-app/target/release/taarof-app"),

@@ -4,7 +4,9 @@
 and VTE. The primary shipped surface in this repo is `taarof-app/`: tabbed
 terminals, split panes, session restore, agent-aware activity indicators,
 optional tmux-backed panes, and an optional local HTTP API with a paired
-`taarof-web/` browser client.
+`taarof-web/` browser client. The repository also ships the optional
+`taarof-control-gateway/` for authenticated remote access to one running
+desktop runtime.
 
 The installed `taarof` command comes from `taarof-cli/taarof`, the Python
 client for the desktop app. `examples/taarof` is a separate experimental
@@ -24,6 +26,7 @@ of the desktop bundle.
 - Optional tmux-backed panes plus detach/attach flows
 - Ghostty theme import and OSC 7 cwd tracking, including SSH-aware path display
 - Local Unix socket API and optional loopback-only HTTP API
+- Optional loopback control gateway with device pairing and scoped grants
 - Saved dashboard views and workspace templates
 - Responsive browser view that starts in observe mode and can unlock local control
 
@@ -62,13 +65,15 @@ Start from a local checkout of this repo:
 ```bash
 cargo build --release --manifest-path taarof-app/Cargo.toml
 cargo build --release --manifest-path agent-launcher/Cargo.toml
+cargo build --release --manifest-path taarof-control-gateway/Cargo.toml
 (cd taarof-web && npm ci && npm run build)
 bash packaging/linux/install-local.sh
 ~/.local/bin/taarof-app
 ```
 
-`packaging/linux/install-local.sh` installs the release binary, desktop entry,
-metainfo, icon, and built web bundle under `~/.local`.
+`packaging/linux/install-local.sh` installs the release binaries, desktop entry,
+metainfo, icon, built web bundle, gateway user-service unit, and private Caddy
+template under `~/.local`. It never starts or enables the gateway.
 
 ### Install from a GitHub release tarball
 
@@ -178,6 +183,8 @@ model. See [SECURITY.md](SECURITY.md).
 | [RUNBOOK.md](RUNBOOK.md) | Operator tasks, restart, backup, and health checks |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Known failure modes and fixes |
 | [docs/local-query-api.md](docs/local-query-api.md) | Socket and HTTP API reference |
+| [docs/homelab-control-gateway.md](docs/homelab-control-gateway.md) | Gateway trust boundaries and always-on edge topology |
+| [docs/remote-terminal-runbook.md](docs/remote-terminal-runbook.md) | Gateway build, configuration, recovery, and deployment |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
 | [SECURITY.md](SECURITY.md) | Security reporting and trust model |
 | [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | Community expectations |
@@ -703,6 +710,7 @@ Contributions are welcome. Start with the
 | `terminal.rs`, `terminal/` | VTE lifecycle, PTY child spawning, restore, attach/detach, split handling, broadcast, and terminal signals. |
 | `config.rs`, `keybindings.rs` | Validated live `config.toml` snapshot (including Ghostty import) and the bindable typed `Action` contract. |
 | `socket.rs`, `socket/`, `http.rs`, `http/`, `api.rs` | Same-user socket protocol/registry, token-gated loopback HTTP bridge, and versioned state projections. |
+| `taarof-control-gateway/` | Optional loopback-only remote trust boundary: pairing, grants, terminal relay, runtime pinning, and audit. |
 | `session.rs`, `app_session.rs`, `history/`, `diagnostics.rs` | Coalescing JSON session persistence, optional observational SQLite history, and JSONL diagnostics. |
 | `runtime_probe.rs`, `app_runtime.rs`, `agents/` | Off-GTK runtime probes, stale/degraded reconciliation, and agent process/transcript observation. |
 | `task_launch.rs`, `mise/`, `task_panel.rs`, `sidebar/discovery.rs`, `palette.rs` | One safe task-launch plan shared by palette, sidebar, task panel, and task actions. |

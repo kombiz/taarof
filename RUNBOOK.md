@@ -11,6 +11,7 @@ Operational guide for `taarof`.
 | GTK desktop app | Enabled when launched | Main UI |
 | Unix socket API | Enabled when the runtime dir is trusted | Same-user local control and query surface |
 | HTTP API | Disabled until `[http].enabled = true` | Local web/API surface; write routes need `[http_control]` |
+| Control gateway | Disabled until separately configured and started | Loopback-only authenticated remote trust boundary for one desktop runtime |
 
 ## Start, stop, restart
 
@@ -18,6 +19,7 @@ Operational guide for `taarof`.
 | --- | --- |
 | Run in development | `cargo run --manifest-path taarof-app/Cargo.toml` |
 | Build release binary | `cargo build --release --manifest-path taarof-app/Cargo.toml` |
+| Build gateway binary | `cargo build --release --manifest-path taarof-control-gateway/Cargo.toml` |
 | Launch built binary | `./taarof-app/target/release/taarof-app` |
 | Install local desktop assets | `bash packaging/linux/install-local.sh` |
 | Apply config changes | `config.toml` validates and reloads supported consumers live; restart only after changing startup-owned services or companion files |
@@ -105,9 +107,23 @@ token can execute the narrow write routes documented in `docs/local-query-api.md
 ### Remote control access
 
 Do not expose taarof's raw HTTP port or Unix socket directly. For remote access,
-keep taarof on owner-host loopback and use your own reverse proxy,
-authentication layer, and narrow control gateway. Revoke the gateway's control
-grant, or disable `[http_control]`, when remote control should stop.
+keep taarof and `taarof-control-gateway` on owner-host loopback. The gateway is
+shipped in this repository and translates approved operations to the desktop
+runtime's authenticated local API; it does not widen that API or implement a
+second GTK/control state machine. Revoke the gateway's control grant, or disable
+`[http_control]`, when remote control should stop.
+
+The GTK runtime and gateway must be co-located as the owner user. An always-on
+server may terminate TLS/authentication and maintain a private reverse tunnel
+to the gateway, but is not a terminal runtime. See
+`docs/homelab-control-gateway.md` and `docs/remote-terminal-runbook.md`.
+
+After every desktop-runtime restart, the gateway's configured runtime ID is
+stale by design. A stale pin exits with status 78, and the packaged user unit's
+`RestartPreventExitStatus=78` prevents a restart storm. Other startup failures
+are bounded to three attempts per 60 seconds. Explicitly select the intended
+runtime, update only its pin, run `taarof-control-gateway --check-runtime`, then
+`systemctl --user reset-failed taarof-control-gateway` and restart the service.
 
 ## Runtime paths
 
@@ -122,6 +138,9 @@ grant, or disable `[http_control]`, when remote control should stop.
 | Socket registry | `$XDG_RUNTIME_DIR/taarof-current.json` |
 | Socket | `$XDG_RUNTIME_DIR/taarof-<pid>.sock` |
 | HTTP token | `$XDG_RUNTIME_DIR/taarof-http-<pid>.token` |
+| Gateway config | `~/.config/taarof/gateway.toml` |
+| Gateway owner socket | `$XDG_RUNTIME_DIR/taarof-control-gateway/owner.sock` |
+| Gateway device store | `~/.local/state/taarof-control-gateway/devices.db` |
 | Diagnostics log | `~/.local/state/taarof/diagnostics.jsonl` |
 | Diagnostics archive | `~/.local/state/taarof/diagnostics.jsonl.1` |
 
@@ -219,7 +238,7 @@ Back up these files before risky changes or local experiments:
 | --- | --- |
 | Known failure patterns | `TROUBLESHOOTING.md` |
 | HTTP API and `/health` | `docs/local-query-api.md` |
-| Remote-control gateway | External authenticated gateway (outside this tree) |
+| Remote-control gateway | `docs/remote-terminal-runbook.md` |
 | Release and packaging flow | `docs/release.md` |
 | tmux-backed pane behavior | `docs/tmux-integration.md` |
 

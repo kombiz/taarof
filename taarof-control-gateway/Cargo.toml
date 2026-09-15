@@ -1,0 +1,53 @@
+[package]
+name = "taarof-control-gateway"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Loopback-only control gateway relaying the Taarof Remote Protocol to the desktop runtime"
+
+# The crate ships both a library (public API exercised by integration tests and,
+# later, the gateway's protocol handlers) and a thin binary entry point.
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
+axum = { version = "0.8", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# Bundled SQLite keeps this standalone systemd service independent of a host
+# libsqlite3, matching the "fails closed, no surprises" posture of the design.
+rusqlite = { version = "0.31", features = ["bundled"] }
+# Pairing/attestation/session crypto. Ed25519 for device signatures and the
+# synthetic attestation chain; `der` encodes the certificate and attestation
+# structures verified up to a pinned trust anchor.
+ed25519-dalek = "2"
+der = { version = "0.7", features = ["derive", "oid", "alloc"] }
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+# Constant-time comparison of attacker-influenced values (challenge, app id,
+# attested key) against expected material.
+subtle = "2"
+getrandom = "0.2"
+uuid = { version = "1", features = ["v4"] }
+# The HTTP runtime adapter is a loopback client of the desktop app's PTY
+# WebSocket adapter and its narrow control POSTs. tokio-tungstenite speaks the
+# terminal-frame WebSocket; the hyper-util legacy client issues the tab/split
+# control requests. Versions match the desktop app so both ends share one
+# tungstenite/hyper.
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+
+[dev-dependencies]
+# The runtime-adapter test stands up a real local WebSocket + control server for
+# the HTTP adapter to talk to; that needs axum's `ws` feature, which the shipped
+# gateway itself does not require (it is a client of the desktop app's socket).
+axum = { version = "0.8", features = ["ws"] }
+# Validate gateway-emitted frames against the published JSON Schema
+# (protocol/schemas/terminal-frame.json), not just the gateway's own validator,
+# so the exact wire shapes the Android/iOS clients depend on cannot drift.
+boon = "0.6"
+tower = { version = "0.5", features = ["util"] }

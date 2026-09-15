@@ -1,0 +1,387 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://taarof.onlyarag.com/protocol/schemas/terminal-frame.json",
+  "title": "Taarof Remote TerminalFrame",
+  "oneOf": [
+    { "$ref": "#/$defs/CheckpointFrame" },
+    { "$ref": "#/$defs/OutputFrame" },
+    { "$ref": "#/$defs/InputFrame" },
+    { "$ref": "#/$defs/ResizeFrame" },
+    { "$ref": "#/$defs/AckFrame" },
+    { "$ref": "#/$defs/HeartbeatFrame" },
+    { "$ref": "#/$defs/ErrorFrame" },
+    { "$ref": "#/$defs/GrantExpiringFrame" },
+    { "$ref": "#/$defs/ControlRevokedFrame" }
+  ],
+  "$defs": {
+    "FrameBase": {
+      "type": "object",
+      "required": [
+        "kind",
+        "protocol_version",
+        "runtime_id",
+        "session_name",
+        "tab_id",
+        "pane_id",
+        "epoch"
+      ],
+      "properties": {
+        "kind": { "type": "string" },
+        "protocol_version": { "$ref": "common.json#/$defs/ProtocolVersion" },
+        "runtime_id": { "$ref": "common.json#/$defs/Uuid" },
+        "session_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "tab_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        },
+        "pane_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        },
+        "epoch": { "$ref": "common.json#/$defs/Uuid" }
+      }
+    },
+    "CheckpointFrame": {
+      "allOf": [
+        { "$ref": "#/$defs/FrameBase" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "protocol_version",
+            "runtime_id",
+            "session_name",
+            "tab_id",
+            "pane_id",
+            "epoch",
+            "output_seq",
+            "cols",
+            "rows",
+            "checkpoint"
+          ],
+          "properties": {
+            "kind": { "const": "checkpoint" },
+            "protocol_version": { "$ref": "common.json#/$defs/ProtocolVersion" },
+            "runtime_id": { "$ref": "common.json#/$defs/Uuid" },
+            "session_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "tab_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "pane_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "epoch": { "$ref": "common.json#/$defs/Uuid" },
+            "output_seq": { "$ref": "common.json#/$defs/Uint64DecimalString" },
+            "cols": { "type": "integer", "minimum": 2, "maximum": 500 },
+            "rows": { "type": "integer", "minimum": 2, "maximum": 200 },
+            "checkpoint": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["ansi_base64", "byte_count", "state_hash"],
+              "properties": {
+                "ansi_base64": { "$ref": "common.json#/$defs/Base64String" },
+                "byte_count": { "type": "integer", "minimum": 0, "maximum": 262144 },
+                "state_hash": {
+                  "type": "string",
+                  "pattern": "^sha256:[0-9a-f]{64}$"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "OutputFrame": {
+      "allOf": [
+        { "$ref": "#/$defs/FrameBase" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "protocol_version",
+            "runtime_id",
+            "session_name",
+            "tab_id",
+            "pane_id",
+            "epoch",
+            "output_seq",
+            "payload_base64",
+            "byte_count"
+          ],
+          "properties": {
+            "kind": { "const": "output" },
+            "protocol_version": { "$ref": "common.json#/$defs/ProtocolVersion" },
+            "runtime_id": { "$ref": "common.json#/$defs/Uuid" },
+            "session_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "tab_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "pane_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "epoch": { "$ref": "common.json#/$defs/Uuid" },
+            "output_seq": { "$ref": "common.json#/$defs/Uint64DecimalString" },
+            "payload_base64": { "$ref": "common.json#/$defs/Base64String" },
+            "byte_count": { "type": "integer", "minimum": 0, "maximum": 262144 }
+          }
+        }
+      ]
+    },
+    "InputFrame": {
+      "allOf": [
+        { "$ref": "#/$defs/FrameBase" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "protocol_version",
+            "runtime_id",
+            "session_name",
+            "tab_id",
+            "pane_id",
+            "epoch",
+            "input_seq",
+            "grant_generation",
+            "nonce",
+            "deadline_ms",
+            "payload_base64",
+            "byte_count"
+          ],
+          "properties": {
+            "kind": { "const": "input" },
+            "protocol_version": { "$ref": "common.json#/$defs/ProtocolVersion" },
+            "runtime_id": { "$ref": "common.json#/$defs/Uuid" },
+            "session_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "tab_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "pane_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "epoch": { "$ref": "common.json#/$defs/Uuid" },
+            "input_seq": { "$ref": "common.json#/$defs/Uint64DecimalString" },
+            "grant_generation": { "$ref": "common.json#/$defs/Uint64DecimalString" },
+            "nonce": { "$ref": "common.json#/$defs/Nonce" },
+            "deadline_ms": { "$ref": "common.json#/$defs/UnixDeadlineMs" },
+            "payload_base64": { "$ref": "common.json#/$defs/Base64String" },
+            "byte_count": { "type": "integer", "minimum": 0, "maximum": 65536 }
+          },
+          "$comment": "Requires pane-control scope. Input is acknowledged only after final PTY dispatch and is never carried across connection epochs."
+        }
+      ]
+    },
+    "ResizeFrame": {
+      "allOf": [
+        { "$ref": "#/$defs/FrameBase" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "protocol_version",
+            "runtime_id",
+            "session_name",
+            "tab_id",
+            "pane_id",
+            "epoch",
+            "input_seq",
+            "grant_generation",
+            "nonce",
+            "deadline_ms",
+            "cols",
+            "rows"
+          ],
+          "properties": {
+            "kind": { "const": "resize" },
+            "protocol_version": { "$ref": "common.json#/$defs/ProtocolVersion" },
+            "runtime_id": { "$ref": "common.json#/$defs/Uuid" },
+            "session_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "tab_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "pane_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "epoch": { "$ref": "common.json#/$defs/Uuid" },
+            "input_seq": { "$ref": "common.json#/$defs/Uint64DecimalString" },
+            "grant_generation": { "$ref": "common.json#/$defs/Uint64DecimalString" },
+            "nonce": { "$ref": "common.json#/$defs/Nonce" },
+            "deadline_ms": { "$ref": "common.json#/$defs/UnixDeadlineMs" },
+            "cols": { "type": "integer", "minimum": 2, "maximum": 500 },
+            "rows": { "type": "integer", "minimum": 2, "maximum": 200 }
+          },
+          "$comment": "Requires pane-control scope."
+        }
+      ]
+    },
+    "InputResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested_bytes", "written_bytes", "status"],
+      "properties": {
+        "input_seq": { "$ref": "common.json#/$defs/Uint64DecimalString" },
+        "requested_bytes": { "type": "integer", "minimum": 0, "maximum": 65536 },
+        "written_bytes": { "type": "integer", "minimum": 0, "maximum": 65536 },
+        "status": { "enum": ["delivered", "cancelled", "deadline_expired", "closed", "write_failed", "rejected"] }
+      }
+    },
+    "AckFrame": {
+      "allOf": [
+        { "$ref": "#/$defs/FrameBase" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "protocol_version",
+            "runtime_id",
+            "session_name",
+            "tab_id",
+            "pane_id",
+            "epoch",
+            "ack_output_seq"
+          ],
+          "properties": {
+            "kind": { "const": "ack" },
+            "protocol_version": { "$ref": "common.json#/$defs/ProtocolVersion" },
+            "runtime_id": { "$ref": "common.json#/$defs/Uuid" },
+            "session_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "tab_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "pane_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "epoch": { "$ref": "common.json#/$defs/Uuid" },
+            "ack_output_seq": { "$ref": "common.json#/$defs/Uint64DecimalString" },
+            "input_result": { "$ref": "#/$defs/InputResult" }
+          }
+        }
+      ]
+    },
+    "HeartbeatFrame": {
+      "allOf": [
+        { "$ref": "#/$defs/FrameBase" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "protocol_version",
+            "runtime_id",
+            "session_name",
+            "tab_id",
+            "pane_id",
+            "epoch",
+            "monotonic_ms"
+          ],
+          "properties": {
+            "kind": { "const": "heartbeat" },
+            "protocol_version": { "$ref": "common.json#/$defs/ProtocolVersion" },
+            "runtime_id": { "$ref": "common.json#/$defs/Uuid" },
+            "session_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "tab_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "pane_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "epoch": { "$ref": "common.json#/$defs/Uuid" },
+            "monotonic_ms": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "ErrorFrame": {
+      "allOf": [
+        { "$ref": "#/$defs/FrameBase" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "protocol_version",
+            "runtime_id",
+            "session_name",
+            "tab_id",
+            "pane_id",
+            "epoch",
+            "error"
+          ],
+          "properties": {
+            "kind": { "const": "error" },
+            "protocol_version": { "$ref": "common.json#/$defs/ProtocolVersion" },
+            "runtime_id": { "$ref": "common.json#/$defs/Uuid" },
+            "session_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "tab_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "pane_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "epoch": { "$ref": "common.json#/$defs/Uuid" },
+            "error": { "$ref": "common.json#/$defs/ErrorBody" },
+            "input_result": { "$ref": "#/$defs/InputResult" }
+          }
+        }
+      ]
+    },
+    "GrantExpiringFrame": {
+      "allOf": [
+        { "$ref": "#/$defs/FrameBase" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "protocol_version",
+            "runtime_id",
+            "session_name",
+            "tab_id",
+            "pane_id",
+            "epoch",
+            "scope",
+            "expires_at_ms"
+          ],
+          "properties": {
+            "kind": { "const": "grant_expiring" },
+            "protocol_version": { "$ref": "common.json#/$defs/ProtocolVersion" },
+            "runtime_id": { "$ref": "common.json#/$defs/Uuid" },
+            "session_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "tab_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "pane_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "epoch": { "$ref": "common.json#/$defs/Uuid" },
+            "scope": { "$ref": "common.json#/$defs/Scope" },
+            "expires_at_ms": { "$ref": "common.json#/$defs/UnixDeadlineMs" }
+          }
+        }
+      ]
+    },
+    "ControlRevokedFrame": {
+      "allOf": [
+        { "$ref": "#/$defs/FrameBase" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "protocol_version",
+            "runtime_id",
+            "session_name",
+            "tab_id",
+            "pane_id",
+            "epoch",
+            "scope",
+            "reason"
+          ],
+          "properties": {
+            "kind": { "const": "control_revoked" },
+            "protocol_version": { "$ref": "common.json#/$defs/ProtocolVersion" },
+            "runtime_id": { "$ref": "common.json#/$defs/Uuid" },
+            "session_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "tab_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "pane_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "epoch": { "$ref": "common.json#/$defs/Uuid" },
+            "scope": { "type": "string", "enum": ["pane-control", "runtime-mutation"] },
+            "reason": {
+              "type": "string",
+              "enum": [
+                "backgrounded",
+                "connection_closed",
+                "device_revoked",
+                "grant_expired",
+                "observe_lost",
+                "pane_changed",
+                "runtime_changed"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

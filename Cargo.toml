@@ -1,5 +1,10 @@
 [workspace]
-members = ["taarof-app", "agent-session-core", "agent-launcher"]
+members = [
+  "taarof-app",
+  "agent-session-core",
+  "agent-launcher",
+  "taarof-control-gateway",
+]
 default-members = ["taarof-app"]
 exclude = ["wasm-sidebar"]
 resolver = "2"

@@ -15,6 +15,14 @@ desktop_install_path="$prefix/share/applications/$desktop_id.desktop"
 metainfo_install_path="$prefix/share/metainfo/$desktop_id.metainfo.xml"
 web_dist_path="$repo_root/taarof-web/dist"
 web_install_dir="$prefix/share/taarof/web"
+gateway_binary_path="${TAAROF_INSTALL_GATEWAY_BINARY:-${CARGO_TARGET_DIR:-$repo_root/taarof-app/target}/release/taarof-control-gateway}"
+gateway_binary_install_path="$prefix/bin/taarof-control-gateway"
+gateway_service_source="$script_dir/systemd/taarof-control-gateway.service"
+gateway_service_install_path="$prefix/share/systemd/user/taarof-control-gateway.service"
+gateway_caddy_source="$script_dir/caddy/taarof-control.caddy"
+gateway_caddy_install_path="$prefix/share/taarof/caddy/taarof-control.caddy"
+gateway_license_source="$repo_root/taarof-control-gateway/LICENSE"
+gateway_license_install_path="$prefix/share/licenses/taarof-control-gateway/LICENSE"
 install_manifest_path="$prefix/share/taarof/install-manifest.json"
 default_sidecar_path="$default_binary_path.provenance.json"
 artifact_sidecar_path="${TAAROF_INSTALL_PROVENANCE:-${TAAROF_INSTALL_BINARY:+$binary_path.provenance.json}}"
@@ -122,6 +130,25 @@ if ! python3 "$script_dir/bundle-provenance.py" create \
     --app-sidecar "$install_manifest_path" --agent "$prefix/bin/agent" \
     --cli "$cli_install_path" --output "$bundle_manifest_path"; then
     echo "note: complete bundle provenance unavailable; this installation is not source-verified" >&2
+fi
+
+# Install the in-repo gateway's operator artifacts, but never activate them.
+# ExecStart is rewritten for a non-default prefix. The binary is optional so a
+# desktop-only source build remains installable; `mise run build` builds it.
+install -d "$(dirname "$gateway_service_install_path")" "$(dirname "$gateway_caddy_install_path")"
+sed \
+    -e "s|^ExecStart=.*$|ExecStart=$(escape_sed_replacement "$gateway_binary_install_path")|" \
+    "$gateway_service_source" >"$gateway_service_install_path"
+chmod 644 "$gateway_service_install_path"
+install -Dm644 "$gateway_caddy_source" "$gateway_caddy_install_path"
+install -Dm644 "$gateway_license_source" "$gateway_license_install_path"
+
+if [[ -x "$gateway_binary_path" ]]; then
+    install -Dm755 "$gateway_binary_path" "$gateway_binary_install_path"
+    echo "installed taarof-control-gateway binary to $gateway_binary_install_path"
+else
+    echo "note: taarof-control-gateway binary not built; installed gateway service+caddy artifacts only" >&2
+    echo "      build it first with: cargo build --release --manifest-path \"$repo_root/taarof-control-gateway/Cargo.toml\"" >&2
 fi
 
 if [[ "$project_license" == "NOASSERTION" ]]; then

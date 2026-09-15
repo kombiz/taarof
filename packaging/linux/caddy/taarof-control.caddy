@@ -1,0 +1,69 @@
+# Taarof remote control gateway -- private tailnet HTTPS edge.
+#
+# This is the ONLY component that faces the Tailscale network. It terminates
+# TLS and reverse-proxies to the loopback control gateway and NOTHING else.
+#
+# Hard invariants (see docs/remote-terminal-runbook.md and the design spec's
+# "Private HTTPS edge" section):
+#   * Listen ONLY on the Tailscale interface/address -- never 0.0.0.0, never the
+#     LAN address.
+#   * Proxy ONLY to the loopback gateway (127.0.0.1:8710).
+#   * NEVER proxy to taarof's own HTTP port (7800) or its Unix socket. Those are
+#     the desktop app's private loopback surface and must stay unreachable from
+#     any remote path.
+#
+# -------------------------------------------------------------------------
+# REPLACE THESE TWO PLACEHOLDERS before deploying (or export them as env vars
+# so Caddy substitutes them at load time):
+#
+#   TAAROF_TAILNET_HOST  Your host's MagicDNS name, e.g.
+#                        cachy.tailXXXXXX.ts.net  (NOT a bare "cachy.ts"
+#                        shorthand and NOT a *.onlyarag.com public name).
+#   TAAROF_TAILNET_ADDR  Your host's Tailscale interface address, e.g. the
+#                        100.x.y.z address shown by `tailscale ip -4`. Binding
+#                        to this address is what keeps the listener off the LAN
+#                        and the public internet.
+#
+# The defaults below are non-routable placeholders that let `caddy validate`
+# run but MUST NOT be deployed as-is.
+# -------------------------------------------------------------------------
+
+{
+	# Suppress Caddy's automatic HTTP->HTTPS redirect. That redirect is served by
+	# an implicit :80 listener whose interface binding does NOT reliably inherit
+	# the site's `bind` directive, so it can answer on all interfaces. It is only
+	# a 308 responder (it never proxies to the gateway, so it cannot expose shell
+	# control), but a tailnet-only box should have no all-interfaces listener at
+	# all. Disabling redirects means no :80 listener is created.
+	auto_https disable_redirects
+}
+
+{$TAAROF_TAILNET_HOST:taarof-control.invalid.ts.net} {
+	# Bind the listener to the Tailscale address only. Without this, Caddy would
+	# listen on all interfaces (including the LAN and any public NIC) for this
+	# site. This single line is the network-isolation boundary.
+	bind {$TAAROF_TAILNET_ADDR:127.0.0.1}
+
+	# Private CA. The pairing QR pins this certificate's SHA-256 SPKI, so the
+	# mobile client validates hostname + pin rather than a public CA chain.
+	# Swap for a tailnet-issued cert (`get_certificate tailscale`) if you run a
+	# Caddy build with the Tailscale module; the pin flow is unchanged.
+	tls internal
+
+	# Do not leak server identity or allow content sniffing on this operator
+	# surface. HSTS is safe because this vhost is HTTPS-only by construction.
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+
+	# The gateway does its own device authentication, attestation, grant, and
+	# rate-limit enforcement. Caddy's job is transport only: terminate TLS and
+	# hand the request to the loopback gateway. It MUST point at the gateway,
+	# never at 127.0.0.1:7800 (taarof HTTP) or a Unix socket. Caddy already sets
+	# X-Forwarded-Proto/For/Host on the upstream request, so the gateway's audit
+	# and rate-limit logic sees the real tailnet client address.
+	reverse_proxy 127.0.0.1:8710
+}

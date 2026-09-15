@@ -418,6 +418,32 @@ payload uses a supported delimiter. If the warning persists, compare a manual
 remote `tmux display-message -p` probe with `taarof list-tabs --pretty`; verify
 SSH access and the target session before changing parser behavior.
 
+### Gateway stops with status 78 after Taarof restarts
+
+The gateway pins both the desktop runtime ID and session name. A Taarof restart
+rotates the runtime ID, so gateway startup prints `ACTION REQUIRED: stale
+runtime pin` and exits with status 78. The packaged systemd unit deliberately
+sets `RestartPreventExitStatus=78`; this is a fail-closed operator gate, not a
+crash to retry.
+
+Verify the intended app/session with `taarof runtime-identity --pretty` (or
+`taarof --session NAME runtime-identity --pretty`), update only
+`[runtime].instance_id` in `~/.config/taarof/gateway.toml`, and run:
+
+```bash
+TAAROF_GATEWAY_CONFIG="$HOME/.config/taarof/gateway.toml" \
+  taarof-control-gateway --check-runtime
+systemctl --user reset-failed taarof-control-gateway
+systemctl --user restart taarof-control-gateway
+```
+
+Do not automatically trust the newest registry entry or copy bearer-token
+values. `--check-runtime` authenticates to the configured loopback endpoint and
+validates the pin without opening the listener or database. If startup fails for
+another reason, the packaged unit is still bounded to three attempts per 60
+seconds; fix the cause and reset the failed unit rather than adding a restart
+loop. See `docs/remote-terminal-runbook.md` for the full procedure.
+
 ### Remote Claude or Codex is active but no agent appears
 
 Taarof deliberately cannot inspect a process after it crosses an SSH boundary.

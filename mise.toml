@@ -5,10 +5,11 @@
 node = "lts"
 
 [tasks.setup]
-description = "Fetch/install dependencies for app + web client"
+description = "Fetch/install dependencies for shipped Rust crates + web client"
 run = [
   "cargo fetch --manifest-path agent-launcher/Cargo.toml",
   "cargo fetch --manifest-path taarof-app/Cargo.toml",
+  "cargo fetch --manifest-path taarof-control-gateway/Cargo.toml",
   "npm --prefix taarof-web ci",
   "npm --prefix taarof-web run build",
 ]
@@ -18,10 +19,11 @@ description = "Run taarof in debug mode"
 run = "cargo run --manifest-path taarof-app/Cargo.toml"
 
 [tasks.build]
-description = "Build the release binary"
+description = "Build the shipped release binaries"
 run = [
   "cargo build --release --manifest-path agent-launcher/Cargo.toml",
   "cargo build --release --manifest-path taarof-app/Cargo.toml",
+  "cargo build --release --manifest-path taarof-control-gateway/Cargo.toml",
 ]
 
 [tasks."web:build"]
@@ -41,6 +43,7 @@ run = [
   "cargo fmt --manifest-path taarof-app/Cargo.toml --all --check",
   "cargo fmt --manifest-path wasm-sidebar/Cargo.toml --all --check",
   "cargo clippy --manifest-path taarof-app/Cargo.toml --all-targets -- -D warnings",
+  "cargo clippy --manifest-path taarof-control-gateway/Cargo.toml --all-targets -- -D warnings",
 ]
 
 [tasks.typecheck]
@@ -49,6 +52,7 @@ run = [
   "cargo check --manifest-path taarof-app/Cargo.toml --all-targets",
   "cargo check --manifest-path taarof-app/Cargo.toml --example performance_harness --features harness",
   "cargo check --manifest-path taarof-app/Cargo.toml --no-default-features",
+  "cargo check --manifest-path taarof-control-gateway/Cargo.toml --all-targets",
   "npm --prefix taarof-web run build",
 ]
 
@@ -61,6 +65,7 @@ run = [
   "cargo test --manifest-path agent-launcher/Cargo.toml",
   "python3 testing/test_bundle_provenance.py",
   "cargo test --manifest-path taarof-app/Cargo.toml",
+  "cargo test --manifest-path taarof-control-gateway/Cargo.toml",
   "python3 taarof-cli/test_taarof_cli.py",
   "npm --prefix taarof-web test",
   "python3 testing/test_http_contract_docs.py",

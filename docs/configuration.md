@@ -571,8 +571,17 @@ path before starting Taarof when the default path should not be used.
 
 ## Remote-control boundary
 
-The v0.1.x public release does not ship gateway configuration. Keep the
-HTTP API on loopback and follow the root `SECURITY.md` guidance.
+`taarof-control-gateway` reads `~/.config/taarof/gateway.toml` at startup. Its
+strict schema contains `[gateway].bind_address`, the pinned
+`[runtime].session_name`, `instance_id`, `registry_path`, and loopback
+`http_address`, plus `[database].path`. Both network addresses must be loopback;
+unknown fields and missing identities fail closed.
+
+The gateway is co-located with the owner-user GTK runtime. An always-on server
+may host a TLS/auth edge and private reverse tunnel, but must forward only to
+the gateway. It cannot replace the graphical runtime. Follow
+[remote-terminal-runbook.md](remote-terminal-runbook.md) for the complete
+configuration and explicit runtime-ID rotation recovery procedure.
 
 ## UI-managed JSON stores
 

@@ -1,0 +1,114 @@
+[Unit]
+Description=Taarof remote control gateway (loopback-only)
+Documentation=https://github.com/kombiz/taarof/blob/main/docs/remote-terminal-runbook.md
+# The gateway is a client of the desktop taarof runtime: it fails closed at
+# startup if the runtime registry ($XDG_RUNTIME_DIR/taarof-current*.json) is
+# absent. We only order it after the graphical session target; we do not bind
+# it. Runtime rotation requires an explicit operator re-pin.
+After=graphical-session.target
+# Bound all startup failures, including legacy local ExecStartPre overrides.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# Normal service startup takes no flags (--check-runtime is a read-only
+# operator preflight). Its configuration is the TOML
+# file named by TAAROF_GATEWAY_CONFIG (loopback bind address, pinned runtime
+# identity + registry path, and the SQLite device-store path). install-local.sh
+# rewrites ExecStart to the concrete install prefix; the committed default
+# assumes the standard ~/.local prefix.
+Environment=TAAROF_GATEWAY_CONFIG=%h/.config/taarof/gateway.toml
+ExecStart=%h/.local/bin/taarof-control-gateway
+Restart=on-failure
+RestartSec=2
+# EX_CONFIG: stale runtime identity is an operator action, never a retry.
+RestartPreventExitStatus=78
+
+# ---------------------------------------------------------------------------
+# Hardening. This service faces the tailnet (via Caddy) and holds the path to
+# taarof's process-scoped bearer token, so it runs with the least authority
+# that still lets it (a) bind loopback TCP, (b) connect to taarof's loopback
+# HTTP/WebSocket API and its $XDG_RUNTIME_DIR Unix socket, and (c) persist a
+# small SQLite device store. Every directive below is justified against that
+# exact need; anything the gateway does not require is denied.
+# ---------------------------------------------------------------------------
+
+# Never gain privileges via setuid/setgid/file capabilities on exec. The
+# gateway binds port 8710 (>1024) so it needs no elevation at all.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Whole filesystem read-only except the explicitly writable state dir below.
+# /run/user/<uid> stays read-only except for the bounded RuntimeDirectory below;
+# the gateway reads the registry/token and owns one mode-0600 admin socket.
+ProtectSystem=strict
+# Home is readable (gateway.toml lives under ~/.config) but not writable...
+ProtectHome=read-only
+# ...except this dedicated, auto-created 0700 state directory, which systemd
+# adds to the writable set. The SQLite device store MUST live here so paired
+# devices survive restarts; point database.path at
+# ~/.local/state/taarof-control-gateway/ in gateway.toml.
+StateDirectory=taarof-control-gateway
+StateDirectoryMode=0700
+# Private owner-administration Unix socket. systemd makes only this bounded
+# runtime subdirectory writable under ProtectSystem=strict.
+RuntimeDirectory=taarof-control-gateway
+RuntimeDirectoryMode=0700
+
+# The device store and any file the gateway creates are private to the owner.
+UMask=0077
+
+# No physical devices, no private-tmp leakage, no other users' IPC.
+PrivateTmp=true
+PrivateDevices=true
+RemoveIPC=true
+
+# Kernel and host state are off-limits: the gateway neither tunes the kernel,
+# loads modules, reads kmsg, edits cgroups, changes the clock/hostname, nor
+# needs to see other users' processes (taarof runs as the same user and stays
+# visible under ProtectProc=invisible).
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+
+# Only the socket families the gateway actually uses: AF_UNIX for taarof's
+# runtime socket, AF_INET/AF_INET6 for the loopback listener and the loopback
+# client to taarof's HTTP/WebSocket API. AF_NETLINK, AF_PACKET, etc. are denied.
+# AF_NETLINK is intentionally omitted: the gateway talks to loopback IP literals
+# (127.0.0.1/::1) and does no DNS resolution, so it needs no NSS/netlink lookups.
+# If a future change makes the gateway resolve hostnames, AF_NETLINK must be
+# added here or getaddrinfo() will fail.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Defense in depth for the network path: even if bind_address were ever
+# misconfigured, the kernel refuses any non-loopback address for this service.
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+# No new namespaces, no realtime scheduling, no setuid/setgid bits on files it
+# creates, no changing the ELF personality.
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# W^X: forbid mappings that are writable and executable at once. The gateway is
+# ahead-of-time compiled Rust with no JIT dependency, so this is free.
+MemoryDenyWriteExecute=true
+
+# Restrict to the native syscall ABI and the vetted service syscall set; deny
+# privileged, raw-I/O, and resource-control syscalls the gateway never issues.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @raw-io
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=default.target

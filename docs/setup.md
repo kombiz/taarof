@@ -66,13 +66,15 @@ Without `mise`, run the underlying commands:
 ```bash
 cargo build --release --manifest-path taarof-app/Cargo.toml
 cargo build --release --manifest-path agent-launcher/Cargo.toml
+cargo build --release --manifest-path taarof-control-gateway/Cargo.toml
 npm --prefix taarof-web ci
 npm --prefix taarof-web run build
 bash packaging/linux/install-local.sh
 ```
 
-The installer writes only under the selected prefix (default `~/.local`) and
-does not start or enable the optional remote-control gateway.
+The installer writes only under the selected prefix (default `~/.local`). A
+source build also installs the gateway binary, systemd user unit, and private
+Caddy template; it does not start or enable the optional gateway.
 
 ### Contributor verification
 
@@ -88,6 +90,7 @@ For standalone native tests in a fresh checkout, build the web assets first:
 npm --prefix taarof-web ci
 npm --prefix taarof-web run build
 cargo test --manifest-path taarof-app/Cargo.toml
+cargo test --manifest-path taarof-control-gateway/Cargo.toml
 python3 taarof-cli/test_taarof_cli.py
 cargo check --manifest-path taarof-app/Cargo.toml --example performance_harness --features harness
 ```
@@ -386,8 +389,28 @@ the hashed filenames manually.
 
 ## 8. Remote-control boundary
 
-The v0.1.x public release does not ship a remote-control gateway. Keep
-the HTTP API on loopback and follow the root `SECURITY.md` guidance.
+The source tree ships `taarof-control-gateway` as an optional workspace member.
+The gateway and GTK runtime must run as the same owner user on the same
+graphical host: the runtime registry, Unix socket, and process-scoped token are
+local, and both the runtime HTTP API and gateway listener stay on loopback.
+
+An always-on server may provide only the TLS/auth edge and a private reverse
+tunnel to the owner-host gateway. It must forward to the gateway, never to the
+raw runtime HTTP port or Unix socket. When the owner desktop sleeps or stops,
+terminal access is unavailable; a new headless/server runtime is not part of
+this topology.
+
+Build and install from the repository root, then follow the operator runbook:
+
+```bash
+cargo build --release --manifest-path taarof-control-gateway/Cargo.toml
+bash packaging/linux/install-local.sh
+```
+
+The installer does not enable the user unit. Configure and verify the runtime
+pin before starting it. See [homelab-control-gateway.md](homelab-control-gateway.md)
+for the topology and [remote-terminal-runbook.md](remote-terminal-runbook.md)
+for configuration, `--check-runtime`, bounded restart behavior, and recovery.
 
 ## 9. Upgrade and rollback
 
@@ -444,17 +467,18 @@ prevent resume; retry after the provider finishes writing.
 
 ### Rust workspace and reproducible artifacts
 
-The desktop app, shared session core, and standalone launcher share the root
-`Cargo.toml` workspace and `Cargo.lock`. Keep their dependency identity relative
-to this common workspace: independent sibling crates acquire checkout-dependent
-Cargo metadata even when Rust source paths are remapped. The gateway and WASM
-experiment remain separate packages with their own lockfiles.
+The desktop app, shared session core, standalone launcher, and control gateway
+share the root `Cargo.toml` workspace and `Cargo.lock`. Keep their dependency
+identity relative to this common workspace: independent sibling crates acquire
+checkout-dependent Cargo metadata even when Rust source paths are remapped. The
+WASM experiment remains a separate package with its own lockfile.
 
 Run Cargo from the repository root. `.cargo/config.toml` keeps shipped artifacts
 in `taarof-app/target`, including `release/agent`; `CARGO_TARGET_DIR` overrides
 that directory for isolated/container builds. Installed names remain
-`bin/taarof-app`, `bin/taarof`, and `bin/agent`. Packaging explicitly selects the
-build directory and uses the root lockfile.
+`bin/taarof-app`, `bin/taarof`, `bin/agent`, and the optional
+`bin/taarof-control-gateway`. Packaging explicitly selects the build directory
+and uses the root lockfile.
 
 The public-export validator compares both executables, provenance, and entire
 release bundles across independent exports. Failed validation retains its
