@@ -163,6 +163,13 @@ pub fn discover_pi_sessions(
             Ok(mapped_paths) => {
                 let mut seen = HashSet::new();
                 for path in mapped_paths {
+                    // Pi's ACP map can retain paths after a transcript is moved
+                    // or removed. A stale reference is not a store failure.
+                    if fs::metadata(&path)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        continue;
+                    }
                     if seen.insert(path.clone()) {
                         paths.push(path);
                     }
