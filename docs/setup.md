@@ -61,6 +61,11 @@ mise run setup
 mise run install
 ```
 
+`mise run install` builds the current checkout in release mode, builds the web
+client, records the build's source provenance, and installs the result. Re-run
+it after pulling to install the latest version, then restart Taarof. Use
+`mise run dev` to run a debug build from the checkout without installing it.
+
 Without `mise`, run the underlying commands:
 
 ```bash
