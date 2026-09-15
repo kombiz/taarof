@@ -28,8 +28,10 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -46,6 +48,7 @@ const MAX_TOOL_CALLS: usize = 20;
 const MAX_FILES: usize = 20;
 const MAX_CHILD_AGENTS: usize = 32;
 const MAX_SESSION_START_SKEW_MS: u64 = 5 * 60 * 1_000;
+const MAX_PROCESS_ENVIRONMENT_BYTES: u64 = 2 * 1024 * 1024;
 const TRANSCRIPT_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// `(tab_id, pane_id)` — the same key shape used across the runtime probe.
@@ -625,6 +628,7 @@ pub(crate) trait TranscriptAdapter: Send + Sync {
         session_id: Option<&str>,
         cwd: Option<&str>,
         process_started_at_unix_ms: Option<u64>,
+        provider_sessions_root: Option<&Path>,
     ) -> Option<ResolvedTranscript>;
 
     /// Fold complete JSONL lines into `state`, returning typed changes seen in
@@ -1145,6 +1149,58 @@ fn binding_agent_cwd(binding: &PaneTranscriptBinding) -> Option<String> {
     })
 }
 
+/// Read one named value from a live same-user process without copying or
+/// logging the rest of its environment. Linux bounds the environment at exec,
+/// but keep an explicit cap so a procfs read can never grow without limit.
+fn process_environment_value(pid: i32, name: &str) -> Option<OsString> {
+    if name.is_empty() || name.as_bytes().contains(&b'=') || name.as_bytes().contains(&0) {
+        return None;
+    }
+    let mut reader = BufReader::new(File::open(format!("/proc/{pid}/environ")).ok()?);
+    let mut bytes_read = 0_u64;
+    let mut prefix = name.as_bytes().to_vec();
+    prefix.push(b'=');
+    loop {
+        let remaining = MAX_PROCESS_ENVIRONMENT_BYTES.checked_sub(bytes_read)?;
+        let mut entry = Vec::new();
+        let read = (&mut reader)
+            .take(remaining + 1)
+            .read_until(0, &mut entry)
+            .ok()?;
+        if read == 0 {
+            return None;
+        }
+        bytes_read += read as u64;
+        if bytes_read > MAX_PROCESS_ENVIRONMENT_BYTES {
+            return None;
+        }
+        if entry.last() == Some(&0) {
+            entry.pop();
+        }
+        if let Some(value) = entry
+            .strip_prefix(prefix.as_slice())
+            .filter(|value| !value.is_empty())
+        {
+            return Some(OsString::from_vec(value.to_vec()));
+        }
+    }
+}
+
+fn binding_codex_sessions_root(binding: &PaneTranscriptBinding) -> Option<PathBuf> {
+    if binding.agent != "codex" {
+        return None;
+    }
+    let shell_pid = binding.shell_pid?;
+    let agent_pid = find_agent_process_pid(shell_pid, &binding.agent)?;
+    let mut codex_home = PathBuf::from(process_environment_value(agent_pid, "CODEX_HOME")?);
+    if codex_home.is_relative() {
+        codex_home = fs::read_link(format!("/proc/{agent_pid}/cwd"))
+            .ok()?
+            .join(codex_home);
+    }
+    codex_sessions_root(Some(codex_home), None)
+}
+
 /// Map a cwd to Claude Code's project-directory name. Claude replaces every `/`
 /// and `.` with `-` (verified on-disk against
 /// `~/.claude/projects/-home-developer-...`).
@@ -1186,6 +1242,7 @@ impl TranscriptAdapter for ClaudeTranscriptAdapter {
         session_id: Option<&str>,
         cwd: Option<&str>,
         process_started_at_unix_ms: Option<u64>,
+        _provider_sessions_root: Option<&Path>,
     ) -> Option<ResolvedTranscript> {
         let root = self.projects_root.as_ref()?;
         if !root.exists() {
@@ -1484,8 +1541,12 @@ impl TranscriptAdapter for CodexTranscriptAdapter {
         session_id: Option<&str>,
         cwd: Option<&str>,
         process_started_at_unix_ms: Option<u64>,
+        provider_sessions_root: Option<&Path>,
     ) -> Option<ResolvedTranscript> {
-        let root = self.sessions_root.as_deref()?;
+        // The live Codex process is authoritative for its own CODEX_HOME. A
+        // desktop-launched Taarof often has no CODEX_HOME even though a pane
+        // launcher sets one, which previously left a real turn stuck at IDLE.
+        let root = provider_sessions_root.or(self.sessions_root.as_deref())?;
         if !root.is_dir() {
             return None;
         }
@@ -1602,6 +1663,7 @@ impl TranscriptAdapter for PiTranscriptAdapter {
         session_id: Option<&str>,
         cwd: Option<&str>,
         process_started_at_unix_ms: Option<u64>,
+        _provider_sessions_root: Option<&Path>,
     ) -> Option<ResolvedTranscript> {
         let root = self.sessions_root.as_deref()?;
         if !root.is_dir() {
@@ -1706,6 +1768,7 @@ impl TranscriptAdapter for KimiTranscriptAdapter {
         session_id: Option<&str>,
         cwd: Option<&str>,
         process_started_at_unix_ms: Option<u64>,
+        _provider_sessions_root: Option<&Path>,
     ) -> Option<ResolvedTranscript> {
         let root = self.sessions_root.as_deref()?;
         if !root.is_dir() {
@@ -1847,6 +1910,10 @@ impl TranscriptTracker {
             .iter()
             .map(|binding| (binding.key, binding_agent_cwd(binding)))
             .collect();
+        let binding_provider_roots: HashMap<PaneTranscriptKey, Option<PathBuf>> = bindings
+            .iter()
+            .map(|binding| (binding.key, binding_codex_sessions_root(binding)))
+            .collect();
         let mut inner = self.inner.lock().expect("transcript tracker lock poisoned");
         let mut ticks = Vec::new();
         let mut removed = Vec::new();
@@ -1902,6 +1969,9 @@ impl TranscriptTracker {
                             .get(&binding.key)
                             .and_then(|cwd| cwd.as_deref()),
                         binding_process_starts.get(&binding.key).copied().flatten(),
+                        binding_provider_roots
+                            .get(&binding.key)
+                            .and_then(|root| root.as_deref()),
                     ) else {
                         // Unresolvable session: insert nothing, degrade silently.
                         continue;
@@ -2396,7 +2466,7 @@ mod tests {
         let adapter = ClaudeTranscriptAdapter::with_projects_root(root.clone());
         assert!(
             adapter
-                .resolve_path(Some("bogus-session"), Some("/tmp/x"), None)
+                .resolve_path(Some("bogus-session"), Some("/tmp/x"), None, None)
                 .is_none(),
             "no file exists for a bogus session"
         );
@@ -3278,7 +3348,12 @@ mod tests {
             codex_sessions_root(Some(custom), Some(root.join("user"))).unwrap(),
         );
         let resolved = adapter
-            .resolve_path(Some("inert-custom-session"), Some("/inert/project"), None)
+            .resolve_path(
+                Some("inert-custom-session"),
+                Some("/inert/project"),
+                None,
+                None,
+            )
             .expect("explicit Codex home must be discoverable");
         assert_eq!(resolved.path, file);
         let mut state = TranscriptState::default();
@@ -3293,6 +3368,70 @@ mod tests {
             super::super::lifecycle::AgentLifecycle::Idle
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // The test owns the Child and always kills then waits below.
+    fn live_codex_process_home_projects_current_turn_as_working() {
+        let root = unique_temp_dir("codex-process-home");
+        let project = root.join("project");
+        let custom_home = root.join("pane-codex-home");
+        let sessions = custom_home.join("sessions/2026/09/15");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        let executable = root.join("codex");
+        std::os::unix::fs::symlink("/bin/sleep", &executable).unwrap();
+        let mut child = std::process::Command::new(&executable)
+            .arg("30")
+            .current_dir(&project)
+            .env("CODEX_HOME", &custom_home)
+            .spawn()
+            .expect("inert Codex fixture should start");
+
+        let observed_at = now_unix_ms();
+        let meta = serde_json::json!({"type":"session_meta","payload":{
+            "id":"live-custom-session", "cwd":project, "timestamp":observed_at
+        }});
+        let started = serde_json::json!({"type":"event_msg","timestamp":observed_at,
+            "payload":{"type":"task_started","turn_id":"live-turn"}});
+        fs::write(
+            sessions.join("rollout-live-custom.jsonl"),
+            format!("{meta}\n{started}\n"),
+        )
+        .unwrap();
+        let binding = PaneTranscriptBinding {
+            key: (31, 7),
+            agent: "codex".into(),
+            session_id: None,
+            cwd: Some(project.to_string_lossy().into_owned()),
+            shell_pid: Some(child.id() as i32),
+            process_started_at_unix_ms: None,
+        };
+
+        let expected_root = custom_home.join("sessions");
+        let detected_root = (0..100).find_map(|_| {
+            let result = binding_codex_sessions_root(&binding);
+            if result.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result
+        });
+        let tracker = TranscriptTracker::with_adapters(vec![Box::new(
+            CodexTranscriptAdapter::with_sessions_root(root.join("wrong-home/sessions")),
+        )]);
+        let result = tracker.sync_and_poll(std::slice::from_ref(&binding));
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(detected_root.as_deref(), Some(expected_root.as_path()));
+        assert_eq!(result.ticks.len(), 1);
+        assert!(result.ticks[0].baseline);
+        assert_eq!(
+            super::super::lifecycle::resolve(None, Some(result.ticks[0].state.turn), observed_at,),
+            super::super::lifecycle::AgentLifecycle::Working
+        );
     }
 
     #[test]
