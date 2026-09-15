@@ -630,12 +630,13 @@ or workspace state and should be treated as generated data.
 
 ### Codex transcript discovery and activity
 
-The native transcript adapter uses `CODEX_HOME/sessions` when `CODEX_HOME` is
-set in the Taarof process environment; otherwise it uses `~/.codex/sessions`.
-Start Taarof with the same Codex home used by its panes. A custom home set only
-inside a pane is not visible to the parent app. Discovery still requires an
-exact session ID or an unambiguous process-start/cwd match; it never chooses the
-newest transcript just because it shares a project directory.
+The native transcript adapter uses the live Codex process's
+`CODEX_HOME/sessions` when set, then falls back to `CODEX_HOME/sessions` from
+the Taarof process and finally `~/.codex/sessions`. This lets a pane launcher
+select a custom Codex home without requiring the desktop app to inherit that
+setting. Discovery still requires an exact session ID or an unambiguous
+process-start/cwd match; it never chooses the newest transcript just because it
+shares a project directory.
 
 Activity labels describe observations, not task acceptance. An open native turn
 keeps the agent WORKING during silent thinking for up to five minutes after its

@@ -32,6 +32,21 @@ bash testing/kasm/container-run.sh 'DISPLAY=:1 bash testing/kasm/test-restored-b
 bash testing/kasm/container-run.sh 'DISPLAY=:1 bash testing/kasm/test-sidebar-width.sh'
 ```
 
+Codex activity uses an isolated real GTK window, an inert process, and a
+synthetic current-format transcript. The probe verifies all lifecycle labels
+through the accessibility tree and confirms each rendered background color in
+the captured pixels:
+
+```bash
+cargo build -p taarof-app
+dbus-run-session -- xvfb-run -a --server-args='-screen 0 1280x1024x24' \
+  /usr/bin/python3 \
+  testing/kasm/test-codex-activity-indicator.py \
+  --binary taarof-app/target/debug/taarof-app \
+  --cli taarof-cli/taarof \
+  --evidence /tmp/taarof-codex-activity-evidence
+```
+
 The descriptor-boundary probe takes an explicitly built binary and an evidence
 directory; see `python3 testing/kasm/test_pty_descriptor_boundary.py --help`.
 All these checks require a real GTK display. Headless Rust tests do not replace
