@@ -107,6 +107,65 @@ fn pi_discovery_prefers_session_map() {
 }
 
 #[test]
+fn pi_discovery_skips_stale_map_paths_and_uses_valid_history() {
+    let dir = unique_temp_dir("pi-stale-map");
+    let sessions_dir = dir.join(".pi/agent/sessions/workspace");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let valid = sessions_dir.join("valid.jsonl");
+    fs::write(
+        &valid,
+        "{\"type\":\"session\",\"id\":\"valid\",\"timestamp\":\"2026-05-20T00:00:00Z\",\"cwd\":\"/tmp/pi\"}\n",
+    )
+    .unwrap();
+    let missing = sessions_dir.join("moved.jsonl");
+    let map = dir.join(".pi/pi-acp/session-map.json");
+    fs::create_dir_all(map.parent().unwrap()).unwrap();
+    fs::write(
+        &map,
+        serde_json::json!({"sessions": {
+            "a": {"sessionFile": missing},
+            "b": {"sessionFile": valid}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+
+    let (status, sessions) = discover_pi_sessions(Some(&sessions_dir), Some(&map), 1);
+    assert!(status.ok, "stale map entries must not fail Pi history");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "valid");
+}
+
+#[test]
+fn pi_discovery_falls_back_to_store_when_map_is_entirely_stale() {
+    let dir = unique_temp_dir("pi-all-stale-map");
+    let sessions_dir = dir.join(".pi/agent/sessions/workspace");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let valid = sessions_dir.join("valid.jsonl");
+    fs::write(
+        &valid,
+        "{\"type\":\"session\",\"id\":\"valid\",\"timestamp\":\"2026-05-20T00:00:00Z\",\"cwd\":\"/tmp/pi\"}\n",
+    )
+    .unwrap();
+    let map = dir.join(".pi/pi-acp/session-map.json");
+    fs::create_dir_all(map.parent().unwrap()).unwrap();
+    fs::write(
+        &map,
+        serde_json::json!({"sessions": {
+            "stale": {"sessionFile": sessions_dir.join("gone.jsonl")}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+
+    let (status, sessions) =
+        discover_pi_sessions(Some(sessions_dir.parent().unwrap()), Some(&map), 1);
+    assert!(status.ok);
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "valid");
+}
+
+#[test]
 fn kimi_discovery_reads_index_and_builds_verified_resume_command() {
     let dir = unique_temp_dir("kimi");
     let sessions_dir = dir.join(".kimi-code/sessions");
