@@ -211,11 +211,11 @@ Back up these files before risky changes or local experiments:
 ### Source/build rollback
 
 1. Check out the desired git revision or tag.
-2. Rebuild with `mise run build`. Without mise, run the full command list in
-   `docs/setup.md`: `install-local.sh` also needs the release `agent` binary and
-   the built web bundle, not only `taarof-app`.
-3. Reinstall with `mise run install`, or with
-   `bash packaging/linux/install-local.sh`, if you use the local desktop bundle.
+2. Rebuild and reinstall with `mise run install`, which also rebuilds the web
+   bundle, if you use the local desktop bundle.
+3. Without mise, run the commands under "Without `mise`" in the "Source
+   checkout" section of `docs/setup.md`. `install-local.sh` also needs the
+   release `agent` binary and the built web bundle, not only `taarof-app`.
 
 ## Troubleshooting map
 

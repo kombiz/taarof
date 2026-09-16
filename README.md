@@ -74,7 +74,8 @@ bash packaging/linux/install-local.sh
 metainfo, icon, and built web bundle under `~/.local`.
 `emit-artifact-provenance.sh` records which commit the binary came from. It
 fails on a tree without usable Git metadata, such as an unpacked source
-archive; skip it there and the app reports its source identity as unknown.
+archive. Skip it there: the install still works, and the app then reports its
+source identity as unknown.
 
 ### Install from a GitHub release tarball
 
