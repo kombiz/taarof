@@ -16,10 +16,11 @@ Operational guide for `taarof`.
 
 | Task | Command / action |
 | --- | --- |
-| Run in development | `cargo run --manifest-path taarof-app/Cargo.toml` |
-| Build release binary | `cargo build --release --manifest-path taarof-app/Cargo.toml` |
+| Run in development | `mise run dev` (or `cargo run --manifest-path taarof-app/Cargo.toml`) |
+| Build release binary | `mise run build` (or `cargo build --release --manifest-path taarof-app/Cargo.toml`) |
 | Launch built binary | `./taarof-app/target/release/taarof-app` |
-| Install local desktop assets | `bash packaging/linux/install-local.sh` |
+| Build and install this checkout | `mise run install` |
+| Install already-built desktop assets | `bash packaging/linux/install-local.sh` |
 | Apply config changes | `config.toml` validates and reloads supported consumers live; restart only after changing startup-owned services or companion files |
 
 ## Verify the running local build
@@ -210,8 +211,11 @@ Back up these files before risky changes or local experiments:
 ### Source/build rollback
 
 1. Check out the desired git revision or tag.
-2. Rebuild with `cargo build --release --manifest-path taarof-app/Cargo.toml`.
-3. Reinstall with `bash packaging/linux/install-local.sh` if you use the local desktop bundle.
+2. Rebuild and reinstall with `mise run install`, which also rebuilds the web
+   bundle, if you use the local desktop bundle.
+3. Without mise, run the commands under "Without `mise`" in the "Source
+   checkout" section of `docs/setup.md`. `install-local.sh` also needs the
+   release `agent` binary and the built web bundle, not only `taarof-app`.
 
 ## Troubleshooting map
 

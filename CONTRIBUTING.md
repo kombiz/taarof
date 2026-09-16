@@ -23,13 +23,14 @@ Install the system packages for your distribution, then install the Rust and
 Node toolchains. If you use `mise`, run:
 
 ```bash
-mise install
+mise install   # installs the toolchains, not taarof itself
 ```
 
 Useful local commands:
 
 ```bash
 mise run build
+mise run install   # build this checkout and install it under ~/.local
 mise run test
 mise run lint
 (cd taarof-web && npm ci && npm run build)

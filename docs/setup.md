@@ -61,6 +61,11 @@ mise run setup
 mise run install
 ```
 
+`mise run install` builds the current checkout in release mode, builds the web
+client, records the build's source provenance, and installs the result. Re-run
+it after pulling to install the latest version, then restart Taarof. Use
+`mise run dev` to run a debug build from the checkout without installing it.
+
 Without `mise`, run the underlying commands:
 
 ```bash
@@ -68,8 +73,13 @@ cargo build --release --manifest-path taarof-app/Cargo.toml
 cargo build --release --manifest-path agent-launcher/Cargo.toml
 npm --prefix taarof-web ci
 npm --prefix taarof-web run build
+bash packaging/linux/emit-artifact-provenance.sh taarof-app/target/release/taarof-app
 bash packaging/linux/install-local.sh
 ```
+
+The provenance step records which commit the binary was built from. It fails on
+a tree without usable Git metadata, such as an unpacked source archive; the
+install still works, and the app then reports its source identity as unknown.
 
 The installer writes only under the selected prefix (default `~/.local`) and
 does not start or enable the optional remote-control gateway.

@@ -57,18 +57,25 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ### Build and install locally
 
-Start from a local checkout of this repo:
+Start from a local checkout of this repo. With `mise`, `mise run install` runs
+the build, provenance, and install steps below, but does not launch the app.
+Without it:
 
 ```bash
 cargo build --release --manifest-path taarof-app/Cargo.toml
 cargo build --release --manifest-path agent-launcher/Cargo.toml
 (cd taarof-web && npm ci && npm run build)
+bash packaging/linux/emit-artifact-provenance.sh taarof-app/target/release/taarof-app
 bash packaging/linux/install-local.sh
 ~/.local/bin/taarof-app
 ```
 
 `packaging/linux/install-local.sh` installs the release binary, desktop entry,
 metainfo, icon, and built web bundle under `~/.local`.
+`emit-artifact-provenance.sh` records which commit the binary came from. It
+fails on a tree without usable Git metadata, such as an unpacked source
+archive. Skip it there: the install still works, and the app then reports its
+source identity as unknown.
 
 ### Install from a GitHub release tarball
 
