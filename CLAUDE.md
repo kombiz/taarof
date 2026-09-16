@@ -30,7 +30,8 @@ on disk.
 Create task branches from `origin/kmux` in dedicated worktrees and target pull
 requests to `kmux`.
 Promote reviewed work from `kmux` to `main` only with explicit authorization.
-GitHub's default branch remains `main`.
+`kmux` is GitHub's default branch, so clones and new pull requests start there.
+`main` carries only promoted work.
 
 ## Gates
 

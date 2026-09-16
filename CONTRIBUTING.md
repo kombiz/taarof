@@ -67,7 +67,7 @@ For security-sensitive reports, use `SECURITY.md` instead of a public issue.
 - Create task branches from `origin/kmux` in dedicated worktrees and target pull
   requests to `kmux`.
 - Promotion from `kmux` to `main` requires review and explicit authorization;
-  `main` remains the GitHub default branch.
+  `kmux` is the GitHub default branch and `main` carries only promoted work.
 - Keep PRs focused on one behavior change, bug fix, or documentation topic.
 - Open an issue first for large design changes or changes to the local trust
   model.
