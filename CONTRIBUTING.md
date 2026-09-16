@@ -23,7 +23,7 @@ Install the system packages for your distribution, then install the Rust and
 Node toolchains. If you use `mise`, run:
 
 ```bash
-mise install
+mise install   # installs the toolchains, not taarof itself
 ```
 
 Useful local commands:
