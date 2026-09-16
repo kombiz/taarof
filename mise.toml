@@ -28,7 +28,11 @@ run = [
 description = "Build this checkout in release mode and install it under ~/.local"
 depends = ["build", "web:build"]
 run = [
-  'bash packaging/linux/emit-artifact-provenance.sh "${CARGO_TARGET_DIR:-taarof-app/target}/release/taarof-app"',
+  # Non-fatal like install-local.sh: a checkout without usable Git provenance
+  # still installs, it just records no verified source identity.
+  'bash packaging/linux/emit-artifact-provenance.sh "${CARGO_TARGET_DIR:-taarof-app/target}/release/taarof-app" || echo "note: no build provenance for this binary; installing without source verification" >&2',
+  # Keep install-local.sh last: mise appends any extra task arguments to the
+  # final command, which is how an alternate prefix reaches the installer.
   "bash packaging/linux/install-local.sh",
 ]
 

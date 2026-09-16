@@ -30,6 +30,7 @@ Useful local commands:
 
 ```bash
 mise run build
+mise run install   # build this checkout and install it under ~/.local
 mise run test
 mise run lint
 (cd taarof-web && npm ci && npm run build)

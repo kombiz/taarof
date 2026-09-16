@@ -211,9 +211,10 @@ Back up these files before risky changes or local experiments:
 ### Source/build rollback
 
 1. Check out the desired git revision or tag.
-2. Rebuild and reinstall with `mise run install`, or rebuild with
-   `cargo build --release --manifest-path taarof-app/Cargo.toml` if you do not
-   use the local desktop bundle.
+2. Rebuild with `mise run build`, or with
+   `cargo build --release --manifest-path taarof-app/Cargo.toml`.
+3. Reinstall with `mise run install`, or with
+   `bash packaging/linux/install-local.sh`, if you use the local desktop bundle.
 
 ## Troubleshooting map
 

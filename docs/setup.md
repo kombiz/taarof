@@ -73,8 +73,13 @@ cargo build --release --manifest-path taarof-app/Cargo.toml
 cargo build --release --manifest-path agent-launcher/Cargo.toml
 npm --prefix taarof-web ci
 npm --prefix taarof-web run build
+bash packaging/linux/emit-artifact-provenance.sh taarof-app/target/release/taarof-app
 bash packaging/linux/install-local.sh
 ```
+
+The provenance step records which commit the binary was built from. It fails on
+a tree without usable Git metadata, such as an unpacked source archive; the
+install still works, and the app then reports its source identity as unknown.
 
 The installer writes only under the selected prefix (default `~/.local`) and
 does not start or enable the optional remote-control gateway.
