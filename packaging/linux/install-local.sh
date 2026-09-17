@@ -111,6 +111,10 @@ done
 # The sidecar was emitted after linking and binds its source claim to the exact
 # artifact by SHA. Never reconstruct it from this checkout: that would label an
 # arbitrary TAAROF_INSTALL_BINARY with unrelated ambient Git state.
+# Clear any earlier manifest first, for the same reason the bundle manifest is
+# removed below: when this copy is skipped or rejected, an install must report
+# no source identity rather than the previous artifact's claim beside new bytes.
+rm -f "$install_manifest_path"
 taarof_copy_artifact_provenance "$artifact_sidecar_path" "$binary_path" "$install_manifest_path" || true
 
 # Development installs remain usable when source proof is unavailable, but an

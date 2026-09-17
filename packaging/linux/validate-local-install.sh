@@ -237,6 +237,30 @@ if PATH="$fake_python_dir:$PATH" bash "$script_dir/install-local.sh" "$fake_pref
 fi
 grep -F "python3 >= 3.11 is required to install the taarof CLI" "$fake_error" >/dev/null
 
+# A replacement artifact without valid provenance must not inherit the previous
+# install's manifest: reporting an unrelated revision for the installed bytes is
+# worse than reporting none.
+stale_prefix="$(mktemp -d)"
+stale_binary_dir="$(mktemp -d)"
+stale_error="$stale_binary_dir/install.err"
+stale_manifest_path="$stale_prefix/share/taarof/install-manifest.json"
+
+bash "$script_dir/install-local.sh" "$stale_prefix" >/dev/null
+test -f "$stale_manifest_path"
+
+cp "$binary_path" "$stale_binary_dir/taarof-app"
+printf '\n' >>"$stale_binary_dir/taarof-app"
+chmod 755 "$stale_binary_dir/taarof-app"
+
+TAAROF_INSTALL_BINARY="$stale_binary_dir/taarof-app" \
+    bash "$script_dir/install-local.sh" "$stale_prefix" \
+    >/dev/null 2>"$stale_error"
+grep -F "no valid artifact provenance sidecar" "$stale_error" >/dev/null
+if [[ -f "$stale_manifest_path" ]]; then
+    echo "expected install-local.sh to drop the stale install manifest" >&2
+    exit 1
+fi
+
 if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$desktop_path"
 fi
