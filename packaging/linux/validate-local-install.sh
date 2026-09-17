@@ -11,6 +11,8 @@ bundle_prefix=""
 runtime_dir=""
 fake_python_dir=""
 fake_prefix=""
+stale_prefix=""
+stale_binary_dir=""
 
 cleanup() {
     for path in \
@@ -20,7 +22,9 @@ cleanup() {
         "$bundle_prefix" \
         "$runtime_dir" \
         "$fake_python_dir" \
-        "$fake_prefix"
+        "$fake_prefix" \
+        "$stale_prefix" \
+        "$stale_binary_dir"
     do
         if [[ -n "$path" ]]; then
             rm -rf "$path"
@@ -236,6 +240,44 @@ if PATH="$fake_python_dir:$PATH" bash "$script_dir/install-local.sh" "$fake_pref
     exit 1
 fi
 grep -F "python3 >= 3.11 is required to install the taarof CLI" "$fake_error" >/dev/null
+
+# A replacement artifact without valid provenance must not inherit the previous
+# install's manifest: reporting an unrelated revision for the installed bytes is
+# worse than reporting none. Verification fails two ways, so cover both: no
+# sidecar beside the binary, and a sidecar describing different bytes.
+stale_prefix="$(mktemp -d)"
+stale_binary_dir="$(mktemp -d)"
+stale_error="$stale_binary_dir/install.err"
+stale_manifest_path="$stale_prefix/share/taarof/install-manifest.json"
+
+cp "$binary_path" "$stale_binary_dir/taarof-app"
+printf '\n' >>"$stale_binary_dir/taarof-app"
+chmod 755 "$stale_binary_dir/taarof-app"
+
+for sidecar_case in missing mismatched; do
+    bash "$script_dir/install-local.sh" "$stale_prefix" >/dev/null
+    test -f "$stale_manifest_path"
+
+    rm -f "$stale_binary_dir/taarof-app.provenance.json"
+    if [[ "$sidecar_case" == mismatched ]]; then
+        cp "$CARGO_TARGET_DIR/release/taarof-app.provenance.json" \
+            "$stale_binary_dir/taarof-app.provenance.json"
+    fi
+
+    if ! TAAROF_INSTALL_BINARY="$stale_binary_dir/taarof-app" \
+        bash "$script_dir/install-local.sh" "$stale_prefix" \
+        >/dev/null 2>"$stale_error"; then
+        echo "expected install-local.sh to install with a $sidecar_case sidecar" >&2
+        cat "$stale_error" >&2
+        exit 1
+    fi
+    grep -F "no valid artifact provenance sidecar" "$stale_error" >/dev/null
+    if [[ -f "$stale_manifest_path" ]]; then
+        echo "expected install-local.sh to drop the stale install manifest" \
+            "for a $sidecar_case sidecar" >&2
+        exit 1
+    fi
+done
 
 if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$desktop_path"
