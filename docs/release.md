@@ -254,7 +254,10 @@ until the unvalidated areas above have been exercised.
    with the current validation date, scope, and known issues.
 4. Update the version in `taarof-app/Cargo.toml` and `wasm-sidebar/Cargo.toml` if
    the release changes published versions.
-5. Create an annotated tag, for example `git tag -a v0.1.0 -m "taarof v0.1.0"`.
+5. Check out `main` at the promoted commit and create an annotated tag there,
+   for example `git tag -a v0.1.0 -m "taarof v0.1.0"`. `release.yml` matches any
+   `v*` tag regardless of the branch it points at, so a tag cut from `kmux` or a
+   task branch publishes a real GitHub Release from unpromoted code.
 6. Push the tag with `git push origin v0.1.0`.
 7. Confirm the `Release` workflow creates the GitHub Release and uploads:
   - `taarof-linux-x86_64.tar.gz`
