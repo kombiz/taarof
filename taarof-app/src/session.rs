@@ -632,9 +632,6 @@ enum SessionWriteCommand {
 
 type SessionWriteFn = dyn Fn(&Path, &str) -> io::Result<()> + Send + Sync;
 
-#[cfg(test)]
-const SESSION_WRITER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-#[cfg(not(test))]
 const SESSION_WRITER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct SessionWriterInner {
@@ -652,6 +649,11 @@ struct SessionWriterOwner {
     tx: Mutex<Option<mpsc::Sender<SessionWriteCommand>>>,
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
     worker_thread: std::thread::ThreadId,
+    // Per writer rather than a cfg(test) constant: a test that observes the
+    // timeout needs a short deadline, while a test that blocks the worker
+    // deliberately needs a generous one. One shared short value made the
+    // latter race its own synchronization on a loaded machine.
+    shutdown_timeout: std::time::Duration,
 }
 
 #[cfg(test)]
@@ -788,12 +790,20 @@ impl SessionWriter {
         if let Some(writer) = writers.get(&path).and_then(Weak::upgrade) {
             return Ok(Self(writer));
         }
-        let writer = Self::start_at(path.clone(), Arc::new(write_atomically))?;
+        let writer = Self::start_at(
+            path.clone(),
+            Arc::new(write_atomically),
+            SESSION_WRITER_SHUTDOWN_TIMEOUT,
+        )?;
         writers.insert(path, Arc::downgrade(&writer.0));
         Ok(writer)
     }
 
-    fn start_at(path: PathBuf, write: Arc<SessionWriteFn>) -> io::Result<Self> {
+    fn start_at(
+        path: PathBuf,
+        write: Arc<SessionWriteFn>,
+        shutdown_timeout: std::time::Duration,
+    ) -> io::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(SessionWriterInner {
             latest: Mutex::new(None),
@@ -848,6 +858,7 @@ impl SessionWriter {
             tx: Mutex::new(Some(tx)),
             join: Mutex::new(Some(join)),
             worker_thread,
+            shutdown_timeout,
         })))
     }
 
@@ -884,7 +895,7 @@ impl SessionWriter {
             self.0.shared.record_error(error.to_string());
             return Err(error);
         }
-        match done_rx.recv_timeout(SESSION_WRITER_SHUTDOWN_TIMEOUT) {
+        match done_rx.recv_timeout(self.0.shutdown_timeout) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let error =
@@ -963,7 +974,16 @@ impl SessionWriter {
         path: PathBuf,
         write: impl Fn(&Path, &str) -> io::Result<()> + Send + Sync + 'static,
     ) -> io::Result<Self> {
-        Self::start_at(path, Arc::new(write))
+        Self::start_at(path, Arc::new(write), SESSION_WRITER_SHUTDOWN_TIMEOUT)
+    }
+
+    #[cfg(test)]
+    fn for_test_with_shutdown_timeout(
+        path: PathBuf,
+        shutdown_timeout: std::time::Duration,
+        write: impl Fn(&Path, &str) -> io::Result<()> + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        Self::start_at(path, Arc::new(write), shutdown_timeout)
     }
 
     #[cfg(test)]
@@ -1838,13 +1858,20 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = std::sync::Mutex::new(release_rx);
 
-        let writer = SessionWriter::for_test(path.clone(), move |path, json| {
-            if json.contains("\"autosave\"") {
-                started_tx.send(()).unwrap();
-                release_rx.lock().unwrap().recv().unwrap();
-            }
-            write_atomically(path, json)
-        })
+        // This test asserts ordering, never the timeout, so give it a deadline
+        // it cannot reach. The release below waits on a cross-thread handshake,
+        // and any wall-clock budget turns that handshake into a race.
+        let writer = SessionWriter::for_test_with_shutdown_timeout(
+            path.clone(),
+            std::time::Duration::from_secs(3600),
+            move |path, json| {
+                if json.contains("\"autosave\"") {
+                    started_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                write_atomically(path, json)
+            },
+        )
         .unwrap();
 
         writer.schedule_autosave(session_writer_capture("autosave"));
@@ -1852,7 +1879,10 @@ mod tests {
         let final_writer = writer.clone();
         let final_save =
             std::thread::spawn(move || final_writer.shutdown(session_writer_capture("shutdown")));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        // Bounded only so a real regression fails instead of hanging. The
+        // spawned thread sets this flag in microseconds; a loaded runner that
+        // needs longer must not fail the assertion below.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !writer.is_shutting_down() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -2113,16 +2143,21 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let (final_tx, final_rx) = mpsc::channel();
         let release_rx = Mutex::new(release_rx);
-        let writer = SessionWriter::for_test(path, move |_, json| {
-            if json.contains("\"autosave\"") {
-                started_tx.send(()).unwrap();
-                release_rx.lock().unwrap().recv().unwrap();
-            }
-            if json.contains("\"shutdown\"") {
-                final_tx.send(()).unwrap();
-            }
-            Ok(())
-        })
+        // This test observes the timeout itself, so it asks for a short one.
+        let writer = SessionWriter::for_test_with_shutdown_timeout(
+            path,
+            std::time::Duration::from_millis(100),
+            move |_, json| {
+                if json.contains("\"autosave\"") {
+                    started_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                if json.contains("\"shutdown\"") {
+                    final_tx.send(()).unwrap();
+                }
+                Ok(())
+            },
+        )
         .unwrap();
         writer.schedule_autosave(session_writer_capture("autosave"));
         started_rx.recv().unwrap();
