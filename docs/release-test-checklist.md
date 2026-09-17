@@ -129,9 +129,9 @@ Automated coverage now validates persisted saved views/templates through
 config round-trips and the read-only `query-state` surface. `cargo test` also
 covers the headless `agent-workspace` state path. The two-distro release gate
 runs credential-free Claude, Codex, Pi, and Kimi process/signature and explicit
-activity-lifecycle scenarios. Real provider prompts remain opt-in through
-`mise run release:e2e:live-agents` after either isolated LiteLLM configuration
-or dedicated test-account authentication; they are never part of ordinary CI.
+activity-lifecycle scenarios. Real provider prompts remain opt-in and are run
+by hand after either isolated LiteLLM configuration or dedicated test-account
+authentication; they are never part of ordinary CI.
 The checks below are the remaining
 live-instance and manual UI/UX validation pass.
 
