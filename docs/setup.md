@@ -492,7 +492,9 @@ before copying programs and verifies the installed bytes before copying it.
 Release acceptance and the installed smoke require a clean committed checkout. A local
 development install can still run when complete provenance is unavailable,
 but reports that limitation and removes any previous complete bundle manifest.
-The existing desktop `install-manifest.json` remains available separately.
+The desktop `install-manifest.json` is written only when the installed bytes
+verify against their sidecar, and is removed otherwise.
+
 ### Keyboard session picker
 
 Bare `agent` opens a local-first picker. New lists executable providers with a
