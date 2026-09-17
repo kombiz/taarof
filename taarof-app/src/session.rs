@@ -1858,13 +1858,20 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = std::sync::Mutex::new(release_rx);
 
-        let writer = SessionWriter::for_test(path.clone(), move |path, json| {
-            if json.contains("\"autosave\"") {
-                started_tx.send(()).unwrap();
-                release_rx.lock().unwrap().recv().unwrap();
-            }
-            write_atomically(path, json)
-        })
+        // This test asserts ordering, never the timeout, so give it a deadline
+        // it cannot reach. The release below waits on a cross-thread handshake,
+        // and any wall-clock budget turns that handshake into a race.
+        let writer = SessionWriter::for_test_with_shutdown_timeout(
+            path.clone(),
+            std::time::Duration::from_secs(3600),
+            move |path, json| {
+                if json.contains("\"autosave\"") {
+                    started_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                write_atomically(path, json)
+            },
+        )
         .unwrap();
 
         writer.schedule_autosave(session_writer_capture("autosave"));
@@ -1872,7 +1879,10 @@ mod tests {
         let final_writer = writer.clone();
         let final_save =
             std::thread::spawn(move || final_writer.shutdown(session_writer_capture("shutdown")));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        // Bounded only so a real regression fails instead of hanging. The
+        // spawned thread sets this flag in microseconds; a loaded runner that
+        // needs longer must not fail the assertion below.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !writer.is_shutting_down() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
