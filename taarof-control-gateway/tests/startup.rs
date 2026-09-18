@@ -196,3 +196,18 @@ fn packaged_user_service_bounds_all_retries_and_never_restarts_a_stale_pin() {
         );
     }
 }
+
+#[test]
+fn build_info_is_available_without_runtime_configuration() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_taarof-control-gateway"))
+        .arg("--build-info")
+        .env_remove("TAAROF_GATEWAY_CONFIG")
+        .output()
+        .expect("gateway build-info command should run");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema"], "taarof.gateway-build.v1");
+    assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+    assert!(value["build_id"].as_str().is_some_and(|id| !id.is_empty()));
+}

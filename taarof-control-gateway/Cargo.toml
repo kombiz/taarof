@@ -2,6 +2,7 @@
 name = "taarof-control-gateway"
 version = "0.1.0"
 edition = "2021"
+build = "../taarof-app/build.rs"
 license = "GPL-3.0-or-later"
 description = "Loopback-only control gateway relaying the Taarof Remote Protocol to the desktop runtime"
 

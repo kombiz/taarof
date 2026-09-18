@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bind the three shipped programs to verified compile-time provenance, including explicitly dirty builds."""
+"""Bind installed programs to verified compile-time provenance, including explicitly dirty builds."""
 import argparse
 import hashlib
 import json
@@ -68,14 +68,45 @@ def agent_identity(args, app):
     return agent
 
 
+def gateway_identity(args, app):
+    if not args.gateway:
+        return None
+    binary = Path(args.gateway).read_bytes()
+    require(app["build_id"].encode() in binary,
+            "gateway embedded build identity is unavailable")
+    result = subprocess.run([str(Path(args.gateway).resolve()), "--build-info"],
+                            env={}, capture_output=True, timeout=10, check=False)
+    require(result.returncode == 0, "gateway build identity is unavailable")
+    require(len(result.stdout) <= 16_384 and len(result.stderr) <= 16_384,
+            "gateway build identity exceeds its bound")
+    gateway = json.loads(result.stdout)
+    require(isinstance(gateway, dict) and gateway.get("schema") == "taarof.gateway-build.v1",
+            "gateway build identity schema mismatch")
+    require(gateway.get("source_revision") == app["source_revision"]
+            and gateway.get("source_dirty") is app["source_dirty"],
+            "gateway/application source mismatch")
+    require(gateway.get("profile") == app.get("profile") == "release",
+            "bundle requires release-profile artifacts")
+    require(isinstance(app.get("built_at_unix"), str) and app["built_at_unix"].isdigit()
+            and gateway.get("built_at_unix") == app["built_at_unix"],
+            "gateway/application build epoch mismatch")
+    build_id = gateway.get("build_id")
+    require(isinstance(build_id, str) and bool(build_id), "gateway build ID is unavailable")
+    require(build_id.encode() in binary, "gateway build ID is not embedded")
+    return gateway
+
+
 def artifact_hashes(args):
-    return {name: {"sha256": digest(path)} for name, path in
-            (("taarof-app", args.app), ("taarof", args.cli), ("agent", args.agent))}
+    artifacts = (("taarof-app", args.app), ("taarof", args.cli), ("agent", args.agent))
+    if args.gateway:
+        artifacts += (("taarof-control-gateway", args.gateway),)
+    return {name: {"sha256": digest(path)} for name, path in artifacts}
 
 
 def create(args):
     app = app_identity(args)
     agent = agent_identity(args, app)
+    gateway = gateway_identity(args, app)
     # Dirty bundles remain installable but cannot claim exact committed CLI source.
     if not app["source_dirty"]:
         result = subprocess.run(
@@ -93,6 +124,8 @@ def create(args):
         "agent_build_id": agent["build_id"],
         "artifacts": artifact_hashes(args),
     }
+    if gateway:
+        manifest["gateway_build_id"] = gateway["build_id"]
     Path(args.output).write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
                                  encoding="utf-8")
 
@@ -107,6 +140,9 @@ def verify(args):
     require(manifest.get("artifacts") == artifact_hashes(args), "bundle artifact hash mismatch")
     agent = agent_identity(args, app)
     require(manifest.get("agent_build_id") == agent["build_id"], "bundle/launcher build mismatch")
+    gateway = gateway_identity(args, app)
+    require(manifest.get("gateway_build_id") == (gateway or {}).get("build_id"),
+            "bundle/gateway build mismatch")
 
 
 def main():
@@ -114,6 +150,7 @@ def main():
     parser.add_argument("operation", choices=("create", "verify"))
     for field in ("app", "app-sidecar", "agent", "cli"):
         parser.add_argument("--" + field, required=True)
+    parser.add_argument("--gateway")
     parser.add_argument("--source-root")
     parser.add_argument("--output")
     parser.add_argument("--manifest")

@@ -125,10 +125,15 @@ taarof_copy_artifact_provenance "$artifact_sidecar_path" "$binary_path" "$instal
 # old complete manifest must never describe replacement artifact bytes.
 bundle_manifest_path="$prefix/share/taarof/bundle-manifest.json"
 rm -f "$bundle_manifest_path"
+gateway_provenance_args=()
+if [[ -x "$gateway_binary_path" ]]; then
+    gateway_provenance_args=(--gateway "$gateway_binary_path")
+fi
 if ! python3 "$script_dir/bundle-provenance.py" create \
     --source-root "$repo_root" --app "$binary_install_path" \
     --app-sidecar "$install_manifest_path" --agent "$prefix/bin/agent" \
-    --cli "$cli_install_path" --output "$bundle_manifest_path"; then
+    --cli "$cli_install_path" --output "$bundle_manifest_path" \
+    "${gateway_provenance_args[@]}"; then
     echo "note: complete bundle provenance unavailable; this installation is not source-verified" >&2
 fi
 

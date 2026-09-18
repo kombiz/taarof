@@ -33,6 +33,8 @@ class BundleProvenanceTests(unittest.TestCase):
                                                binary_sha256=self.hash(self.app))))
         self.agent = self.root / "agent"
         self.write_agent()
+        self.gateway = self.root / "taarof-control-gateway"
+        self.write_gateway()
         self.manifest = self.root / "bundle.json"
 
     @staticmethod
@@ -46,14 +48,21 @@ class BundleProvenanceTests(unittest.TestCase):
         self.agent.write_text("#!/usr/bin/python3\nprint(" + repr(json.dumps(info)) + ")\n")
         self.agent.chmod(0o755)
 
+    def write_gateway(self, **changes):
+        info = dict(self.identity, schema="taarof.gateway-build.v1", version="0.1.0")
+        info.update(changes)
+        self.gateway.write_text("#!/usr/bin/python3\nprint(" + repr(json.dumps(info)) + ")\n")
+        self.gateway.chmod(0o755)
+
     def invoke(self, operation):
         args = [sys.executable, str(HELPER), operation, "--app", str(self.app),
-                "--app-sidecar", str(self.sidecar), "--agent", str(self.agent), "--cli", str(self.cli)]
+                "--app-sidecar", str(self.sidecar), "--agent", str(self.agent), "--cli", str(self.cli),
+                "--gateway", str(self.gateway)]
         args += (["--source-root", str(self.root), "--output", str(self.manifest)]
                  if operation == "create" else ["--manifest", str(self.manifest)])
         return subprocess.run(args, capture_output=True, text=True)
 
-    def test_binds_all_three_artifacts_to_the_compiled_revision(self):
+    def test_binds_all_installed_artifacts_to_the_compiled_revision(self):
         result = self.invoke("create")
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = json.loads(self.manifest.read_text())
@@ -63,7 +72,9 @@ class BundleProvenanceTests(unittest.TestCase):
             "taarof-app": {"sha256": self.hash(self.app)},
             "taarof": {"sha256": self.hash(self.cli)},
             "agent": {"sha256": self.hash(self.agent)},
+            "taarof-control-gateway": {"sha256": self.hash(self.gateway)},
         })
+        self.assertEqual(manifest["gateway_build_id"], self.identity["build_id"])
         self.assertEqual(self.invoke("verify").returncode, 0)
 
     def test_stale_or_dirty_launcher_cannot_borrow_application_identity(self):
@@ -78,6 +89,7 @@ class BundleProvenanceTests(unittest.TestCase):
         self.sidecar.write_text(json.dumps(dict(self.identity, schema="taarof.artifact.v1",
                                                binary_sha256=self.hash(self.app))))
         self.write_agent()
+        self.write_gateway()
         self.cli.write_text("uncommitted synthetic CLI change\n")
         result = self.invoke("create")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -102,7 +114,7 @@ class BundleProvenanceTests(unittest.TestCase):
 
     def test_each_replaced_artifact_fails_verification(self):
         self.assertEqual(self.invoke("create").returncode, 0)
-        for path in (self.app, self.agent, self.cli):
+        for path in (self.app, self.agent, self.cli, self.gateway):
             with self.subTest(path=path.name):
                 original = path.read_bytes()
                 path.write_bytes(original + b"changed\n")
@@ -113,10 +125,18 @@ class BundleProvenanceTests(unittest.TestCase):
         self.assertEqual(self.invoke("create").returncode, 0)
         original = json.loads(self.manifest.read_text())
         for field, value in (("source_revision", "0" * 40), ("source_dirty", True),
-                             ("app_build_id", "other"), ("agent_build_id", "other")):
+                             ("app_build_id", "other"), ("agent_build_id", "other"),
+                             ("gateway_build_id", "other")):
             with self.subTest(field=field):
                 self.manifest.write_text(json.dumps(dict(original, **{field: value})))
                 self.assertNotEqual(self.invoke("verify").returncode, 0)
+
+    def test_stale_gateway_cannot_borrow_application_identity(self):
+        for change in (dict(source_revision="0" * 40), dict(source_dirty=True), dict(profile="debug")):
+            with self.subTest(change=change):
+                self.write_gateway(**change)
+                self.assertNotEqual(self.invoke("create").returncode, 0)
+                self.assertFalse(self.manifest.exists())
 
 
 if __name__ == "__main__":

@@ -65,6 +65,13 @@ cmp "$repo_root/taarof-control-gateway/LICENSE" \
     "$prefix/share/licenses/taarof-control-gateway/LICENSE"
 grep -Fx "ExecStart=$prefix/bin/taarof-control-gateway" \
     "$prefix/share/systemd/user/taarof-control-gateway.service" >/dev/null
+python3 "$script_dir/bundle-provenance.py" verify \
+    --manifest "$prefix/share/taarof/bundle-manifest.json" \
+    --app "$binary_path" \
+    --app-sidecar "$prefix/share/taarof/install-manifest.json" \
+    --agent "$prefix/bin/agent" \
+    --cli "$cli_path" \
+    --gateway "$prefix/bin/taarof-control-gateway"
 for argument in --version --build-info --help providers; do
     HOME="$prefix" "$prefix/bin/agent" "$argument" >/dev/null
 done

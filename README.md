@@ -197,12 +197,16 @@ model. See [SECURITY.md](SECURITY.md).
 - Browser/mobile access is observation-first; desktop usage remains the primary
   experience
 
-Repository automation validates formatting, tests, desktop buildability, the
-web bundle, and local Linux packaging on pull requests. See
+Repository automation validates formatting, tests, desktop and control-gateway
+buildability, the web bundle, and local Linux packaging on pull requests. See
 [docs/release.md](docs/release.md) for the current release policy.
 
 ## License
-This project is dual-licensed under either `MIT` or `Apache-2.0`, at your option. See `LICENSE-MIT` and `LICENSE-APACHE`.
+
+Most of this repository is dual-licensed under either `MIT` or `Apache-2.0`, at
+your option. The `taarof-control-gateway/` and `protocol/` components are
+licensed separately under `GPL-3.0-or-later`; see their component `LICENSE`
+files. The root [LICENSE](LICENSE) records the complete boundary.
 
 ## CWD Tracking Setup
 

@@ -35,10 +35,14 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), GatewayError> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 1 && args[0] == "--build-info" {
+        println!("{}", build_info());
+        return Ok(());
+    }
     let check_only = args.len() == 1 && args[0] == "--check-runtime";
     if !args.is_empty() && !check_only {
         return Err(GatewayError::RuntimeProtocol(
-            "usage: taarof-control-gateway [--check-runtime]".into(),
+            "usage: taarof-control-gateway [--check-runtime|--build-info]".into(),
         ));
     }
     let config_path = config_path();
@@ -101,6 +105,21 @@ async fn run() -> Result<(), GatewayError> {
     )
     .map_err(GatewayError::Io)?;
     Ok(())
+}
+
+fn build_info() -> serde_json::Value {
+    let nonempty = |value: &str| (!value.is_empty()).then(|| value.to_owned());
+    serde_json::json!({
+        "schema": "taarof.gateway-build.v1",
+        "version": env!("CARGO_PKG_VERSION"),
+        "build_id": nonempty(env!("TAAROF_BUILD_ID")),
+        "source_revision": nonempty(env!("TAAROF_BUILD_SOURCE_REVISION")),
+        "source_dirty": match env!("TAAROF_BUILD_SOURCE_DIRTY") {
+            "true" => Some(true), "false" => Some(false), _ => None,
+        },
+        "profile": nonempty(env!("TAAROF_BUILD_PROFILE")),
+        "built_at_unix": nonempty(env!("TAAROF_BUILD_SOURCE_BUILT_AT_UNIX")),
+    })
 }
 
 fn owner_socket_path() -> Result<PathBuf, GatewayError> {
