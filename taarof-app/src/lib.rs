@@ -2691,7 +2691,10 @@ fn install_periodic_pollers(
         // Single-flight guard: a tick that fires while the probe build is still
         // in flight is coalesced away, never queued.
         let probe_in_flight = crate::runtime_probe::ProbeInFlight::default();
-        glib::timeout_add_seconds_local(3, move || {
+        let probe_interval_seconds =
+            u32::try_from(crate::runtime_probe::PROBE_REFRESH_INTERVAL_MS / 1_000)
+                .expect("probe refresh interval fits a u32 second count");
+        glib::timeout_add_seconds_local(probe_interval_seconds, move || {
             app_runtime::update_agent_indicators(
                 &runtime,
                 &term_stack,
