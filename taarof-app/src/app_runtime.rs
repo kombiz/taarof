@@ -458,8 +458,21 @@ pub(crate) fn update_agent_indicators(
             }
 
             let dashboard_dirty = !pending_events.is_empty();
+            // Rows sample the probe truth when they refresh, so a refresh that
+            // ran inside a stale window latches "probe stale" until something
+            // re-renders it. Installing a snapshot that moves the truth state
+            // is such a re-render trigger even when the snapshot itself
+            // renders identically.
+            let truth_state_changed = crate::runtime_probe::rendered_truth_state_changes(
+                st.runtime_probe.as_ref(),
+                &snapshot,
+                &tab_pids,
+                &pane_pids,
+                crate::events::unix_time_ms(),
+                crate::runtime_probe::PROBE_TTL_MS,
+            );
             st.install_runtime_probe(snapshot);
-            let dirty = snapshot_changed || rows_dirty || dashboard_dirty;
+            let dirty = snapshot_changed || rows_dirty || dashboard_dirty || truth_state_changed;
             (dirty, dashboard_dirty, pending_events, probe_failures)
         };
         // Socket/web clients must keep receiving these regardless of the sidebar

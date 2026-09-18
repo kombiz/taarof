@@ -8,7 +8,17 @@ use crate::{
     probe::ProbeState,
 };
 
-pub(crate) const PROBE_TTL_MS: u64 = 3_000;
+/// How often the main-loop tick rebuilds the runtime probe snapshot.
+pub(crate) const PROBE_REFRESH_INTERVAL_MS: u64 = 3_000;
+/// How long a snapshot stays fresh. "Stale" must mean the probe missed a whole
+/// refresh round, so the window is two intervals: the sidebar samples the
+/// truth between ticks, and `timeout_add_seconds` fires up to a second late.
+/// A window equal to the interval labelled every healthy pane "probe stale".
+pub(crate) const PROBE_TTL_MS: u64 = 2 * PROBE_REFRESH_INTERVAL_MS;
+const _: () = assert!(
+    PROBE_TTL_MS > PROBE_REFRESH_INTERVAL_MS + 1_000,
+    "a freshness window at or below the refresh interval (plus timer jitter) reports every healthy probe stale"
+);
 const AGENT_SCAN_MAX_PROCESSES: usize = 256;
 
 type PaneKey = (u32, u32);
@@ -138,6 +148,23 @@ pub(crate) fn runtime_probe_truth(
         ports_error: snapshot.ports_error.clone(),
         checked_at_unix_ms: Some(snapshot.probed_at_unix_ms),
     }
+}
+
+/// True when installing `next` over `previous` moves the truth state the
+/// sidebar rows render. Rows sample [`runtime_probe_truth_for_state`] at
+/// refresh time, so an event-driven refresh inside a stale window can latch
+/// "probe stale"; the tick must re-render rows on this transition even when
+/// the two snapshots render identically.
+pub(crate) fn rendered_truth_state_changes(
+    previous: Option<&RuntimeProbeSnapshot>,
+    next: &RuntimeProbeSnapshot,
+    tab_pids: &[(u32, Vec<i32>)],
+    pane_pids: &[(u32, u32, i32)],
+    now_ms: u64,
+    ttl_ms: u64,
+) -> bool {
+    runtime_probe_truth(previous, tab_pids, pane_pids, now_ms, ttl_ms).state
+        != runtime_probe_truth(Some(next), tab_pids, pane_pids, now_ms, ttl_ms).state
 }
 
 pub(crate) fn runtime_probe_truth_for_state(
@@ -1881,6 +1908,75 @@ mod tests {
             ),
             ProbeState::Stale
         );
+    }
+
+    #[test]
+    fn a_snapshot_one_refresh_interval_old_is_still_fresh() {
+        // The sidebar samples `runtime_probe_truth_for_state` between ticks. A
+        // freshness window at or below the tick interval labels every healthy
+        // pane "probe stale" whenever a refresh lands just before the next
+        // tick, and `timeout_add_seconds` can fire up to a second late. The
+        // interval/window ordering itself is a compile-time assertion beside
+        // the constants.
+        let source = FakeProbeSource::with_projection_fixture();
+        let tab_pids = vec![(1, vec![10])];
+        let pane_pids = vec![(1, 7, 10)];
+        let snapshot = RuntimeProbeSnapshot::build(&source, 1_000, &tab_pids, &pane_pids);
+
+        let just_before_next_tick = 1_000 + PROBE_REFRESH_INTERVAL_MS + 999;
+        assert_eq!(
+            snapshot.process_probe_state_for(
+                &tab_pids,
+                &pane_pids,
+                just_before_next_tick,
+                PROBE_TTL_MS
+            ),
+            ProbeState::Ok,
+            "one refresh interval old must still render as ok"
+        );
+        assert_eq!(
+            snapshot.process_probe_state_for(
+                &tab_pids,
+                &pane_pids,
+                1_000 + PROBE_TTL_MS + 1,
+                PROBE_TTL_MS
+            ),
+            ProbeState::Stale,
+            "past the freshness window the probe has genuinely missed a round"
+        );
+    }
+
+    #[test]
+    fn installing_a_fresh_snapshot_over_a_stale_one_changes_the_rendered_truth() {
+        // A row can latch "probe stale" from an event-driven refresh that
+        // sampled inside a stale window; the tick must re-render rows whenever
+        // installing the new snapshot moves the truth state, even when the
+        // snapshot itself renders identically.
+        let source = FakeProbeSource::with_projection_fixture();
+        let tab_pids = vec![(1, vec![10])];
+        let pane_pids = vec![(1, 7, 10)];
+        let old = RuntimeProbeSnapshot::build(&source, 1_000, &tab_pids, &pane_pids);
+        let now = 1_000 + PROBE_TTL_MS + 5_000;
+        let new = RuntimeProbeSnapshot::build(&source, now - 100, &tab_pids, &pane_pids);
+        assert!(old.renders_same_as(&new));
+
+        assert!(rendered_truth_state_changes(
+            Some(&old),
+            &new,
+            &tab_pids,
+            &pane_pids,
+            now,
+            PROBE_TTL_MS
+        ));
+        let recent = RuntimeProbeSnapshot::build(&source, now - 500, &tab_pids, &pane_pids);
+        assert!(!rendered_truth_state_changes(
+            Some(&recent),
+            &new,
+            &tab_pids,
+            &pane_pids,
+            now,
+            PROBE_TTL_MS
+        ));
     }
 
     #[test]
