@@ -1138,15 +1138,30 @@ fn binding_process_start(binding: &PaneTranscriptBinding) -> Option<u64> {
     })
 }
 
+/// The directory the agent itself is running in, in canonical form.
+///
+/// Native transcripts record the agent process's own cwd (`getcwd`, always
+/// canonical). The pane cwd arrives from the shell's OSC 7, which reports the
+/// logical `$PWD` and keeps symlink components, so `~/llm-hq` never string-
+/// matches a session recorded under `~/code/llm-hq`. Prefer the live agent
+/// process cwd, then canonicalize the pane cwd; keep the raw value only when
+/// the path does not resolve on this host.
 fn binding_agent_cwd(binding: &PaneTranscriptBinding) -> Option<String> {
-    binding.cwd.clone().or_else(|| {
-        let shell_pid = binding.shell_pid?;
+    let live_agent_cwd = binding.shell_pid.and_then(|shell_pid| {
         let agent_pid = find_agent_process_pid(shell_pid, &binding.agent)?;
         fs::read_link(format!("/proc/{agent_pid}/cwd"))
             .ok()?
             .to_str()
             .map(str::to_owned)
-    })
+    });
+    live_agent_cwd.or_else(|| binding.cwd.as_deref().map(canonical_cwd))
+}
+
+fn canonical_cwd(cwd: &str) -> String {
+    fs::canonicalize(cwd)
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_owned))
+        .unwrap_or_else(|| cwd.to_owned())
 }
 
 /// Read one named value from a live same-user process without copying or
@@ -3368,6 +3383,54 @@ mod tests {
             super::super::lifecycle::AgentLifecycle::Idle
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_pane_cwd_through_a_symlink_resolves_the_canonical_session() {
+        // The shell reports its logical `$PWD` (symlink form) through OSC 7,
+        // while Codex records the canonical directory in `session_meta.cwd`.
+        // The pane must still bind to its live session.
+        let root = unique_temp_dir("codex-symlink-cwd");
+        let real_project = root.join("code").join("project");
+        let link_parent = root.join("home");
+        let linked_project = link_parent.join("project");
+        let sessions = root.join("sessions/2026/09/17");
+        fs::create_dir_all(&real_project).unwrap();
+        fs::create_dir_all(&link_parent).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        std::os::unix::fs::symlink(&real_project, &linked_project).unwrap();
+        let canonical_project = fs::canonicalize(&real_project).unwrap();
+
+        let meta = serde_json::json!({"type":"session_meta","payload":{
+            "id":"symlink-session", "cwd":canonical_project, "timestamp":T0
+        }});
+        let started = serde_json::json!({"type":"event_msg","timestamp":T0,
+            "payload":{"type":"task_started","turn_id":"symlink-turn"}});
+        fs::write(
+            sessions.join("rollout-symlink.jsonl"),
+            format!("{meta}\n{started}\n"),
+        )
+        .unwrap();
+
+        let tracker = TranscriptTracker::with_adapters(vec![Box::new(
+            CodexTranscriptAdapter::with_sessions_root(root.join("sessions")),
+        )]);
+        let result = tracker.sync_and_poll(&[PaneTranscriptBinding {
+            key: (41, 0),
+            agent: "codex".into(),
+            session_id: None,
+            cwd: Some(linked_project.to_string_lossy().into_owned()),
+            shell_pid: None,
+            process_started_at_unix_ms: Some(at(T0)),
+        }]);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(result.ticks.len(), 1, "the symlinked pane cwd must bind");
+        assert_eq!(result.ticks[0].state.session_id, "symlink-session");
+        assert_eq!(
+            super::super::lifecycle::resolve(None, Some(result.ticks[0].state.turn), at(T0)),
+            super::super::lifecycle::AgentLifecycle::Working
+        );
     }
 
     #[test]
