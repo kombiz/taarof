@@ -1,4 +1,4 @@
-FROM archlinux:base
+FROM mirror.gcr.io/library/archlinux:base
 
 # Arch is rolling-release and does not support partial upgrades. Keep the base
 # and build dependencies synchronized in one layer.
