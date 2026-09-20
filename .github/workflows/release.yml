@@ -22,7 +22,7 @@ jobs:
     if: github.repository == 'kombiz/taarof'
     runs-on: [self-hosted, onlyarag-taarof-x64]
     container:
-      image: debian:trixie-slim
+      image: mirror.gcr.io/library/debian:trixie-slim
     steps:
       - name: Install system dependencies
         run: |
