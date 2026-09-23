@@ -7,6 +7,12 @@ on:
       - main
       - kmux
 
+# Pull requests cancel a superseded head; pushes to main and kmux queue and are
+# never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Fork pull requests only need to read this repository. Keep the default token
 # deliberately narrow for every CI job.
 permissions:
