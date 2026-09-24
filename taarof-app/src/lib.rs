@@ -4,6 +4,7 @@ mod agents;
 mod api;
 mod app_runtime;
 mod app_session;
+mod attention;
 mod browser;
 mod child_env;
 mod child_process;
@@ -1644,19 +1645,22 @@ fn install_search_palette_actions(
         let tab_list = tab_list.clone();
         let term_stack = term_stack.clone();
         action_jump_attention.connect_activate(move |_, _| {
-            let attention_id = {
+            let attention_target = {
                 let st = state.borrow();
-                let attention_id = st
-                    .all_tabs()
-                    .find(|tab| st.tab_needs_attention(tab))
-                    .map(|tab| tab.id);
-                attention_id
+                views::first_attention_target(&st)
             };
-            if let Some(tab_id) = attention_id {
-                if sidebar::activate_tab(&tab_list, &state, &term_stack, tab_id) {
-                    if let Some(terminal) = get_active_terminal(&state) {
-                        terminal.grab_focus();
-                    }
+            if let Some((tab_id, pane_id)) = attention_target {
+                let target_exists = {
+                    let mut st = state.borrow_mut();
+                    views::jump_to_attention_target(&mut st, tab_id, pane_id)
+                };
+                if !target_exists || !sidebar::activate_tab(&tab_list, &state, &term_stack, tab_id)
+                {
+                    show_error_toast("Attention target is no longer available");
+                    return;
+                }
+                if let Some(terminal) = get_active_terminal(&state) {
+                    terminal.grab_focus();
                 }
             }
         });

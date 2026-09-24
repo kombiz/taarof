@@ -457,7 +457,6 @@ pub(crate) fn update_agent_indicators(
                     || previous_primary_state != tab.primary_state();
             }
 
-            let dashboard_dirty = !pending_events.is_empty();
             // Rows sample the probe truth when they refresh, so a refresh that
             // ran inside a stale window latches "probe stale" until something
             // re-renders it. Installing a snapshot that moves the truth state
@@ -472,6 +471,15 @@ pub(crate) fn update_agent_indicators(
                 crate::runtime_probe::PROBE_TTL_MS,
             );
             st.install_runtime_probe(snapshot);
+            if st.refresh_attention_projection() {
+                pending_events.push((
+                    "agent_attention_changed",
+                    serde_json::json!({
+                        "source": "attention-projection",
+                    }),
+                ));
+            }
+            let dashboard_dirty = !pending_events.is_empty();
             let dirty = snapshot_changed || rows_dirty || dashboard_dirty || truth_state_changed;
             (dirty, dashboard_dirty, pending_events, probe_failures)
         };

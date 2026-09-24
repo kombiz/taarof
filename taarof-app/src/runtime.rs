@@ -84,6 +84,10 @@ pub struct AppState {
     /// The control gateway owns the authoritative device records; this mirrors
     /// offers and operator decisions for the local socket surface.
     pub pairing: crate::socket::PairingCoordinator,
+    /// Last rendered canonical Needs You projection. The periodic runtime poll
+    /// compares against it so freshness expiry redraws GTK and invalidates web
+    /// state even when no new terminal output arrives.
+    attention_projection_signature: Vec<crate::attention::AttentionTarget>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -162,6 +166,7 @@ impl AppState {
             revealed_task_tabs: HashSet::new(),
             pane_transcripts: HashMap::new(),
             pairing: crate::socket::PairingCoordinator::new(),
+            attention_projection_signature: Vec::new(),
         };
         s.event_store.emit(
             "session_started",
@@ -758,6 +763,15 @@ impl AppState {
 
     pub(crate) fn tab_needs_attention(&self, tab: &Tab) -> bool {
         tab.needs_attention || self.pending_socket_notifications.contains_key(&tab.id)
+    }
+
+    pub(crate) fn refresh_attention_projection(&mut self) -> bool {
+        let next = crate::attention::attention_targets_at(self, crate::events::unix_time_ms());
+        if self.attention_projection_signature == next {
+            return false;
+        }
+        self.attention_projection_signature = next;
+        true
     }
 
     pub(crate) fn tab_primary_state(&self, tab: &Tab) -> crate::workspace::TabPrimaryState {

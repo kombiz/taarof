@@ -1,5 +1,6 @@
 import type {
   AgentBadgeSnapshot,
+  AttentionEvidenceSnapshot,
   PaneSnapshot,
   TaarofStateSnapshot,
   TabAgentSnapshot,
@@ -179,6 +180,9 @@ export function panePriority(
   pane: PaneSnapshot,
 ): number {
   let score = 0;
+  const agent = paneAgent(tab, pane.pane_id);
+  const attention = pane.attention ?? agent?.attention ?? null;
+  const hasCanonicalAttention = pane.attention !== undefined || agent?.attention !== undefined;
 
   if (workspace.id === snapshot.active_workspace) {
     score += 120;
@@ -189,16 +193,16 @@ export function panePriority(
   if (tab.tab_id === workspace.active_tab) {
     score += 80;
   }
-  if (tab.needs_attention) {
+  if (attention || (!hasCanonicalAttention && tab.needs_attention)) {
     score += 220;
   }
-  if (tab.agent_running) {
+  if (agent?.state === "working" || (!tab.agents?.length && tab.agent_running)) {
     score += 190;
   }
-  if (tab.agent_activity?.state === "waiting-input") {
+  if (!hasCanonicalAttention && tab.agent_activity?.state === "waiting-input") {
     score += 180;
   }
-  if (tab.agent_activity?.state === "errored") {
+  if (!hasCanonicalAttention && tab.agent_activity?.state === "errored") {
     score += 170;
   }
   if (tab.agent_pane_id === pane.pane_id) {
@@ -274,6 +278,13 @@ export function applyManualOrder(targets: PaneTarget[], orderedKeys: string[]): 
 }
 
 export function isAttentionTarget(target: PaneTarget): boolean {
+  const agent = paneAgent(target.tab, target.pane.pane_id);
+  if (target.pane.attention || agent?.attention) {
+    return true;
+  }
+  if (target.pane.attention !== undefined || agent?.attention !== undefined) {
+    return false;
+  }
   return (
     target.tab.needs_attention ||
     target.tab.agent_activity?.state === "waiting-input" ||
@@ -282,6 +293,13 @@ export function isAttentionTarget(target: PaneTarget): boolean {
 }
 
 export function isLiveTarget(target: PaneTarget): boolean {
+  const agent = paneAgent(target.tab, target.pane.pane_id);
+  if (agent?.state) {
+    return agent.state === "working";
+  }
+  if (target.tab.agents?.length) {
+    return false;
+  }
   return target.tab.agent_running || target.tab.agent_activity?.state === "running";
 }
 
@@ -358,6 +376,14 @@ export function buildFilterOptions(
  */
 export function paneAgent(tab: TabSnapshot, paneId: number): TabAgentSnapshot | null {
   return tab.agents?.find((agent) => agent.pane_id === paneId) ?? null;
+}
+
+export function paneAttention(target: PaneTarget): AttentionEvidenceSnapshot | null {
+  return (
+    target.pane.attention ??
+    paneAgent(target.tab, target.pane.pane_id)?.attention ??
+    null
+  );
 }
 
 /**

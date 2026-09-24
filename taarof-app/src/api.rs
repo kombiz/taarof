@@ -36,6 +36,8 @@ struct StateSnapshotIngredients {
     live_pane_process_states: HashMap<(u32, u32), PaneProcessState>,
     live_pane_agents: HashMap<(u32, u32), crate::agents::AgentStatus>,
     pane_transcripts: HashMap<(u32, u32), crate::agents::TranscriptState>,
+    attention_targets: Vec<crate::attention::AttentionTarget>,
+    attention: HashMap<(u32, u32), crate::attention::AttentionEvidence>,
 }
 
 impl StateSnapshotIngredients {
@@ -43,12 +45,19 @@ impl StateSnapshotIngredients {
         let (tab_pids, pane_pids) = collect_runtime_probe_pids(state);
         let live_pane_process_states = collect_live_pane_process_states(state, &pane_pids);
         let live_pane_agents = collect_live_pane_agents(state, &pane_pids);
+        let attention_targets = crate::attention::attention_targets_at(state, unix_time_ms());
+        let attention = attention_targets
+            .iter()
+            .map(|target| ((target.tab_id, target.pane_id), target.evidence.clone()))
+            .collect();
         Self {
             tab_pids,
             pane_pids,
             live_pane_process_states,
             live_pane_agents,
             pane_transcripts: state.pane_transcripts.clone(),
+            attention_targets,
+            attention,
         }
     }
 }
@@ -68,7 +77,7 @@ pub fn build_state_snapshot(state: &AppState) -> Value {
     let ingredients = StateSnapshotIngredients::collect(state);
     let workspaces = build_workspaces_projection(state, &ingredients);
     let active_ports = build_active_ports(state);
-    let alerts = build_active_alerts(state);
+    let alerts = build_active_alerts(state, &ingredients);
     let recent_alerts = build_recent_alerts(&state.event_store, 20);
     let saved_views = build_saved_views_snapshot();
     let saved_templates = build_saved_templates_snapshot();
@@ -321,6 +330,7 @@ fn build_panes_projection(state: &AppState, ingredients: &StateSnapshotIngredien
                 }
 
                 panes.into_iter().map(move |mut payload| {
+                    attach_attention_payload(&mut payload, tab.id, ingredients);
                     if let Some(object) = payload.as_object_mut() {
                         object.insert("workspace_id".into(), json!(workspace.id));
                         object.insert("tab_id".into(), json!(tab.id));
@@ -383,6 +393,9 @@ fn tab_payload(state: &AppState, tab: &Tab, ingredients: &StateSnapshotIngredien
         } else {
             panes.extend(pending_pane_payloads(state, tab.id));
         }
+    }
+    for pane in &mut panes {
+        attach_attention_payload(pane, tab.id, ingredients);
     }
     let agents = tab_agents_payload(tab, ingredients);
     let primary_activity = tab.primary_agent_activity();
@@ -474,11 +487,22 @@ fn tab_agents_payload(tab: &Tab, ingredients: &StateSnapshotIngredients) -> Vec<
         .into_iter()
         .map(|instance| {
             let activity = tab.pane_agent_activity(instance.pane_id);
-            agent_entry_payload(
+            let mut payload = agent_entry_payload(
                 &instance,
                 activity.map(agent_activity_payload),
                 tab.pane_lifecycle(instance.pane_id),
-            )
+            );
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "attention".into(),
+                    ingredients
+                        .attention
+                        .get(&(tab.id, instance.pane_id))
+                        .map(attention_evidence_payload)
+                        .unwrap_or(Value::Null),
+                );
+            }
+            payload
         })
         .collect()
 }
@@ -889,7 +913,37 @@ fn agent_activity_payload(activity: &AgentActivity) -> Value {
         "text": activity.text,
         "source": activity.source,
         "origin": agent_activity_origin_label(activity.origin),
+        "observed_at_unix_ms": activity.observed_at_unix_ms,
     })
+}
+
+fn attention_evidence_payload(evidence: &crate::attention::AttentionEvidence) -> Value {
+    json!({
+        "reason": evidence.reason.wire(),
+        "provider": evidence.provider,
+        "provenance": evidence.provenance,
+        "authority": evidence.authority.wire(),
+        "freshness": evidence.freshness.wire(),
+        "last_verified_unix_ms": evidence.last_verified_unix_ms,
+    })
+}
+
+fn attach_attention_payload(
+    payload: &mut Value,
+    tab_id: u32,
+    ingredients: &StateSnapshotIngredients,
+) {
+    let pane_id = payload
+        .get("pane_id")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    let attention = pane_id
+        .and_then(|pane_id| ingredients.attention.get(&(tab_id, pane_id)))
+        .map(attention_evidence_payload)
+        .unwrap_or(Value::Null);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("attention".into(), attention);
+    }
 }
 
 fn tracking_payload(tracking: &TrackingData) -> Value {
@@ -965,26 +1019,26 @@ fn build_active_ports(state: &AppState) -> Vec<Value> {
         .collect()
 }
 
-fn build_active_alerts(state: &AppState) -> Vec<Value> {
-    state
-        .workspaces
+fn build_active_alerts(state: &AppState, ingredients: &StateSnapshotIngredients) -> Vec<Value> {
+    ingredients
+        .attention_targets
         .iter()
-        .flat_map(|workspace| {
-            workspace.tabs.iter().filter_map(move |tab| {
-                if !state.tab_needs_attention(tab) {
-                    return None;
-                }
-
-                Some(json!({
-                    "workspace_id": workspace.id,
-                    "workspace_name": workspace.name,
-                    "tab_id": tab.id,
-                    "tab_name": tab.name,
-                    "message": state.tab_notification_message(tab).unwrap_or(&tab.name),
-                    "agent_running": tab.has_fresh_running_activity(),
-                    "agent_activity": tab.agent_activity.as_ref().map(agent_activity_payload),
-                }))
-            })
+        .filter_map(|target| {
+            let (_, tab) = state.find_tab(target.tab_id)?;
+            Some(json!({
+                "workspace_id": target.workspace_id,
+                "workspace_name": target.workspace_name,
+                "repository": target.repository,
+                "worktree": target.worktree,
+                "machine": target.machine,
+                "tab_id": target.tab_id,
+                "tab_name": target.tab_name,
+                "pane_id": target.pane_id,
+                "message": state.tab_notification_message(tab).unwrap_or(&tab.name),
+                "agent_running": tab.pane_lifecycle(target.pane_id).is_working(),
+                "agent_activity": tab.pane_agent_activity(target.pane_id).map(agent_activity_payload),
+                "attention": attention_evidence_payload(&target.evidence),
+            }))
         })
         .collect()
 }
@@ -1419,6 +1473,8 @@ mod tests {
             live_pane_process_states: HashMap::new(),
             live_pane_agents: HashMap::new(),
             pane_transcripts: HashMap::new(),
+            attention_targets: Vec::new(),
+            attention: HashMap::new(),
         }
     }
 
@@ -1641,6 +1697,59 @@ mod tests {
         assert_eq!(payload["state"], serde_json::json!("working"));
         assert_eq!(payload["state_label"], serde_json::json!("WORKING"));
         assert_eq!(payload["activity"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn state_snapshot_projects_one_canonical_attention_object_to_pane_agent_and_alert() {
+        let mut state = AppState::new();
+        let workspace_id = state.active_workspace;
+        let (tab_id, pane_id) = crate::seed_headless_terminal_tab(
+            &mut state,
+            workspace_id,
+            "waiting agent",
+            HeadlessPaneSeed::default(),
+        )
+        .expect("headless tab should be seeded");
+        state
+            .find_tab_mut(tab_id)
+            .expect("seeded tab")
+            .set_pane_agent_activity(
+                pane_id,
+                AgentActivity::termprop(
+                    AgentActivityState::WaitingInput,
+                    "waiting for input",
+                    Some("claude".into()),
+                ),
+            );
+
+        let snapshot = super::build_state_snapshot(&state);
+        let tab = snapshot["workspaces"][0]["tabs"]
+            .as_array()
+            .expect("tabs")
+            .iter()
+            .find(|tab| tab["tab_id"] == tab_id)
+            .expect("waiting tab");
+        let pane_attention = &tab["panes"][0]["attention"];
+        let agent_attention = &tab["agents"][0]["attention"];
+        let alert = snapshot["alerts"]
+            .as_array()
+            .expect("alerts")
+            .iter()
+            .find(|alert| alert["pane_id"] == pane_id)
+            .expect("pane alert");
+
+        assert_eq!(pane_attention["reason"], "waiting_input");
+        assert_eq!(pane_attention["provider"], "claude");
+        assert_eq!(pane_attention["provenance"], "termprop");
+        assert_eq!(pane_attention["authority"], "provider_explicit");
+        assert_eq!(pane_attention["freshness"], "fresh");
+        assert!(pane_attention["last_verified_unix_ms"].as_u64().is_some());
+        assert_eq!(agent_attention, pane_attention);
+        assert_eq!(alert["attention"], *pane_attention);
+        assert_eq!(
+            tab["agent_activity"]["observed_at_unix_ms"],
+            pane_attention["last_verified_unix_ms"]
+        );
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {

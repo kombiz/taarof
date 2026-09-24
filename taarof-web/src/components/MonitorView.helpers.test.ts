@@ -159,3 +159,33 @@ test("remote panes render unknown process state instead of idle or done", () => 
   assertEqual(paneStatusLabel(target), "remote");
   assertEqual(activityLabel(target), "remote process state unavailable");
 });
+
+test("activityLabel renders the exact pane attention reason and freshness", () => {
+  const [waiting] = buildPaneTargets(snapshot({
+    workspaces: [workspace({ tabs: [tab({ panes: [pane({
+      attention: {
+        reason: "waiting_input",
+        provider: "claude",
+        provenance: "termprop",
+        authority: "provider_explicit",
+        freshness: "fresh",
+        last_verified_unix_ms: 1_800_000_000_000,
+      },
+    })] })] })],
+  }));
+  const [stale] = buildPaneTargets(snapshot({
+    workspaces: [workspace({ tabs: [tab({ panes: [pane({
+      attention: {
+        reason: "unknown",
+        provider: "codex",
+        provenance: "output_scan",
+        authority: "terminal_heuristic",
+        freshness: "stale",
+        last_verified_unix_ms: 1_799_999_990_000,
+      },
+    })] })] })],
+  }));
+
+  assertEqual(activityLabel(waiting), "Waiting for input · claude · provider explicit · fresh");
+  assertEqual(activityLabel(stale), "Unknown reason · codex · terminal heuristic · stale");
+});

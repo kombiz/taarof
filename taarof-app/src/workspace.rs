@@ -73,6 +73,9 @@ pub struct AgentActivity {
     pub source: Option<String>,
     pub origin: AgentActivityOrigin,
     pub updated_at: Instant,
+    /// Wall-clock time of the actual signal receipt. Rendering and polling
+    /// must never advance this: it identifies when the evidence was verified.
+    pub observed_at_unix_ms: u64,
 }
 
 impl AgentActivity {
@@ -106,6 +109,10 @@ impl AgentActivity {
             source,
             origin,
             updated_at: Instant::now(),
+            observed_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or_default(),
         })
     }
 
@@ -702,6 +709,8 @@ mod tests {
             source: Some("copilot".to_string()),
             origin,
             updated_at: Instant::now() - std::time::Duration::from_secs(age_seconds),
+            observed_at_unix_ms: crate::events::unix_time_ms()
+                .saturating_sub(age_seconds.saturating_mul(1_000)),
         }
     }
 
