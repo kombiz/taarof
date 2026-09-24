@@ -106,6 +106,11 @@ jobs:
     # that Ubuntu 24.04 runners (vte 0.76) cannot meet.
     container:
       image: mirror.gcr.io/library/debian:trixie-slim
+      # SQLite test fixtures must not share the runner's contended disk journal.
+      # Keep real SQLite transactions/locking and the ten-second flush deadline;
+      # only disposable test files use this bounded, executable tmpfs. The short
+      # mount path also leaves room for Unix socket fixture names (SUN_LEN).
+      options: --tmpfs /t:rw,exec,size=1g,mode=1777
     env:
       CARGO_HOME: /tmp/taarof-cargo
       RUSTUP_HOME: /tmp/taarof-rustup
@@ -169,6 +174,8 @@ jobs:
         run: cargo check --manifest-path taarof-app/Cargo.toml --example performance_harness --features harness
 
       - name: Run taarof-app tests
+        env:
+          TMPDIR: /t
         run: cargo test --manifest-path taarof-app/Cargo.toml
 
       - name: Build taarof-app release binary

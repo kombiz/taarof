@@ -35,6 +35,7 @@ trap cleanup EXIT
 
 bash "$repo_root/testing/test-release-bundle-provenance.sh"
 python3 "$repo_root/testing/test_bundle_provenance.py"
+python3 "$repo_root/testing/test_install_channel.py"
 
 manifest_license="$(
     sed -n 's/^license[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' \

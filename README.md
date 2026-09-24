@@ -57,9 +57,28 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ### Build and install locally
 
-Start from a local checkout of this repo. With `mise`, `mise run install` runs
-the build, provenance, and install steps below, but does not launch the app.
-Without it:
+From a trusted checkout of public `kombiz/taarof`, install either channel:
+
+```bash
+mise run install          # latest origin/main: production
+mise run install kmux     # latest origin/kmux: development
+```
+
+Launch production with `taarof-app`, or development with `taarof-app-kmux`.
+The application menu has **Taarof** and **Taarof Development (kmux)** entries.
+Use `taarof` and `taarof-kmux` for their respective control CLIs.
+
+Each command fetches and builds the selected branch at a pinned commit in a
+separate temporary worktree. It does not install your task branch, switch your
+checkout, or restart a running app. Channel payloads live under
+`~/.local/lib/taarof/{main,kmux}`; `--prefix /absolute/path` changes the install
+prefix. Development uses the named session `kmux`, with separate saved layouts,
+application identity and socket discovery. Settings remain shared; see
+[installation channels](docs/setup.md#installation-channels) for the HTTP and
+update-path constraints.
+
+To install the **current checkout** for packaging/development instead, use
+`mise run install:checkout /explicit/prefix`, or these underlying commands:
 
 ```bash
 cargo build --release --manifest-path taarof-app/Cargo.toml
