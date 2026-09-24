@@ -641,6 +641,20 @@ pub(crate) fn jump_to_attention_target(
     state.activate_tab(tab_id).is_some()
 }
 
+pub(crate) fn focus_attention_target(
+    state: &std::rc::Rc<std::cell::RefCell<crate::AppState>>,
+    tab_list: &gtk::Box,
+    term_stack: &gtk::Stack,
+    tab_id: u32,
+    pane_id: u32,
+) -> bool {
+    let target_exists = {
+        let mut state = state.borrow_mut();
+        jump_to_attention_target(&mut state, tab_id, pane_id)
+    };
+    target_exists && crate::sidebar::focus_agent_pane(state, tab_list, term_stack, tab_id, pane_id)
+}
+
 fn populate_attention_list_view(
     detail_box: &gtk::Box,
     state: &std::rc::Rc<std::cell::RefCell<crate::AppState>>,
@@ -751,22 +765,9 @@ fn append_attention_row(
         let tab_id = entry.tab_id;
         let pane_id = entry.pane_id;
         jump_button.connect_clicked(move |_| {
-            let activated = {
-                let mut st = state.borrow_mut();
-                jump_to_attention_target(&mut st, tab_id, pane_id)
-            };
-            if !activated {
+            if !focus_attention_target(&state, &tab_list, &term_stack, tab_id, pane_id) {
                 crate::show_error_toast("Attention target is no longer available");
                 return;
-            }
-
-            if !crate::sidebar::activate_tab(&tab_list, &state, &term_stack, tab_id) {
-                crate::show_error_toast("Attention target is no longer available");
-                return;
-            }
-
-            if let Some(terminal) = crate::get_active_terminal(&state) {
-                terminal.grab_focus();
             }
             crate::dashboard::refresh_dashboard_if_open(&state, &term_stack);
         });

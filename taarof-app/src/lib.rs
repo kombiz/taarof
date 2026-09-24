@@ -1650,17 +1650,8 @@ fn install_search_palette_actions(
                 views::first_attention_target(&st)
             };
             if let Some((tab_id, pane_id)) = attention_target {
-                let target_exists = {
-                    let mut st = state.borrow_mut();
-                    views::jump_to_attention_target(&mut st, tab_id, pane_id)
-                };
-                if !target_exists || !sidebar::activate_tab(&tab_list, &state, &term_stack, tab_id)
-                {
+                if !views::focus_attention_target(&state, &tab_list, &term_stack, tab_id, pane_id) {
                     show_error_toast("Attention target is no longer available");
-                    return;
-                }
-                if let Some(terminal) = get_active_terminal(&state) {
-                    terminal.grab_focus();
                 }
             }
         });

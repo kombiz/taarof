@@ -233,21 +233,33 @@ pub(crate) fn attention_targets_at(
     let mut targets = Vec::new();
     for workspace in &state.workspaces {
         for tab in &workspace.tabs {
+            let has_notification = state.tab_needs_attention(tab);
+            let notification_pane_id =
+                has_notification.then_some(tab.notification_pane_id.unwrap_or(tab.focused_pane_id));
             let mut pane_ids = tab
                 .pane_agent_activity
                 .keys()
                 .chain(tab.pane_turn.keys())
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>();
+            pane_ids.extend(notification_pane_id);
             pane_ids.retain(|pane_id| tab.panes.contains_pane(*pane_id));
 
-            let target_start = targets.len();
             for pane_id in pane_ids {
-                let Some(mut evidence) = pane_attention_evidence_at(tab, pane_id, now_unix_ms)
-                else {
+                let canonical = pane_attention_evidence_at(tab, pane_id, now_unix_ms);
+                let generic_notification =
+                    (notification_pane_id == Some(pane_id)).then_some(AttentionEvidence {
+                        reason: AttentionReason::Unknown,
+                        provider: None,
+                        provenance: "system_notification",
+                        authority: AttentionAuthority::System,
+                        freshness: AttentionFreshness::Unknown,
+                        last_verified_unix_ms: None,
+                    });
+                let Some(mut evidence) = canonical.or(generic_notification) else {
                     continue;
                 };
-                if evidence.provider.is_none() {
+                if evidence.provider.is_none() && evidence.authority != AttentionAuthority::System {
                     evidence.provider = provider_hint(state, tab, pane_id);
                 }
                 targets.push(AttentionTarget {
@@ -268,37 +280,6 @@ pub(crate) fn attention_targets_at(
                     pane_id,
                     evidence,
                 });
-            }
-
-            if targets.len() == target_start && state.tab_needs_attention(tab) {
-                let pane_id = tab.notification_pane_id.unwrap_or(tab.focused_pane_id);
-                if tab.panes.contains_pane(pane_id) {
-                    targets.push(AttentionTarget {
-                        workspace_id: workspace.id,
-                        workspace_name: workspace.name.clone(),
-                        repository: workspace
-                            .repo_root
-                            .clone()
-                            .unwrap_or_else(|| workspace.name.clone()),
-                        worktree: workspace
-                            .working_tree_path
-                            .clone()
-                            .or_else(|| workspace.repo_root.clone())
-                            .unwrap_or_else(|| workspace.name.clone()),
-                        machine: pane_machine(workspace, tab, pane_id),
-                        tab_id: tab.id,
-                        tab_name: tab.name.clone(),
-                        pane_id,
-                        evidence: AttentionEvidence {
-                            reason: AttentionReason::Unknown,
-                            provider: None,
-                            provenance: "system_notification",
-                            authority: AttentionAuthority::System,
-                            freshness: AttentionFreshness::Unknown,
-                            last_verified_unix_ms: None,
-                        },
-                    });
-                }
             }
         }
     }
@@ -514,5 +495,50 @@ mod tests {
 
         assert!(state.refresh_attention_projection());
         assert!(!state.refresh_attention_projection());
+    }
+
+    #[test]
+    #[ignore = "requires an owned disposable GTK display"]
+    fn independent_generic_notification_stays_visible_beside_canonical_attention() {
+        gtk::init().expect("owned GTK display");
+        let mut state = crate::AppState::new();
+        let canonical_pane = 41;
+        let generic_pane = 42;
+        let mut tab = tab_with(7, canonical_pane);
+        tab.panes = Box::new(PaneNode::Split {
+            direction: crate::pane::SplitDirection::Horizontal,
+            first: Box::new(PaneNode::Stub {
+                pane_id: canonical_pane,
+            }),
+            second: Box::new(PaneNode::Stub {
+                pane_id: generic_pane,
+            }),
+            widget: gtk::Paned::new(gtk::Orientation::Horizontal),
+        });
+        tab.set_pane_agent_activity(
+            canonical_pane,
+            AgentActivity::socket(
+                AgentActivityState::WaitingInput,
+                "waiting for input",
+                Some("codex".into()),
+            ),
+        );
+        tab.needs_attention = true;
+        tab.notification_msg = Some("generic notification".into());
+        tab.notification_pane_id = Some(generic_pane);
+        state.workspaces[0].tabs.push(tab);
+
+        let targets = attention_targets_at(&state, crate::events::unix_time_ms());
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.pane_id, target.evidence.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (canonical_pane, AttentionReason::WaitingInput),
+                (generic_pane, AttentionReason::Unknown),
+            ]
+        );
+        assert_eq!(targets[1].evidence.authority, AttentionAuthority::System);
     }
 }

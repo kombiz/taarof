@@ -1034,13 +1034,41 @@ fn build_active_alerts(state: &AppState, ingredients: &StateSnapshotIngredients)
                 "tab_id": target.tab_id,
                 "tab_name": target.tab_name,
                 "pane_id": target.pane_id,
-                "message": state.tab_notification_message(tab).unwrap_or(&tab.name),
+                "message": active_alert_message(state, tab, target),
                 "agent_running": tab.pane_lifecycle(target.pane_id).is_working(),
                 "agent_activity": tab.pane_agent_activity(target.pane_id).map(agent_activity_payload),
                 "attention": attention_evidence_payload(&target.evidence),
             }))
         })
         .collect()
+}
+
+fn active_alert_message<'a>(
+    state: &'a AppState,
+    tab: &'a Tab,
+    target: &crate::attention::AttentionTarget,
+) -> &'a str {
+    let verified_signal = (target.evidence.freshness
+        == crate::attention::AttentionFreshness::Fresh
+        && target.evidence.reason != crate::attention::AttentionReason::Unknown
+        && matches!(
+            target.evidence.authority,
+            crate::attention::AttentionAuthority::ProviderExplicit
+                | crate::attention::AttentionAuthority::TerminalHeuristic
+        ))
+    .then(|| tab.pane_agent_activity(target.pane_id))
+    .flatten()
+    .map(|activity| activity.text.as_str());
+    let exact_notification = (target.evidence.authority
+        == crate::attention::AttentionAuthority::System)
+        .then(|| {
+            let notification_pane_id = tab.notification_pane_id.unwrap_or(tab.focused_pane_id);
+            (notification_pane_id == target.pane_id)
+                .then(|| state.tab_notification_message(tab))
+                .flatten()
+        })
+        .flatten();
+    verified_signal.or(exact_notification).unwrap_or(&tab.name)
 }
 
 fn runtime_probe_payload(state: &AppState, ingredients: &StateSnapshotIngredients) -> Value {
@@ -1442,9 +1470,9 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_badge_payload, agent_entry_payload, build_health_snapshot_from_parts,
-        host_status_payload, pane_attach_metadata, pane_payload_from_data,
-        pane_process_state_for_snapshot, runtime_probe_health_components,
+        agent_badge_payload, agent_entry_payload, build_active_alerts,
+        build_health_snapshot_from_parts, host_status_payload, pane_attach_metadata,
+        pane_payload_from_data, pane_process_state_for_snapshot, runtime_probe_health_components,
         runtime_probe_payload_from_truth, tab_payload, tmux_probe_payload, transcript_payload,
         PaneAttachWireKind, PanePayloadData, StateSnapshotIngredients,
     };
@@ -1750,6 +1778,76 @@ mod tests {
             tab["agent_activity"]["observed_at_unix_ms"],
             pane_attention["last_verified_unix_ms"]
         );
+    }
+
+    #[test]
+    fn active_alert_messages_stay_scoped_to_their_exact_panes() {
+        let mut state = AppState::new();
+        let workspace_id = state.active_workspace;
+        let (tab_id, first_pane) = crate::seed_headless_terminal_tab(
+            &mut state,
+            workspace_id,
+            "two requesting agents",
+            HeadlessPaneSeed::default(),
+        )
+        .expect("headless tab should be seeded");
+        let second_pane = first_pane + 1;
+        let tab = state.find_tab_mut(tab_id).expect("seeded tab");
+        tab.set_pane_agent_activity(
+            first_pane,
+            AgentActivity::socket(
+                AgentActivityState::WaitingInput,
+                "first pane needs input",
+                Some("codex".into()),
+            ),
+        );
+        tab.set_pane_agent_activity(
+            second_pane,
+            AgentActivity::socket(
+                AgentActivityState::Errored,
+                "second pane failed",
+                Some("claude".into()),
+            ),
+        );
+        tab.notification_msg = Some("most recent sibling message".into());
+
+        let target = |pane_id, reason, provider: &str| crate::attention::AttentionTarget {
+            workspace_id,
+            workspace_name: "default".into(),
+            repository: "repository".into(),
+            worktree: "worktree".into(),
+            machine: "machine".into(),
+            tab_id,
+            tab_name: "two requesting agents".into(),
+            pane_id,
+            evidence: crate::attention::AttentionEvidence {
+                reason,
+                provider: Some(provider.into()),
+                provenance: "socket",
+                authority: crate::attention::AttentionAuthority::ProviderExplicit,
+                freshness: crate::attention::AttentionFreshness::Fresh,
+                last_verified_unix_ms: Some(crate::events::unix_time_ms()),
+            },
+        };
+        let ingredients = StateSnapshotIngredients {
+            attention_targets: vec![
+                target(
+                    first_pane,
+                    crate::attention::AttentionReason::WaitingInput,
+                    "codex",
+                ),
+                target(
+                    second_pane,
+                    crate::attention::AttentionReason::Error,
+                    "claude",
+                ),
+            ],
+            ..empty_ingredients()
+        };
+
+        let alerts = build_active_alerts(&state, &ingredients);
+        assert_eq!(alerts[0]["message"], "first pane needs input");
+        assert_eq!(alerts[1]["message"], "second pane failed");
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {
