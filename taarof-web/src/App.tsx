@@ -25,6 +25,12 @@ import { AgentsView } from "./components/AgentsView";
 import { selectPane, selectStage, selectTab, viewModeFromHash } from "./components/PaneStage.helpers";
 import { Sidebar } from "./components/Sidebar";
 import { TokenGate } from "./components/TokenGate";
+import {
+  DatasetRefreshScheduler,
+  RefreshRequestTimeoutError,
+  classifyEventRefreshDomains,
+  runGuardedRefresh,
+} from "./refreshScheduler";
 import type {
   AgentSessionsSnapshot,
   DashboardSnapshot,
@@ -149,9 +155,12 @@ export function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [areAgentSessionsLoading, setAreAgentSessionsLoading] = useState(false);
   const [agentSessionsError, setAgentSessionsError] = useState<string | null>(null);
-  const [refreshNonce, setRefreshNonce] = useState(0);
+  const [paneRefreshGeneration, setPaneRefreshGeneration] = useState(0);
   const [isNavOpen, setIsNavOpen] = useState(false);
   const navigationTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const refreshGenerationRef = useRef(0);
+  const stateRefreshRef = useRef<DatasetRefreshScheduler | null>(null);
+  const agentSessionsRefreshRef = useRef<DatasetRefreshScheduler | null>(null);
 
   const selectedStage = selectStage(snapshot, {
     workspaceId: selectedWorkspaceId,
@@ -162,7 +171,17 @@ export function App() {
   const dashboard = selectedDashboard(snapshot);
   const agentJobs = snapshot?.agent_jobs ?? [];
 
+  function advanceRefreshGeneration() {
+    refreshGenerationRef.current += 1;
+    stateRefreshRef.current?.dispose();
+    agentSessionsRefreshRef.current?.dispose();
+    stateRefreshRef.current = null;
+    agentSessionsRefreshRef.current = null;
+    return refreshGenerationRef.current;
+  }
+
   function handleUnauthorized(message: string) {
+    advanceRefreshGeneration();
     clearStoredToken();
     setSnapshot(null);
     setAgentSessions(null);
@@ -180,6 +199,9 @@ export function App() {
   }
 
   useEffect(() => {
+    const generation = advanceRefreshGeneration();
+    const isCurrent = () => refreshGenerationRef.current === generation;
+
     if (!token) {
       setSnapshot(null);
       setAgentSessions(null);
@@ -192,95 +214,79 @@ export function App() {
       setLoadError(null);
       setAgentSessionsError(null);
       setIsNavOpen(false);
-      return;
+      return () => {
+        if (isCurrent()) refreshGenerationRef.current += 1;
+      };
     }
 
-    let isCancelled = false;
-    const abortController = new AbortController();
-
-    setIsLoading(true);
-    setLoadError(null);
-
-    fetchState(token, abortController.signal)
-      .then((nextSnapshot) => {
-        if (isCancelled) {
-          return;
-        }
-        startTransition(() => {
+    const stateRefresh = new DatasetRefreshScheduler((signal) =>
+      runGuardedRefresh({
+        signal,
+        isCurrent,
+        load: () => fetchState(token, signal),
+        enqueueWrite: (write) => startTransition(write),
+        onLoading: setIsLoading,
+        onSuccess: (nextSnapshot) => {
           setSnapshot(nextSnapshot);
-        });
-      })
-      .catch((error: unknown) => {
-        if (isCancelled) {
-          return;
-        }
-        if (error instanceof ApiUnauthorizedError) {
+          setPaneRefreshGeneration((current) => current + 1);
+        },
+        onError: (error) => {
+          setLoadError(
+            error === null
+              ? null
+              : error instanceof RefreshRequestTimeoutError
+                ? "Refreshing taarof state timed out. Displaying the last snapshot."
+                : error instanceof Error
+                  ? error.message
+                  : "Failed to load taarof state.",
+          );
+        },
+        isUnauthorized: (error) => error instanceof ApiUnauthorizedError,
+        onUnauthorized: () => {
           handleUnauthorized("The taarof token was rejected. Paste a current token.");
-          return;
-        }
-        if (error instanceof DOMException && error.name === "AbortError") {
-          return;
-        }
-        setLoadError(error instanceof Error ? error.message : "Failed to load taarof state.");
-      })
-      .finally(() => {
-        if (!isCancelled) {
-          setIsLoading(false);
-        }
-      });
+        },
+      }),
+    );
+    const agentSessionsRefresh = new DatasetRefreshScheduler((signal) =>
+      runGuardedRefresh({
+        signal,
+        isCurrent,
+        load: () => fetchAgentSessions(token, signal),
+        enqueueWrite: (write) => startTransition(write),
+        onLoading: setAreAgentSessionsLoading,
+        onSuccess: setAgentSessions,
+        onError: (error) => {
+          setAgentSessionsError(
+            error === null
+              ? null
+              : error instanceof RefreshRequestTimeoutError
+                ? "Refreshing recent agent sessions timed out. Displaying the last catalog."
+                : error instanceof Error
+                  ? error.message
+                  : "Failed to load recent agent sessions.",
+          );
+        },
+        isUnauthorized: (error) => error instanceof ApiUnauthorizedError,
+        onUnauthorized: () => {
+          handleUnauthorized("The taarof token was rejected. Paste a current token.");
+        },
+      }),
+    );
+    stateRefreshRef.current = stateRefresh;
+    agentSessionsRefreshRef.current = agentSessionsRefresh;
+    stateRefresh.invalidate({ immediate: true });
+    agentSessionsRefresh.invalidate({ immediate: true });
 
     return () => {
-      isCancelled = true;
-      abortController.abort();
+      stateRefresh.dispose();
+      agentSessionsRefresh.dispose();
+      if (stateRefreshRef.current === stateRefresh) stateRefreshRef.current = null;
+      if (agentSessionsRefreshRef.current === agentSessionsRefresh) {
+        agentSessionsRefreshRef.current = null;
+      }
+      if (isCurrent()) refreshGenerationRef.current += 1;
     };
-  }, [token, refreshNonce]);
-
-  useEffect(() => {
-    if (!token) {
-      return;
-    }
-
-    let isCancelled = false;
-    const abortController = new AbortController();
-
-    setAreAgentSessionsLoading(true);
-    setAgentSessionsError(null);
-
-    fetchAgentSessions(token, abortController.signal)
-      .then((nextSnapshot) => {
-        if (isCancelled) {
-          return;
-        }
-        startTransition(() => {
-          setAgentSessions(nextSnapshot);
-        });
-      })
-      .catch((error: unknown) => {
-        if (isCancelled) {
-          return;
-        }
-        if (error instanceof ApiUnauthorizedError) {
-          handleUnauthorized("The taarof token was rejected. Paste a current token.");
-          return;
-        }
-        if (error instanceof DOMException && error.name === "AbortError") {
-          return;
-        }
-        setAgentSessionsError(
-          error instanceof Error ? error.message : "Failed to load recent agent sessions.",
-        );
-      })
-      .finally(() => {
-        if (!isCancelled) {
-          setAreAgentSessionsLoading(false);
-        }
-      });
-
-    return () => {
-      isCancelled = true;
-      abortController.abort();
-    };
-  }, [token, refreshNonce]);
+  }, [token]);
 
   useEffect(() => {
     if (!token) {
@@ -288,25 +294,19 @@ export function App() {
     }
 
     const socket = new WebSocket(buildEventsWebSocketUrl(token));
-    let refreshTimer: number | null = null;
-
-    function scheduleRefresh() {
-      if (refreshTimer !== null) {
-        window.clearTimeout(refreshTimer);
+    function scheduleRefresh(event: MessageEvent) {
+      for (const domain of classifyEventRefreshDomains(event.data)) {
+        if (domain === "state") {
+          stateRefreshRef.current?.invalidate();
+        } else {
+          agentSessionsRefreshRef.current?.invalidate();
+        }
       }
-      refreshTimer = window.setTimeout(() => {
-        startTransition(() => {
-          setRefreshNonce((current) => current + 1);
-        });
-      }, 150);
     }
 
     socket.addEventListener("message", scheduleRefresh);
 
     return () => {
-      if (refreshTimer !== null) {
-        window.clearTimeout(refreshTimer);
-      }
       socket.removeEventListener("message", scheduleRefresh);
       socket.close();
     };
@@ -365,12 +365,13 @@ export function App() {
     }
 
     storeToken(nextToken);
+    advanceRefreshGeneration();
     setToken(nextToken);
     setTokenError(null);
-    setRefreshNonce((current) => current + 1);
   }
 
   function handleResetToken() {
+    advanceRefreshGeneration();
     clearStoredToken();
     setSnapshot(null);
     setToken(null);
@@ -409,7 +410,9 @@ export function App() {
   }
 
   function handleRefresh() {
-    setRefreshNonce((current) => current + 1);
+    stateRefreshRef.current?.invalidate({ immediate: true });
+    agentSessionsRefreshRef.current?.invalidate({ immediate: true });
+    setPaneRefreshGeneration((current) => current + 1);
   }
 
   function handleSelectLiveTarget(
@@ -659,7 +662,7 @@ export function App() {
                 selectedPaneId={selectedPane?.pane_id ?? null}
                 onSelectPane={handleSelectPane}
                 onUnauthorized={handleUnauthorized}
-                refreshGeneration={refreshNonce}
+                refreshGeneration={paneRefreshGeneration}
               />
             </Suspense>
           </LazyTerminalViewBoundary>

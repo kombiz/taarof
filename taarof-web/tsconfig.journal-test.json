@@ -9,6 +9,8 @@
     "types": []
   },
   "include": [
+    "src/refreshScheduler.ts",
+    "src/refreshScheduler.test.ts",
     "src/monitorBoard.test.ts",
     "src/monitorPaneJournal.ts",
     "src/monitorPaneJournal.test.ts",
