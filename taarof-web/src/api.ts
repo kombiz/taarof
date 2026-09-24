@@ -5,6 +5,7 @@ import type {
   HistoryPage,
   TaarofStateSnapshot,
 } from "./types.js";
+import type { EventPage } from "./eventRecovery.js";
 
 export class ApiUnauthorizedError extends Error {
   constructor(message = "taarof bearer token was rejected") {
@@ -93,6 +94,44 @@ export async function fetchAgentSessions(
   });
 
   return parseEnvelope<AgentSessionsSnapshot>(response);
+}
+
+export interface RuntimeIdentityResponse {
+  schema: string;
+  runtime_id: string;
+  session_name: string;
+  identity: unknown;
+}
+
+export async function fetchRuntimeIdentity(
+  token: string,
+  signal?: AbortSignal,
+): Promise<RuntimeIdentityResponse> {
+  const response = await fetch("/api/v1/runtime-identity", {
+    signal,
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+  return parseEnvelope<RuntimeIdentityResponse>(response);
+}
+
+export async function fetchEvents(
+  token: string,
+  sinceSeq: number,
+  signal?: AbortSignal,
+): Promise<EventPage> {
+  const query = new URLSearchParams({
+    since_seq: String(sinceSeq),
+    limit: "256",
+  });
+  const response = await fetch(`/api/v1/events?${query.toString()}`, {
+    signal,
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+  return parseEnvelope<EventPage>(response);
 }
 
 export async function fetchHistory(
