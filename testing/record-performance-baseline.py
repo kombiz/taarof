@@ -35,13 +35,34 @@ CONTRACTS = {
 
 
 def command_output(*command: str, cwd: Path | None = None) -> str:
-    return subprocess.run(
+    result = subprocess.run(
         command,
         cwd=cwd,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
-    ).stdout.strip()
+    )
+    if result.returncode != 0:
+        executable = Path(command[0]).name
+        message = f"{executable} exited with status {result.returncode}"
+        # The recorder's Git commands carry no credentials. Include only their
+        # bounded stderr so CI can distinguish trust/ownership failures without
+        # echoing captured stdout or arbitrary subprocess arguments.
+        if executable == "git":
+            detail = " ".join(result.stderr.split())
+            if len(detail) > 500:
+                detail = detail[:497] + "..."
+            if detail:
+                message += f": {detail}"
+        raise RuntimeError(message)
+    return result.stdout.strip()
+
+
+def source_identity(repo: Path) -> tuple[str, bool]:
+    return (
+        command_output("git", "rev-parse", "HEAD", cwd=repo),
+        bool(command_output("git", "status", "--porcelain", cwd=repo)),
+    )
 
 
 def cpu_model() -> str:
@@ -107,8 +128,7 @@ def record(
     ci_base_sha: str | None,
 ) -> dict[str, object]:
     repo = Path(__file__).resolve().parents[1]
-    source_sha = command_output("git", "rev-parse", "HEAD", cwd=repo)
-    source_dirty = bool(command_output("git", "status", "--porcelain", cwd=repo))
+    source_sha, source_dirty = source_identity(repo)
     workloads = []
     for workload, contract in CONTRACTS.items():
         iterations = int(contract["iterations"])

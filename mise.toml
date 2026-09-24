@@ -73,6 +73,7 @@ run = [
 [tasks.performance]
 description = "Run and validate the reproducible release performance workloads"
 run = [
+  "python3 testing/test_performance_baseline.py",
   "cargo build --release --manifest-path taarof-app/Cargo.toml --example performance_harness --features harness",
   "cargo test --manifest-path taarof-app/Cargo.toml --features harness --lib performance::",
   'python3 testing/record-performance-baseline.py --binary "${CARGO_TARGET_DIR:-taarof-app/target}/release/examples/performance_harness" --output "${PERFORMANCE_BASELINE_OUTPUT:-taarof-app/target/performance-baseline.json}"',

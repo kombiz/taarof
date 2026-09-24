@@ -135,6 +135,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # The container runs as root over a workspace owned by the runner user.
+      # actions/checkout marks it safe under a temporary HOME only; later Git
+      # provenance reads need the exact workspace trusted in the restored HOME.
+      - name: Trust the checkout for performance provenance
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -173,6 +179,7 @@ jobs:
 
       - name: Run performance correctness gate
         run: |
+          python3 testing/test_performance_baseline.py
           cargo build --release --manifest-path taarof-app/Cargo.toml --example performance_harness --features harness
           cargo test --manifest-path taarof-app/Cargo.toml --features harness --lib performance::
           python3 testing/record-performance-baseline.py \
