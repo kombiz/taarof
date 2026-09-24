@@ -412,6 +412,7 @@ impl AppState {
             listening_ports_updated_at_unix_ms: None,
             socket_agent_activity: None,
             pane_agent_activity: HashMap::new(),
+            pane_explicit_observation: HashMap::new(),
             agent_activity: None,
             needs_attention: false,
             notified: false,
@@ -1166,7 +1167,7 @@ impl RuntimeHandle {
 
         let (focus_terminal, deferred_stack_widget) =
             remove_pane_from_tree(&mut tab.panes, pane_id, term_stack, stack_name);
-        tab.clear_pane_agent_activity(pane_id);
+        tab.reset_pane_agent_activity_evidence(pane_id);
         tab.focused_pane_id = first_pane_id(&tab.panes).unwrap_or(0);
 
         Some(ClosedPaneState {
@@ -1214,6 +1215,7 @@ fn build_terminal_tab(tab_id: u32, registration: TerminalTabRegistration) -> Tab
         listening_ports_updated_at_unix_ms: None,
         socket_agent_activity: None,
         pane_agent_activity: HashMap::new(),
+        pane_explicit_observation: HashMap::new(),
         agent_activity: None,
         needs_attention: false,
         notified: false,

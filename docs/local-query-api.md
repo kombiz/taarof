@@ -250,6 +250,9 @@ volume does not affect their ordering.
 Expired evidence stays visible as `unknown`/`stale` until replaced or removed.
 Disagreeing fresh signals stay visible as `unknown`/`conflicting`. A generic
 notification has system authority, no inferred provider, and unknown freshness.
+When a tab-scoped generic notification has no recorded pane origin, its
+`pane_id` is the tab's focused pane as a navigation fallback; it is not proof
+that the notification originated in that pane.
 
 #### Pane transcript object
 

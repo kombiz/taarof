@@ -1101,6 +1101,7 @@ mod tests {
             listening_ports_updated_at_unix_ms: None,
             socket_agent_activity: None,
             pane_agent_activity: HashMap::new(),
+            pane_explicit_observation: HashMap::new(),
             agent_activity: None,
             needs_attention: false,
             notified: false,

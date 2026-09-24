@@ -3196,6 +3196,11 @@ fn handle_agent_status_message(
 
         match activity_state {
             SocketActivityState::Idle => {
+                tab.note_explicit_pane_idle(
+                    pane_id,
+                    source.map(str::to_string),
+                    crate::workspace::AgentActivityOrigin::Socket,
+                );
                 tab.set_pane_agent_activity(pane_id, None);
                 tab.clear_pane_notification(pane_id);
                 if should_clear_tab_attention && !retarget_tab_attention_to_remaining_activity(tab)
@@ -3301,14 +3306,11 @@ fn schedule_done_activity_clear(
             let Some(tab) = st.find_tab_mut(tab_id) else {
                 return;
             };
-            tab.clear_pane_agent_activity_if(pane_id, |activity| {
-                matches!(activity.state, AgentActivityState::Done)
-                    && matches!(
-                        activity.origin,
-                        crate::workspace::AgentActivityOrigin::Socket
-                    )
-                    && activity.updated_at == done_at
-            })
+            tab.prune_done_pane_agent_activity(
+                pane_id,
+                crate::workspace::AgentActivityOrigin::Socket,
+                done_at,
+            )
         };
 
         if should_refresh {
@@ -5798,6 +5800,7 @@ mod tests {
             listening_ports_updated_at_unix_ms: None,
             socket_agent_activity: None,
             pane_agent_activity: HashMap::new(),
+            pane_explicit_observation: HashMap::new(),
             agent_activity: None,
             needs_attention: false,
             notified: false,
@@ -5833,6 +5836,7 @@ mod tests {
             listening_ports_updated_at_unix_ms: None,
             socket_agent_activity: None,
             pane_agent_activity: HashMap::new(),
+            pane_explicit_observation: HashMap::new(),
             agent_activity: None,
             needs_attention: false,
             notified: false,

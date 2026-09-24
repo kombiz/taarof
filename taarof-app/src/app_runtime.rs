@@ -524,6 +524,19 @@ pub(crate) fn update_agent_indicators(
 ///
 /// Structurally mirrors [`update_agent_indicators`]: a single-flight guard
 /// coalesces overlapping ticks, and the heavy work crosses to `gio::spawn_blocking`.
+fn apply_transcript_turn_for_session(
+    tab: &mut crate::workspace::Tab,
+    pane_id: u32,
+    previous_session_id: Option<&str>,
+    next_session_id: &str,
+    turn: crate::agents::PaneTurn,
+) {
+    if previous_session_id.is_some_and(|previous| previous != next_session_id) {
+        tab.clear_retired_pane_explicit_observation(pane_id);
+    }
+    tab.set_pane_turn(pane_id, turn);
+}
+
 pub(crate) fn update_pane_transcripts(
     runtime: &RuntimeHandle,
     tracker: &Arc<crate::agents::TranscriptTracker>,
@@ -594,9 +607,19 @@ pub(crate) fn update_pane_transcripts(
                 // transcript record's own timestamp, so replayed history is
                 // already stale on arrival and cannot fake live work.
                 let turn = tick.state.turn;
+                let previous_session_id = st
+                    .pane_transcripts
+                    .get(&tick.key)
+                    .map(|previous| previous.session_id.clone());
                 if let Some(tab) = st.find_tab_mut(tick.key.0) {
                     let before = tab.pane_lifecycle(tick.key.1);
-                    tab.set_pane_turn(tick.key.1, turn);
+                    apply_transcript_turn_for_session(
+                        tab,
+                        tick.key.1,
+                        previous_session_id.as_deref(),
+                        &tick.state.session_id,
+                        turn,
+                    );
                     let after = tab.pane_lifecycle(tick.key.1);
                     if let Some(mut payload) = crate::events::agent_activity_transition_payload(
                         tick.key.0,
@@ -609,13 +632,11 @@ pub(crate) fn update_pane_transcripts(
                         transition_events.push(payload);
                     }
                 }
-                let previous = st.pane_transcripts.get(&tick.key);
                 // The tracker marks first discovery and agent-session switches
                 // explicitly. Cache those folded states, including an empty
                 // transcript, but never replay their history as current work.
                 let same_session = !tick.baseline
-                    && previous
-                        .is_some_and(|previous| previous.session_id == tick.state.session_id);
+                    && previous_session_id.as_deref() == Some(tick.state.session_id.as_str());
                 let work_events = if same_session {
                     tick.work_events
                         .iter()
@@ -706,7 +727,10 @@ pub(crate) fn update_pane_transcripts(
 
 #[cfg(test)]
 mod tests {
-    use super::focus_pane_notification;
+    use super::{apply_transcript_turn_for_session, focus_pane_notification};
+    use crate::agents::{PaneTurn, TurnPhase};
+    use crate::attention::{pane_attention_evidence_at, AttentionReason};
+    use crate::workspace::{AgentActivity, AgentActivityOrigin, AgentActivityState};
 
     #[test]
     fn focus_pane_notification_targets_the_driving_pane() {
@@ -725,5 +749,123 @@ mod tests {
         let (action, notif_id) = focus_pane_notification(3, None, 8);
         assert_eq!(action, "app.focus-pane::3:8");
         assert_eq!(notif_id, "tab-attention-3");
+    }
+
+    #[test]
+    fn provider_session_replacement_drops_only_retired_explicit_evidence() {
+        let now = crate::events::unix_time_ms();
+        let mut state = crate::AppState::new();
+        let workspace_id = state.active_workspace;
+        let (tab_id, pane_id) = crate::seed_headless_terminal_tab(
+            &mut state,
+            workspace_id,
+            "session switch",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .expect("headless pane");
+        let tab = state.find_tab_mut(tab_id).expect("seeded tab");
+        let mut done =
+            AgentActivity::socket(AgentActivityState::Done, "done", Some("codex".into()))
+                .expect("done activity");
+        done.observed_at_unix_ms = now;
+        let done_at = done.updated_at;
+        tab.set_pane_agent_activity(pane_id, Some(done));
+        assert!(tab.prune_done_pane_agent_activity(pane_id, AgentActivityOrigin::Socket, done_at,));
+
+        apply_transcript_turn_for_session(
+            tab,
+            pane_id,
+            Some("old-session"),
+            "new-session",
+            PaneTurn::new(TurnPhase::Errored, now - 1),
+        );
+
+        let evidence =
+            pane_attention_evidence_at(tab, pane_id, now).expect("new session transcript error");
+        assert_eq!(evidence.reason, AttentionReason::Error);
+        assert!(tab.pane_explicit_observation(pane_id).is_none());
+    }
+
+    #[test]
+    fn first_discovery_and_current_explicit_signal_preserve_ordering_evidence() {
+        let now = crate::events::unix_time_ms();
+        let mut state = crate::AppState::new();
+        let workspace_id = state.active_workspace;
+        let (tab_id, pane_id) = crate::seed_headless_terminal_tab(
+            &mut state,
+            workspace_id,
+            "initial discovery",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .expect("headless pane");
+        let tab = state.find_tab_mut(tab_id).expect("seeded tab");
+        let mut done =
+            AgentActivity::socket(AgentActivityState::Done, "done", Some("codex".into()))
+                .expect("done activity");
+        done.observed_at_unix_ms = now;
+        let done_at = done.updated_at;
+        tab.set_pane_agent_activity(pane_id, Some(done));
+        assert!(tab.prune_done_pane_agent_activity(pane_id, AgentActivityOrigin::Socket, done_at,));
+        apply_transcript_turn_for_session(
+            tab,
+            pane_id,
+            None,
+            "first-session",
+            PaneTurn::new(TurnPhase::Errored, now - 1),
+        );
+        assert!(pane_attention_evidence_at(tab, pane_id, now).is_none());
+
+        let mut waiting = AgentActivity::socket(
+            AgentActivityState::WaitingInput,
+            "waiting for input",
+            Some("codex".into()),
+        )
+        .expect("waiting activity");
+        waiting.observed_at_unix_ms = now;
+        tab.set_pane_agent_activity(pane_id, Some(waiting));
+        apply_transcript_turn_for_session(
+            tab,
+            pane_id,
+            Some("first-session"),
+            "replacement-session",
+            PaneTurn::new(TurnPhase::Errored, now - 1),
+        );
+        let evidence =
+            pane_attention_evidence_at(tab, pane_id, now).expect("current explicit waiting signal");
+        assert_eq!(evidence.reason, AttentionReason::WaitingInput);
+    }
+
+    #[test]
+    fn provider_session_replacement_drops_expired_stored_signal() {
+        let now = crate::events::unix_time_ms();
+        let mut state = crate::AppState::new();
+        let workspace_id = state.active_workspace;
+        let (tab_id, pane_id) = crate::seed_headless_terminal_tab(
+            &mut state,
+            workspace_id,
+            "expired old session",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .expect("headless pane");
+        let tab = state.find_tab_mut(tab_id).expect("seeded tab");
+        let mut running =
+            AgentActivity::socket(AgentActivityState::Running, "working", Some("codex".into()))
+                .expect("running activity");
+        running.updated_at = std::time::Instant::now() - std::time::Duration::from_secs(9);
+        running.observed_at_unix_ms = now;
+        tab.set_pane_agent_activity(pane_id, Some(running));
+
+        apply_transcript_turn_for_session(
+            tab,
+            pane_id,
+            Some("old-session"),
+            "new-session",
+            PaneTurn::new(TurnPhase::Errored, now - 1),
+        );
+
+        let evidence =
+            pane_attention_evidence_at(tab, pane_id, now).expect("new session transcript error");
+        assert_eq!(evidence.reason, AttentionReason::Error);
+        assert!(tab.pane_explicit_observation(pane_id).is_none());
     }
 }

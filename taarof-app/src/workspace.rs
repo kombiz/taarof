@@ -78,6 +78,38 @@ pub struct AgentActivity {
     pub observed_at_unix_ms: u64,
 }
 
+/// Last provider-explicit observation for a pane, retained independently of
+/// the short-lived activity badge. This is ordering evidence only: it cannot
+/// create an attention row by itself.
+#[derive(Clone, Debug)]
+pub(crate) struct PaneExplicitObservation {
+    pub state: AgentActivityState,
+    pub source: Option<String>,
+    pub origin: AgentActivityOrigin,
+    pub updated_at: Instant,
+    pub observed_at_unix_ms: u64,
+}
+
+impl PaneExplicitObservation {
+    fn from_activity(activity: &AgentActivity) -> Option<Self> {
+        matches!(
+            activity.origin,
+            AgentActivityOrigin::Socket | AgentActivityOrigin::Termprop
+        )
+        .then(|| Self {
+            state: activity.state,
+            source: activity.source.clone(),
+            origin: activity.origin,
+            updated_at: activity.updated_at,
+            observed_at_unix_ms: activity.observed_at_unix_ms,
+        })
+    }
+
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.updated_at.elapsed() < EXPLICIT_ACTIVITY_FRESHNESS
+    }
+}
+
 impl AgentActivity {
     fn build(
         state: AgentActivityState,
@@ -284,6 +316,9 @@ pub struct Tab {
     pub listening_ports_updated_at_unix_ms: Option<u64>,
     pub socket_agent_activity: Option<AgentActivity>,
     pub pane_agent_activity: HashMap<u32, AgentActivity>,
+    /// Provider-explicit ordering evidence that survives visible activity
+    /// expiry. Pane removal or child/session replacement resets it explicitly.
+    pub(crate) pane_explicit_observation: HashMap<u32, PaneExplicitObservation>,
     /// Native transcript turn evidence per pane, mirrored here from
     /// [`crate::AppState::pane_transcripts`] so tab-level state derivation
     /// needs nothing but the tab. See [`crate::agents::lifecycle`].
@@ -452,6 +487,9 @@ impl Tab {
 
     pub fn set_pane_agent_activity(&mut self, pane_id: u32, activity: Option<AgentActivity>) {
         if let Some(activity) = activity {
+            if let Some(observation) = PaneExplicitObservation::from_activity(&activity) {
+                self.pane_explicit_observation.insert(pane_id, observation);
+            }
             self.pane_agent_activity.insert(pane_id, activity);
         } else {
             self.pane_agent_activity.remove(&pane_id);
@@ -461,6 +499,61 @@ impl Tab {
 
     pub fn pane_agent_activity(&self, pane_id: u32) -> Option<&AgentActivity> {
         self.pane_agent_activity.get(&pane_id)
+    }
+
+    pub(crate) fn pane_explicit_observation(
+        &self,
+        pane_id: u32,
+    ) -> Option<&PaneExplicitObservation> {
+        self.pane_explicit_observation.get(&pane_id)
+    }
+
+    /// Forget retirement evidence from a replaced provider session once its
+    /// visible activity has already cleared. A current matching explicit
+    /// signal may belong to the newly discovered session and stays intact.
+    pub(crate) fn clear_retired_pane_explicit_observation(&mut self, pane_id: u32) -> bool {
+        let backed_by_current_signal = self
+            .pane_explicit_observation
+            .get(&pane_id)
+            .zip(self.pane_agent_activity.get(&pane_id))
+            .is_some_and(|(observation, activity)| {
+                activity.is_fresh()
+                    && matches!(
+                        activity.origin,
+                        AgentActivityOrigin::Socket | AgentActivityOrigin::Termprop
+                    )
+                    && observation.state == activity.state
+                    && observation.source == activity.source
+                    && observation.origin == activity.origin
+                    && observation.updated_at == activity.updated_at
+                    && observation.observed_at_unix_ms == activity.observed_at_unix_ms
+            });
+        !backed_by_current_signal && self.pane_explicit_observation.remove(&pane_id).is_some()
+    }
+
+    /// Record an explicit idle signal before removing the visible activity.
+    /// Clearing the badge must not erase the fact that this observation came
+    /// after an older transcript error.
+    pub(crate) fn note_explicit_pane_idle(
+        &mut self,
+        pane_id: u32,
+        source: Option<String>,
+        origin: AgentActivityOrigin,
+    ) {
+        debug_assert!(matches!(
+            origin,
+            AgentActivityOrigin::Socket | AgentActivityOrigin::Termprop
+        ));
+        self.pane_explicit_observation.insert(
+            pane_id,
+            PaneExplicitObservation {
+                state: AgentActivityState::Idle,
+                source,
+                origin,
+                updated_at: Instant::now(),
+                observed_at_unix_ms: crate::events::unix_time_ms(),
+            },
+        );
     }
 
     /// Decide whether a desktop notification should fire for a pane entering
@@ -511,12 +604,35 @@ impl Tab {
         matches
     }
 
+    pub(crate) fn prune_done_pane_agent_activity(
+        &mut self,
+        pane_id: u32,
+        origin: AgentActivityOrigin,
+        updated_at: Instant,
+    ) -> bool {
+        self.clear_pane_agent_activity_if(pane_id, |activity| {
+            matches!(activity.state, AgentActivityState::Done)
+                && activity.origin == origin
+                && activity.updated_at == updated_at
+        })
+    }
+
     pub fn clear_pane_agent_activity(&mut self, pane_id: u32) -> bool {
         let removed = self.pane_agent_activity.remove(&pane_id).is_some();
         if removed {
             self.refresh_agent_activity_summary();
         }
         removed
+    }
+
+    /// Reset evidence when the pane identity ends or is replaced. Ordinary
+    /// badge expiry deliberately uses `clear_pane_agent_activity` so the last
+    /// explicit observation remains available for transcript ordering.
+    pub(crate) fn reset_pane_agent_activity_evidence(&mut self, pane_id: u32) -> bool {
+        let activity_removed = self.clear_pane_agent_activity(pane_id);
+        let observation_removed = self.pane_explicit_observation.remove(&pane_id).is_some();
+        let turn_removed = self.clear_pane_turn(pane_id);
+        activity_removed || observation_removed || turn_removed
     }
 
     pub fn clear_pane_agent_activities_if(
@@ -683,6 +799,7 @@ mod tests {
             listening_ports_updated_at_unix_ms: None,
             socket_agent_activity: None,
             pane_agent_activity: HashMap::new(),
+            pane_explicit_observation: HashMap::new(),
             agent_activity: None,
             needs_attention: false,
             notified: false,
