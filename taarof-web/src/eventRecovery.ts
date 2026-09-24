@@ -47,7 +47,7 @@ interface EventRecoveryOptions {
   fetchRuntimeIdentity(signal: AbortSignal): Promise<string>;
   fetchEvents(cursor: number, signal: AbortSignal): Promise<EventPage>;
   recoverSnapshot(signal: AbortSignal): Promise<void>;
-  onEvent(data: string): void;
+  onEvent(data: string, source: "live" | "recovery"): void;
   onRecoveryBoundary(): void;
   onRuntimeReset(): void;
   onUnauthorized(): void;
@@ -320,7 +320,7 @@ export class EventRecoveryController {
         }
         const seq = eventSequence(data);
         if (seq === null) {
-          this.options.onEvent(data);
+          this.options.onEvent(data, "recovery");
           appliedAfterSnapshot = true;
           continue;
         }
@@ -331,7 +331,7 @@ export class EventRecoveryController {
           replayRequired = true;
           continue;
         }
-        this.options.onEvent(data);
+        this.options.onEvent(data, "recovery");
         this.cursor = seq;
         appliedAfterSnapshot = true;
       }
@@ -355,7 +355,7 @@ export class EventRecoveryController {
       snapshotFloor = Math.max(snapshotFloor, page.high_watermark);
       for (const record of page.events) {
         if (!Number.isSafeInteger(record.seq) || record.seq <= cursor) continue;
-        this.options.onEvent(JSON.stringify(record));
+        this.options.onEvent(JSON.stringify(record), "recovery");
         cursor = record.seq;
         this.cursor = cursor;
       }
@@ -375,7 +375,7 @@ export class EventRecoveryController {
     }
     const seq = eventSequence(data);
     if (seq === null) {
-      this.options.onEvent(data);
+      this.options.onEvent(data, "live");
       this.freshness = "stale";
       this.publishStatus();
       return;
@@ -386,7 +386,7 @@ export class EventRecoveryController {
       return;
     }
     if (seq <= this.cursor) return;
-    this.options.onEvent(data);
+    this.options.onEvent(data, "live");
     this.cursor = seq;
     this.freshness = "stale";
     this.publishStatus();

@@ -389,7 +389,8 @@ export function App() {
         (await fetchRuntimeIdentity(token, signal)).runtime_id,
       fetchEvents: (cursor, signal) => fetchEvents(token, cursor, signal),
       recoverSnapshot,
-      onEvent: (data) => {
+      onEvent: (data, source) => {
+        if (source === "recovery") return;
         for (const domain of classifyEventRefreshDomains(data)) {
           if (domain === "state") stateRefreshRef.current?.invalidate();
           else agentSessionsRefreshRef.current?.invalidate();
