@@ -174,17 +174,19 @@ pub(crate) fn pane_attention_evidence_at(
     });
 
     // A strictly newer provider-explicit observation supersedes an older
-    // transcript error. This also lets a newer Running or Done observation
-    // remove an obsolete Error target. Ties and timestamps that cannot be
-    // verified continue through the conservative conflict resolution below.
+    // transcript error. Preserve that established ordering after the shorter
+    // explicit-signal freshness window expires, so an obsolete Error does not
+    // reappear. Ties and timestamps that cannot be verified continue through
+    // the conservative conflict resolution below.
     if let (Some(signal), Some(turn)) = (signal, turn) {
         let signal_verified = verified_time(signal.observed_at_unix_ms, now_unix_ms);
         let turn_verified = verified_time(turn.at_unix_ms, now_unix_ms);
-        if signal.has_fresh_explicit_update()
-            && turn.is_fresh(now_unix_ms)
-            && signal_verified
-                .zip(turn_verified)
-                .is_some_and(|(signal_at, turn_at)| signal_at > turn_at)
+        if matches!(
+            signal.origin,
+            AgentActivityOrigin::Socket | AgentActivityOrigin::Termprop
+        ) && signal_verified
+            .zip(turn_verified)
+            .is_some_and(|(signal_at, turn_at)| signal_at > turn_at)
         {
             return signal_evidence;
         }
@@ -453,6 +455,54 @@ mod tests {
     }
 
     #[test]
+    fn expired_newer_explicit_waiting_does_not_resurrect_an_older_error() {
+        let mut tab = tab_with(7, 41);
+        let mut signal = AgentActivity::socket(
+            AgentActivityState::WaitingInput,
+            "waiting for input",
+            Some("codex".into()),
+        )
+        .expect("waiting activity");
+        signal.updated_at = Instant::now() - Duration::from_secs(9);
+        signal.observed_at_unix_ms = NOW - 9_000;
+        tab.set_pane_agent_activity(41, Some(signal));
+        tab.set_pane_turn(41, PaneTurn::new(TurnPhase::Errored, NOW - 10_000));
+
+        let evidence = pane_attention_evidence_at(&tab, 41, NOW).expect("stale evidence");
+        assert_eq!(evidence.reason, AttentionReason::Unknown);
+        assert_eq!(evidence.freshness, AttentionFreshness::Stale);
+        assert_eq!(evidence.last_verified_unix_ms, Some(NOW - 9_000));
+    }
+
+    #[test]
+    fn expired_newer_explicit_running_does_not_resurrect_an_older_error() {
+        let mut tab = tab_with(7, 41);
+        let mut signal =
+            AgentActivity::socket(AgentActivityState::Running, "working", Some("codex".into()))
+                .expect("running activity");
+        signal.updated_at = Instant::now() - Duration::from_secs(9);
+        signal.observed_at_unix_ms = NOW - 9_000;
+        tab.set_pane_agent_activity(41, Some(signal));
+        tab.set_pane_turn(41, PaneTurn::new(TurnPhase::Errored, NOW - 10_000));
+
+        assert!(pane_attention_evidence_at(&tab, 41, NOW).is_none());
+    }
+
+    #[test]
+    fn expired_newer_explicit_done_does_not_resurrect_an_older_error() {
+        let mut tab = tab_with(7, 41);
+        let mut signal =
+            AgentActivity::socket(AgentActivityState::Done, "done", Some("codex".into()))
+                .expect("done activity");
+        signal.updated_at = Instant::now() - Duration::from_secs(9);
+        signal.observed_at_unix_ms = NOW - 9_000;
+        tab.set_pane_agent_activity(41, Some(signal));
+        tab.set_pane_turn(41, PaneTurn::new(TurnPhase::Errored, NOW - 10_000));
+
+        assert!(pane_attention_evidence_at(&tab, 41, NOW).is_none());
+    }
+
+    #[test]
     fn equal_explicit_waiting_and_transcript_error_remain_conflicting() {
         let mut tab = tab_with(7, 41);
         let mut signal = AgentActivity::socket(
@@ -471,15 +521,16 @@ mod tests {
     }
 
     #[test]
-    fn generic_notification_remains_system_unknown_after_newer_running_supersedes_error() {
+    fn generic_notification_remains_system_unknown_after_expired_newer_running_supersedes_error() {
         let mut state = crate::AppState::new();
         let mut tab = tab_with(7, 41);
         let mut signal =
             AgentActivity::socket(AgentActivityState::Running, "working", Some("codex".into()))
                 .expect("running activity");
-        signal.observed_at_unix_ms = NOW;
+        signal.updated_at = Instant::now() - Duration::from_secs(9);
+        signal.observed_at_unix_ms = NOW - 9_000;
         tab.set_pane_agent_activity(41, Some(signal));
-        tab.set_pane_turn(41, PaneTurn::new(TurnPhase::Errored, NOW - 1));
+        tab.set_pane_turn(41, PaneTurn::new(TurnPhase::Errored, NOW - 10_000));
         tab.needs_attention = true;
         tab.notification_msg = Some("independent notification".into());
         tab.notification_pane_id = Some(41);
