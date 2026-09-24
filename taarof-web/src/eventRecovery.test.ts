@@ -452,3 +452,14 @@ test("terminal authorization failure and stop cancel retries and stale callbacks
   assertEqual(stopped.clock.timers.size, 0);
   assertEqual(stopped.sockets[0].closed, true);
 });
+
+test("socket close rotates refresh ownership before the auth probe or backoff", async () => {
+  const heldProbe = deferred<string>();
+  const closing = harness({ fetchRuntimeIdentity: () => heldProbe.promise });
+  closing.controller.start();
+  closing.sockets[0].disconnect();
+
+  assertEqual(closing.boundaries, 1, "disconnect must rotate generation synchronously");
+  assertEqual(closing.clock.timers.size, 1, "the held probe owns only its timeout timer");
+  closing.controller.stop();
+});

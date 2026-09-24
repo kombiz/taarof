@@ -398,9 +398,13 @@ export function App() {
       },
       onRecoveryBoundary: () => {
         schedulers = installRefreshSchedulers();
+        setIsLoading(false);
+        setAreAgentSessionsLoading(false);
       },
       onRuntimeReset: () => {
         schedulers = installRefreshSchedulers();
+        setIsLoading(false);
+        setAreAgentSessionsLoading(false);
       },
       onUnauthorized: () => {
         handleUnauthorized("The taarof token was rejected. Paste a current token.");

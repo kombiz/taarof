@@ -190,6 +190,7 @@ export class EventRecoveryController {
       this.recovering = false;
       this.recoveryController?.abort(new DOMException("Event socket closed.", "AbortError"));
       this.recoveryController = null;
+      this.options.onRecoveryBoundary();
       this.connection = "disconnected";
       this.freshness = "stale";
       this.publishStatus();
