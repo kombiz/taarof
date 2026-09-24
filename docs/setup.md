@@ -57,14 +57,59 @@ LTS. If the checkout is trusted by `mise`, the repository's standard path is:
 
 ```bash
 mise trust mise.toml
-mise run setup
-mise run install
+mise run install       # production from origin/main
+mise run install kmux  # development from origin/kmux
 ```
 
-`mise run install` builds the current checkout in release mode, builds the web
-client, records the build's source provenance, and installs the result. Re-run
-it after pulling to install the latest version, then restart Taarof. Use
-`mise run dev` to run a debug build from the checkout without installing it.
+### Installation channels
+
+| Install command | Public branch | Desktop command | Control CLI |
+| --- | --- | --- | --- |
+| `mise run install` | `kombiz/taarof:main` | `taarof-app` | `taarof` |
+| `mise run install kmux` | `kombiz/taarof:kmux` | `taarof-app-kmux` | `taarof-kmux` |
+
+`main` is the promoted production branch; `kmux` is the development branch of
+this same public repository. The installer rejects other origins. Each command
+fetches its branch, pins its commit, builds in a temporary detached worktree,
+checks artifact provenance, and installs only that channel. Your working branch
+and uncommitted changes are preserved. Internet access and the native build
+dependencies are required. The command is available from checkouts containing
+this installer; it can build older `main` revisions that predate the task.
+
+The default prefix is `~/.local`; for example,
+`mise run install kmux --prefix /absolute/path` changes it. The channels have
+separate binaries, web assets and provenance under `<prefix>/lib/taarof/main`
+and `<prefix>/lib/taarof/kmux`. Public launchers live in `<prefix>/bin`; menu
+entries are **Taarof** and **Taarof Development (kmux)**. Builds are cached under
+`${XDG_CACHE_HOME:-~/.cache}/taarof-install`. Failed builds leave the installed
+channel alone; unexpected changes in a build worktree are retained for inspection.
+
+Development always launches the existing named session `kmux`; production uses
+the default session. This separates GTK application identity, socket/registry,
+saved workspace layout and default history files. It does **not** copy existing
+production tabs into development. Both channels share your Taarof settings,
+provider authentication/history, projects and other configuration. No credentials
+are copied. Use the public launchers rather than executing payloads directly.
+The optional agent launcher is `agent-kmux` for development and `agent` for
+production when that branch includes it.
+
+**Shared settings:** leave `[http].enabled = false` when running both apps at
+once: the shared configured HTTP port cannot serve two runtimes simultaneously.
+The local control CLIs use their channel's socket. Remove any explicit
+`[update].installed_binary_path` override for channel-aware update detection;
+otherwise that configuration takes precedence over the launcher's channel path.
+The launchers set `TAAROF_INSTALLED_BINARY` and `TAAROF_WEB_DIST_DIR` to the
+matching payload and clear inherited socket/HTTP target overrides.
+
+Installation does not launch, stop or restart an app. Quit and reopen the desired
+channel when ready, then check `taarof --version` or `taarof-kmux --version` to
+verify the running revision. A successful install does not prove the running
+process has changed.
+
+For a debug build of your current checkout, use `mise run dev`. For a release
+install of **unmerged checkout changes**, use
+`mise run install:checkout /explicit/prefix` (the lower-level packaging path).
+It does not select a branch or create channel launchers.
 
 Without `mise`, run the underlying commands:
 

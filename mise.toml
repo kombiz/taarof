@@ -25,14 +25,20 @@ run = [
 ]
 
 [tasks.install]
-description = "Build this checkout in release mode and install it under ~/.local"
+description = "Install origin/main (default) or origin/kmux as separate desktop apps"
+usage = '''
+arg "[channel]" default="main" help="Public source branch" {
+  choices "main" "kmux"
+}
+flag "--prefix <prefix>" help="Installation prefix (default: ~/.local)"
+'''
+run = 'python3 packaging/linux/install-channel.py "$usage_channel" --prefix "${usage_prefix:-$HOME/.local}"'
+
+[tasks."install:checkout"]
+description = "Build and install this checkout under an explicit prefix (developer packaging)"
 depends = ["build", "web:build"]
 run = [
-  # Non-fatal like install-local.sh: a checkout without usable Git provenance
-  # still installs, it just records no verified source identity.
-  'bash packaging/linux/emit-artifact-provenance.sh "${CARGO_TARGET_DIR:-taarof-app/target}/release/taarof-app" || echo "note: no build provenance for this binary; installing without source verification" >&2',
-  # Keep install-local.sh last: mise appends any extra task arguments to the
-  # final command, which is how an alternate prefix reaches the installer.
+  'bash packaging/linux/emit-artifact-provenance.sh "${CARGO_TARGET_DIR:-taarof-app/target}/release/taarof-app"',
   "bash packaging/linux/install-local.sh",
 ]
 
@@ -72,6 +78,7 @@ run = [
   "cargo test --manifest-path agent-session-core/Cargo.toml --no-default-features",
   "cargo test --manifest-path agent-launcher/Cargo.toml",
   "python3 testing/test_bundle_provenance.py",
+  "python3 testing/test_install_channel.py",
   "cargo test --manifest-path taarof-app/Cargo.toml",
   "python3 taarof-cli/test_taarof_cli.py",
   "npm --prefix taarof-web test",
