@@ -177,6 +177,14 @@ jobs:
             --binary taarof-app/target/release/examples/performance_harness \
             --output taarof-app/target/performance-baseline.json
 
+      - name: Upload performance baseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-baseline-${{ github.sha }}
+          path: taarof-app/target/performance-baseline.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Run taarof-app tests
         env:
           TMPDIR: /t

@@ -16,7 +16,10 @@ mise run performance
 The task builds `performance_harness` in release mode, warms each workload once,
 then records five measured repetitions at 200 iterations per repetition. It
 writes `taarof-app/target/performance-baseline.json` by default. Set
-`PERFORMANCE_BASELINE_OUTPUT` to keep a named artifact elsewhere.
+`PERFORMANCE_BASELINE_OUTPUT` to keep a named artifact elsewhere. Pull-request
+CI uploads the record as `performance-baseline-<source SHA>` for 30 days. The
+first clean workstation record is checked in at
+[performance-baselines/70b14c4-workstation.md](performance-baselines/70b14c4-workstation.md).
 
 The JSON record includes the source SHA and dirty-tree status, Rust toolchain,
 OS/kernel/CPU details, fixture identifiers, iteration settings, warmups,
@@ -47,11 +50,16 @@ Keep both JSON files and compare every sample and summary; do not compare only
 the fastest run. A source change that alters the fixture is not a before/after
 performance comparison.
 
-## Interactive GTK/VTE baseline
+## Application runtime baseline
 
-Headless CI cannot validate input-to-paint latency, GTK main-thread callback
-duration, idle desktop CPU/RSS, web request counts during UI actions, or remote
-disconnect behavior. Capture these on a separate named development session;
+The current synthetic harness does not measure input-to-paint latency, GTK
+main-thread callback duration, idle app CPU/RSS, web request counts, or remote
+disconnect behavior. Physical input-to-paint and GTK presentation tracing
+require a real GTK/VTE session. CPU/RSS, loopback request counts, and remote
+disconnect behavior can be automated headlessly once CI has an isolated app,
+HTTP, and disposable remote fixture; that capture is not implemented yet.
+
+Until then, capture all six metrics on a separate named development session;
 do not reuse a production or pinned acceptance instance.
 
 Record the source SHA, installed binary identity, host/display details, session
@@ -77,10 +85,10 @@ Attach the raw trace or counter output and a table with these fields:
 | --- | ---: | ---: | --- |
 | Input-to-paint median / worst | — | — | Requires real GTK/VTE session |
 | GTK callbacks over 16.7 ms / maximum | — | — | Requires GTK tracing |
-| Idle CPU median / maximum | — | — | Requires isolated running app |
-| Idle RSS median / maximum | — | — | Requires isolated running app |
-| Web requests by route | — | — | Requires isolated HTTP session |
-| Remote disconnect detection / recovery | — | — | Requires disposable remote fixture |
+| Idle CPU median / maximum | — | — | Current harness does not start an isolated app |
+| Idle RSS median / maximum | — | — | Current harness does not start an isolated app |
+| Web requests by route | — | — | Current harness has no HTTP fixture |
+| Remote disconnect detection / recovery | — | — | Current harness has no disposable remote fixture |
 
 An unavailable interactive metric stays explicitly unavailable. It does not
 turn a headless checksum/work-count regression into a pass, and it does not
