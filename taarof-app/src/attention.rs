@@ -121,14 +121,13 @@ pub(crate) fn pane_attention_evidence_at(
     pane_id: u32,
     now_unix_ms: u64,
 ) -> Option<AttentionEvidence> {
-    let signal = tab
-        .pane_agent_activity(pane_id)
-        .filter(|signal| signal_reason(signal).is_some());
+    let signal = tab.pane_agent_activity(pane_id);
     let turn = tab
         .pane_turn(pane_id)
         .filter(|turn| matches!(turn.phase, TurnPhase::Errored));
 
-    let signal_evidence = signal.map(|signal| {
+    let signal_evidence = signal.and_then(|signal| {
+        let reason = signal_reason(signal)?;
         let verified = verified_time(signal.observed_at_unix_ms, now_unix_ms);
         let freshness = if verified.is_none() {
             AttentionFreshness::Unknown
@@ -137,9 +136,9 @@ pub(crate) fn pane_attention_evidence_at(
         } else {
             AttentionFreshness::Stale
         };
-        AttentionEvidence {
+        Some(AttentionEvidence {
             reason: if freshness == AttentionFreshness::Fresh {
-                signal_reason(signal).unwrap_or(AttentionReason::Unknown)
+                reason
             } else {
                 AttentionReason::Unknown
             },
@@ -148,7 +147,7 @@ pub(crate) fn pane_attention_evidence_at(
             authority: signal_authority(signal.origin),
             freshness,
             last_verified_unix_ms: verified,
-        }
+        })
     });
 
     let turn_evidence = turn.map(|turn| {
@@ -173,6 +172,23 @@ pub(crate) fn pane_attention_evidence_at(
             last_verified_unix_ms: verified,
         }
     });
+
+    // A strictly newer provider-explicit observation supersedes an older
+    // transcript error. This also lets a newer Running or Done observation
+    // remove an obsolete Error target. Ties and timestamps that cannot be
+    // verified continue through the conservative conflict resolution below.
+    if let (Some(signal), Some(turn)) = (signal, turn) {
+        let signal_verified = verified_time(signal.observed_at_unix_ms, now_unix_ms);
+        let turn_verified = verified_time(turn.at_unix_ms, now_unix_ms);
+        if signal.has_fresh_explicit_update()
+            && turn.is_fresh(now_unix_ms)
+            && signal_verified
+                .zip(turn_verified)
+                .is_some_and(|(signal_at, turn_at)| signal_at > turn_at)
+        {
+            return signal_evidence;
+        }
+    }
 
     match (signal_evidence, turn_evidence) {
         (Some(signal), Some(turn))
@@ -218,10 +234,15 @@ fn pane_machine(workspace: &crate::Workspace, tab: &Tab, pane_id: u32) -> String
         .unwrap_or_else(|| glib::host_name().to_string())
 }
 
-fn provider_hint(state: &crate::AppState, tab: &Tab, pane_id: u32) -> Option<String> {
-    state
-        .runtime_probe
-        .as_ref()
+fn provider_hint(
+    snapshot: Option<&crate::runtime_probe::RuntimeProbeSnapshot>,
+    process_truth_fresh: bool,
+    tab: &Tab,
+    pane_id: u32,
+) -> Option<String> {
+    process_truth_fresh
+        .then_some(snapshot)
+        .flatten()
         .and_then(|probe| probe.pane_agents.get(&(tab.id, pane_id)))
         .and_then(|status| status.agent_name.clone())
 }
@@ -231,9 +252,13 @@ pub(crate) fn attention_targets_at(
     now_unix_ms: u64,
 ) -> Vec<AttentionTarget> {
     let mut targets = Vec::new();
+    let process_truth_fresh = crate::runtime_probe::runtime_process_truth_is_fresh(state);
     for workspace in &state.workspaces {
         for tab in &workspace.tabs {
             let has_notification = state.tab_needs_attention(tab);
+            // A tab-scoped notification has no pane-origin evidence. Preserve
+            // the legacy focused-pane destination for navigation, while its
+            // System/Unknown evidence below makes that limitation explicit.
             let notification_pane_id =
                 has_notification.then_some(tab.notification_pane_id.unwrap_or(tab.focused_pane_id));
             let mut pane_ids = tab
@@ -260,7 +285,12 @@ pub(crate) fn attention_targets_at(
                     continue;
                 };
                 if evidence.provider.is_none() && evidence.authority != AttentionAuthority::System {
-                    evidence.provider = provider_hint(state, tab, pane_id);
+                    evidence.provider = provider_hint(
+                        state.runtime_probe.as_ref(),
+                        process_truth_fresh,
+                        tab,
+                        pane_id,
+                    );
                 }
                 targets.push(AttentionTarget {
                     workspace_id: workspace.id,
@@ -289,8 +319,8 @@ pub(crate) fn attention_targets_at(
 #[cfg(test)]
 mod tests {
     use super::{
-        attention_targets_at, pane_attention_evidence_at, AttentionAuthority, AttentionFreshness,
-        AttentionReason,
+        attention_targets_at, pane_attention_evidence_at, provider_hint, AttentionAuthority,
+        AttentionFreshness, AttentionReason,
     };
     use crate::agents::{PaneTurn, TurnPhase};
     use crate::pane::PaneNode;
@@ -375,6 +405,116 @@ mod tests {
         let evidence = pane_attention_evidence_at(&tab, 41, NOW).expect("conflicting evidence");
         assert_eq!(evidence.reason, AttentionReason::Unknown);
         assert_eq!(evidence.freshness, AttentionFreshness::Conflicting);
+    }
+
+    #[test]
+    fn newer_explicit_waiting_supersedes_an_older_transcript_error() {
+        let mut tab = tab_with(7, 41);
+        let mut signal = AgentActivity::socket(
+            AgentActivityState::WaitingInput,
+            "waiting for input",
+            Some("codex".into()),
+        )
+        .expect("waiting activity");
+        signal.observed_at_unix_ms = NOW;
+        tab.set_pane_agent_activity(41, Some(signal));
+        tab.set_pane_turn(41, PaneTurn::new(TurnPhase::Errored, NOW - 1));
+
+        let evidence = pane_attention_evidence_at(&tab, 41, NOW).expect("waiting evidence");
+        assert_eq!(evidence.reason, AttentionReason::WaitingInput);
+        assert_eq!(evidence.freshness, AttentionFreshness::Fresh);
+        assert_eq!(evidence.provider.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn newer_explicit_running_removes_an_older_transcript_error() {
+        let mut tab = tab_with(7, 41);
+        let mut signal =
+            AgentActivity::socket(AgentActivityState::Running, "working", Some("codex".into()))
+                .expect("running activity");
+        signal.observed_at_unix_ms = NOW;
+        tab.set_pane_agent_activity(41, Some(signal));
+        tab.set_pane_turn(41, PaneTurn::new(TurnPhase::Errored, NOW - 1));
+
+        assert!(pane_attention_evidence_at(&tab, 41, NOW).is_none());
+    }
+
+    #[test]
+    fn newer_explicit_done_removes_an_older_transcript_error() {
+        let mut tab = tab_with(7, 41);
+        let mut signal =
+            AgentActivity::socket(AgentActivityState::Done, "done", Some("codex".into()))
+                .expect("done activity");
+        signal.observed_at_unix_ms = NOW;
+        tab.set_pane_agent_activity(41, Some(signal));
+        tab.set_pane_turn(41, PaneTurn::new(TurnPhase::Errored, NOW - 1));
+
+        assert!(pane_attention_evidence_at(&tab, 41, NOW).is_none());
+    }
+
+    #[test]
+    fn equal_explicit_waiting_and_transcript_error_remain_conflicting() {
+        let mut tab = tab_with(7, 41);
+        let mut signal = AgentActivity::socket(
+            AgentActivityState::WaitingInput,
+            "waiting for input",
+            Some("codex".into()),
+        )
+        .expect("waiting activity");
+        signal.observed_at_unix_ms = NOW;
+        tab.set_pane_agent_activity(41, Some(signal));
+        tab.set_pane_turn(41, PaneTurn::new(TurnPhase::Errored, NOW));
+
+        let evidence = pane_attention_evidence_at(&tab, 41, NOW).expect("conflicting evidence");
+        assert_eq!(evidence.reason, AttentionReason::Unknown);
+        assert_eq!(evidence.freshness, AttentionFreshness::Conflicting);
+    }
+
+    #[test]
+    fn generic_notification_remains_system_unknown_after_newer_running_supersedes_error() {
+        let mut state = crate::AppState::new();
+        let mut tab = tab_with(7, 41);
+        let mut signal =
+            AgentActivity::socket(AgentActivityState::Running, "working", Some("codex".into()))
+                .expect("running activity");
+        signal.observed_at_unix_ms = NOW;
+        tab.set_pane_agent_activity(41, Some(signal));
+        tab.set_pane_turn(41, PaneTurn::new(TurnPhase::Errored, NOW - 1));
+        tab.needs_attention = true;
+        tab.notification_msg = Some("independent notification".into());
+        tab.notification_pane_id = Some(41);
+        state.workspaces[0].tabs.push(tab);
+
+        let targets = attention_targets_at(&state, NOW);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].evidence.reason, AttentionReason::Unknown);
+        assert_eq!(targets[0].evidence.authority, AttentionAuthority::System);
+        assert_eq!(targets[0].evidence.freshness, AttentionFreshness::Unknown);
+    }
+
+    #[test]
+    fn provider_hint_requires_fresh_process_truth() {
+        let mut snapshot = crate::runtime_probe::RuntimeProbeSnapshot::worker_failure(
+            NOW,
+            &[],
+            &[],
+            crate::runtime_probe::RuntimeProbeWorkerFailure::Panicked,
+        );
+        snapshot.pane_agents.insert(
+            (7, 41),
+            crate::agents::AgentStatus {
+                agent_name: Some("codex".into()),
+                session_id: None,
+                running: true,
+            },
+        );
+        let tab = tab_with(7, 41);
+
+        assert_eq!(provider_hint(Some(&snapshot), false, &tab, 41), None);
+        assert_eq!(
+            provider_hint(Some(&snapshot), true, &tab, 41).as_deref(),
+            Some("codex")
+        );
     }
 
     #[test]
