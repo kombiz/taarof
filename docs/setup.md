@@ -95,7 +95,10 @@ production when that branch includes it.
 
 **Shared settings:** leave `[http].enabled = false` when running both apps at
 once: the shared configured HTTP port cannot serve two runtimes simultaneously.
-The local control CLIs use their channel's socket. Remove any explicit
+Use `taarof query-state` / `taarof-kmux query-state` and `list-tabs` for
+channel-scoped socket reads. CLI commands such as `state`, `sessions`, `tabs`,
+`health` and `events` use HTTP and are unavailable when HTTP is disabled.
+Remove any explicit
 `[update].installed_binary_path` override for channel-aware update detection;
 otherwise that configuration takes precedence over the launcher's channel path.
 The launchers set `TAAROF_INSTALLED_BINARY` and `TAAROF_WEB_DIST_DIR` to the
