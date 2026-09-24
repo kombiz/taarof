@@ -1,8 +1,10 @@
 import {
   buildPaneControlUrl,
+  fetchEvents,
   fetchFilePreview,
   fetchFileStat,
   fetchHistory,
+  fetchRuntimeIdentity,
   runPaneCommand,
 } from "./api.js";
 
@@ -188,6 +190,62 @@ test("fetchHistory mirrors the bounded authenticated query contract", async () =
     assert(authorization === "Bearer secret", "history should use bearer auth");
     assert(requestedSignal === controller.signal, "history should forward AbortSignal");
     assert(page.scanned === 1, "history response should parse scan metadata");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("event recovery APIs forward cursor, bearer token, and cancellation", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; authorization: string; signal: AbortSignal | null | undefined }> = [];
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    requests.push({
+      url,
+      authorization: String((init?.headers as Record<string, string> | undefined)?.Authorization ?? ""),
+      signal: init?.signal,
+    });
+    const data = url.startsWith("/api/v1/events?")
+      ? {
+          schema: "taarof.events.v1",
+          since_seq: 42,
+          limit: 256,
+          next_seq: 43,
+          high_watermark: 43,
+          oldest_seq: 1,
+          gap: false,
+          gap_from: null,
+          gap_to: null,
+          resnapshot_required: false,
+          capacity: 1_000,
+          dropped: 0,
+          last_dropped_at_unix_ms: null,
+          events: [{ seq: 43, ts_unix_ms: 430, event_type: "work_recorded", payload: {} }],
+        }
+      : {
+          schema: "taarof.runtime-identity.v1",
+          runtime_id: "00000000-0000-4000-8000-000000000001",
+          session_name: "default",
+          identity: {},
+        };
+    return new Response(JSON.stringify({ ok: true, data }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    const controller = new AbortController();
+    const [events, identity] = await Promise.all([
+      fetchEvents("secret", 42, controller.signal),
+      fetchRuntimeIdentity("secret", controller.signal),
+    ]);
+    assert(requests[0].url === "/api/v1/events?since_seq=42&limit=256", "event replay must use the bounded cursor route");
+    assert(requests[1].url === "/api/v1/runtime-identity", "runtime recovery must use the router identity route");
+    assert(requests.every((request) => request.authorization === "Bearer secret"), "recovery APIs should use bearer auth");
+    assert(requests.every((request) => request.signal === controller.signal), "recovery APIs should forward AbortSignal");
+    assert(events.events[0]?.seq === 43, "event page should parse records");
+    assert(identity.runtime_id === "00000000-0000-4000-8000-000000000001", "runtime identity should parse");
   } finally {
     globalThis.fetch = originalFetch;
   }

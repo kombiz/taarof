@@ -13,6 +13,8 @@ import {
   ApiUnauthorizedError,
   buildEventsWebSocketUrl,
   fetchAgentSessions,
+  fetchEvents,
+  fetchRuntimeIdentity,
   fetchState,
 } from "./api";
 import {
@@ -25,6 +27,10 @@ import { AgentsView } from "./components/AgentsView";
 import { selectPane, selectStage, selectTab, viewModeFromHash } from "./components/PaneStage.helpers";
 import { Sidebar } from "./components/Sidebar";
 import { TokenGate } from "./components/TokenGate";
+import {
+  EventRecoveryController,
+  type EventConnectionStatus,
+} from "./eventRecovery";
 import {
   DatasetRefreshScheduler,
   RefreshRequestTimeoutError,
@@ -140,6 +146,15 @@ function selectedDashboard(snapshot: TaarofStateSnapshot | null): DashboardSnaps
   return snapshot?.dashboard ?? null;
 }
 
+function eventStatusLabel(status: EventConnectionStatus) {
+  const connection = `${status.connection[0].toUpperCase()}${status.connection.slice(1)}`;
+  if (status.freshness === "verified") return `${connection} · verified`;
+  if (status.last_verified_at_unix_ms === null) return `${connection} · stale · never verified`;
+  return `${connection} · stale · last verified ${new Date(
+    status.last_verified_at_unix_ms,
+  ).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+}
+
 export function App() {
   const [token, setToken] = useState<string | null>(() => {
     return bootstrapTokenFromUrl() ?? getStoredToken();
@@ -157,10 +172,18 @@ export function App() {
   const [agentSessionsError, setAgentSessionsError] = useState<string | null>(null);
   const [paneRefreshGeneration, setPaneRefreshGeneration] = useState(0);
   const [isNavOpen, setIsNavOpen] = useState(false);
+  const [eventStatus, setEventStatus] = useState<EventConnectionStatus>({
+    connection: "disconnected",
+    freshness: "stale",
+    cursor: null,
+    last_verified_at_unix_ms: null,
+    attempt: 0,
+  });
   const navigationTriggerRef = useRef<HTMLButtonElement | null>(null);
   const refreshGenerationRef = useRef(0);
   const stateRefreshRef = useRef<DatasetRefreshScheduler | null>(null);
   const agentSessionsRefreshRef = useRef<DatasetRefreshScheduler | null>(null);
+  const eventRecoveryRef = useRef<EventRecoveryController | null>(null);
 
   const selectedStage = selectStage(snapshot, {
     workspaceId: selectedWorkspaceId,
@@ -181,6 +204,8 @@ export function App() {
   }
 
   function handleUnauthorized(message: string) {
+    eventRecoveryRef.current?.stop();
+    eventRecoveryRef.current = null;
     advanceRefreshGeneration();
     clearStoredToken();
     setSnapshot(null);
@@ -199,8 +224,8 @@ export function App() {
   }
 
   useEffect(() => {
-    const generation = advanceRefreshGeneration();
-    const isCurrent = () => refreshGenerationRef.current === generation;
+    let disposed = false;
+    let generation = advanceRefreshGeneration();
 
     if (!token) {
       setSnapshot(null);
@@ -214,101 +239,195 @@ export function App() {
       setLoadError(null);
       setAgentSessionsError(null);
       setIsNavOpen(false);
+      setEventStatus({
+        connection: "disconnected",
+        freshness: "stale",
+        cursor: null,
+        last_verified_at_unix_ms: null,
+        attempt: 0,
+      });
       return () => {
-        if (isCurrent()) refreshGenerationRef.current += 1;
+        disposed = true;
+        if (refreshGenerationRef.current === generation) refreshGenerationRef.current += 1;
       };
     }
 
-    const stateRefresh = new DatasetRefreshScheduler((signal) =>
-      runGuardedRefresh({
-        signal,
-        isCurrent,
-        load: () => fetchState(token, signal),
-        enqueueWrite: (write) => startTransition(write),
-        onLoading: setIsLoading,
-        onSuccess: (nextSnapshot) => {
-          setSnapshot(nextSnapshot);
-          setPaneRefreshGeneration((current) => current + 1);
-        },
-        onError: (error) => {
-          setLoadError(
-            error === null
-              ? null
-              : error instanceof RefreshRequestTimeoutError
-                ? "Refreshing taarof state timed out. Displaying the last snapshot."
-                : error instanceof Error
-                  ? error.message
-                  : "Failed to load taarof state.",
-          );
-        },
-        isUnauthorized: (error) => error instanceof ApiUnauthorizedError,
-        onUnauthorized: () => {
-          handleUnauthorized("The taarof token was rejected. Paste a current token.");
-        },
-      }),
-    );
-    const agentSessionsRefresh = new DatasetRefreshScheduler((signal) =>
-      runGuardedRefresh({
-        signal,
-        isCurrent,
-        load: () => fetchAgentSessions(token, signal),
-        enqueueWrite: (write) => startTransition(write),
-        onLoading: setAreAgentSessionsLoading,
-        onSuccess: setAgentSessions,
-        onError: (error) => {
-          setAgentSessionsError(
-            error === null
-              ? null
-              : error instanceof RefreshRequestTimeoutError
-                ? "Refreshing recent agent sessions timed out. Displaying the last catalog."
-                : error instanceof Error
-                  ? error.message
-                  : "Failed to load recent agent sessions.",
-          );
-        },
-        isUnauthorized: (error) => error instanceof ApiUnauthorizedError,
-        onUnauthorized: () => {
-          handleUnauthorized("The taarof token was rejected. Paste a current token.");
-        },
-      }),
-    );
-    stateRefreshRef.current = stateRefresh;
-    agentSessionsRefreshRef.current = agentSessionsRefresh;
-    stateRefresh.invalidate({ immediate: true });
-    agentSessionsRefresh.invalidate({ immediate: true });
-
-    return () => {
-      stateRefresh.dispose();
-      agentSessionsRefresh.dispose();
-      if (stateRefreshRef.current === stateRefresh) stateRefreshRef.current = null;
-      if (agentSessionsRefreshRef.current === agentSessionsRefresh) {
-        agentSessionsRefreshRef.current = null;
-      }
-      if (isCurrent()) refreshGenerationRef.current += 1;
+    const installRefreshSchedulers = () => {
+      generation = advanceRefreshGeneration();
+      const installedGeneration = generation;
+      const isCurrent = () =>
+        !disposed && refreshGenerationRef.current === installedGeneration;
+      const stateRefresh = new DatasetRefreshScheduler((signal) =>
+        runGuardedRefresh({
+          signal,
+          isCurrent,
+          load: () => fetchState(token, signal),
+          enqueueWrite: (write) => startTransition(write),
+          onLoading: setIsLoading,
+          onSuccess: (nextSnapshot) => {
+            setSnapshot(nextSnapshot);
+            setPaneRefreshGeneration((current) => current + 1);
+            eventRecoveryRef.current?.markSnapshotVerified();
+          },
+          onError: (error) => {
+            setLoadError(
+              error === null
+                ? null
+                : error instanceof RefreshRequestTimeoutError
+                  ? "Refreshing taarof state timed out. Displaying the last snapshot."
+                  : error instanceof Error
+                    ? error.message
+                    : "Failed to load taarof state.",
+            );
+          },
+          isUnauthorized: (error) => error instanceof ApiUnauthorizedError,
+          onUnauthorized: () => {
+            handleUnauthorized("The taarof token was rejected. Paste a current token.");
+          },
+        }),
+      );
+      const agentSessionsRefresh = new DatasetRefreshScheduler((signal) =>
+        runGuardedRefresh({
+          signal,
+          isCurrent,
+          load: () => fetchAgentSessions(token, signal),
+          enqueueWrite: (write) => startTransition(write),
+          onLoading: setAreAgentSessionsLoading,
+          onSuccess: setAgentSessions,
+          onError: (error) => {
+            setAgentSessionsError(
+              error === null
+                ? null
+                : error instanceof RefreshRequestTimeoutError
+                  ? "Refreshing recent agent sessions timed out. Displaying the last catalog."
+                  : error instanceof Error
+                    ? error.message
+                    : "Failed to load recent agent sessions.",
+            );
+          },
+          isUnauthorized: (error) => error instanceof ApiUnauthorizedError,
+          onUnauthorized: () => {
+            handleUnauthorized("The taarof token was rejected. Paste a current token.");
+          },
+        }),
+      );
+      stateRefreshRef.current = stateRefresh;
+      agentSessionsRefreshRef.current = agentSessionsRefresh;
+      return { stateRefresh, agentSessionsRefresh, isCurrent };
     };
-  }, [token]);
 
-  useEffect(() => {
-    if (!token) {
-      return;
-    }
+    let schedulers = installRefreshSchedulers();
+    schedulers.stateRefresh.invalidate({ immediate: true });
+    schedulers.agentSessionsRefresh.invalidate({ immediate: true });
 
-    const socket = new WebSocket(buildEventsWebSocketUrl(token));
-    function scheduleRefresh(event: MessageEvent) {
-      for (const domain of classifyEventRefreshDomains(event.data)) {
-        if (domain === "state") {
-          stateRefreshRef.current?.invalidate();
-        } else {
-          agentSessionsRefreshRef.current?.invalidate();
+    const recoverSnapshot = async (signal: AbortSignal) => {
+      const recoveryGeneration = generation;
+      const ownsGeneration = () =>
+        !disposed && refreshGenerationRef.current === recoveryGeneration;
+      const isCurrent = () =>
+        ownsGeneration() && !signal.aborted;
+      if (!isCurrent()) throw signal.reason ?? new DOMException("Recovery replaced.", "AbortError");
+      setIsLoading(true);
+      setAreAgentSessionsLoading(true);
+      setLoadError(null);
+      setAgentSessionsError(null);
+      try {
+        const [stateResult, sessionsResult] = await Promise.allSettled([
+          fetchState(token, signal),
+          fetchAgentSessions(token, signal),
+        ]);
+        if (!isCurrent()) {
+          throw signal.reason ?? new DOMException("Recovery replaced.", "AbortError");
+        }
+        if (stateResult.status === "rejected" || sessionsResult.status === "rejected") {
+          if (stateResult.status === "rejected" && !(stateResult.reason instanceof ApiUnauthorizedError)) {
+            setLoadError(
+              stateResult.reason instanceof Error
+                ? stateResult.reason.message
+                : "Failed to recover taarof state.",
+            );
+          }
+          if (
+            sessionsResult.status === "rejected" &&
+            !(sessionsResult.reason instanceof ApiUnauthorizedError)
+          ) {
+            setAgentSessionsError(
+              sessionsResult.reason instanceof Error
+                ? sessionsResult.reason.message
+                : "Failed to recover recent agent sessions.",
+            );
+          }
+          if (stateResult.status === "rejected") throw stateResult.reason;
+          if (sessionsResult.status === "rejected") throw sessionsResult.reason;
+        }
+        startTransition(() => {
+          if (!isCurrent()) return;
+          setSnapshot(stateResult.value);
+          setAgentSessions(sessionsResult.value);
+          setPaneRefreshGeneration((current) => current + 1);
+        });
+      } finally {
+        if (ownsGeneration()) {
+          setIsLoading(false);
+          setAreAgentSessionsLoading(false);
         }
       }
-    }
+    };
 
-    socket.addEventListener("message", scheduleRefresh);
+    const eventRecovery = new EventRecoveryController({
+      createSocket: () => {
+        const socket = new WebSocket(buildEventsWebSocketUrl(token));
+        return {
+          addEventListener: (type, listener) =>
+            socket.addEventListener(type, listener as EventListener),
+          removeEventListener: (type, listener) =>
+            socket.removeEventListener(type, listener as EventListener),
+          close: () => socket.close(),
+        };
+      },
+      fetchRuntimeIdentity: async (signal) =>
+        (await fetchRuntimeIdentity(token, signal)).runtime_id,
+      fetchEvents: (cursor, signal) => fetchEvents(token, cursor, signal),
+      recoverSnapshot,
+      onEvent: (data, source) => {
+        if (source === "recovery") return;
+        for (const domain of classifyEventRefreshDomains(data)) {
+          if (domain === "state") stateRefreshRef.current?.invalidate();
+          else agentSessionsRefreshRef.current?.invalidate();
+        }
+      },
+      onRecoveryBoundary: () => {
+        schedulers = installRefreshSchedulers();
+        setIsLoading(false);
+        setAreAgentSessionsLoading(false);
+      },
+      onRuntimeReset: () => {
+        schedulers = installRefreshSchedulers();
+        setIsLoading(false);
+        setAreAgentSessionsLoading(false);
+      },
+      onUnauthorized: () => {
+        handleUnauthorized("The taarof token was rejected. Paste a current token.");
+      },
+      onStatus: (status) => {
+        if (!disposed) setEventStatus(status);
+      },
+      isUnauthorized: (error) => error instanceof ApiUnauthorizedError,
+    });
+    eventRecoveryRef.current = eventRecovery;
+    eventRecovery.start();
 
     return () => {
-      socket.removeEventListener("message", scheduleRefresh);
-      socket.close();
+      disposed = true;
+      if (eventRecoveryRef.current === eventRecovery) eventRecoveryRef.current = null;
+      eventRecovery.stop();
+      schedulers.stateRefresh.dispose();
+      schedulers.agentSessionsRefresh.dispose();
+      if (stateRefreshRef.current === schedulers.stateRefresh) stateRefreshRef.current = null;
+      if (agentSessionsRefreshRef.current === schedulers.agentSessionsRefresh) {
+        agentSessionsRefreshRef.current = null;
+      }
+      if (refreshGenerationRef.current === generation) refreshGenerationRef.current += 1;
     };
   }, [token]);
 
@@ -365,12 +484,16 @@ export function App() {
     }
 
     storeToken(nextToken);
+    eventRecoveryRef.current?.stop();
+    eventRecoveryRef.current = null;
     advanceRefreshGeneration();
     setToken(nextToken);
     setTokenError(null);
   }
 
   function handleResetToken() {
+    eventRecoveryRef.current?.stop();
+    eventRecoveryRef.current = null;
     advanceRefreshGeneration();
     clearStoredToken();
     setSnapshot(null);
@@ -582,6 +705,14 @@ export function App() {
                 History
               </button>
             </div>
+            <span
+              className={`main-shell__connection-state main-shell__connection-state--${eventStatus.connection}`}
+              data-connection={eventStatus.connection}
+              data-freshness={eventStatus.freshness}
+              role="status"
+            >
+              {eventStatusLabel(eventStatus)}
+            </span>
             <span className="main-shell__token-state">token cached</span>
             <button onClick={handleRefresh} type="button">
               Refresh

@@ -1056,7 +1056,14 @@ even when the retained event page reports no ring gap.
 
 The browser client subscribes to this stream and debounces state refreshes after
 event messages, so workspace/tab/pane metadata does not rely only on manual
-refresh.
+refresh. After a disconnect it reconnects with capped exponential backoff and
+jitter, pages `/api/v1/events` from the last applied sequence, and deduplicates
+events seen by both replay and the live socket. Every reconnect also refreshes a
+full state and agent-session snapshot, including when the socket is otherwise
+silent. A retention gap, `_lagged` frame, lower event high watermark, or changed
+`/api/v1/runtime-identity` value discards the old cursor and requires a new full
+snapshot. The header reports connected, recovering, or disconnected state and
+keeps the last verified time visible while displayed data is stale.
 
 ### WebSocket pane attach
 

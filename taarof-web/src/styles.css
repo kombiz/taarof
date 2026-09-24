@@ -569,6 +569,35 @@ code {
   font-weight: 700;
 }
 
+.main-shell__connection-state {
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  color: var(--text-muted);
+  background: rgba(17, 35, 27, 0.05);
+  font-size: 0.82rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.main-shell__connection-state--connected {
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+}
+
+.main-shell__connection-state--recovering,
+.main-shell__connection-state--connecting {
+  border-color: color-mix(in srgb, var(--warning) 32%, transparent);
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+
+.main-shell__connection-state--disconnected {
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+
 .main-shell__intro {
   padding: 1.25rem 1.5rem;
   color: var(--text-muted);
@@ -2520,6 +2549,7 @@ code {
     flex: 1 1 0;
   }
 
+  .main-shell__connection-state,
   .main-shell__token-state {
     width: 100%;
     text-align: center;
