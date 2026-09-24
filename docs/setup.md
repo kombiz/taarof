@@ -139,6 +139,19 @@ local gate. It installs locked web dependencies, builds the web bundle, checks
 the optional performance harness, and runs native, CLI, and frontend tests.
 Pull-request CI also compiles the harness and runs the CLI regression suite.
 
+The native CI job gives its tests a 1 GiB executable tmpfs at
+`/tmp/taarof-tests`, selected with `TMPDIR` only for the test step. Disposable
+SQLite fixtures therefore avoid host disk-journal contention while retaining
+SQLite transactions, locking, reopen checks, and the ten-second history flush
+deadline. Builds, caches, and package validation still use disk. These tests
+do not measure physical-disk durability or latency.
+
+When investigating a CI-only history flush timeout, compare the same test
+binary with disk-backed and tmpfs-backed temporary directories on the failing
+host before changing the writer or its timeout. Check I/O pressure and bounded
+`fsync` timings as well as CPU load; a passing local run alone cannot identify
+the cause.
+
 For standalone native tests in a fresh checkout, build the web assets first:
 `runtime_smoke` exercises the web-asset resolver and requires `taarof-web/dist`.
 
