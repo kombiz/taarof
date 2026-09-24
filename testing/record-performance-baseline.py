@@ -98,7 +98,14 @@ def summarize(samples: list[dict[str, int | str]]) -> dict[str, int | float]:
     }
 
 
-def record(binary: Path, warmups: int, repetitions: int) -> dict[str, object]:
+def record(
+    binary: Path,
+    warmups: int,
+    repetitions: int,
+    ci_event_name: str | None,
+    ci_head_sha: str | None,
+    ci_base_sha: str | None,
+) -> dict[str, object]:
     repo = Path(__file__).resolve().parents[1]
     source_sha = command_output("git", "rev-parse", "HEAD", cwd=repo)
     source_dirty = bool(command_output("git", "status", "--porcelain", cwd=repo))
@@ -119,7 +126,7 @@ def record(binary: Path, warmups: int, repetitions: int) -> dict[str, object]:
             }
         )
 
-    return {
+    baseline = {
         "schema": SCHEMA,
         "captured_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "source_sha": source_sha,
@@ -143,6 +150,19 @@ def record(binary: Path, warmups: int, repetitions: int) -> dict[str, object]:
         },
         "workloads": workloads,
     }
+    if ci_event_name:
+        baseline["ci"] = {
+            "event_name": ci_event_name,
+            "head_sha": ci_head_sha,
+            "base_sha": ci_base_sha,
+            "checkout_sha": source_sha,
+            "checkout_context": (
+                "pull-request merge checkout"
+                if ci_event_name == "pull_request"
+                else "branch push checkout"
+            ),
+        }
+    return baseline
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,6 +171,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repetitions", type=int, default=5)
+    parser.add_argument("--ci-event-name")
+    parser.add_argument("--ci-head-sha")
+    parser.add_argument("--ci-base-sha")
     args = parser.parse_args()
     if args.warmups < 1 or args.repetitions < 1:
         parser.error("--warmups and --repetitions must be positive")
@@ -164,7 +187,14 @@ def main() -> int:
         raise SystemExit(f"performance harness not found: {binary}")
 
     try:
-        baseline = record(binary, args.warmups, args.repetitions)
+        baseline = record(
+            binary,
+            args.warmups,
+            args.repetitions,
+            args.ci_event_name,
+            args.ci_head_sha,
+            args.ci_base_sha,
+        )
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"performance baseline failed: {error}", file=sys.stderr)
         return 1

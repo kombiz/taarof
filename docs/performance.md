@@ -16,9 +16,11 @@ mise run performance
 The task builds `performance_harness` in release mode, warms each workload once,
 then records five measured repetitions at 200 iterations per repetition. It
 writes `taarof-app/target/performance-baseline.json` by default. Set
-`PERFORMANCE_BASELINE_OUTPUT` to keep a named artifact elsewhere. Pull-request
-CI uploads the record as `performance-baseline-<source SHA>` for 30 days. The
-first clean workstation record is checked in at
+`PERFORMANCE_BASELINE_OUTPUT` to keep a named artifact elsewhere. CI uploads
+the record as `performance-baseline-<PR head or push SHA>` for 30 days. On a
+pull request, `source_sha` remains the actual synthetic merge checkout tested;
+the `ci` object separately records the durable PR head and base SHAs and labels
+the merge context. The first clean workstation record is checked in at
 [performance-baselines/70b14c4-workstation.md](performance-baselines/70b14c4-workstation.md).
 
 The JSON record includes the source SHA and dirty-tree status, Rust toolchain,

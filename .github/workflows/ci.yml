@@ -129,6 +129,7 @@ jobs:
             libsqlite3-dev \
             libvte-2.91-gtk4-dev \
             pkg-config \
+            python3 \
             tmux
 
       - name: Checkout repository
@@ -173,14 +174,18 @@ jobs:
       - name: Run performance correctness gate
         run: |
           cargo build --release --manifest-path taarof-app/Cargo.toml --example performance_harness --features harness
+          cargo test --manifest-path taarof-app/Cargo.toml --features harness --lib performance::
           python3 testing/record-performance-baseline.py \
             --binary taarof-app/target/release/examples/performance_harness \
-            --output taarof-app/target/performance-baseline.json
+            --output taarof-app/target/performance-baseline.json \
+            --ci-event-name "${{ github.event_name }}" \
+            --ci-head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --ci-base-sha "${{ github.event.pull_request.base.sha || '' }}"
 
       - name: Upload performance baseline
         uses: actions/upload-artifact@v4
         with:
-          name: performance-baseline-${{ github.sha }}
+          name: performance-baseline-${{ github.event.pull_request.head.sha || github.sha }}
           path: taarof-app/target/performance-baseline.json
           if-no-files-found: error
           retention-days: 30
