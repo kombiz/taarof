@@ -20,8 +20,8 @@ fn main() {
     };
     let elapsed_ns = started.elapsed().as_nanos();
     println!(
-        "{{\"workload\":\"{workload}\",\"iterations\":{iterations},\"elapsed_ns\":{elapsed_ns},\"checksum\":{},\"source_reads\":{}}}",
-        result.checksum, result.source_reads
+        "{{\"workload\":\"{workload}\",\"fixture\":\"{}\",\"iterations\":{iterations},\"elapsed_ns\":{elapsed_ns},\"checksum\":{},\"source_reads\":{},\"work_units\":{}}}",
+        result.fixture, result.checksum, result.source_reads, result.work_units
     );
 }
 

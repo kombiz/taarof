@@ -70,6 +70,13 @@ run = [
   "npm --prefix taarof-web run build",
 ]
 
+[tasks.performance]
+description = "Run and validate the reproducible release performance workloads"
+run = [
+  "cargo build --release --manifest-path taarof-app/Cargo.toml --example performance_harness --features harness",
+  'python3 testing/record-performance-baseline.py --binary "${CARGO_TARGET_DIR:-taarof-app/target}/release/examples/performance_harness" --output "${PERFORMANCE_BASELINE_OUTPUT:-taarof-app/target/performance-baseline.json}"',
+]
+
 [tasks.test]
 depends = ["web:build"]
 description = "Run app and web tests"
@@ -110,6 +117,7 @@ run = [
   "mise run setup",
   "mise run lint",
   "mise run typecheck",
+  "mise run performance",
   "mise run test",
   "mise run package:validate",
 ]

@@ -170,8 +170,12 @@ jobs:
       - name: Lint taarof-app
         run: cargo clippy --manifest-path taarof-app/Cargo.toml --all-targets -- -D warnings
 
-      - name: Compile performance harness
-        run: cargo check --manifest-path taarof-app/Cargo.toml --example performance_harness --features harness
+      - name: Run performance correctness gate
+        run: |
+          cargo build --release --manifest-path taarof-app/Cargo.toml --example performance_harness --features harness
+          python3 testing/record-performance-baseline.py \
+            --binary taarof-app/target/release/examples/performance_harness \
+            --output taarof-app/target/performance-baseline.json
 
       - name: Run taarof-app tests
         env:
