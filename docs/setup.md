@@ -135,9 +135,12 @@ does not start or enable the optional remote-control gateway.
 ### Contributor verification
 
 After installing the native packages above, run `mise run ci` for the full
-local gate. It installs locked web dependencies, builds the web bundle, checks
-the optional performance harness, and runs native, CLI, and frontend tests.
-Pull-request CI also compiles the harness and runs the CLI regression suite.
+local gate. It installs locked web dependencies, builds the web bundle, runs
+the optional performance harness in release mode, and runs native, CLI, and
+frontend tests. Pull-request CI also executes both performance workloads and
+fails semantic checksum, source-read, or work-count drift. See
+[Performance measurement](performance.md) for the recorded output and the
+separate GTK/VTE capture procedure.
 
 The native CI job gives its tests a 1 GiB executable tmpfs at
 `/t`, selected with `TMPDIR` only for the test step. The short mount path
@@ -161,7 +164,7 @@ npm --prefix taarof-web ci
 npm --prefix taarof-web run build
 cargo test --manifest-path taarof-app/Cargo.toml
 python3 taarof-cli/test_taarof_cli.py
-cargo check --manifest-path taarof-app/Cargo.toml --example performance_harness --features harness
+mise run performance
 ```
 
 These are headless checks. Use the Kasm desktop and its visual checklist in

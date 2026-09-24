@@ -15,10 +15,13 @@ type PanePidList = Vec<(u32, u32, i32)>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct WorkloadResult {
+    pub fixture: &'static str,
     pub checksum: u64,
     /// Total source reads across all iterations; divide by the iteration count
     /// to compare the number of reads performed by one scan.
     pub source_reads: usize,
+    /// Number of semantic fixture records processed across all iterations.
+    pub work_units: usize,
 }
 
 #[derive(Default)]
@@ -127,8 +130,10 @@ pub fn runtime_probe(iterations: usize) -> WorkloadResult {
         checksum = checksum.wrapping_add(snapshot_checksum(&snapshot));
     }
     WorkloadResult {
+        fixture: "runtime-probe-v1-8x4x12",
         checksum,
         source_reads: source.reads.get(),
+        work_units: iterations * 8 * 4 * 12,
     }
 }
 
@@ -328,8 +333,10 @@ pub fn session_restore(iterations: usize) -> WorkloadResult {
         checksum = checksum.wrapping_add(session_state_checksum(&state));
     }
     WorkloadResult {
+        fixture: "session-restore-v1-8x16x4",
         checksum,
         source_reads: 0,
+        work_units: iterations * (8 + 8 * 16 + 8 * 16 * 4),
     }
 }
 
@@ -394,5 +401,20 @@ mod tests {
 
         state.workspaces[0].work_origin = Some("workspace-different".to_string());
         assert_ne!(session_state_checksum(&state), expected);
+    }
+
+    #[test]
+    fn workload_contract_counts_and_checksums_are_stable() {
+        let runtime_probe = runtime_probe(1);
+        assert_eq!(runtime_probe.fixture, "runtime-probe-v1-8x4x12");
+        assert_eq!(runtime_probe.checksum, 12_978_782_536_162_598_354);
+        assert_eq!(runtime_probe.source_reads, 1_569);
+        assert_eq!(runtime_probe.work_units, 384);
+
+        let session_restore = session_restore(1);
+        assert_eq!(session_restore.fixture, "session-restore-v1-8x16x4");
+        assert_eq!(session_restore.checksum, 7_725_976_349_535_212_874);
+        assert_eq!(session_restore.source_reads, 0);
+        assert_eq!(session_restore.work_units, 648);
     }
 }
