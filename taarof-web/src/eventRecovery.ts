@@ -260,12 +260,12 @@ export class EventRecoveryController {
     this.publishStatus();
 
     try {
-      await this.withTimeout((signal) => this.recover(signal), controller);
+      const verified = await this.withTimeout((signal) => this.recover(signal), controller);
       if (!this.isCurrent(operation, controller)) return;
       this.attempt = 0;
       this.connection = "connected";
-      this.freshness = "verified";
-      this.lastVerifiedAt = this.clock.now();
+      this.freshness = verified ? "verified" : "stale";
+      if (verified) this.lastVerifiedAt = this.clock.now();
       this.publishStatus();
     } catch (error) {
       if (!this.isCurrent(operation, controller)) return;
@@ -292,6 +292,7 @@ export class EventRecoveryController {
     this.observeRuntime(runtimeId);
 
     let replayRequired = true;
+    let closingSnapshot = false;
     for (let round = 0; round < EVENT_RECOVERY_MAX_ROUNDS; round += 1) {
       let snapshotFloor = this.cursor ?? 0;
       if (replayRequired) snapshotFloor = await this.replayPages(signal);
@@ -305,15 +306,17 @@ export class EventRecoveryController {
       if (this.runtimeId !== verifiedRuntimeId) {
         this.observeRuntime(verifiedRuntimeId);
         replayRequired = true;
+        closingSnapshot = false;
         continue;
       }
 
       const buffered = this.bufferedMessages;
       this.bufferedMessages = [];
-      if (buffered.length === 0) return;
+      if (buffered.length === 0) return true;
 
       replayRequired = false;
-      let appliedAfterSnapshot = false;
+      const pending: Array<{ data: string; seq: number | null }> = [];
+      let scanCursor = this.cursor ?? 0;
       for (const data of buffered) {
         if (isLaggedFrame(data)) {
           replayRequired = true;
@@ -321,22 +324,32 @@ export class EventRecoveryController {
         }
         const seq = eventSequence(data);
         if (seq === null) {
-          this.options.onEvent(data, "recovery");
-          appliedAfterSnapshot = true;
+          pending.push({ data, seq });
           continue;
         }
-        const cursor = this.cursor ?? 0;
-        if (seq <= cursor) continue;
-        if (seq > cursor + 1) {
+        if (seq <= scanCursor) continue;
+        if (seq > scanCursor + 1) {
           this.bufferedMessages.push(data);
           replayRequired = true;
           continue;
         }
-        this.options.onEvent(data, "recovery");
-        this.cursor = seq;
-        appliedAfterSnapshot = true;
+        pending.push({ data, seq });
+        scanCursor = seq;
       }
-      if (!replayRequired && !appliedAfterSnapshot && this.bufferedMessages.length === 0) return;
+
+      const source = closingSnapshot && !replayRequired ? "live" : "recovery";
+      for (const item of pending) {
+        this.options.onEvent(item.data, source);
+        if (item.seq !== null) this.cursor = item.seq;
+      }
+
+      if (replayRequired) {
+        closingSnapshot = false;
+        continue;
+      }
+      if (pending.length === 0) return true;
+      if (closingSnapshot) return false;
+      closingSnapshot = true;
     }
     throw new Error("Event recovery could not reach a stable snapshot.");
   }

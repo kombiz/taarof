@@ -148,6 +148,7 @@ function harness(overrides: {
   const sockets: FakeSocket[] = [];
   const statuses: EventConnectionStatus[] = [];
   const applied: number[] = [];
+  const appliedSources: Array<"live" | "recovery"> = [];
   const calls: string[] = [];
   let boundaries = 0;
   let resets = 0;
@@ -163,9 +164,10 @@ function harness(overrides: {
     fetchRuntimeIdentity: overrides.fetchRuntimeIdentity ?? (async () => "runtime-a"),
     fetchEvents: overrides.fetchEvents ?? (async (cursor) => page([], cursor)),
     recoverSnapshot: overrides.recoverSnapshot ?? (async () => { snapshots += 1; }),
-    onEvent: (data) => {
+    onEvent: (data, source) => {
       const parsed = JSON.parse(data) as { seq?: number };
       if (parsed.seq !== undefined) applied.push(parsed.seq);
+      appliedSources.push(source);
     },
     onRecoveryBoundary: () => {
       boundaries += 1;
@@ -191,6 +193,7 @@ function harness(overrides: {
     sockets,
     statuses,
     applied,
+    appliedSources,
     calls,
     get boundaries() { return boundaries; },
     get resets() { return resets; },
@@ -254,6 +257,29 @@ test("live events buffered during replay and snapshot apply once before verifica
   assertEqual(snapshots, 2, "an event arriving during snapshot requires a closing snapshot");
   assertEqual(h.statuses[h.statuses.length - 1]?.cursor, 2);
   assertEqual(h.statuses[h.statuses.length - 1]?.freshness, "verified");
+});
+
+test("continuous events during snapshots hand off stale work without disconnecting", async () => {
+  let snapshots = 0;
+  let h!: ReturnType<typeof harness>;
+  h = harness({
+    fetchEvents: async (cursor) => page([], cursor, { next_seq: cursor }),
+    recoverSnapshot: async () => {
+      snapshots += 1;
+      h.sockets[0].message(JSON.stringify(event(snapshots)));
+    },
+  });
+
+  h.controller.start();
+  h.sockets[0].open();
+  await flush();
+
+  assertEqual(snapshots, 2, "recovery should take one closing snapshot without waiting for quiet");
+  assertEqual(h.applied.join(","), "1,2");
+  assertEqual(h.appliedSources.join(","), "recovery,live");
+  assertEqual(h.sockets[0].closed, false, "a healthy busy stream must stay connected");
+  assertEqual(h.statuses[h.statuses.length - 1]?.connection, "connected");
+  assertEqual(h.statuses[h.statuses.length - 1]?.freshness, "stale");
 });
 
 test("retention gaps and unsequenced lag frames force a snapshot", async () => {
