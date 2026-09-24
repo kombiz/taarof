@@ -72,8 +72,18 @@ class FakeClock {
 
 test("event classification isolates known state events and safely refreshes ambiguous events", () => {
   assertEqual(
-    classifyEventRefreshDomains(JSON.stringify({ event_type: "workspace_renamed" })).join(","),
+    classifyEventRefreshDomains(JSON.stringify({ event_type: "work_recorded" })).join(","),
     "state",
+  );
+  assertEqual(
+    classifyEventRefreshDomains(JSON.stringify({ event_type: "runtime_probe_state_changed" })).join(","),
+    "state,agent-sessions",
+    "runtime probe changes can affect catalog live-binding status",
+  );
+  assertEqual(
+    classifyEventRefreshDomains(JSON.stringify({ event_type: "command_exited" })).join(","),
+    "state,agent-sessions",
+    "process exits can affect catalog activity",
   );
   assertEqual(
     classifyEventRefreshDomains(JSON.stringify({ event_type: "agent_activity_changed" })).join(","),
@@ -172,6 +182,91 @@ test("failed and timed-out requests release the dataset and preserve one follow-
   assertEqual(scheduler.status().active, false);
 });
 
+test("a timed-out request cannot commit late success or clear its active follow-up", async () => {
+  const clock = new FakeClock();
+  const first = deferred<string>();
+  const second = deferred<string>();
+  let requestNumber = 0;
+  let loading = false;
+  let timeoutErrors = 0;
+  const successes: string[] = [];
+  const scheduler = new DatasetRefreshScheduler((signal) => {
+    requestNumber += 1;
+    return runGuardedRefresh({
+      signal,
+      isCurrent: () => true,
+      load: () => requestNumber === 1 ? first.promise : second.promise,
+      enqueueWrite: (write) => write(),
+      onLoading: (value) => { loading = value; },
+      onSuccess: (value) => successes.push(value),
+      onError: (error) => {
+        if (error instanceof RefreshRequestTimeoutError) timeoutErrors += 1;
+      },
+      isUnauthorized: () => false,
+      onUnauthorized: () => undefined,
+    });
+  }, { clock, coalesceMs: 10, minIntervalMs: 50, requestTimeoutMs: 100 });
+
+  scheduler.invalidate();
+  await clock.advance(10);
+  scheduler.invalidate();
+  await clock.advance(100);
+  await clock.advance(10);
+  assertEqual(requestNumber, 2);
+  assertEqual(loading, true, "the follow-up owns loading after the timeout");
+  assertEqual(timeoutErrors, 1, "the legitimate timeout should be reported once");
+
+  first.resolve("stale-success");
+  for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+  assertEqual(successes.length, 0, "late success from the aborted request must be inert");
+  assertEqual(loading, true, "late settlement must not clear follow-up loading");
+
+  second.resolve("fresh-success");
+  for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+  assertEqual(successes.join(","), "fresh-success");
+  assertEqual(loading, false);
+});
+
+test("a timed-out request cannot apply a late 401 to its active follow-up", async () => {
+  class Unauthorized extends Error {}
+  const clock = new FakeClock();
+  const first = deferred<string>();
+  const second = deferred<string>();
+  let requestNumber = 0;
+  let loading = false;
+  let unauthorized = 0;
+  let timeoutErrors = 0;
+  const scheduler = new DatasetRefreshScheduler((signal) => {
+    requestNumber += 1;
+    return runGuardedRefresh({
+      signal,
+      isCurrent: () => true,
+      load: () => requestNumber === 1 ? first.promise : second.promise,
+      enqueueWrite: (write) => write(),
+      onLoading: (value) => { loading = value; },
+      onSuccess: () => undefined,
+      onError: (error) => {
+        if (error instanceof RefreshRequestTimeoutError) timeoutErrors += 1;
+      },
+      isUnauthorized: (error) => error instanceof Unauthorized,
+      onUnauthorized: () => { unauthorized += 1; },
+    });
+  }, { clock, coalesceMs: 10, minIntervalMs: 50, requestTimeoutMs: 100 });
+
+  scheduler.invalidate();
+  await clock.advance(10);
+  scheduler.invalidate();
+  await clock.advance(100);
+  await clock.advance(10);
+  first.reject(new Unauthorized("stale token response"));
+  for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+
+  assertEqual(timeoutErrors, 1);
+  assertEqual(unauthorized, 0, "late 401 from the aborted request must be inert");
+  assertEqual(loading, true, "late 401 must not clear follow-up loading");
+  second.resolve("fresh-success");
+});
+
 test("state and agent schedulers remain independent while one request is slow", async () => {
   const clock = new FakeClock();
   const slowState = deferred<void>();
@@ -186,7 +281,7 @@ test("state and agent schedulers remain independent while one request is slow", 
     throw new Error("catalog failure");
   }, { clock, coalesceMs: 10, minIntervalMs: 50, requestTimeoutMs: 500 });
 
-  for (const domain of classifyEventRefreshDomains(JSON.stringify({ event_type: "workspace_renamed" }))) {
+  for (const domain of classifyEventRefreshDomains(JSON.stringify({ event_type: "work_recorded" }))) {
     (domain === "state" ? state : catalog).invalidate();
   }
   await clock.advance(10);

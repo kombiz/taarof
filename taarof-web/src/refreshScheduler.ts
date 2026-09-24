@@ -13,17 +13,7 @@ const ALL_REFRESH_DOMAINS: readonly RefreshDomain[] = ["state", "agent-sessions"
 const STATE_REFRESH_DOMAIN: readonly RefreshDomain[] = ["state"];
 
 const STATE_ONLY_EVENT_TYPES = new Set([
-  "session_started",
-  "session_stopping",
-  "workspace_created",
-  "workspace_renamed",
-  "command_exited",
-  "probe_state_changed",
-  "runtime_probe_state_changed",
   "alert_raised",
-  "socket_message_received",
-  "http_control_action",
-  "http_pane_control_lifecycle",
   "work_recorded",
   "work_preferences_changed",
   "work_ledger_cleared",
@@ -242,9 +232,20 @@ export async function runGuardedRefresh<T>({
   onLoading(true);
   onError(null);
 
+  let removeAbortListener: () => void = () => undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const handleAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", handleAbort, { once: true });
+    removeAbortListener = () => signal.removeEventListener("abort", handleAbort);
+  });
+
   try {
-    const value = await load(signal);
-    if (!isCurrent()) {
+    const value = await Promise.race([load(signal), aborted]);
+    if (!isCurrent() || signal.aborted) {
       return;
     }
     enqueueWrite(() => {
@@ -265,6 +266,7 @@ export async function runGuardedRefresh<T>({
     }
     onError(signal.reason instanceof RefreshRequestTimeoutError ? signal.reason : error);
   } finally {
+    removeAbortListener();
     if (isCurrent()) {
       onLoading(false);
     }
