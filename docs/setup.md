@@ -140,7 +140,8 @@ the optional performance harness, and runs native, CLI, and frontend tests.
 Pull-request CI also compiles the harness and runs the CLI regression suite.
 
 The native CI job gives its tests a 1 GiB executable tmpfs at
-`/tmp/taarof-tests`, selected with `TMPDIR` only for the test step. Disposable
+`/t`, selected with `TMPDIR` only for the test step. The short mount path
+leaves room for fixture names within the Unix socket path-length limit. Disposable
 SQLite fixtures therefore avoid host disk-journal contention while retaining
 SQLite transactions, locking, reopen checks, and the ten-second history flush
 deadline. Builds, caches, and package validation still use disk. These tests

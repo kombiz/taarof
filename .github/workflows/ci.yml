@@ -108,8 +108,9 @@ jobs:
       image: mirror.gcr.io/library/debian:trixie-slim
       # SQLite test fixtures must not share the runner's contended disk journal.
       # Keep real SQLite transactions/locking and the ten-second flush deadline;
-      # only disposable test files use this bounded, executable tmpfs.
-      options: --tmpfs /tmp/taarof-tests:rw,exec,size=1g,mode=1777
+      # only disposable test files use this bounded, executable tmpfs. The short
+      # mount path also leaves room for Unix socket fixture names (SUN_LEN).
+      options: --tmpfs /t:rw,exec,size=1g,mode=1777
     env:
       CARGO_HOME: /tmp/taarof-cargo
       RUSTUP_HOME: /tmp/taarof-rustup
@@ -174,7 +175,7 @@ jobs:
 
       - name: Run taarof-app tests
         env:
-          TMPDIR: /tmp/taarof-tests
+          TMPDIR: /t
         run: cargo test --manifest-path taarof-app/Cargo.toml
 
       - name: Build taarof-app release binary
