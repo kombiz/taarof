@@ -108,6 +108,10 @@ class FakeSocket implements EventSocket {
   disconnect(code = 1006) {
     this.emit("close", { code });
   }
+
+  listenerCount() {
+    return [...this.listeners.values()].reduce((count, listeners) => count + listeners.size, 0);
+  }
 }
 
 function page(
@@ -447,6 +451,7 @@ test("a bounded recovery timeout closes the stale socket and schedules reconnect
   await h.clock.advance(10_000);
 
   assertEqual(h.sockets[0].closed, true);
+  assertEqual(h.sockets[0].listenerCount(), 0, "retired sockets must release every listener");
   assertEqual(h.statuses[h.statuses.length - 1]?.connection, "disconnected");
   assertEqual(h.clock.timers.size, 1, "timeout must leave exactly one reconnect timer");
   h.controller.stop();
@@ -461,11 +466,13 @@ test("terminal authorization failure and stop cancel retries and stale callbacks
   });
 
   h.controller.start();
-  h.sockets[0].disconnect();
+  h.sockets[0].open();
   probe.reject(new Unauthorized("expired"));
   await flush();
   assertEqual(h.unauthorized, 1);
   assertEqual(h.clock.timers.size, 0, "terminal auth rejection must not retain a retry timer");
+  assertEqual(h.sockets[0].closed, true);
+  assertEqual(h.sockets[0].listenerCount(), 0, "terminal auth must release every socket listener");
 
   const lateIdentity = deferred<string>();
   const stopped = harness({ fetchRuntimeIdentity: () => lateIdentity.promise });
@@ -477,6 +484,31 @@ test("terminal authorization failure and stop cancel retries and stale callbacks
   assertEqual(stopped.snapshots, 0);
   assertEqual(stopped.clock.timers.size, 0);
   assertEqual(stopped.sockets[0].closed, true);
+  assertEqual(stopped.sockets[0].listenerCount(), 0, "stop must release every socket listener");
+});
+
+test("a socket that never opens times out and retries with no retained listeners", async () => {
+  const h = harness();
+  h.controller.start();
+
+  assertEqual(h.statuses[h.statuses.length - 1]?.connection, "connecting");
+  await h.clock.advance(9_999);
+  assertEqual(h.sockets.length, 1);
+  assertEqual(h.sockets[0].closed, false);
+
+  await h.clock.advance(1);
+  assertEqual(h.sockets[0].closed, true);
+  assertEqual(h.sockets[0].listenerCount(), 0);
+  assertEqual(h.statuses[h.statuses.length - 1]?.connection, "disconnected");
+  assertEqual(h.clock.timers.size, 1, "the open deadline must become one reconnect timer");
+
+  await h.clock.advance(500);
+  assertEqual(h.sockets.length, 2, "the bounded open failure must retry");
+  assertEqual(h.statuses[h.statuses.length - 1]?.connection, "connecting");
+  h.controller.stop();
+  assertEqual(h.sockets[1].closed, true);
+  assertEqual(h.sockets[1].listenerCount(), 0);
+  assertEqual(h.clock.timers.size, 0);
 });
 
 test("socket close rotates refresh ownership before the auth probe or backoff", async () => {

@@ -103,6 +103,8 @@ export class EventRecoveryController {
   private readonly requestTimeoutMs: number;
   private active = false;
   private socket: EventSocket | null = null;
+  private socketDetach: (() => void) | null = null;
+  private socketOpenTimer: number | null = null;
   private reconnectTimer: number | null = null;
   private recoveryController: AbortController | null = null;
   private operation = 0;
@@ -136,9 +138,8 @@ export class EventRecoveryController {
     this.clearReconnectTimer();
     this.recoveryController?.abort(new DOMException("Event recovery stopped.", "AbortError"));
     this.recoveryController = null;
-    const socket = this.socket;
-    this.socket = null;
-    socket?.close();
+    if (this.socket) this.retireSocket(this.socket, true);
+    else this.clearSocketOpenTimer();
     this.connection = "disconnected";
     this.freshness = "stale";
     this.publishStatus();
@@ -171,6 +172,7 @@ export class EventRecoveryController {
 
     const onOpen = () => {
       if (!this.active || this.socket !== socket) return;
+      this.clearSocketOpenTimer();
       void this.beginRecovery();
     };
     const onMessage = (rawEvent: unknown) => {
@@ -184,8 +186,7 @@ export class EventRecoveryController {
     };
     const onClose = () => {
       if (!this.active || this.socket !== socket) return;
-      detach();
-      this.socket = null;
+      this.retireSocket(socket, false);
       this.operation += 1;
       this.recovering = false;
       this.recoveryController?.abort(new DOMException("Event socket closed.", "AbortError"));
@@ -202,11 +203,22 @@ export class EventRecoveryController {
       socket.removeEventListener("message", onMessage);
       socket.removeEventListener("close", onClose);
       socket.removeEventListener("error", onError);
+      if (this.socketDetach === detach) this.socketDetach = null;
     };
+    this.socketDetach = detach;
     socket.addEventListener("open", onOpen);
     socket.addEventListener("message", onMessage);
     socket.addEventListener("close", onClose);
     socket.addEventListener("error", onError);
+    this.socketOpenTimer = this.clock.setTimeout(() => {
+      this.socketOpenTimer = null;
+      if (!this.active || this.socket !== socket) return;
+      this.retireSocket(socket, true);
+      this.connection = "disconnected";
+      this.freshness = "stale";
+      this.publishStatus();
+      this.scheduleReconnect();
+    }, this.requestTimeoutMs);
   }
 
   private async probeAuthorizationThenReconnect() {
@@ -247,6 +259,21 @@ export class EventRecoveryController {
     this.reconnectTimer = null;
   }
 
+  private clearSocketOpenTimer() {
+    if (this.socketOpenTimer === null) return;
+    this.clock.clearTimeout(this.socketOpenTimer);
+    this.socketOpenTimer = null;
+  }
+
+  private retireSocket(socket: EventSocket, close: boolean) {
+    if (this.socket !== socket) return;
+    this.clearSocketOpenTimer();
+    this.socketDetach?.();
+    this.socketDetach = null;
+    this.socket = null;
+    if (close) socket.close();
+  }
+
   private async beginRecovery() {
     if (!this.active || this.recovering) return;
     this.recovering = true;
@@ -276,9 +303,7 @@ export class EventRecoveryController {
       this.connection = "disconnected";
       this.freshness = "stale";
       this.publishStatus();
-      const socket = this.socket;
-      this.socket = null;
-      socket?.close();
+      if (this.socket) this.retireSocket(this.socket, true);
       this.scheduleReconnect();
     } finally {
       if (this.operation === operation) this.recovering = false;
@@ -426,9 +451,8 @@ export class EventRecoveryController {
     this.clearReconnectTimer();
     this.recoveryController?.abort(new DOMException("Authorization rejected.", "AbortError"));
     this.recoveryController = null;
-    const socket = this.socket;
-    this.socket = null;
-    socket?.close();
+    if (this.socket) this.retireSocket(this.socket, true);
+    else this.clearSocketOpenTimer();
     this.connection = "disconnected";
     this.freshness = "stale";
     this.publishStatus();
