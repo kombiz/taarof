@@ -423,6 +423,7 @@ struct TaskPanelViewContext {
     show_pull_requests: bool,
     remote_target: Option<RemoteTaskTarget>,
     pull_request_target: Option<PullRequestTarget>,
+    local_pull_request_identity_checking: bool,
 }
 
 use crate::agent_projection::{project_all_agent_panes, AgentPaneProjection};
@@ -1430,6 +1431,7 @@ impl TaskPanel {
         if context.mode == TaskPanelMode::Review {
             let forge = review_forge_projection(
                 active_pr_target.as_ref(),
+                context.local_pull_request_identity_checking,
                 &self.pull_request_cache.borrow(),
             );
             let task = review_task_projection(state, &next, active_pr_target.as_ref());
@@ -1942,6 +1944,7 @@ impl TaskPanel {
                 show_pull_requests: false,
                 remote_target: None,
                 pull_request_target: None,
+                local_pull_request_identity_checking: false,
             };
         }
 
@@ -1967,6 +1970,12 @@ impl TaskPanel {
             });
         let mode_key = active_mode_key(state, pull_request_target.as_ref(), remote_target.as_ref());
         let selected_mode = self.mode_selection.borrow().mode_for_context(&mode_key);
+        let local_pull_request_identity_checking = remote_target.is_none()
+            && local_pull_request_probe_request(state).is_some_and(|request| {
+                self.local_pull_request_inflight
+                    .borrow()
+                    .contains(&request.key)
+            });
 
         if matches!(
             selected_mode,
@@ -1979,6 +1988,7 @@ impl TaskPanel {
                 show_pull_requests: self.pull_request_mode_enabled,
                 remote_target,
                 pull_request_target,
+                local_pull_request_identity_checking,
             };
         }
 
@@ -1989,6 +1999,7 @@ impl TaskPanel {
                 show_pull_requests: self.pull_request_mode_enabled,
                 remote_target,
                 pull_request_target,
+                local_pull_request_identity_checking,
             };
         }
 
@@ -1998,6 +2009,7 @@ impl TaskPanel {
             show_pull_requests: self.pull_request_mode_enabled,
             remote_target: None,
             pull_request_target,
+            local_pull_request_identity_checking,
         }
     }
 
@@ -3367,9 +3379,18 @@ fn now_ms() -> u64 {
 
 fn review_forge_projection(
     target: Option<&PullRequestTarget>,
+    identity_checking: bool,
     cache: &HashMap<PullRequestKey, PullRequestsEntry>,
 ) -> crate::review::ReviewForgeProjection {
     let Some(target) = target else {
+        if identity_checking {
+            return crate::review::ReviewForgeProjection {
+                summary: "Checking repository and PR identity…".to_string(),
+                detail: "Reading the selected worktree's repository, branch, and HEAD before querying the forge."
+                    .to_string(),
+                url: None,
+            };
+        }
         return crate::review::ReviewForgeProjection {
             summary: "PR association unavailable".to_string(),
             detail: "Repository, branch, or forge identity is unavailable or ambiguous."
@@ -6322,7 +6343,13 @@ mod tests {
         let target = review_pr_target(head);
         let key = PullRequestKey::for_target(&target);
 
-        let unavailable = review_forge_projection(Some(&target), &HashMap::new());
+        let checking_identity = review_forge_projection(None, true, &HashMap::new());
+        assert!(checking_identity.summary.contains("Checking repository"));
+
+        let unavailable_identity = review_forge_projection(None, false, &HashMap::new());
+        assert_eq!(unavailable_identity.summary, "PR association unavailable");
+
+        let unavailable = review_forge_projection(Some(&target), false, &HashMap::new());
         assert!(unavailable.summary.contains("Checking"));
 
         let mut cache = HashMap::new();
@@ -6336,7 +6363,7 @@ mod tests {
             },
         );
         assert_eq!(
-            review_forge_projection(Some(&target), &cache).summary,
+            review_forge_projection(Some(&target), false, &cache).summary,
             "Forge unavailable"
         );
 
@@ -6358,7 +6385,7 @@ mod tests {
             },
         );
         assert_eq!(
-            review_forge_projection(Some(&target), &cache).summary,
+            review_forge_projection(Some(&target), false, &cache).summary,
             "No PR for this exact branch"
         );
 
@@ -6379,7 +6406,7 @@ mod tests {
                 error: None,
             },
         );
-        let failed = review_forge_projection(Some(&target), &cache);
+        let failed = review_forge_projection(Some(&target), false, &cache);
         assert!(failed.detail.contains("checks failed"));
         assert!(failed.detail.contains("head 111111111111"));
         assert!(failed.detail.contains("PR/check data fetched"));
@@ -6392,7 +6419,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .pull_requests[0] = review_pr(moved, PullRequestChecks::Ready);
-        let moved = review_forge_projection(Some(&target), &cache);
+        let moved = review_forge_projection(Some(&target), false, &cache);
         assert!(moved.summary.contains("head does not match"));
         assert!(moved
             .detail
