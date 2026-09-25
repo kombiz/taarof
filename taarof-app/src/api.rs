@@ -585,13 +585,11 @@ fn transcript_payload(state: &crate::agents::TranscriptState) -> Value {
 fn pane_payload(tab: &Tab, leaf: &PaneLeaf, ingredients: &StateSnapshotIngredients) -> Value {
     let live_pane_process_states = &ingredients.live_pane_process_states;
     let tmux_session = leaf
-        .tmux_backing
-        .as_ref()
-        .map(|backing| backing.session_name.clone());
+        .tmux_display_metadata()
+        .map(|(session_name, _)| session_name.to_string());
     let tmux_host = leaf
-        .tmux_backing
-        .as_ref()
-        .and_then(|backing| backing.target.ssh_target_string());
+        .tmux_display_metadata()
+        .and_then(|(_, target)| target.ssh_target_string());
     let tmux_probe = leaf
         .tmux_backing
         .as_ref()
@@ -603,9 +601,13 @@ fn pane_payload(tab: &Tab, leaf: &PaneLeaf, ingredients: &StateSnapshotIngredien
         &leaf.process_state,
         live_pane_process_states,
     );
+    let exact_tmux_unverified = leaf
+        .tmux_backing
+        .as_ref()
+        .is_some_and(|backing| !backing.expected_generation_is_verified());
     let (attach_supported, attach_kind) = live_pane_attach_metadata(
         leaf.tmux_backing.is_some(),
-        leaf.restore_unavailable_reason.is_some(),
+        leaf.restore_unavailable_reason.is_some() || exact_tmux_unverified,
     );
     // Broker-owned panes expose the raw PTY adapter; every other live pane is
     // represented by the legacy snapshot capability.
@@ -647,6 +649,11 @@ fn pane_payload(tab: &Tab, leaf: &PaneLeaf, ingredients: &StateSnapshotIngredien
         attach_supported,
         attach_kind,
         attach_unavailable_reason: leaf.restore_unavailable_reason.clone().or_else(|| {
+            exact_tmux_unverified.then(|| {
+                "Browser viewer reconnect unavailable: the exact saved tmux generation is not currently verified."
+                    .to_string()
+            })
+        }).or_else(|| {
             (!attach_supported).then(|| {
                 "Browser viewer reconnect unavailable: this live pane has no supported viewer target."
                     .to_string()

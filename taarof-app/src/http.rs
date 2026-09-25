@@ -54,8 +54,8 @@ pub use crate::api::StateProjection;
 
 #[cfg(test)]
 use self::pane_attach::{
-    control_terminal_update_frame_json, replace_frame_json, snapshot_frame_json,
-    PaneAttachBaseline, PaneAttachUpdate,
+    control_terminal_update_frame_json, replace_frame_json, resolve_live_pane_attach_target,
+    snapshot_frame_json, PaneAttachBaseline, PaneAttachUpdate,
 };
 #[cfg(test)]
 use self::web_assets::{
@@ -1793,6 +1793,7 @@ mod tests {
             kind: PaneAttachKind::Tmux {
                 session_name: "taarof-session".into(),
                 target: crate::tmux::TmuxTarget::Local,
+                expected_generation: None,
             },
         }
     }
@@ -2598,6 +2599,74 @@ mod tests {
         let error = connect_async(url)
             .await
             .expect_err("unsupported attach should reject websocket upgrade");
+        match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+            }
+            other => panic!("unexpected websocket error: {other}"),
+        }
+        bridge_task.await.expect("bridge task should complete");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn refused_restore_websocket_does_not_capture_same_named_tmux_replacement() {
+        let (bridge_tx, mut bridge_rx) = mpsc::channel(8);
+        let state = test_http_state(
+            "secret",
+            bridge_tx.clone(),
+            default_pane_snapshotter(bridge_tx),
+            HTTP_PANE_ATTACH_POLL_INTERVAL,
+        );
+        let (addr, server) = spawn_ws_test_server(state).await;
+        let bridge_task = tokio::spawn(async move {
+            match bridge_rx
+                .recv()
+                .await
+                .expect("bridge should receive attach lookup")
+            {
+                HttpBridgeRequest::ResolvePaneAttach {
+                    tab_id,
+                    pane_id,
+                    reply,
+                } => {
+                    let mut backing = crate::pane::TmuxBacking {
+                        session_name: "same-name-replacement-must-not-leak".into(),
+                        target: crate::tmux::TmuxTarget::Local,
+                        expected_generation: Some(crate::session::SavedTmuxIdentity {
+                            session_id: "$1".into(),
+                            session_created: 1,
+                            continuity_id: "11111111111111111111111111111111".into(),
+                        }),
+                        pane_info: crate::probe::ProbeSnapshot::default(),
+                    };
+                    backing.pane_info.record_success(crate::tmux::TmuxPaneInfo {
+                        current_command: "zsh".into(),
+                        cwd: "/replacement".into(),
+                        pid: 42,
+                        width: 80,
+                        height: 24,
+                        session_id: "$2".into(),
+                        session_created: 2,
+                        continuity_id: Some("22222222222222222222222222222222".into()),
+                    });
+                    let lookup = resolve_live_pane_attach_target(
+                        tab_id.expect("tab-scoped request"),
+                        pane_id,
+                        Some(&backing),
+                        false,
+                    );
+                    assert_eq!(lookup, PaneAttachLookup::Unsupported);
+                    let _ = reply.send(lookup);
+                }
+                _ => panic!("unexpected bridge request"),
+            }
+        });
+
+        let url = format!("ws://{addr}/api/v1/tabs/42/panes/7/attach?token=secret");
+        let error = connect_async(url)
+            .await
+            .expect_err("refused restore must reject websocket upgrade");
         match error {
             tokio_tungstenite::tungstenite::Error::Http(response) => {
                 assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -4846,6 +4915,7 @@ mod tests {
                 kind: PaneAttachKind::Tmux {
                     session_name: "taarof-session".into(),
                     target: crate::tmux::TmuxTarget::Local,
+                    expected_generation: None,
                 },
             })
         );
@@ -4928,6 +4998,7 @@ mod tests {
                 kind: PaneAttachKind::Tmux {
                     session_name: "first-session".into(),
                     target: crate::tmux::TmuxTarget::Local,
+                    expected_generation: None,
                 },
             })
         );
@@ -4939,6 +5010,7 @@ mod tests {
                 kind: PaneAttachKind::Tmux {
                     session_name: "second-session".into(),
                     target: crate::tmux::TmuxTarget::Local,
+                    expected_generation: None,
                 },
             })
         );
@@ -5062,6 +5134,7 @@ mod tests {
             kind: PaneAttachKind::Tmux {
                 session_name: "taarof-session".into(),
                 target: crate::tmux::TmuxTarget::Local,
+                expected_generation: None,
             },
         };
         let snapshot = PaneSnapshot {
@@ -5087,6 +5160,7 @@ mod tests {
             kind: PaneAttachKind::Tmux {
                 session_name: "taarof-session-a".into(),
                 target: crate::tmux::TmuxTarget::Local,
+                expected_generation: None,
             },
         };
         let replacement_target = PaneAttachTarget {
@@ -5097,6 +5171,7 @@ mod tests {
                 target: crate::tmux::TmuxTarget::Remote {
                     ssh_target: "builder@ci-box".into(),
                 },
+                expected_generation: None,
             },
         };
         let snapshot = PaneSnapshot {
@@ -5197,6 +5272,7 @@ mod tests {
             kind: PaneAttachKind::Tmux {
                 session_name: "taarof-session".into(),
                 target: crate::tmux::TmuxTarget::Local,
+                expected_generation: None,
             },
         };
         let fixture = PaneAttachFixture::new(
@@ -5279,6 +5355,7 @@ mod tests {
             kind: PaneAttachKind::Tmux {
                 session_name: "taarof-session".into(),
                 target: crate::tmux::TmuxTarget::Local,
+                expected_generation: None,
             },
         };
         let fixture = PaneAttachFixture::new_with_state_override(
@@ -5320,6 +5397,7 @@ mod tests {
             kind: PaneAttachKind::Tmux {
                 session_name: "taarof-session-a".into(),
                 target: crate::tmux::TmuxTarget::Local,
+                expected_generation: None,
             },
         };
         let replacement_target = PaneAttachTarget {
@@ -5330,6 +5408,7 @@ mod tests {
                 target: crate::tmux::TmuxTarget::Remote {
                     ssh_target: "builder@ci-box".into(),
                 },
+                expected_generation: None,
             },
         };
         let fixture = PaneAttachFixture::new(
@@ -5404,6 +5483,7 @@ mod tests {
             kind: PaneAttachKind::Tmux {
                 session_name: "taarof-session".into(),
                 target: crate::tmux::TmuxTarget::Local,
+                expected_generation: None,
             },
         };
         let fixture = PaneAttachFixture::new(

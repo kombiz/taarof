@@ -1185,45 +1185,65 @@ pub struct StartupSessionLoad {
     pub writer_block_reason: Option<String>,
 }
 
+enum StartupCandidateFailure {
+    Preserve(io::Error),
+    LeaveInPlace(&'static str),
+}
+
+impl StartupCandidateFailure {
+    fn reason(&self) -> String {
+        match self {
+            Self::Preserve(error) => error.to_string(),
+            Self::LeaveInPlace(reason) => (*reason).to_string(),
+        }
+    }
+}
+
 fn load_primary_startup_candidate(
     path: &Path,
     expected_identity: Option<&str>,
-) -> Result<Option<SessionStateV2>, io::Error> {
+) -> Result<Option<SessionStateV2>, StartupCandidateFailure> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+        Err(error) => return Err(StartupCandidateFailure::Preserve(error)),
     };
-    let state = load_v2_from_str(&content)
-        .filter(|state| layout_matches_session(state, expected_identity))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "layout is corrupt or belongs to another session identity",
-            )
-        })?;
+    let state = load_v2_from_str(&content).ok_or_else(|| {
+        StartupCandidateFailure::Preserve(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "layout is corrupt",
+        ))
+    })?;
+    if !layout_matches_session(&state, expected_identity) {
+        return Err(StartupCandidateFailure::LeaveInPlace(
+            "layout belongs to another session identity",
+        ));
+    }
     Ok(Some(state))
 }
 
 fn load_legacy_startup_candidate(
     path: &Path,
     expected_identity: Option<&str>,
-) -> Result<Option<SessionStateV2>, io::Error> {
+) -> Result<Option<SessionStateV2>, StartupCandidateFailure> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+        Err(error) => return Err(StartupCandidateFailure::Preserve(error)),
     };
-    let mut state = load_v2_from_str(&content)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "legacy layout is corrupt"))?;
+    let mut state = load_v2_from_str(&content).ok_or_else(|| {
+        StartupCandidateFailure::Preserve(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy layout is corrupt",
+        ))
+    })?;
     if state.session_namespace.is_some()
         || state
             .session_identity
             .as_deref()
             .is_some_and(|identity| Some(identity) != expected_identity)
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        return Err(StartupCandidateFailure::LeaveInPlace(
             "legacy layout identity is ambiguous",
         ));
     }
@@ -1238,45 +1258,57 @@ fn load_v2_for_startup_at(
     expected_identity: Option<&str>,
     preserve: &dyn Fn(&Path) -> io::Result<PathBuf>,
 ) -> StartupSessionLoad {
-    let (failed_path, failure_reason) =
-        match load_primary_startup_candidate(path, expected_identity) {
-            Ok(Some(state)) => {
+    let (failed_path, failure) = match load_primary_startup_candidate(path, expected_identity) {
+        Ok(Some(state)) => {
+            return StartupSessionLoad {
+                state: Some(state),
+                diagnostic: None,
+                writer_block_reason: None,
+            };
+        }
+        Ok(None) => match legacy {
+            Some(legacy_path) => {
+                match load_legacy_startup_candidate(legacy_path, expected_identity) {
+                    Ok(Some(state)) => {
+                        return StartupSessionLoad {
+                            state: Some(state),
+                            diagnostic: None,
+                            writer_block_reason: None,
+                        };
+                    }
+                    Ok(None) => {
+                        return StartupSessionLoad {
+                            state: None,
+                            diagnostic: None,
+                            writer_block_reason: None,
+                        };
+                    }
+                    Err(error) => (legacy_path, error),
+                }
+            }
+            None => {
                 return StartupSessionLoad {
-                    state: Some(state),
+                    state: None,
                     diagnostic: None,
                     writer_block_reason: None,
                 };
             }
-            Ok(None) => match legacy {
-                Some(legacy_path) => {
-                    match load_legacy_startup_candidate(legacy_path, expected_identity) {
-                        Ok(Some(state)) => {
-                            return StartupSessionLoad {
-                                state: Some(state),
-                                diagnostic: None,
-                                writer_block_reason: None,
-                            };
-                        }
-                        Ok(None) => {
-                            return StartupSessionLoad {
-                                state: None,
-                                diagnostic: None,
-                                writer_block_reason: None,
-                            };
-                        }
-                        Err(error) => (legacy_path, error.to_string()),
-                    }
-                }
-                None => {
-                    return StartupSessionLoad {
-                        state: None,
-                        diagnostic: None,
-                        writer_block_reason: None,
-                    };
-                }
-            },
-            Err(error) => (path, error.to_string()),
+        },
+        Err(error) => (path, error),
+    };
+
+    let failure_reason = failure.reason();
+    if matches!(failure, StartupCandidateFailure::LeaveInPlace(_)) {
+        let reason = format!(
+            "saved workspace layout at {} was not opened ({failure_reason}); the original was left unchanged and session persistence is blocked",
+            failed_path.display(),
+        );
+        return StartupSessionLoad {
+            state: None,
+            diagnostic: Some(reason.clone()),
+            writer_block_reason: Some(reason),
         };
+    }
 
     match preserve(failed_path) {
         Ok(recovery) => StartupSessionLoad {
@@ -1510,6 +1542,105 @@ mod tests {
 
         write_atomically(&path, r#"{"version":2,"workspaces":[]}"#).unwrap();
         assert_eq!(fs::read(&recovery).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn foreign_layout_stays_in_place_and_blocks_all_writes() {
+        use std::cell::Cell;
+
+        let dir = recovery_test_dir("foreign");
+        let path = dir.join("session.json");
+        let foreign = SessionStateV2 {
+            version: 2,
+            session_namespace: Some(instance::session_storage_key_for("other-session")),
+            session_identity: Some("other-session".into()),
+            session_name: Some("other-session".into()),
+            workspaces: Vec::new(),
+            active_workspace_index: 0,
+            window_width: 1200,
+            window_height: 800,
+            detached_sessions: Vec::new(),
+            background_section_collapsed: None,
+        };
+        let original = serde_json::to_vec_pretty(&foreign).unwrap();
+        fs::write(&path, &original).unwrap();
+        let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let preserve_called = Cell::new(false);
+        let preserve = |_path: &Path| -> io::Result<PathBuf> {
+            preserve_called.set(true);
+            Err(io::Error::other("foreign layout must not be relocated"))
+        };
+
+        let loaded = load_v2_for_startup_at(&path, None, Some("expected-session"), &preserve);
+        assert!(loaded.state.is_none());
+        assert!(!preserve_called.get());
+        let reason = loaded
+            .writer_block_reason
+            .expect("foreign layout must block persistence");
+        assert!(reason.contains("belongs to another session identity"));
+        assert!(reason.contains("left unchanged"));
+        let writer = SessionWriter::blocked_at(path.clone(), reason).unwrap();
+        writer.schedule_autosave(session_writer_capture("must not overwrite"));
+        assert!(writer.flush().is_err());
+        assert!(writer
+            .shutdown(session_writer_capture("must not overwrite on shutdown"))
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            original_modified
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_legacy_layout_stays_in_place_and_blocks_primary_writer() {
+        use std::cell::Cell;
+
+        let dir = recovery_test_dir("ambiguous-legacy");
+        let primary = dir.join("session.json");
+        let legacy = dir.join("session-legacy.json");
+        let ambiguous = SessionStateV2 {
+            version: 2,
+            session_namespace: Some("already-namespaced".into()),
+            session_identity: Some("other-session".into()),
+            session_name: Some("other-session".into()),
+            workspaces: Vec::new(),
+            active_workspace_index: 0,
+            window_width: 1200,
+            window_height: 800,
+            detached_sessions: Vec::new(),
+            background_section_collapsed: None,
+        };
+        let original = serde_json::to_vec_pretty(&ambiguous).unwrap();
+        fs::write(&legacy, &original).unwrap();
+        let original_modified = fs::metadata(&legacy).unwrap().modified().unwrap();
+        let preserve_called = Cell::new(false);
+        let preserve = |_path: &Path| -> io::Result<PathBuf> {
+            preserve_called.set(true);
+            Err(io::Error::other("ambiguous legacy layout must stay put"))
+        };
+
+        let loaded =
+            load_v2_for_startup_at(&primary, Some(&legacy), Some("expected-session"), &preserve);
+        assert!(!preserve_called.get());
+        let reason = loaded
+            .writer_block_reason
+            .expect("ambiguous legacy layout must block persistence");
+        assert!(reason.contains("legacy layout identity is ambiguous"));
+        let writer = SessionWriter::blocked_at(primary.clone(), reason).unwrap();
+        writer.schedule_autosave(session_writer_capture("must not write primary"));
+        assert!(writer.flush().is_err());
+        assert!(writer
+            .shutdown(session_writer_capture("must not write on shutdown"))
+            .is_err());
+        assert!(!primary.exists());
+        assert_eq!(fs::read(&legacy).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&legacy).unwrap().modified().unwrap(),
+            original_modified
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

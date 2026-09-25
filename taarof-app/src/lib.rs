@@ -3196,7 +3196,8 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
     let startup_session = session::load_v2_for_startup();
     let persistence_block = startup_session.writer_block_reason.clone();
     if let Some(diagnostic) = startup_session.diagnostic.as_deref() {
-        show_error_toast(diagnostic);
+        diagnostics::record_session_recovery(diagnostic);
+        show_toast(diagnostic);
     } else if startup_session.state.is_some() {
         show_toast(
             "Reopened layout. Display checkpoints are context only; live terminal and agent resume validate separately.",

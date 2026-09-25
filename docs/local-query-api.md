@@ -215,6 +215,7 @@ attention object exposed on its pane and in the matching top-level alert.
 | `tmux_host` | string \| null | SSH target for remote tmux |
 | `attach_supported` | bool | Whether the browser client can attempt a live pane attach |
 | `attach_kind` | string | `"tmux"` for supported tmux-backed panes, otherwise `"unsupported"` |
+| `attach_unavailable_reason` | string \| null | Concrete reason browser viewer reattach is unavailable; callers should show this at the attach action point |
 | `cols` | number \| null | Current visible terminal width when known |
 | `rows` | number \| null | Current visible terminal height when known |
 | `transcript` | object \| null | Live agent transcript summary when a transcript resolves (see below) |

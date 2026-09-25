@@ -296,6 +296,26 @@ pub(super) fn restored_leaf_label(
     (label, false)
 }
 
+pub(super) const LEGACY_TMUX_UNAVAILABLE_REASON: &str =
+    "Reattach unavailable: saved layout lacks exact tmux generation.";
+
+fn restored_tmux_display_metadata(
+    tmux_session: Option<&String>,
+    tmux_host: Option<&String>,
+    has_exact_backing: bool,
+) -> Option<crate::pane::RestoredTmuxMetadata> {
+    let session_name = tmux_session.filter(|_| !has_exact_backing)?;
+    Some(crate::pane::RestoredTmuxMetadata {
+        session_name: session_name.clone(),
+        target: match tmux_host {
+            Some(ssh_target) => crate::tmux::TmuxTarget::Remote {
+                ssh_target: ssh_target.clone(),
+            },
+            None => crate::tmux::TmuxTarget::Local,
+        },
+    })
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct NormalizedPaneRect {
     pub(super) left: f64,
@@ -1753,14 +1773,26 @@ pub(super) fn build_restored_pane_tree(
                 auto_resume_agents,
             );
 
+            let restored_spawn_kind = (spawn_cmd.is_some() && agent_resume.is_some())
+                .then_some(crate::pane::RestoredSpawnKind::AgentResume);
             spawns.push((pane_id, terminal.clone(), spawn_cwd, spawn_cmd));
             let mut leaf = build_pane_leaf(pane_id, &terminal, &container, None);
             leaf.work_origin = work_origin
                 .clone()
                 .unwrap_or_else(crate::pane::new_pane_work_origin);
+            leaf.restored_tmux = restored_tmux_display_metadata(
+                tmux_session.as_ref(),
+                tmux_host.as_ref(),
+                backing.is_some(),
+            );
+            leaf.restore_unavailable_reason = leaf
+                .restored_tmux
+                .as_ref()
+                .map(|_| LEGACY_TMUX_UNAVAILABLE_REASON.to_string());
             leaf.tmux_backing = backing;
             leaf.current_task = current_task.clone();
             leaf.restored_agent_session = agent_session.clone();
+            leaf.restored_spawn_kind = restored_spawn_kind;
             leaf.agent_resume = agent_resume;
             PaneNode::Leaf(leaf)
         }
@@ -1882,7 +1914,10 @@ mod sync_command_tests {
 
 #[cfg(test)]
 mod agent_resume_tests {
-    use super::{plan_restored_spawns, restored_leaf_label, SessionRestoreResumePolicy};
+    use super::{
+        plan_restored_spawns, restored_leaf_label, restored_tmux_display_metadata,
+        SessionRestoreResumePolicy,
+    };
     use crate::session::{SavedAgentSession, SavedAgentSessionSource, SavedPaneNode};
 
     fn leaf(agent_session: Option<SavedAgentSession>) -> SavedPaneNode {
@@ -2063,6 +2098,14 @@ mod agent_resume_tests {
         );
         assert!(plan[0].spawn_cmd.is_none());
         assert_eq!(plan[0].tmux_session.as_deref(), Some("same-name"));
+        assert_eq!(
+            restored_tmux_display_metadata(Some(&"same-name".into()), None, false),
+            Some(crate::pane::RestoredTmuxMetadata {
+                session_name: "same-name".into(),
+                target: crate::tmux::TmuxTarget::Local,
+            })
+        );
+        assert!(restored_tmux_display_metadata(Some(&"same-name".into()), None, true).is_none());
     }
 }
 

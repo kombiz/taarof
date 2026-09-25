@@ -185,17 +185,40 @@ pub(super) fn child_exit_ui_action(
     }
 }
 
-fn restored_tmux_exit_reason(exit_code: i32, has_exact_binding: bool) -> Option<String> {
-    if exit_code == 0 || !has_exact_binding {
+fn restored_child_exit_reason(
+    exit_code: i32,
+    has_exact_tmux_binding: bool,
+    restored_spawn_kind: Option<crate::pane::RestoredSpawnKind>,
+) -> Option<String> {
+    if exit_code == 0 {
         return None;
     }
-    Some(if exit_code == 75 {
-        crate::tmux::EXACT_ATTACH_UNAVAILABLE_REASON.to_string()
-    } else {
+    if has_exact_tmux_binding {
+        return Some(if exit_code == 75 {
+            crate::tmux::EXACT_ATTACH_UNAVAILABLE_REASON.to_string()
+        } else {
+            format!(
+                "Reattach unavailable: the exact saved tmux target could not be validated (exit status {exit_code})."
+            )
+        });
+    }
+    (restored_spawn_kind == Some(crate::pane::RestoredSpawnKind::AgentResume)).then(|| {
         format!(
-            "Reattach unavailable: the exact saved tmux target could not be validated (exit status {exit_code})."
+            "Resume agent conversation failed (exit status {exit_code}); the terminal output was retained for diagnosis."
         )
     })
+}
+
+fn child_exit_ui_action_with_restore_reason(
+    restore_unavailable_reason: Option<&str>,
+    leaf_count: usize,
+    close_on_exit: bool,
+    total_tabs: usize,
+) -> ChildExitUiAction {
+    restore_unavailable_reason.map_or_else(
+        || child_exit_ui_action(leaf_count, close_on_exit, total_tabs),
+        |_| ChildExitUiAction::None,
+    )
 }
 
 /// Watch a brokered pane's child for exit. VTE no longer owns the child (the
@@ -305,11 +328,12 @@ fn run_child_exit_cleanup(
             return;
         };
         let restore_unavailable_reason = tab.panes.leaf(pane_id).and_then(|leaf| {
-            restored_tmux_exit_reason(
+            restored_child_exit_reason(
                 exit_code,
                 leaf.tmux_backing
                     .as_ref()
                     .is_some_and(|backing| backing.expected_generation.is_some()),
+                leaf.restored_spawn_kind,
             )
         });
         if let Some(leaf) = tab.panes.leaf_mut(pane_id) {
@@ -336,9 +360,11 @@ fn run_child_exit_cleanup(
             tab.close_on_exit = true;
         }
         (
-            restore_unavailable_reason.map_or_else(
-                || child_exit_ui_action(leaf_count, close_on_exit, total_tabs),
-                |_| ChildExitUiAction::None,
+            child_exit_ui_action_with_restore_reason(
+                restore_unavailable_reason.as_deref(),
+                leaf_count,
+                close_on_exit,
+                total_tabs,
             ),
             respawn_on_exit,
         )
@@ -451,20 +477,21 @@ fn run_child_exit_cleanup(
 
 #[cfg(test)]
 mod tests {
-    use super::restored_tmux_exit_reason;
+    use super::restored_child_exit_reason;
+    use crate::pane::RestoredSpawnKind;
 
     #[test]
     fn exact_restore_refusal_becomes_persistent_unavailable_state() {
         assert_eq!(
-            restored_tmux_exit_reason(75, true).as_deref(),
+            restored_child_exit_reason(75, true, None).as_deref(),
             Some(crate::tmux::EXACT_ATTACH_UNAVAILABLE_REASON)
         );
-        assert!(restored_tmux_exit_reason(75, false).is_none());
+        assert!(restored_child_exit_reason(75, false, None).is_none());
     }
 
     #[test]
     fn successful_exact_restore_keeps_normal_exit_behavior() {
-        assert!(restored_tmux_exit_reason(0, true).is_none());
+        assert!(restored_child_exit_reason(0, true, None).is_none());
         assert_eq!(
             super::child_exit_ui_action(2, true, 1),
             super::ChildExitUiAction::ClosePane
@@ -474,10 +501,36 @@ mod tests {
     #[test]
     fn restored_tmux_transport_failure_reports_its_exit_status() {
         assert_eq!(
-            restored_tmux_exit_reason(255, true).as_deref(),
+            restored_child_exit_reason(255, true, None).as_deref(),
             Some(
                 "Reattach unavailable: the exact saved tmux target could not be validated (exit status 255)."
             )
         );
+    }
+
+    #[test]
+    fn failed_automatic_agent_resume_becomes_retained_diagnostic() {
+        let reason = restored_child_exit_reason(2, false, Some(RestoredSpawnKind::AgentResume));
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                "Resume agent conversation failed (exit status 2); the terminal output was retained for diagnosis."
+            )
+        );
+        assert_eq!(
+            super::child_exit_ui_action_with_restore_reason(reason.as_deref(), 1, true, 1,),
+            super::ChildExitUiAction::None
+        );
+    }
+
+    #[test]
+    fn successful_resume_and_ordinary_failures_keep_normal_exit_behavior() {
+        let reason = restored_child_exit_reason(0, false, Some(RestoredSpawnKind::AgentResume));
+        assert!(reason.is_none());
+        assert_eq!(
+            super::child_exit_ui_action_with_restore_reason(reason.as_deref(), 2, true, 1),
+            super::ChildExitUiAction::ClosePane
+        );
+        assert!(restored_child_exit_reason(2, false, None).is_none());
     }
 }

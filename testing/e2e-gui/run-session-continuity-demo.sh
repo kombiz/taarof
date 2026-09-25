@@ -39,7 +39,8 @@ trap cleanup EXIT
 # HOME deliberately remains the product's normal absolute spelling while the
 # mount at that path is a new empty directory. The namespace has its own /tmp,
 # network, PID, IPC, UTS, X server, D-Bus session, tmux socket, and synthetic
-# provider history. No browser profile or bearer token is created.
+# provider history. No browser profile is created; the app's per-process HTTP
+# token stays inside the disposable namespace and is handled in memory only.
 exec bwrap \
   --die-with-parent --unshare-pid --unshare-net --unshare-ipc --unshare-uts \
   --proc /proc --dev /dev --tmpfs /tmp \

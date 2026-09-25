@@ -777,19 +777,59 @@ pub fn capture_pane_snapshot(
     target: &TmuxTarget,
     session_name: &str,
     preserve_ansi: bool,
+    expected_generation: Option<&crate::session::SavedTmuxIdentity>,
 ) -> Result<TmuxPaneSnapshot, String> {
-    let pane_info = run_tmux_command_sync_result(&pane_info_command(target, session_name))
-        .and_then(|output| {
+    capture_pane_snapshot_with_runner(
+        target,
+        session_name,
+        preserve_ansi,
+        expected_generation,
+        run_tmux_command_sync_result,
+    )
+}
+
+fn capture_pane_snapshot_with_runner(
+    target: &TmuxTarget,
+    session_name: &str,
+    preserve_ansi: bool,
+    expected_generation: Option<&crate::session::SavedTmuxIdentity>,
+    mut run: impl FnMut(&[String]) -> Result<String, String>,
+) -> Result<TmuxPaneSnapshot, String> {
+    let read_info = |run: &mut dyn FnMut(&[String]) -> Result<String, String>| {
+        run(&pane_info_command(target, session_name)).and_then(|output| {
             parse_pane_info(&output)
                 .ok_or_else(|| "tmux pane probe returned invalid metadata".to_string())
-        })?;
+        })
+    };
+    let verify = |info: &TmuxPaneInfo| {
+        if expected_generation.is_none_or(|expected| {
+            info.session_id == expected.session_id
+                && info.session_created == expected.session_created
+                && info.continuity_id.as_deref() == Some(expected.continuity_id.as_str())
+        }) {
+            Ok(())
+        } else {
+            Err(EXACT_ATTACH_UNAVAILABLE_REASON.to_string())
+        }
+    };
+
+    let mut pane_info = read_info(&mut run)?;
+    verify(&pane_info)?;
 
     let capture_command = if preserve_ansi {
         capture_pane_ansi_command(target, session_name)
     } else {
         capture_pane_text_command(target, session_name)
     };
-    let output = run_tmux_command_sync_result(&capture_command)?;
+    let output = run(&capture_command)?;
+
+    // A saved target may be replaced after resolution or even after the first
+    // probe. Hold the captured bytes locally and revalidate before returning
+    // them, so replacement output never reaches a websocket subscriber.
+    if expected_generation.is_some() {
+        pane_info = read_info(&mut run)?;
+        verify(&pane_info)?;
+    }
 
     Ok(TmuxPaneSnapshot {
         output,
@@ -2868,6 +2908,64 @@ mod tests {
         assert_eq!(info.pid, 12345);
         assert_eq!(info.width, 120);
         assert_eq!(info.height, 40);
+    }
+
+    #[test]
+    fn exact_snapshot_discards_replacement_between_resolution_and_capture() {
+        let expected = crate::session::SavedTmuxIdentity {
+            session_id: "$1".into(),
+            session_created: 1711720000,
+            continuity_id: TEST_CONTINUITY_ID.into(),
+        };
+        let replacement = pane_info_line("zsh", "/replacement", PANE_INFO_SEPARATOR)
+            .replace("$1", "$2")
+            .replace("1711720000", "1711720001")
+            .replace(TEST_CONTINUITY_ID, "22222222222222222222222222222222");
+        let mut outputs = std::collections::VecDeque::from([
+            pane_info_line("zsh", "/original", PANE_INFO_SEPARATOR),
+            "replacement terminal contents must not escape".to_string(),
+            replacement,
+        ]);
+
+        let error = capture_pane_snapshot_with_runner(
+            &TmuxTarget::Local,
+            "same-name",
+            false,
+            Some(&expected),
+            |_| Ok(outputs.pop_front().expect("three tmux calls")),
+        )
+        .expect_err("replacement capture must be discarded");
+
+        assert_eq!(error, EXACT_ATTACH_UNAVAILABLE_REASON);
+        assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn exact_snapshot_returns_only_after_post_capture_identity_match() {
+        let expected = crate::session::SavedTmuxIdentity {
+            session_id: "$1".into(),
+            session_created: 1711720000,
+            continuity_id: TEST_CONTINUITY_ID.into(),
+        };
+        let info = pane_info_line("zsh", "/original", PANE_INFO_SEPARATOR);
+        let mut outputs = std::collections::VecDeque::from([
+            info.clone(),
+            "original terminal contents".to_string(),
+            info,
+        ]);
+
+        let snapshot = capture_pane_snapshot_with_runner(
+            &TmuxTarget::Local,
+            "same-name",
+            false,
+            Some(&expected),
+            |_| Ok(outputs.pop_front().expect("three tmux calls")),
+        )
+        .expect("matching generation remains capturable");
+
+        assert_eq!(snapshot.output, "original terminal contents");
+        assert_eq!((snapshot.width, snapshot.height), (120, 40));
+        assert!(outputs.is_empty());
     }
 
     #[test]
