@@ -32,9 +32,10 @@ or rewind support. Those capabilities need their own declared actions.
 
 ## Saved-state recovery
 
-If the saved layout is corrupt, unreadable, or belongs to another session
-identity, Taarof preserves the original bytes under a collision-safe
-`session.json.recovery.*` name and shows that path. If preservation fails,
-autosave and shutdown persistence remain blocked for that process so an empty
-layout cannot replace the recovery source. A valid intentionally empty layout
-loads normally.
+If the saved layout is corrupt or unreadable, Taarof preserves the original
+bytes under a collision-safe `session.json.recovery.*` name and shows that
+path. If preservation fails, autosave and shutdown persistence remain blocked
+for that process so an empty layout cannot replace the recovery source. A
+readable layout that belongs to another session identity, or whose legacy
+identity is ambiguous, is left unchanged in place while autosave and shutdown
+persistence remain blocked. A valid intentionally empty layout loads normally.
