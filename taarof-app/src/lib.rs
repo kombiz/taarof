@@ -32,6 +32,7 @@ mod probe;
 mod project_config;
 mod projects;
 pub mod pty_broker;
+mod review;
 mod runtime;
 pub mod runtime_identity;
 mod runtime_probe;
