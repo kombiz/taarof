@@ -36,15 +36,20 @@ def tmux_identity():
     return {"session_id": session_id, "session_created": int(created), "continuity_id": nonce}
 
 
-def tmux_clients():
-    result = run("tmux", "list-clients", "-F", "#{client_session}", check=False)
-    return sum(line == SESSION for line in result.stdout.splitlines())
-
-
-def tmux_client_check():
-    result = run("tmux", "list-clients", "-F", "#{client_session}", check=False)
-    count = sum(line == SESSION for line in result.stdout.splitlines())
+def tmux_attachment_check():
+    # list-clients exits 1 when no clients exist, which is ambiguous with a
+    # failed query. session_attached is a target-specific status query: exit 0
+    # proves the saved-name replacement still exists while the value proves
+    # whether the app attached a client to it.
+    result = run("tmux", "display-message", "-t", SESSION, "-p",
+                 "#{session_attached}", check=False)
+    count = int(result.stdout.strip()) if result.returncode == 0 else None
     return result, count
+
+
+def tmux_clients():
+    result, count = tmux_attachment_check()
+    return count if result.returncode == 0 else None
 
 
 def write_provider_fixture():
@@ -173,7 +178,7 @@ def main():
     first_window_mapped = wait_until(lambda: taarof_window_mapped(env))
     resume_observed = wait_until(lambda: (HOME / "resume-observed").exists())
     exact_attach_observed = wait_until(lambda: tmux_clients() == 1)
-    original_client_result, original_client_count = tmux_client_check()
+    original_attachment_result, original_attached_count = tmux_attachment_check()
     time.sleep(1)
     screenshot("original-generation.png", env)
     first_exe = os.readlink(f"/proc/{first.pid}/exe") if first.poll() is None else None
@@ -191,8 +196,12 @@ def main():
     second = start_app(env)
     second_window_mapped = wait_until(lambda: taarof_window_mapped(env))
     time.sleep(1)
-    replacement_client_result, replacement_client_count = tmux_client_check()
-    replacement_rejected = replacement_client_count == 0
+    replacement_attachment_result, replacement_attached_count = tmux_attachment_check()
+    replacement_rejected = (
+        replacement_attachment_result.returncode == 0
+        and replacement_attached_count == 0
+        and replacement["continuity_id"] != original["continuity_id"]
+    )
     screenshot("replacement-generation.png", env)
     stop_app(second)
     run("tmux", "kill-server", check=False)
@@ -219,8 +228,8 @@ def main():
         "original_tmux_identity": original, "replacement_tmux_identity": replacement,
         "resume_agent_conversation_observed": resume_observed,
         "reattach_live_terminal_observed": exact_attach_observed,
-        "original_tmux_client_count": original_client_count,
-        "replacement_tmux_client_count": replacement_client_count,
+        "original_tmux_attached_count": original_attached_count,
+        "replacement_tmux_attached_count": replacement_attached_count,
         "replacement_generation_rejected": replacement_rejected,
         "tmux_survived_desktop_shutdown": tmux_survived_desktop,
         "tmux_loss_observed": tmux_loss_observed,
@@ -229,8 +238,8 @@ def main():
         "command_exits": {
             "app_build_info": app_build_result.returncode,
             "agent_build_info": agent_build_result.returncode,
-            "original_tmux_list_clients": original_client_result.returncode,
-            "replacement_tmux_list_clients": replacement_client_result.returncode,
+            "original_tmux_attachment_query": original_attachment_result.returncode,
+            "replacement_tmux_attachment_query": replacement_attachment_result.returncode,
             "tmux_has_session_after_desktop_shutdown": survived_result.returncode,
             "tmux_has_session_after_server_loss": lost_result.returncode,
         },
