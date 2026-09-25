@@ -1811,8 +1811,8 @@ export function PaneTerminal({
           <div className="terminal-surface__unsupported">
             <h3>Live attach not available</h3>
             <p>
-              This pane is still visible in the browser client, but the current
-              backend only exposes live terminal attach for tmux-backed panes.
+              {pane.attach_unavailable_reason ??
+                "This pane has no supported live browser viewer target."}
             </p>
           </div>
         ) : (

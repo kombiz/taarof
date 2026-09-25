@@ -88,6 +88,10 @@ test("preview labels distinguish browser viewing from native process attach", ()
   assertEqual(previewPhaseLabel("fallback"), "fallback");
   assertEqual(describePreviewCapability(pane()), "live browser viewer available");
   assertEqual(describePreviewCapability(pane({ attach_supported: false, attach_kind: "unsupported" })), "live browser viewer unavailable for this pane type");
+  assertEqual(
+    describePreviewCapability(pane({ attach_supported: false, attach_unavailable_reason: "exact reason" })),
+    "exact reason",
+  );
   assertEqual(paneDimensions(pane({ cols: 80, rows: 24 }), null), "80x24");
   assertEqual(paneDimensions(pane({ cols: undefined, rows: undefined, tmux_probe: { width: 100, height: 30 } }), { cols: 120, rows: 40 }), "120x40");
 });

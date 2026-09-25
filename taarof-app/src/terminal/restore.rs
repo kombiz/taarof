@@ -1672,7 +1672,7 @@ fn plan_restored_spawns_inner(
         } => {
             let pane_id = *next_pane_id;
             *next_pane_id += 1;
-            let (spawn_cwd, spawn_cmd, backing, agent_resume) = restored_leaf_spawn(
+            let (spawn_cwd, spawn_cmd, _backing, agent_resume) = restored_leaf_spawn(
                 cwd.as_deref(),
                 ssh_command.as_ref(),
                 tmux_session.as_deref(),
@@ -1689,7 +1689,11 @@ fn plan_restored_spawns_inner(
                 remote_shell: ssh_command.is_some() || tmux_host.is_some(),
                 spawn_cwd,
                 spawn_cmd,
-                tmux_session: backing.as_ref().map(|b| b.session_name.clone()),
+                // Preserve the saved name as display metadata even when a
+                // legacy snapshot lacks exact generation authority. The
+                // absence of `spawn_cmd`/backing remains the fail-closed
+                // execution decision.
+                tmux_session: tmux_session.clone(),
                 tmux_host: tmux_host.clone(),
                 current_task: current_task.clone(),
                 agent_resume,
@@ -2018,7 +2022,7 @@ mod agent_resume_tests {
             false,
         );
         assert!(plan[0].spawn_cmd.is_none());
-        assert!(plan[0].tmux_session.is_none());
+        assert_eq!(plan[0].tmux_session.as_deref(), Some("same-name"));
     }
 }
 

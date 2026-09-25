@@ -648,6 +648,10 @@ fn pane_payload(tab: &Tab, leaf: &PaneLeaf, ingredients: &StateSnapshotIngredien
         tmux_probe,
         attach_supported,
         attach_kind,
+        attach_unavailable_reason: (!attach_supported).then(|| {
+            "Browser viewer reconnect unavailable: this live pane has no supported viewer target."
+                .to_string()
+        }),
         pty_capability,
         cols,
         rows,
@@ -702,6 +706,10 @@ fn headless_pane_payload(pane_id: u32, pane: &crate::runtime::HeadlessPaneState)
         tmux_probe,
         attach_supported,
         attach_kind,
+        attach_unavailable_reason: (!attach_supported).then(|| {
+            "Browser viewer reconnect unavailable: this headless pane has no supported viewer target."
+                .to_string()
+        }),
         pty_capability: "legacy_snapshot",
         cols,
         rows,
@@ -727,6 +735,11 @@ fn pending_pane_payloads(state: &AppState, tab_id: u32) -> Vec<Value> {
     )
     .into_iter()
     .map(|pane| {
+        let attach_unavailable_reason = if pane.tmux_session.is_some() && pane.spawn_cmd.is_none() {
+            "Browser viewer reconnect unavailable: native Reattach live terminal lacks the exact saved tmux generation."
+        } else {
+            "Browser viewer reconnect unavailable until the native saved pane is materialized."
+        };
         pane_payload_from_data(PanePayloadData {
             pane_id: pane.pane_id,
             shell_running: false,
@@ -742,6 +755,7 @@ fn pending_pane_payloads(state: &AppState, tab_id: u32) -> Vec<Value> {
             // Pending panes have no live resolver target until materialized.
             attach_supported: false,
             attach_kind: "unsupported",
+            attach_unavailable_reason: Some(attach_unavailable_reason.to_string()),
             pty_capability: "legacy_snapshot",
             cols: None,
             rows: None,
@@ -835,6 +849,7 @@ struct PanePayloadData {
     tmux_probe: Option<Value>,
     attach_supported: bool,
     attach_kind: &'static str,
+    attach_unavailable_reason: Option<String>,
     pty_capability: &'static str,
     cols: Option<u32>,
     rows: Option<u32>,
@@ -864,6 +879,7 @@ fn pane_payload_from_data(data: PanePayloadData) -> Value {
         "tmux_probe": data.tmux_probe,
         "attach_supported": data.attach_supported,
         "attach_kind": data.attach_kind,
+        "attach_unavailable_reason": data.attach_unavailable_reason,
         "pty_capability": data.pty_capability,
         "cols": data.cols,
         "rows": data.rows,
@@ -1963,6 +1979,7 @@ mod tests {
             tmux_probe: None,
             attach_supported: true,
             attach_kind: "tmux",
+            attach_unavailable_reason: None,
             pty_capability: "legacy_snapshot",
             cols: Some(120),
             rows: Some(40),
@@ -2004,6 +2021,7 @@ mod tests {
             tmux_probe: None,
             attach_supported: false,
             attach_kind: "unsupported",
+            attach_unavailable_reason: Some("concrete unavailable reason".into()),
             pty_capability: "legacy_snapshot",
             cols: None,
             rows: None,
@@ -2023,6 +2041,10 @@ mod tests {
         assert!(payload["probe_updated_at_unix_ms"].is_null());
         assert_eq!(payload["attach_supported"], serde_json::json!(false));
         assert_eq!(payload["attach_kind"], serde_json::json!("unsupported"));
+        assert_eq!(
+            payload["attach_unavailable_reason"],
+            serde_json::json!("concrete unavailable reason")
+        );
         assert!(payload["cols"].is_null());
         assert!(payload["rows"].is_null());
     }
@@ -2043,6 +2065,7 @@ mod tests {
             tmux_probe: None,
             attach_supported: false,
             attach_kind: "unsupported",
+            attach_unavailable_reason: None,
             pty_capability: "legacy_snapshot",
             cols: Some(80),
             rows: Some(24),
@@ -2304,6 +2327,10 @@ mod tests {
         assert_eq!(
             tab["panes"][1]["attach_kind"],
             serde_json::json!("unsupported")
+        );
+        assert_eq!(
+            tab["panes"][1]["attach_unavailable_reason"],
+            serde_json::json!("Browser viewer reconnect unavailable: native Reattach live terminal lacks the exact saved tmux generation.")
         );
         assert_eq!(
             tab["panes"][0]["current_task"]["id"],

@@ -118,6 +118,10 @@ export function describePreviewCapability(pane: PaneSnapshot): string {
     return "live browser viewer available";
   }
 
+  if (pane.attach_unavailable_reason) {
+    return pane.attach_unavailable_reason;
+  }
+
   return pane.attach_kind === "unsupported"
     ? "live browser viewer unavailable for this pane type"
     : "browser viewer capability unknown";

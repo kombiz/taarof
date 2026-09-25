@@ -390,6 +390,7 @@ export interface PaneSnapshot {
   } | null;
   attach_supported?: boolean;
   attach_kind?: PaneAttachKind;
+  attach_unavailable_reason?: string | null;
   // Server-advertised transport capability (api.rs): "raw_pty" for broker-owned
   // panes (raw pty/ws attach available), "legacy_snapshot" otherwise.
   pty_capability?: "raw_pty" | "legacy_snapshot";
