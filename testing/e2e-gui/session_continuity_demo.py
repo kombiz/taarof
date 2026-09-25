@@ -18,6 +18,7 @@ SESSION = "taarof--continuity-demo--t1--0"
 NONCE_A = "11111111111111111111111111111111"
 NONCE_B = "22222222222222222222222222222222"
 HTTP_PORT = 17828
+TMUX_MARKER = "REATTACH LIVE TERMINAL: exact synthetic generation accepted"
 
 
 def run(*args, check=True, capture=True, env=None):
@@ -186,6 +187,26 @@ def websocket_checkpoint(process, tab_id, pane_id):
         return status, json.loads(bytes(frame[offset:offset + length]))
 
 
+def snapshot_text(frame):
+    if frame is None or frame.get("type") != "snapshot":
+        return ""
+    return base64.b64decode(frame.get("payload", "")).decode(errors="replace")
+
+
+def websocket_checkpoint_until_marker(process, tab_id, pane_id):
+    deadline = time.monotonic() + 5
+    last_status, last_frame, last_text = None, None, ""
+    while time.monotonic() < deadline:
+        last_status, last_frame = websocket_checkpoint(process, tab_id, pane_id)
+        if last_status != 101:
+            break
+        last_text = snapshot_text(last_frame)
+        if TMUX_MARKER in " ".join(last_text.split()):
+            return last_status, last_frame, last_text, True
+        time.sleep(0.1)
+    return last_status, last_frame, last_text, False
+
+
 def write_provider_fixture():
     config = HOME / ".config"
     providers = config / "agent/providers.d"
@@ -312,7 +333,7 @@ def main():
     os.environ["TMUX_TMPDIR"] = "/tmp/tmux"
     write_provider_fixture()
     run("tmux", "new-session", "-d", "-s", SESSION, "-c", str(HOME / "demo"),
-        "printf 'REATTACH LIVE TERMINAL: exact synthetic generation accepted\\n'; sleep 300")
+        "while :; do printf '\\033[H\\033[2JREATTACH LIVE TERMINAL: exact synthetic generation accepted\\n'; sleep 0.25; done")
     run("tmux", "set-option", "-t", SESSION, "@taarof-continuity-id", NONCE_A)
     original = tmux_identity()
     state = HOME / ".local/share/taarof/session.json"
@@ -332,16 +353,11 @@ def main():
     exact_attach_observed = wait_until(lambda: tmux_clients() == 1)
     exact_viewer_ready = wait_until(exact_tmux_viewer_ready)
     original_tab_id, original_pane_id = tmux_pane_coordinates()
-    original_http_status, original_http_frame = websocket_checkpoint(
+    (original_http_status, original_http_frame, original_http_text,
+     exact_http_capture_observed) = websocket_checkpoint_until_marker(
         first, original_tab_id, original_pane_id
     )
-    exact_http_capture_observed = (
-        original_http_status == 101
-        and original_http_frame.get("type") == "snapshot"
-        and "exact synthetic generation accepted" in base64.b64decode(
-            original_http_frame.get("payload", "")
-        ).decode(errors="replace")
-    )
+    (EVIDENCE / "original-http-snapshot.txt").write_text(original_http_text)
     original_attachment_result, original_attached_count = tmux_attachment_check()
     time.sleep(1)
     screenshot("original-generation.png", env)
