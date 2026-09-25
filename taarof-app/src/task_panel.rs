@@ -237,6 +237,18 @@ fn task_panel_runtime_policy(tasks_enabled: bool) -> TaskPanelRuntimePolicy {
     }
 }
 
+fn loads_task_snapshot(tasks_enabled: bool, mode: TaskPanelMode) -> bool {
+    tasks_enabled && matches!(mode, TaskPanelMode::Tasks | TaskPanelMode::Review)
+}
+
+fn resolves_local_pull_request_identity(
+    tasks_enabled: bool,
+    pull_request_mode_enabled: bool,
+    mode: TaskPanelMode,
+) -> bool {
+    mode == TaskPanelMode::Review || (tasks_enabled && pull_request_mode_enabled)
+}
+
 impl TaskPanelModeSelection {
     fn new(
         tasks_enabled: bool,
@@ -430,6 +442,25 @@ struct TaskPanelViewContext {
     remote_target: Option<RemoteTaskTarget>,
     pull_request_target: Option<PullRequestTarget>,
     local_pull_request_identity_checking: bool,
+}
+
+fn task_panel_context_without_task_sources(
+    mode: TaskPanelMode,
+    pull_request_target: Option<PullRequestTarget>,
+    local_pull_request_identity_checking: bool,
+) -> TaskPanelViewContext {
+    TaskPanelViewContext {
+        mode: match mode {
+            TaskPanelMode::Agents => TaskPanelMode::Agents,
+            TaskPanelMode::Review => TaskPanelMode::Review,
+            _ => TaskPanelMode::Session,
+        },
+        show_task_modes: false,
+        show_pull_requests: false,
+        remote_target: None,
+        pull_request_target,
+        local_pull_request_identity_checking,
+    }
 }
 
 use crate::agent_projection::{project_all_agent_panes, AgentPaneProjection};
@@ -1337,9 +1368,7 @@ impl TaskPanel {
             .set_visible(context.mode == TaskPanelMode::Review);
         let active_pr_target = context.pull_request_target.clone();
         let active_remote_target = context.remote_target.clone();
-        if matches!(context.mode, TaskPanelMode::Tasks | TaskPanelMode::Review)
-            && active_remote_target.is_none()
-        {
+        if loads_task_snapshot(self.tasks_enabled, context.mode) && active_remote_target.is_none() {
             self.ensure_local_task_snapshot(state, tab_list, term_stack, window);
         }
         if context.mode == TaskPanelMode::Review {
@@ -1721,6 +1750,7 @@ impl TaskPanel {
         tab_list: &gtk::Box,
         term_stack: &gtk::Stack,
         window: &adw::ApplicationWindow,
+        include_task_context: bool,
     ) {
         let Some(request) = local_pull_request_probe_request(state) else {
             return;
@@ -1762,7 +1792,12 @@ impl TaskPanel {
                 key.candidates.join("\u{1f}"),
                 key.reporting_token.as_deref().unwrap_or("unbound"),
             ),
-            move || Ok(probe_local_pull_request_target(&worker_request)),
+            move || {
+                Ok(probe_local_pull_request_target(
+                    &worker_request,
+                    include_task_context,
+                ))
+            },
             move |result| {
                 panel.local_pull_request_inflight.borrow_mut().remove(&key);
                 // A local path may have changed, a tab may have been restored,
@@ -1960,18 +1995,24 @@ impl TaskPanel {
         let runtime_policy = task_panel_runtime_policy(self.tasks_enabled);
         if !runtime_policy.load_task_sources {
             let mode = self.mode_selection.borrow().mode_for_context("global");
-            return TaskPanelViewContext {
-                mode: match mode {
-                    TaskPanelMode::Agents => TaskPanelMode::Agents,
-                    TaskPanelMode::Review => TaskPanelMode::Review,
-                    _ => TaskPanelMode::Session,
-                },
-                show_task_modes: false,
-                show_pull_requests: false,
-                remote_target: None,
-                pull_request_target: None,
-                local_pull_request_identity_checking: false,
-            };
+            let review_mode = mode == TaskPanelMode::Review;
+            if review_mode {
+                self.ensure_local_pull_request_identity(state, tab_list, term_stack, window, false);
+            }
+            let pull_request_target = review_mode
+                .then(|| self.cached_local_pull_request_target(state))
+                .flatten();
+            let local_pull_request_identity_checking = review_mode
+                && local_pull_request_probe_request(state).is_some_and(|request| {
+                    self.local_pull_request_inflight
+                        .borrow()
+                        .contains(&request.key)
+                });
+            return task_panel_context_without_task_sources(
+                mode,
+                pull_request_target,
+                local_pull_request_identity_checking,
+            );
         }
 
         let remote_target = remote_task_target(state);
@@ -1981,9 +2022,19 @@ impl TaskPanel {
             .borrow()
             .mode_for_context(&preliminary_key);
         if remote_target.is_none()
-            && (self.pull_request_mode_enabled || preliminary_mode == TaskPanelMode::Review)
+            && resolves_local_pull_request_identity(
+                self.tasks_enabled,
+                self.pull_request_mode_enabled,
+                preliminary_mode,
+            )
         {
-            self.ensure_local_pull_request_identity(state, tab_list, term_stack, window);
+            self.ensure_local_pull_request_identity(
+                state,
+                tab_list,
+                term_stack,
+                window,
+                self.tasks_enabled,
+            );
         }
         let pull_request_target = remote_target
             .as_ref()
@@ -2070,7 +2121,13 @@ impl TaskPanel {
             && (self.pull_request_mode_enabled
                 || matches!(intent, TaskPanelIntent::Select(TaskPanelMode::Review)))
         {
-            self.ensure_local_pull_request_identity(state, tab_list, term_stack, window);
+            self.ensure_local_pull_request_identity(
+                state,
+                tab_list,
+                term_stack,
+                window,
+                self.tasks_enabled,
+            );
         }
         let target = remote_target
             .as_ref()
@@ -2501,7 +2558,7 @@ impl TaskPanel {
             }
         }
 
-        self.ensure_local_pull_request_identity(state, tab_list, term_stack, window);
+        self.ensure_local_pull_request_identity(state, tab_list, term_stack, window, true);
         let Some(target) = self
             .cached_local_pull_request_target(state)
             .filter(|target| target.pane_identity.tab_id == tab_id)
@@ -3099,13 +3156,18 @@ fn local_pull_request_probe_is_current(
 /// by the GTK apply phase.
 fn probe_local_pull_request_target(
     request: &LocalPullRequestProbeRequest,
+    include_task_context: bool,
 ) -> Option<LocalPullRequestProbeResult> {
-    let status = crate::task_binding::current_task_status(
-        Some(&request.key.cwd),
-        None,
-        false,
-        request.binding.as_ref(),
-    );
+    let status = include_task_context
+        .then(|| {
+            crate::task_binding::current_task_status(
+                Some(&request.key.cwd),
+                None,
+                false,
+                request.binding.as_ref(),
+            )
+        })
+        .flatten();
     let pinned = status
         .as_ref()
         .filter(|status| status.resolved)
@@ -3129,7 +3191,9 @@ fn probe_local_pull_request_target(
             reporting_token: binding.reporting_token.clone(),
         })
     });
-    let loop_runner_availability = loop_runner_availability(Some(&checkout_root));
+    let loop_runner_availability = include_task_context
+        .then(|| loop_runner_availability(Some(&checkout_root)))
+        .flatten();
     Some(LocalPullRequestProbeResult {
         checkout_root,
         branch,
@@ -4803,19 +4867,20 @@ mod tests {
     use super::{
         active_current_task_summary, aggregate_progress_text, bind_pane_task_mutation,
         build_pull_request_snapshot, classify_local_gh_failure, clear_pane_task_mutation,
-        local_head_revision_command, local_pull_request_cache_result_for_request,
-        local_pull_request_probe_is_current, local_pull_request_probe_request,
-        local_task_probe_is_current, local_task_probe_request, next_remote_failure_streak,
-        next_remote_git_failure_streak, probe_local_pull_request_target, progress_for_unavailable,
-        project_all_agent_panes, pull_request_discovery_feedback, pull_request_target_for_tab,
-        record_pull_request_fetch, register_pull_request_fetch, remote_cache_key,
-        remote_pull_request_identity_ttl_ms, remote_tasks_error_summary, remote_tasks_ttl_ms,
+        loads_task_snapshot, local_head_revision_command,
+        local_pull_request_cache_result_for_request, local_pull_request_probe_is_current,
+        local_pull_request_probe_request, local_task_probe_is_current, local_task_probe_request,
+        next_remote_failure_streak, next_remote_git_failure_streak,
+        probe_local_pull_request_target, progress_for_unavailable, project_all_agent_panes,
+        pull_request_discovery_feedback, pull_request_target_for_tab, record_pull_request_fetch,
+        register_pull_request_fetch, remote_cache_key, remote_pull_request_identity_ttl_ms,
+        remote_tasks_error_summary, remote_tasks_ttl_ms, resolves_local_pull_request_identity,
         review_forge_projection, state_available_for_refresh, task_markdown_path,
-        task_panel_runtime_policy, task_row_from_entry, task_truth_axis_labels,
-        verify_pull_request_bound_task, visible_task_rows, LocalPullRequestCacheEntry,
-        PullRequestBoundTask, PullRequestDiscoveryFeedback, PullRequestKey, PullRequestTarget,
-        PullRequestsEntry, TaskBindingContext, TaskPanelIntent, TaskPanelMode,
-        TaskPanelModeSelection, TaskPanelRuntimePolicy, LOCAL_PULL_REQUEST_TTL_MS,
+        task_panel_context_without_task_sources, task_panel_runtime_policy, task_row_from_entry,
+        task_truth_axis_labels, verify_pull_request_bound_task, visible_task_rows,
+        LocalPullRequestCacheEntry, PullRequestBoundTask, PullRequestDiscoveryFeedback,
+        PullRequestKey, PullRequestTarget, PullRequestsEntry, TaskBindingContext, TaskPanelIntent,
+        TaskPanelMode, TaskPanelModeSelection, TaskPanelRuntimePolicy, LOCAL_PULL_REQUEST_TTL_MS,
         PULL_REQUESTS_TTL_MS, REMOTE_TASKS_FAILURE_TTL_CAP_MS, REMOTE_TASKS_TTL_MS,
     };
     use crate::tracking::{
@@ -4973,9 +5038,11 @@ mod tests {
                 Some(checkout.to_string_lossy().into_owned());
         }
         let request = local_pull_request_probe_request(&state).expect("local checkout request");
-        let main_result =
-            probe_local_pull_request_target(&request).expect("main branch should be discovered");
+        let main_result = probe_local_pull_request_target(&request, false)
+            .expect("main branch should be discovered");
         assert_eq!(main_result.branch, "main");
+        assert!(main_result.bound_task.is_none());
+        assert!(main_result.loop_runner_availability.is_none());
         let fetched_at_ms = 100;
         let mut cache = HashMap::from([(
             request.key.clone(),
@@ -5013,7 +5080,7 @@ mod tests {
         let same_checkout_request =
             local_pull_request_probe_request(&state).expect("same checkout request");
         assert_eq!(same_checkout_request.key, request.key);
-        let refreshed_result = probe_local_pull_request_target(&same_checkout_request)
+        let refreshed_result = probe_local_pull_request_target(&same_checkout_request, false)
             .expect("feature branch should be rediscovered off-thread");
         assert_eq!(refreshed_result.branch, "feature/next");
 
@@ -5466,6 +5533,40 @@ mod tests {
                 install_task_poll: true,
             }
         );
+    }
+
+    #[test]
+    fn disabled_task_sources_keep_on_demand_review_pr_identity_without_loading_tasks() {
+        let target = review_pr_target("1111111111111111111111111111111111111111");
+        let context = task_panel_context_without_task_sources(
+            TaskPanelMode::Review,
+            Some(target.clone()),
+            true,
+        );
+
+        assert_eq!(context.mode, TaskPanelMode::Review);
+        assert!(!context.show_task_modes);
+        assert!(!context.show_pull_requests);
+        assert!(context.remote_target.is_none());
+        assert_eq!(context.pull_request_target, Some(target));
+        assert!(context.local_pull_request_identity_checking);
+        assert!(resolves_local_pull_request_identity(
+            false,
+            false,
+            TaskPanelMode::Review
+        ));
+        assert!(!resolves_local_pull_request_identity(
+            false,
+            false,
+            TaskPanelMode::Session
+        ));
+        assert!(!resolves_local_pull_request_identity(
+            false,
+            false,
+            TaskPanelMode::Agents
+        ));
+        assert!(!loads_task_snapshot(false, TaskPanelMode::Review));
+        assert!(!loads_task_snapshot(false, TaskPanelMode::Tasks));
     }
 
     #[test]
