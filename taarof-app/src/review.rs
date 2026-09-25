@@ -154,6 +154,14 @@ impl ReviewSnapshot {
             truncated_files: 0,
         }
     }
+
+    fn renders_same_as(&self, other: &Self) -> bool {
+        self.selection == other.selection
+            && self.repository == other.repository
+            && self.files == other.files
+            && self.message == other.message
+            && self.truncated_files == other.truncated_files
+    }
 }
 
 #[derive(Clone)]
@@ -349,7 +357,13 @@ impl ReviewPanel {
     }
 
     fn render(&self, snapshot: ReviewSnapshot) {
-        if self.snapshot.borrow().as_ref() == Some(&snapshot) {
+        if self
+            .snapshot
+            .borrow()
+            .as_ref()
+            .is_some_and(|previous| previous.renders_same_as(&snapshot))
+        {
+            *self.snapshot.borrow_mut() = Some(snapshot);
             return;
         }
         let identity = snapshot.repository.as_ref().map_or_else(
@@ -1120,5 +1134,18 @@ mod tests {
         assert!(!safe_relative_bytes(b"../outside"));
         assert!(!safe_relative_bytes(b"/absolute"));
         assert!(safe_relative_bytes(b"dir/non-utf8-\xff"));
+    }
+
+    #[test]
+    fn capture_time_alone_does_not_invalidate_rendered_file_rows() {
+        let repo = TempRepo::new("capture-time");
+        let selection = repo.selection("workspace-a");
+        let mut earlier = collect_review(selection).expect("initial snapshot");
+        let mut later = earlier.clone();
+        later.captured_at_ms = earlier.captured_at_ms.saturating_add(1_000);
+
+        assert!(earlier.renders_same_as(&later));
+        earlier.message = Some("repository unavailable".to_string());
+        assert!(!earlier.renders_same_as(&later));
     }
 }
