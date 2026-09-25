@@ -1285,7 +1285,10 @@ fn run_git_bounded(
 
 fn review_git_command(worktree: &Path) -> Command {
     let mut command = Command::new("git");
-    command.current_dir(worktree).arg("--no-optional-locks");
+    command
+        .current_dir(worktree)
+        .arg("--no-optional-locks")
+        .args(["-c", "core.fsmonitor=false"]);
     // `--` ends option parsing, but Git still interprets magic pathspecs. Paths
     // here come from Git's changed-file list and must select their literal file.
     command.env("GIT_LITERAL_PATHSPECS", "1");
@@ -1908,6 +1911,27 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(removed.contains(&OsStr::new("INFISICAL_TOKEN")));
         assert!(removed.contains(&OsStr::new("INFISICAL_SERVICE_TOKEN")));
+    }
+
+    #[test]
+    fn review_git_commands_do_not_run_configured_fsmonitor() {
+        let repo = TempRepo::new("no-fsmonitor");
+        run(
+            &repo.0,
+            &[
+                "config",
+                "core.fsmonitor",
+                "sh -c 'touch .git/fsmonitor-ran'",
+            ],
+        );
+        std::fs::write(repo.0.join("tracked.txt"), "changed\n").unwrap();
+
+        let snapshot = collect_review(repo.selection("no-fsmonitor")).unwrap();
+        assert!(snapshot
+            .files
+            .iter()
+            .any(|file| file.path == b"tracked.txt"));
+        assert!(!repo.0.join(".git/fsmonitor-ran").exists());
     }
 
     #[test]
