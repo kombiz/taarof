@@ -974,7 +974,13 @@ fn finish_file(
         let range = format!("{base}..{head_revision}");
         let output = bounded_git_diff(
             worktree,
-            &["diff", "--no-color", "--no-ext-diff", &range],
+            &[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                &range,
+            ],
             &path,
             budget,
         )?;
@@ -987,7 +993,13 @@ fn finish_file(
     if file.layers.contains(&ChangeLayer::Staged) {
         let staged = bounded_git_diff(
             worktree,
-            &["diff", "--cached", "--no-color", "--no-ext-diff"],
+            &[
+                "diff",
+                "--cached",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+            ],
             &path,
             budget,
         )?;
@@ -1000,7 +1012,7 @@ fn finish_file(
     if file.layers.contains(&ChangeLayer::Unstaged) {
         let unstaged = bounded_git_diff(
             worktree,
-            &["diff", "--no-color", "--no-ext-diff"],
+            &["diff", "--no-color", "--no-ext-diff", "--no-textconv"],
             &path,
             budget,
         )?;
@@ -1274,6 +1286,9 @@ fn run_git_bounded(
 fn review_git_command(worktree: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(worktree).arg("--no-optional-locks");
+    // `--` ends option parsing, but Git still interprets magic pathspecs. Paths
+    // here come from Git's changed-file list and must select their literal file.
+    command.env("GIT_LITERAL_PATHSPECS", "1");
     crate::child_env::prepare_child_command(&mut command, &[]);
     command
 }
@@ -1550,6 +1565,53 @@ mod tests {
             before_key,
             viewed_key(after.repository.as_ref().unwrap(), after_file)
         );
+    }
+
+    #[test]
+    fn changed_filename_with_git_pathspec_magic_selects_its_literal_diff() {
+        let repo = TempRepo::new("literal-pathspec");
+        let magic = ":(top)tracked.txt";
+        std::fs::write(repo.0.join(magic), "magic before\n").unwrap();
+        run(&repo.0, &["add", "-A"]);
+        run(&repo.0, &["commit", "-m", "add literal pathspec filename"]);
+        std::fs::write(repo.0.join(magic), "magic after\n").unwrap();
+        std::fs::write(repo.0.join("tracked.txt"), "ordinary after\n").unwrap();
+
+        let snapshot = collect_review(repo.selection("literal-pathspec")).unwrap();
+        let magic_file = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == magic.as_bytes())
+            .unwrap();
+        assert!(magic_file.diff.contains("magic after"));
+        assert!(!magic_file.diff.contains("ordinary after"));
+    }
+
+    #[test]
+    fn review_diff_never_runs_configured_textconv() {
+        let repo = TempRepo::new("no-textconv");
+        std::fs::write(repo.0.join(".gitattributes"), "probe.txt diff=probe\n").unwrap();
+        std::fs::write(repo.0.join("probe.txt"), "before\n").unwrap();
+        run(&repo.0, &["add", "-A"]);
+        run(&repo.0, &["commit", "-m", "add textconv file"]);
+        run(
+            &repo.0,
+            &[
+                "config",
+                "diff.probe.textconv",
+                "sh -c 'touch .git/textconv-ran'",
+            ],
+        );
+        std::fs::write(repo.0.join("probe.txt"), "after\n").unwrap();
+
+        let snapshot = collect_review(repo.selection("no-textconv")).unwrap();
+        let file = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == b"probe.txt")
+            .unwrap();
+        assert!(file.diff.contains("after"));
+        assert!(!repo.0.join(".git/textconv-ran").exists());
     }
 
     #[test]
