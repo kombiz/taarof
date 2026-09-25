@@ -7,7 +7,9 @@ authority at the moment it runs:
   target. Restored tmux panes require the saved tmux server/session identity and
   Taarof's saved random generation. A legacy layout without that generation is
   reported unavailable. Restore never recreates a missing session or silently
-  attaches a same-name replacement.
+  attaches a same-name replacement. Metadata probes, send, resize, and cleanup
+  also retain and revalidate that saved generation, so a refused replacement
+  cannot become writable merely because it reused the saved name.
 - **Resume agent conversation** launches the provider from an exact saved
   provider session identity. The native app delegates to the `agent` binary in
   the same installed channel and verifies that its source identity matches the
@@ -36,4 +38,3 @@ identity, Taarof preserves the original bytes under a collision-safe
 autosave and shutdown persistence remain blocked for that process so an empty
 layout cannot replace the recovery source. A valid intentionally empty layout
 loads normally.
-

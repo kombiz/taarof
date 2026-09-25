@@ -240,6 +240,7 @@ pub fn seed_headless_terminal_tab(
             Some(ssh_target) => tmux::TmuxTarget::Remote { ssh_target },
             None => tmux::TmuxTarget::Local,
         },
+        expected_generation: None,
         pane_info: probe::ProbeSnapshot::default(),
     });
     let workspace_idx = state

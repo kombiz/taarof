@@ -389,6 +389,7 @@ pub(super) fn handle_headless_attach_session(
         let backing = crate::pane::TmuxBacking {
             session_name: detached.session_name.clone(),
             target: detached.target.clone(),
+            expected_generation: None,
             pane_info: crate::probe::ProbeSnapshot::default(),
         };
 

@@ -204,6 +204,13 @@ def main():
     )
     screenshot("replacement-generation.png", env)
     stop_app(second)
+    post_cleanup_attachment_result, post_cleanup_attached_count = tmux_attachment_check()
+    replacement_survived_app_cleanup = (
+        post_cleanup_attachment_result.returncode == 0
+        and post_cleanup_attached_count == 0
+        and tmux_identity() == replacement
+    )
+    replacement_rejected = replacement_rejected and replacement_survived_app_cleanup
     run("tmux", "kill-server", check=False)
     lost_result = run("tmux", "has-session", "-t", SESSION, check=False)
     tmux_loss_observed = lost_result.returncode != 0
@@ -230,6 +237,8 @@ def main():
         "reattach_live_terminal_observed": exact_attach_observed,
         "original_tmux_attached_count": original_attached_count,
         "replacement_tmux_attached_count": replacement_attached_count,
+        "replacement_post_app_cleanup_attached_count": post_cleanup_attached_count,
+        "replacement_survived_app_cleanup": replacement_survived_app_cleanup,
         "replacement_generation_rejected": replacement_rejected,
         "tmux_survived_desktop_shutdown": tmux_survived_desktop,
         "tmux_loss_observed": tmux_loss_observed,
@@ -240,6 +249,9 @@ def main():
             "agent_build_info": agent_build_result.returncode,
             "original_tmux_attachment_query": original_attachment_result.returncode,
             "replacement_tmux_attachment_query": replacement_attachment_result.returncode,
+            "replacement_post_app_cleanup_attachment_query": (
+                post_cleanup_attachment_result.returncode
+            ),
             "tmux_has_session_after_desktop_shutdown": survived_result.returncode,
             "tmux_has_session_after_server_loss": lost_result.returncode,
         },

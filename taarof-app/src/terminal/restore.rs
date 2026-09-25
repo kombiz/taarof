@@ -517,39 +517,11 @@ pub(crate) fn classify_tmux_kill_result(
 }
 
 /// Kill a tmux session. Used when close_behavior is Close (the default).
-#[cfg(test)]
-pub(crate) fn kill_tmux_session(
-    target: &crate::tmux::TmuxTarget,
-    session_name: &str,
-) -> TmuxKillResult {
-    let argv = crate::tmux::kill_session_command(target, session_name);
-    let output = match std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) => {
-            return TmuxKillResult::TransientFailure(format!(
-                "could not execute tmux kill-session: {error}"
-            ));
-        }
-    };
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    classify_tmux_kill_result(output.status.success(), &stderr, || {
-        let detail = stderr.trim();
-        if detail.is_empty() {
-            format!("tmux kill-session exited with {}", output.status)
-        } else {
-            format!("tmux kill-session failed: {detail}")
-        }
-    })
-}
-
 fn backing_matches(
     candidate: &crate::pane::TmuxBacking,
     backing: &crate::pane::TmuxBacking,
 ) -> bool {
-    candidate.session_name == backing.session_name && candidate.target == backing.target
+    candidate.same_execution_target(backing)
 }
 
 fn workspace_holding_backing<'a>(
@@ -778,7 +750,26 @@ fn cleanup_tmux_backing_with_behavior_in_workspace(
 ) -> Result<(), String> {
     match close_behavior {
         crate::config::TmuxCloseBehavior::Close => {
-            let result = kill_tmux_session(&backing.target, &backing.session_name);
+            let argv = crate::tmux::kill_backing_command(backing);
+            let output = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .output();
+            let result = match output {
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    classify_tmux_kill_result(output.status.success(), &stderr, || {
+                        let detail = stderr.trim();
+                        if detail.is_empty() {
+                            format!("tmux kill-session exited with {}", output.status)
+                        } else {
+                            format!("tmux kill-session failed: {detail}")
+                        }
+                    })
+                }
+                Err(error) => TmuxKillResult::TransientFailure(format!(
+                    "could not execute tmux kill-session: {error}"
+                )),
+            };
             apply_tmux_kill_result_in_workspace(state, backing, result, workspace_hint)
         }
         crate::config::TmuxCloseBehavior::Detach => {
@@ -869,6 +860,15 @@ fn remote_tmux_location(
     (!cwd.is_empty()).then(|| (cwd.to_string(), ssh_target.clone()))
 }
 
+fn tmux_matches_expected_generation(
+    expected: &crate::session::SavedTmuxIdentity,
+    info: &crate::tmux::TmuxPaneInfo,
+) -> bool {
+    info.session_id == expected.session_id
+        && info.session_created == expected.session_created
+        && info.continuity_id.as_deref() == Some(expected.continuity_id.as_str())
+}
+
 /// Poll all tmux-backed panes and update their pane_info metadata.
 pub fn poll_tmux_metadata(state: &Rc<RefCell<AppState>>, tab_list: &gtk::Box) {
     // Collect (tab_id, pane_id, argv) for all tmux-backed panes — lightweight, on main thread
@@ -914,7 +914,7 @@ pub fn poll_tmux_metadata(state: &Rc<RefCell<AppState>>, tab_list: &gtk::Box) {
             .unwrap_or_default();
 
         let mut any_changed = false;
-        for (tab_id, pane_id, result) in results {
+        for (tab_id, pane_id, mut result) in results {
             let mut st = state.borrow_mut();
             let mut event = None;
             if let Some(tab) = st.find_tab_mut(tab_id) {
@@ -929,6 +929,20 @@ pub fn poll_tmux_metadata(state: &Rc<RefCell<AppState>>, tab_list: &gtk::Box) {
                             probe_error,
                         ) = {
                             let backing = leaf.tmux_backing.as_mut().expect("checked above");
+                            let replacement_generation = backing
+                                .expected_generation
+                                .as_ref()
+                                .is_some_and(|expected| {
+                                    result.as_ref().is_ok_and(|info| {
+                                        !tmux_matches_expected_generation(expected, info)
+                                    })
+                                });
+                            if replacement_generation {
+                                result = Err(
+                                    "exact saved tmux target no longer exists; same-name replacement refused"
+                                        .to_string(),
+                                );
+                            }
                             let location_update = result
                                 .as_ref()
                                 .ok()
@@ -1516,6 +1530,7 @@ fn restored_leaf_spawn(
         let backing = crate::pane::TmuxBacking {
             session_name: session_name.to_string(),
             target,
+            expected_generation: Some(identity.clone()),
             pane_info: ProbeSnapshot::default(),
         };
         // For tmux, cwd is handled by tmux itself.
@@ -1794,7 +1809,9 @@ pub(super) fn build_restored_pane_tree(
 
 #[cfg(test)]
 mod sync_command_tests {
-    use super::{remote_tmux_location, run_tmux_command_sync_result};
+    use super::{
+        remote_tmux_location, run_tmux_command_sync_result, tmux_matches_expected_generation,
+    };
 
     #[test]
     fn remote_tmux_probe_supplies_authoritative_location() {
@@ -1820,6 +1837,29 @@ mod sync_command_tests {
             remote_tmux_location(&crate::tmux::TmuxTarget::Local, &info),
             None
         );
+    }
+
+    #[test]
+    fn same_name_probe_cannot_promote_a_replacement_generation() {
+        let expected = crate::session::SavedTmuxIdentity {
+            session_id: "$0".into(),
+            session_created: 1711720000,
+            continuity_id: "11".repeat(16),
+        };
+        let mut info = crate::tmux::TmuxPaneInfo {
+            current_command: "zsh".into(),
+            cwd: "/repo".into(),
+            pid: 42,
+            width: 120,
+            height: 40,
+            session_id: expected.session_id.clone(),
+            session_created: expected.session_created,
+            continuity_id: Some(expected.continuity_id.clone()),
+        };
+        assert!(tmux_matches_expected_generation(&expected, &info));
+
+        info.continuity_id = Some("22".repeat(16));
+        assert!(!tmux_matches_expected_generation(&expected, &info));
     }
 
     #[test]

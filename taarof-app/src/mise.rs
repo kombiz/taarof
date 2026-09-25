@@ -1254,6 +1254,7 @@ mod tests {
         let backing = TmuxBacking {
             session_name: "taarof--sample--t18--0".into(),
             target: TmuxTarget::Local,
+            expected_generation: None,
             pane_info,
         };
 

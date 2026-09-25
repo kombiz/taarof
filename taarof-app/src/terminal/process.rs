@@ -40,6 +40,7 @@ pub(super) fn pane_spawn_argv(
             let backing = crate::pane::TmuxBacking {
                 session_name: name.to_string(),
                 target,
+                expected_generation: None,
                 pane_info: ProbeSnapshot::default(),
             };
             return (argv, Some(backing));

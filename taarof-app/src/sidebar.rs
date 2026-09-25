@@ -5057,9 +5057,7 @@ fn close_tab(
         let worker = crate::tmux::default_worker();
         let commands = tmux_backings
             .iter()
-            .map(|backing| {
-                crate::tmux::kill_session_command(&backing.target, &backing.session_name)
-            })
+            .map(crate::tmux::kill_backing_command)
             .collect();
         let tab_list = tab_list.clone();
         let term_stack = term_stack.clone();
@@ -5397,9 +5395,7 @@ pub fn close_workspace_by_id(
         let worker = crate::tmux::default_worker();
         let commands = tmux_backings
             .iter()
-            .map(|backing| {
-                crate::tmux::kill_session_command(&backing.target, &backing.session_name)
-            })
+            .map(crate::tmux::kill_backing_command)
             .collect();
         let tab_list = tab_list.clone();
         let term_stack = term_stack.clone();

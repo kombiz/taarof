@@ -235,6 +235,100 @@ pub fn kill_session_command(target: &TmuxTarget, name: &str) -> Vec<String> {
     wrap_for_target_noninteractive(target, args)
 }
 
+/// Kill a pane's tmux session only while it is still the generation that the
+/// pane was authorized to control. A restored pane keeps its saved generation
+/// separately from live probe metadata, so a refused same-name replacement
+/// cannot be killed by child-exit, pane-close, tab-close, or workspace-close
+/// cleanup.
+pub fn kill_backing_command(backing: &crate::pane::TmuxBacking) -> Vec<String> {
+    let Some(identity) = backing.authoritative_generation() else {
+        return kill_session_command(&backing.target, &backing.session_name);
+    };
+    exact_kill_session_command(
+        &backing.target,
+        &backing.session_name,
+        &identity.session_id,
+        identity.session_created,
+        &identity.continuity_id,
+    )
+    .unwrap_or_else(|| {
+        wrap_for_target_noninteractive(
+            &backing.target,
+            vec![
+                "tmux".to_string(),
+                "display-message".to_string(),
+                "-p".to_string(),
+                "Close unavailable: the saved tmux generation is invalid.".to_string(),
+            ],
+        )
+    })
+}
+
+fn exact_backing_mutation_command(
+    backing: &crate::pane::TmuxBacking,
+    authorized_command: String,
+    mismatch_is_error: bool,
+) -> Option<Vec<String>> {
+    let identity = backing.authoritative_generation()?;
+    let Some(condition) = exact_generation_condition(
+        &identity.session_id,
+        identity.session_created,
+        &identity.continuity_id,
+    ) else {
+        return Some(wrap_for_target_noninteractive(
+            &backing.target,
+            vec![
+                "tmux".to_string(),
+                "run-shell".to_string(),
+                "printf 'Exact tmux generation is invalid.\\n' >&2; exit 75".to_string(),
+            ],
+        ));
+    };
+    let unavailable = if mismatch_is_error {
+        "run-shell \"printf 'Exact saved tmux target no longer exists.\\n' >&2; exit 75\""
+    } else {
+        "display-message -p 'Close skipped: the exact saved tmux target no longer exists.'"
+    };
+    Some(wrap_for_target_noninteractive(
+        &backing.target,
+        vec![
+            "tmux".to_string(),
+            "if-shell".to_string(),
+            "-t".to_string(),
+            backing.session_name.clone(),
+            "-F".to_string(),
+            condition,
+            authorized_command,
+            unavailable.to_string(),
+        ],
+    ))
+}
+
+pub fn resize_backing_command(
+    backing: &crate::pane::TmuxBacking,
+    cols: u32,
+    rows: u32,
+) -> Vec<String> {
+    let escaped_name = agent_session_core::legacy::shell_escape(&backing.session_name);
+    exact_backing_mutation_command(
+        backing,
+        format!("resize-pane -t {escaped_name} -x {cols} -y {rows}"),
+        true,
+    )
+    .unwrap_or_else(|| resize_pane_command(&backing.target, &backing.session_name, cols, rows))
+}
+
+pub fn send_keys_backing_command(backing: &crate::pane::TmuxBacking, keys: &str) -> Vec<String> {
+    let escaped_name = agent_session_core::legacy::shell_escape(&backing.session_name);
+    let escaped_keys = agent_session_core::legacy::shell_escape(keys);
+    exact_backing_mutation_command(
+        backing,
+        format!("send-keys -t {escaped_name} -l {escaped_keys}"),
+        true,
+    )
+    .unwrap_or_else(|| send_keys_command(&backing.target, &backing.session_name, keys))
+}
+
 /// `tmux capture-pane -p -J -t {session} -l {lines}`
 /// `-J` joins soft-wrapped lines so captures read as logical lines (EXAMPLE-89).
 #[cfg(test)]
@@ -535,18 +629,10 @@ pub fn exact_attach_command(
     session_created: u64,
     continuity_id: &str,
 ) -> Option<Vec<String>> {
-    if session_name.is_empty()
-        || session_id.is_empty()
-        || !session_id.starts_with('$')
-        || !session_id[1..].bytes().all(|byte| byte.is_ascii_digit())
-        || continuity_id.len() != 32
-        || !continuity_id.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    if session_name.is_empty() {
         return None;
     }
-    let condition = format!(
-        "#{{&&:#{{==:#{{@taarof-continuity-id}},{continuity_id}}},#{{&&:#{{==:#{{session_id}},{session_id}}},#{{==:#{{session_created}},{session_created}}}}}}}"
-    );
+    let condition = exact_generation_condition(session_id, session_created, continuity_id)?;
     let escaped_name = agent_session_core::legacy::shell_escape(session_name);
     let tmux_args = vec![
         "tmux".to_string(),
@@ -560,6 +646,54 @@ pub fn exact_attach_command(
             .to_string(),
     ];
     Some(wrap_for_target(target, tmux_args))
+}
+
+fn exact_generation_condition(
+    session_id: &str,
+    session_created: u64,
+    continuity_id: &str,
+) -> Option<String> {
+    if session_id.is_empty()
+        || !session_id.starts_with('$')
+        || !session_id[1..].bytes().all(|byte| byte.is_ascii_digit())
+        || continuity_id.len() != 32
+        || !continuity_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(format!(
+        "#{{&&:#{{==:#{{@taarof-continuity-id}},{continuity_id}}},#{{&&:#{{==:#{{session_id}},{session_id}}},#{{==:#{{session_created}},{session_created}}}}}}}"
+    ))
+}
+
+/// Kill only the exact generation through one tmux client. The false branch
+/// is deliberately non-mutating: it leaves a same-name replacement intact.
+pub fn exact_kill_session_command(
+    target: &TmuxTarget,
+    session_name: &str,
+    session_id: &str,
+    session_created: u64,
+    continuity_id: &str,
+) -> Option<Vec<String>> {
+    if session_name.is_empty() {
+        return None;
+    }
+    let condition = exact_generation_condition(session_id, session_created, continuity_id)?;
+    let escaped_name = agent_session_core::legacy::shell_escape(session_name);
+    Some(wrap_for_target_noninteractive(
+        target,
+        vec![
+            "tmux".to_string(),
+            "if-shell".to_string(),
+            "-t".to_string(),
+            session_name.to_string(),
+            "-F".to_string(),
+            condition,
+            format!("kill-session -t {escaped_name}"),
+            "display-message -p 'Close skipped: the exact saved tmux target no longer exists.'"
+                .to_string(),
+        ],
+    ))
 }
 
 /// `tmux list-sessions -F "#{session_name}:#{session_created}:#{session_attached}:#{session_windows}"`
@@ -885,6 +1019,10 @@ impl TmuxCommandOutcome {
             return Err(error.clone());
         }
         let detail = self.stderr.trim();
+        if !detail.is_empty() {
+            return Err(detail.to_string());
+        }
+        let detail = self.stdout.trim();
         if !detail.is_empty() {
             return Err(detail.to_string());
         }
@@ -1667,6 +1805,7 @@ mod tests {
                 crate::pane::TmuxBacking {
                     session_name: "partial-ok".to_string(),
                     target: TmuxTarget::Local,
+                    expected_generation: None,
                     pane_info: crate::probe::ProbeSnapshot::default(),
                 },
                 crate::pane::TmuxBacking {
@@ -1674,6 +1813,7 @@ mod tests {
                     target: TmuxTarget::Remote {
                         ssh_target: "builder@example".to_string(),
                     },
+                    expected_generation: None,
                     pane_info: crate::probe::ProbeSnapshot::default(),
                 },
             ];
@@ -2024,6 +2164,7 @@ mod tests {
                         target: TmuxTarget::Remote {
                             ssh_target: "builder@example".to_string(),
                         },
+                        expected_generation: None,
                         pane_info: crate::probe::ProbeSnapshot::default(),
                     }),
                     ..crate::runtime::HeadlessPaneState::default()
@@ -2279,6 +2420,62 @@ mod tests {
             "legacy-missing-generation",
         )
         .is_none());
+    }
+
+    #[test]
+    fn restored_backing_cleanup_is_bound_to_the_saved_generation() {
+        let mut backing = crate::pane::TmuxBacking {
+            session_name: "same-name".into(),
+            target: TmuxTarget::Local,
+            expected_generation: Some(crate::session::SavedTmuxIdentity {
+                session_id: "$1".into(),
+                session_created: 1711720000,
+                continuity_id: TEST_CONTINUITY_ID.into(),
+            }),
+            pane_info: crate::probe::ProbeSnapshot::default(),
+        };
+
+        backing.pane_info.record_success(TmuxPaneInfo {
+            current_command: "zsh".into(),
+            cwd: "/replacement".into(),
+            pid: 42,
+            width: 80,
+            height: 24,
+            session_id: "$1".into(),
+            session_created: 1711720000,
+            continuity_id: Some("22222222222222222222222222222222".into()),
+        });
+        assert_eq!(
+            backing
+                .authoritative_generation()
+                .expect("saved authority must remain primary")
+                .continuity_id,
+            TEST_CONTINUITY_ID
+        );
+
+        let command = kill_backing_command(&backing);
+        assert_eq!(command[0], "tmux");
+        assert_eq!(command[1], "if-shell");
+        assert_eq!(command[2..5], ["-t", "same-name", "-F"]);
+        assert!(command[5].contains(TEST_CONTINUITY_ID));
+        assert!(command[5].contains("#{session_id},$1"));
+        assert!(command[5].contains("#{session_created},1711720000"));
+        assert_eq!(command[6], "kill-session -t same-name");
+        assert!(command[7].contains("Close skipped"));
+        assert_ne!(command[1], "kill-session");
+
+        let resize = resize_backing_command(&backing, 120, 40);
+        assert_eq!(resize[1], "if-shell");
+        assert!(resize[5].contains(TEST_CONTINUITY_ID));
+        assert_eq!(resize[6], "resize-pane -t same-name -x 120 -y 40");
+        assert!(resize[7].contains("exit 75"));
+
+        let send = send_keys_backing_command(&backing, "text with 'quote'");
+        assert_eq!(send[1], "if-shell");
+        assert!(send[5].contains(TEST_CONTINUITY_ID));
+        assert!(send[6].starts_with("send-keys -t same-name -l "));
+        assert!(send[6].contains("'\"'\"'"));
+        assert!(send[7].contains("exit 75"));
     }
 
     // --- session_style ---

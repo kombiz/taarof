@@ -83,20 +83,10 @@ pub(super) fn save_pane_tree_with_zoom(
                 .tmux_backing
                 .as_ref()
                 .and_then(|b| b.target.ssh_target_string()),
-            tmux_identity: leaf.tmux_backing.as_ref().and_then(|backing| {
-                (backing.pane_info.state == crate::probe::ProbeState::Ok)
-                    .then(|| backing.pane_info.value())
-                    .flatten()
-                    .and_then(|info| {
-                        info.continuity_id.as_ref().map(|continuity_id| {
-                            crate::session::SavedTmuxIdentity {
-                                session_id: info.session_id.clone(),
-                                session_created: info.session_created,
-                                continuity_id: continuity_id.clone(),
-                            }
-                        })
-                    })
-            }),
+            tmux_identity: leaf
+                .tmux_backing
+                .as_ref()
+                .and_then(crate::pane::TmuxBacking::authoritative_generation),
             current_task: leaf.current_task.clone(),
             agent_session: {
                 let (detected_agent_running, detected) = agent_metadata(leaf.pane_id);
@@ -429,6 +419,7 @@ pub(super) fn split_pane_for_tab(
             let backing = crate::pane::TmuxBacking {
                 session_name: session_name.clone(),
                 target: target.clone(),
+                expected_generation: None,
                 pane_info: ProbeSnapshot::default(),
             };
             (argv, Some(backing))
@@ -546,10 +537,7 @@ pub(crate) fn close_pane_async(
         let completion = worker
             .submit_coalesced(
                 crate::tmux::TmuxJobKey::ClosePane { tab_id, pane_id },
-                vec![crate::tmux::kill_session_command(
-                    &backing.target,
-                    &backing.session_name,
-                )],
+                vec![crate::tmux::kill_backing_command(&backing)],
                 std::time::Duration::from_secs(10),
             )
             .await;
@@ -561,10 +549,7 @@ pub(crate) fn close_pane_async(
                         .find_tab(tab_id)
                         .and_then(|(_, tab)| tab.panes.leaf(pane_id))
                         .and_then(|leaf| leaf.tmux_backing.as_ref())
-                        .is_some_and(|live| {
-                            live.session_name == backing.session_name
-                                && live.target == backing.target
-                        });
+                        .is_some_and(|live| live.same_execution_target(&backing));
                     if !still_same {
                         Err("pane close was superseded".to_string())
                     } else {

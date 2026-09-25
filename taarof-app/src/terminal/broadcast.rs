@@ -349,11 +349,7 @@ pub(crate) fn send_bytes_to_pane(
             glib::spawn_future_local(async move {
                 let error = match worker
                     .submit(
-                        vec![crate::tmux::send_keys_command(
-                            &backing.target,
-                            &backing.session_name,
-                            &payload,
-                        )],
+                        vec![crate::tmux::send_keys_backing_command(&backing, &payload)],
                         std::time::Duration::from_secs(10),
                     )
                     .await

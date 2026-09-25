@@ -16,7 +16,30 @@ use crate::tmux::TmuxTarget;
 pub struct TmuxBacking {
     pub session_name: String,
     pub target: TmuxTarget,
+    /// Exact generation this pane was authorized to attach. Restored panes
+    /// keep the saved value even before (or after a failed) live probe so
+    /// cleanup cannot acquire authority over a same-named replacement.
+    pub expected_generation: Option<crate::session::SavedTmuxIdentity>,
     pub pane_info: ProbeSnapshot<crate::tmux::TmuxPaneInfo>,
+}
+
+impl TmuxBacking {
+    pub fn authoritative_generation(&self) -> Option<crate::session::SavedTmuxIdentity> {
+        self.expected_generation.clone().or_else(|| {
+            let info = self.pane_info.value()?;
+            Some(crate::session::SavedTmuxIdentity {
+                session_id: info.session_id.clone(),
+                session_created: info.session_created,
+                continuity_id: info.continuity_id.clone()?,
+            })
+        })
+    }
+
+    pub fn same_execution_target(&self, other: &Self) -> bool {
+        self.session_name == other.session_name
+            && self.target == other.target
+            && self.authoritative_generation() == other.authoritative_generation()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
