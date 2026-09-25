@@ -265,17 +265,17 @@ fn run_child_exit_cleanup(
     pane_id: u32,
     exit_code: i32,
 ) {
-    let failure_snippet = (exit_code != 0)
-        .then(|| {
-            terminal
-                .and_then(|terminal| {
-                    super::capture_last_terminal_lines(terminal, FAILING_TEST_SNIPPET_LINES).ok()
-                })
-                .map(|(text, _)| text.trim().to_string())
-                .filter(|text| !text.is_empty())
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
+    let failure_snippet = if exit_code != 0 {
+        terminal
+            .and_then(|terminal| {
+                super::capture_last_terminal_lines(terminal, FAILING_TEST_SNIPPET_LINES).ok()
+            })
+            .map(|(text, _)| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let command_exit_event = if exit_code == 0 {
         None
     } else {
