@@ -143,10 +143,16 @@ fn record_pull_request_fetch(
     cache: &mut HashMap<PullRequestKey, PullRequestsEntry>,
     key: PullRequestKey,
     result: Result<BranchPullRequestsData, String>,
+    request_started_at_ms: u64,
     fetched_at_ms: u64,
 ) {
     let previous = cache.remove(&key);
-    cache.retain(|existing, _| !existing.same_branch_identity(&key));
+    // A fetch for an older HEAD can finish after a newer revision's fetch.
+    // Keep sibling entries that completed after this request started so the
+    // stale completion cannot evict the current revision's verified result.
+    cache.retain(|existing, entry| {
+        !existing.same_branch_identity(&key) || entry.fetched_at_ms >= request_started_at_ms
+    });
     let entry = match result {
         Ok(data) => PullRequestsEntry {
             fetched_at_ms,
@@ -2410,6 +2416,7 @@ impl TaskPanel {
                 &mut panel.pull_request_cache.borrow_mut(),
                 key.clone(),
                 result,
+                now,
                 now_ms(),
             );
             let current_local_target = (!remote)
@@ -5631,8 +5638,8 @@ mod tests {
             query_complete: true,
         };
         let mut cache = HashMap::new();
-        record_pull_request_fetch(&mut cache, key.clone(), Ok(initial), 10);
-        record_pull_request_fetch(&mut cache, key.clone(), Ok(refreshed), 20);
+        record_pull_request_fetch(&mut cache, key.clone(), Ok(initial), 10, 10);
+        record_pull_request_fetch(&mut cache, key.clone(), Ok(refreshed), 20, 20);
 
         assert_eq!(cache.len(), 1, "a refresh must replace the branch entry");
         let entry = cache.get(&key).expect("refreshed branch entry");
@@ -5676,14 +5683,52 @@ mod tests {
             query_complete: true,
         };
         let mut cache = HashMap::new();
-        record_pull_request_fetch(&mut cache, old.clone(), Ok(data(1)), 10);
-        record_pull_request_fetch(&mut cache, other.clone(), Ok(data(2)), 20);
-        record_pull_request_fetch(&mut cache, current.clone(), Ok(data(3)), 30);
+        record_pull_request_fetch(&mut cache, old.clone(), Ok(data(1)), 10, 10);
+        record_pull_request_fetch(&mut cache, other.clone(), Ok(data(2)), 20, 20);
+        record_pull_request_fetch(&mut cache, current.clone(), Ok(data(3)), 30, 30);
 
         assert_eq!(cache.len(), 2);
         assert!(!cache.contains_key(&old));
         assert_eq!(cache[&current].verified.as_ref().unwrap().total, 3);
         assert_eq!(cache[&other].verified.as_ref().unwrap().total, 2);
+    }
+
+    #[test]
+    fn stale_revision_fetch_completion_does_not_evict_newer_head_cache() {
+        let mut old = PullRequestKey::new(
+            PathBuf::from("/repo"),
+            "owner/repo",
+            "owner",
+            "feature/review",
+        );
+        old.head_revision = Some("1111111111111111111111111111111111111111".into());
+        let mut current = old.clone();
+        current.head_revision = Some("2222222222222222222222222222222222222222".into());
+        let data = |total| BranchPullRequestsData {
+            total,
+            open: total,
+            draft: 0,
+            merged: 0,
+            closed: 0,
+            pull_requests: Vec::new(),
+            query_complete: true,
+        };
+        let mut cache = HashMap::new();
+
+        // The old revision's query starts first but finishes after the current
+        // revision's query. Its completion must not remove the current result.
+        record_pull_request_fetch(&mut cache, current.clone(), Ok(data(2)), 20, 30);
+        record_pull_request_fetch(&mut cache, old.clone(), Ok(data(1)), 10, 40);
+
+        assert_eq!(cache[&current].verified.as_ref().unwrap().total, 2);
+        assert_eq!(cache[&old].verified.as_ref().unwrap().total, 1);
+
+        // A later fetch started after both completions can prune prior revisions.
+        let mut next = current.clone();
+        next.head_revision = Some("3333333333333333333333333333333333333333".into());
+        record_pull_request_fetch(&mut cache, next.clone(), Ok(data(3)), 50, 60);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[&next].verified.as_ref().unwrap().total, 3);
     }
 
     #[test]
@@ -5707,9 +5752,9 @@ mod tests {
             query_complete: true,
         };
         let mut cache = HashMap::new();
-        record_pull_request_fetch(&mut cache, first.clone(), Ok(data(1)), 10);
-        record_pull_request_fetch(&mut cache, first.clone(), Ok(data(2)), 20);
-        record_pull_request_fetch(&mut cache, second.clone(), Ok(data(3)), 30);
+        record_pull_request_fetch(&mut cache, first.clone(), Ok(data(1)), 10, 10);
+        record_pull_request_fetch(&mut cache, first.clone(), Ok(data(2)), 20, 20);
+        record_pull_request_fetch(&mut cache, second.clone(), Ok(data(3)), 30, 30);
 
         assert_eq!(cache.len(), 2);
         assert_eq!(cache[&first].verified.as_ref().unwrap().total, 2);
@@ -5760,8 +5805,8 @@ mod tests {
             query_complete: true,
         };
         let mut cache = HashMap::new();
-        record_pull_request_fetch(&mut cache, key.clone(), Ok(verified), 10);
-        record_pull_request_fetch(&mut cache, key.clone(), Err("offline".into()), 20);
+        record_pull_request_fetch(&mut cache, key.clone(), Ok(verified), 10, 10);
+        record_pull_request_fetch(&mut cache, key.clone(), Err("offline".into()), 20, 20);
         let entry = cache.get(&key).unwrap();
         assert_eq!(entry.fetched_at_ms, 20);
         assert_eq!(entry.verified_at_ms, Some(10));
@@ -5793,8 +5838,8 @@ mod tests {
             query_complete: true,
         };
         let mut cache = HashMap::new();
-        record_pull_request_fetch(&mut cache, old_key.clone(), Ok(verified), 10);
-        record_pull_request_fetch(&mut cache, new_key.clone(), Err("offline".into()), 20);
+        record_pull_request_fetch(&mut cache, old_key.clone(), Ok(verified), 10, 10);
+        record_pull_request_fetch(&mut cache, new_key.clone(), Err("offline".into()), 20, 20);
 
         assert_eq!(cache.len(), 2);
         assert!(cache.get(&old_key).unwrap().verified.is_some());
@@ -5827,8 +5872,8 @@ mod tests {
             query_complete: true,
         };
         let mut cache = HashMap::new();
-        record_pull_request_fetch(&mut cache, old_key.clone(), Ok(verified), 10);
-        record_pull_request_fetch(&mut cache, new_key.clone(), Err("offline".into()), 20);
+        record_pull_request_fetch(&mut cache, old_key.clone(), Ok(verified), 10, 10);
+        record_pull_request_fetch(&mut cache, new_key.clone(), Err("offline".into()), 20, 20);
 
         assert_eq!(old_key.base_repository, "owner/repo");
         assert_eq!(
