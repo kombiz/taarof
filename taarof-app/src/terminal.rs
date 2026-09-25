@@ -3377,6 +3377,7 @@ pub fn register_lazy_restored_tab(
         ssh_command: None,
         tmux_session: None,
         tmux_host: None,
+        tmux_identity: None,
         current_task: None,
         agent_session: None,
     });
@@ -4015,6 +4016,7 @@ mod tests {
             ssh_command: ssh_command.map(|argv| argv.into_iter().map(str::to_string).collect()),
             tmux_session: None,
             tmux_host: None,
+            tmux_identity: None,
             current_task: None,
             agent_session: None,
         }

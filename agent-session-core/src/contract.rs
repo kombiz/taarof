@@ -41,6 +41,30 @@ pub enum ActionKind {
     Attach,
     Fork,
 }
+
+impl ActionKind {
+    /// User-facing continuity action. These labels keep process liveness,
+    /// provider history, and saved layout restoration as separate authorities.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::New => "Start new agent conversation",
+            Self::Resume => "Resume agent conversation",
+            Self::Attach => "Reattach live terminal",
+            Self::Fork => "Fork agent conversation",
+        }
+    }
+
+    pub fn authority_description(self) -> &'static str {
+        match self {
+            Self::New => "starts a new provider session in the selected directory",
+            Self::Resume => {
+                "relaunches the provider using an exact saved provider session identity"
+            }
+            Self::Attach => "reconnects to an exact current live process target",
+            Self::Fork => "asks the provider to create a distinct conversation from saved history",
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {

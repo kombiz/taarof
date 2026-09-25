@@ -288,7 +288,11 @@ changing `installed_binary_path` affects the next refresh without a restart.
 
 | Key | Type | Default | Accepted values | Effect |
 | --- | --- | --- | --- | --- |
-| `auto_resume_agents` | Boolean | `false` | `true`, `false` | When false, restored Claude, Codex, Pi, or Kimi panes start a shell and expose a resume action. When true, Taarof runs the saved agent resume command immediately. tmux-backed panes always reattach tmux and ignore this setting. |
+| `auto_resume_agents` | Boolean | `false` | `true`, `false` | When false, restored non-tmux agent panes start a shell and expose **Resume agent conversation**. When true, Taarof passes the exact saved provider identity to the build-matched `agent` launcher from the same install channel. Restored tmux panes use **Reattach live terminal** only when the saved tmux generation still matches; they never create or attach a same-name replacement. |
+
+See [Session continuity](session-continuity.md) for the separate live-terminal,
+provider-history, saved-layout, and display-checkpoint authorities and their
+shutdown/restart behavior.
 
 ### `[http]` and `[http_control]`
 

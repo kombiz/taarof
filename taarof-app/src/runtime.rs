@@ -1622,6 +1622,7 @@ mod tests {
                     ssh_command: None,
                     tmux_session: None,
                     tmux_host: None,
+                    tmux_identity: None,
                     current_task: None,
                     agent_session: None,
                 },

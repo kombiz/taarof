@@ -1247,6 +1247,9 @@ mod tests {
             pid: 42,
             width: 120,
             height: 40,
+            session_id: "$1".into(),
+            session_created: 1,
+            continuity_id: Some("11".repeat(16)),
         });
         let backing = TmuxBacking {
             session_name: "taarof--sample--t18--0".into(),

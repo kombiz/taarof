@@ -2108,6 +2108,9 @@ mod tests {
             pid: 42,
             width: 132,
             height: 41,
+            session_id: "$1".into(),
+            session_created: 1,
+            continuity_id: Some("11".repeat(16)),
         });
 
         let snapshot = super::build_state_snapshot(&state);
@@ -2254,6 +2257,7 @@ mod tests {
                 ssh_command: None,
                 tmux_session: None,
                 tmux_host: None,
+                tmux_identity: None,
                 current_task: Some(binding),
                 agent_session: None,
             }),
@@ -2263,6 +2267,7 @@ mod tests {
                 ssh_command: None,
                 tmux_session: Some("pending-tmux".into()),
                 tmux_host: None,
+                tmux_identity: None,
                 current_task: None,
                 agent_session: None,
             }),
@@ -2688,6 +2693,9 @@ mod tests {
             pid: 42,
             width: 120,
             height: 40,
+            session_id: "$1".into(),
+            session_created: 1,
+            continuity_id: Some("11".repeat(16)),
         });
         probe.record_failure("probe failed");
 

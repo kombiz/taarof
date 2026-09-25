@@ -294,6 +294,7 @@ fn saved_agent_session(
         return Some(session::SavedAgentSession {
             agent_name: normalized_agent,
             session_id: session_id.clone(),
+            host_identity: crate::agent_sessions::canonical_local_host_identity(),
             source: session::SavedAgentSessionSource::Argv,
         });
     }
@@ -303,6 +304,7 @@ fn saved_agent_session(
     Some(session::SavedAgentSession {
         agent_name: normalized_agent,
         session_id: record.session_id.clone(),
+        host_identity: crate::agent_sessions::canonical_local_host_identity(),
         source: session::SavedAgentSessionSource::TranscriptRecency,
     })
 }
@@ -475,6 +477,7 @@ mod tests {
             Some(SavedAgentSession {
                 agent_name: "codex".into(),
                 session_id: "argv-session".into(),
+                host_identity: crate::agent_sessions::canonical_local_host_identity(),
                 source: SavedAgentSessionSource::Argv,
             })
         );
@@ -488,6 +491,7 @@ mod tests {
             Some(SavedAgentSession {
                 agent_name: "codex".into(),
                 session_id: "newer".into(),
+                host_identity: crate::agent_sessions::canonical_local_host_identity(),
                 source: SavedAgentSessionSource::TranscriptRecency,
             })
         );
@@ -550,6 +554,7 @@ mod tests {
                 &Some(SavedAgentSession {
                     agent_name: "codex".into(),
                     session_id: "argv-session".into(),
+                    host_identity: crate::agent_sessions::canonical_local_host_identity(),
                     source: SavedAgentSessionSource::Argv,
                 })
             ),

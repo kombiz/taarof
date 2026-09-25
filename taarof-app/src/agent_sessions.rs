@@ -188,6 +188,13 @@ pub fn default_catalog() -> Arc<AgentSessionCatalog> {
         .clone()
 }
 
+pub(crate) fn canonical_local_host_identity() -> Option<String> {
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").ok()?;
+    let hostname = hostname.trim();
+    (!hostname.is_empty())
+        .then(|| agent_session_core::StableRef::new("local", hostname, "host").host_identity)
+}
+
 /// Capture the process-dependent discovery roots on GTK before any persistence
 /// worker can use the default catalog. Scanning those roots remains off GTK.
 pub fn initialize_default_catalog() -> Arc<AgentSessionCatalog> {

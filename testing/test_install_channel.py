@@ -63,7 +63,7 @@ import os, pathlib
 p=pathlib.Path(os.environ['CARGO_TARGET_DIR'])/'release/taarof-app'
 p.parent.mkdir(parents=True, exist_ok=True)
 label=pathlib.Path('channel').read_text()
-p.write_text('#!/usr/bin/env python3\\nimport json,os,sys\\nprint(json.dumps(dict(channel='+repr(label)+', session=os.environ.get("TAAROF_SESSION"), installed=os.environ.get("TAAROF_INSTALLED_BINARY"), sock=os.environ.get("TAAROF_SOCK"), argv=sys.argv[1:])))\\n')
+p.write_text('#!/usr/bin/env python3\\nimport json,os,sys\\nprint(json.dumps(dict(channel='+repr(label)+', session=os.environ.get("TAAROF_SESSION"), installed=os.environ.get("TAAROF_INSTALLED_BINARY"), agent=os.environ.get("TAAROF_AGENT_BINARY"), sock=os.environ.get("TAAROF_SOCK"), argv=sys.argv[1:])))\\n')
 p.chmod(0o755)
 ''')
         self.environment = patch.dict(os.environ, {
@@ -109,6 +109,7 @@ p.chmod(0o755)
         self.assertEqual(dev["session"], "kmux")
         self.assertIsNone(dev["sock"])
         self.assertEqual(dev["installed"], str(self.prefix / "lib/taarof/kmux/bin/taarof-app"))
+        self.assertEqual(dev["agent"], str(self.prefix / "lib/taarof/kmux/bin/agent"))
         self.assertEqual(dev["argv"], ["argument with spaces"])
         self.assertEqual(self.launch("taarof-kmux", "state")["argv"], ["--session", "kmux", "state"])
         desktops = list((self.prefix / "share/applications").glob("*.desktop"))

@@ -200,6 +200,7 @@ model. See [SECURITY.md](SECURITY.md).
 | --- | --- |
 | `README.md` | Human-facing overview, install, and feature summary |
 | [docs/setup.md](docs/setup.md) | Complete local, SSH/tmux remote, workstation, and gateway setup |
+| [docs/session-continuity.md](docs/session-continuity.md) | Exact live-terminal reattach, provider resume, layout restore, and recovery behavior |
 | [docs/configuration.md](docs/configuration.md) | Every supported configuration file, key, default, and parameter |
 | [RUNBOOK.md](RUNBOOK.md) | Operator tasks, restart, backup, and health checks |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Known failure modes and fixes |

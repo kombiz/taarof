@@ -167,8 +167,9 @@ export function AgentsView({
         <div>
           <h2>Read-only session history</h2>
           <p>
-            Live jobs come from taarof&apos;s current snapshot. Resume commands are copy-only and
-            never execute in the browser.
+            Browser viewer reconnection only follows an exact pane in taarof&apos;s current snapshot.
+            It does not attach a native process. Resume commands are copy-only and never execute
+            in the browser.
           </p>
         </div>
         <div className="agents-view__header-meta">
@@ -217,7 +218,7 @@ export function AgentsView({
                     }
                     type="button"
                   >
-                    Jump to live tab
+                    Reconnect browser viewer
                   </button>
                 </div>
               </article>
@@ -279,7 +280,10 @@ export function AgentsView({
       <section className="agents-view__section">
         <div className="agents-view__section-heading">
           <h3>Recent sessions</h3>
-          <p>Historical sessions are listed with copyable resume commands and live jump targets.</p>
+          <p>
+            Historical sessions keep provider identity separate from exact current browser-viewer
+            targets.
+          </p>
         </div>
         {snapshot?.sessions.length ? (
           <div className="agents-view__sessions-layout">
@@ -418,30 +422,41 @@ export function AgentsView({
                       </strong>
                     </div>
                     <div className="agents-view__binding-actions">
-                      <button
-                        onClick={() =>
-                          onSelectLiveTarget(
-                            selectedSession.live_binding!.workspace_id,
-                            selectedSession.live_binding!.tab_id,
-                            selectedSession.live_binding!.pane_id,
-                          )
-                        }
-                        type="button"
-                      >
-                        Jump to live pane
-                      </button>
                       {liveBindingTab ? (
-                        <button
-                          aria-expanded={areTabPanesVisible}
-                          onClick={() => setAreTabPanesVisible((current) => !current)}
-                          type="button"
-                        >
-                          {areTabPanesVisible ? "Hide tab panes" : "Show tab panes"}
-                        </button>
-                      ) : null}
+                        <>
+                          <button
+                            onClick={() =>
+                              onSelectLiveTarget(
+                                liveBindingTab.workspace.id,
+                                liveBindingTab.tab.tab_id,
+                                selectedSession.live_binding!.pane_id,
+                              )
+                            }
+                            type="button"
+                          >
+                            Reconnect browser viewer
+                          </button>
+                          <button
+                            aria-expanded={areTabPanesVisible}
+                            onClick={() => setAreTabPanesVisible((current) => !current)}
+                            type="button"
+                          >
+                            {areTabPanesVisible ? "Hide tab panes" : "Show tab panes"}
+                          </button>
+                        </>
+                      ) : (
+                        <span className="agents-view__empty">
+                          Browser viewer reconnect unavailable: the exact current pane is missing.
+                        </span>
+                      )}
                     </div>
                   </div>
-                ) : null}
+                ) : (
+                  <div className="agents-view__empty">
+                    Browser viewer reconnect unavailable: this history record has no exact current
+                    pane binding.
+                  </div>
+                )}
 
                 {areTabPanesVisible && liveBindingTab ? (
                   <section className="agents-view__pane-viewer">
@@ -482,8 +497,11 @@ export function AgentsView({
 
                 <div className="agents-view__command-card">
                   <div className="agents-view__section-heading agents-view__section-heading--tight">
-                    <h3>Resume command</h3>
-                    <p>Copy into your terminal when you want to continue this session.</p>
+                    <h3>Resume agent conversation</h3>
+                    <p>
+                      Copy-only provider command for this saved session identity. The browser does
+                      not run it or infer queue, steer, interrupt, or rewind support.
+                    </p>
                   </div>
                   {selectedSession.resume_command ? (
                     <>
@@ -510,9 +528,22 @@ export function AgentsView({
                   ) : (
                     <div className="agents-view__empty">
                       {selectedSession.resume_unavailable_reason ??
-                        "Resume is unavailable for this session on this host."}
+                        "Resume agent conversation unavailable: no exact provider resume authority was validated on this host."}
                     </div>
                   )}
+                </div>
+
+                <div className="agents-view__command-card">
+                  <div className="agents-view__section-heading agents-view__section-heading--tight">
+                    <h3>Reopen workspace layout</h3>
+                    <p>
+                      Desktop-owned saved arrangement. This browser mirrors the current desktop
+                      snapshot and cannot open or replace saved layout state.
+                    </p>
+                  </div>
+                  <div className="agents-view__empty">
+                    Reopen workspace layout unavailable in the browser; use the native application.
+                  </div>
                 </div>
               </article>
             ) : null}

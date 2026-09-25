@@ -231,7 +231,7 @@ fn tui_hostile_display_fields_render_inertly() {
         "New",
         "Active",
         "Last sent",
-        "Attach",
+        "Reattach",
         "Confidence",
         "degraded",
     ] {

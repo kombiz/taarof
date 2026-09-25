@@ -8,10 +8,10 @@ use ratatui::{
 };
 pub fn action_meaning(kind: ActionKind) -> &'static str {
     match kind {
-        ActionKind::New => "New: start a new provider session",
-        ActionKind::Attach => "Attach: focus or reconnect to the existing live process",
-        ActionKind::Resume => "Resume: relaunch the provider using its saved history",
-        ActionKind::Fork => "Fork: create a separate session from saved history",
+        ActionKind::New => "Start new agent conversation: starts a new provider session in the selected directory",
+        ActionKind::Attach => "Reattach live terminal: reconnects to the exact current live process target",
+        ActionKind::Resume => "Resume agent conversation: relaunches the provider using an exact saved provider session identity",
+        ActionKind::Fork => "Fork agent conversation: creates a distinct conversation from saved history",
     }
 }
 impl Picker {

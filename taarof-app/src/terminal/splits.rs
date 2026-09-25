@@ -59,6 +59,7 @@ pub(super) fn save_pane_tree_with_zoom(
                 ssh_command: None,
                 tmux_session: None,
                 tmux_host: None,
+                tmux_identity: None,
                 current_task,
                 agent_session,
             }
@@ -69,6 +70,7 @@ pub(super) fn save_pane_tree_with_zoom(
             ssh_command: None,
             tmux_session: None,
             tmux_host: None,
+            tmux_identity: None,
             current_task: None,
             agent_session: None,
         },
@@ -81,6 +83,20 @@ pub(super) fn save_pane_tree_with_zoom(
                 .tmux_backing
                 .as_ref()
                 .and_then(|b| b.target.ssh_target_string()),
+            tmux_identity: leaf.tmux_backing.as_ref().and_then(|backing| {
+                (backing.pane_info.state == crate::probe::ProbeState::Ok)
+                    .then(|| backing.pane_info.value())
+                    .flatten()
+                    .and_then(|info| {
+                        info.continuity_id.as_ref().map(|continuity_id| {
+                            crate::session::SavedTmuxIdentity {
+                                session_id: info.session_id.clone(),
+                                session_created: info.session_created,
+                                continuity_id: continuity_id.clone(),
+                            }
+                        })
+                    })
+            }),
             current_task: leaf.current_task.clone(),
             agent_session: {
                 let (detected_agent_running, detected) = agent_metadata(leaf.pane_id);
@@ -803,6 +819,7 @@ mod agent_session_tests {
         SavedAgentSession {
             agent_name: "codex".into(),
             session_id: session_id.into(),
+            host_identity: Some("build.ts".into()),
             source: SavedAgentSessionSource::Argv,
         }
     }

@@ -2304,7 +2304,7 @@ fn show_tab_row_menu(
     layout.append(Some("Discover Tasks"), Some("tab.discover"));
     if let Some(offer) = agent_resume.as_ref() {
         layout.append(
-            Some(&format!("Resume {} session", offer.agent_name)),
+            Some(&format!("Resume agent conversation ({})", offer.agent_name)),
             Some("tab.resume-agent"),
         );
     }
@@ -6463,6 +6463,7 @@ mod tests {
                 ssh_command: None,
                 tmux_session: None,
                 tmux_host: None,
+                tmux_identity: None,
                 current_task: None,
                 agent_session: None,
             },
@@ -6647,6 +6648,7 @@ mod tests {
                         ssh_command: None,
                         tmux_session: None,
                         tmux_host: None,
+                        tmux_identity: None,
                         current_task: None,
                         agent_session: None,
                     },
