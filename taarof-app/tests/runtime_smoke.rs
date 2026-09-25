@@ -18,7 +18,7 @@ use serde_json::Value;
 use taarof_app::{
     config::{HttpConfig, TmuxCloseBehavior},
     http, plan_restored_spawns, seed_headless_terminal_tab, seed_pending_restore_tab,
-    session::{SavedPaneNode, SavedTab, SavedWorkspace, SessionStateV2},
+    session::{SavedPaneNode, SavedTab, SavedTmuxIdentity, SavedWorkspace, SessionStateV2},
     snapshot_session_state_for_test, socket, AppState, HeadlessPaneSeed, PlannedRestoreSpawn,
 };
 use tokio_tungstenite::connect_async;
@@ -2972,7 +2972,11 @@ fn test_lazy_restore_spawns_pane_tree_on_first_activation() {
             ssh_command: None,
             tmux_session: Some("sess-a".into()),
             tmux_host: None,
-            tmux_identity: None,
+            tmux_identity: Some(SavedTmuxIdentity {
+                session_id: "$1".into(),
+                session_created: 1_711_720_000,
+                continuity_id: "11111111111111111111111111111111".into(),
+            }),
             current_task: Some(current_task.clone()),
             agent_session: None,
         }),
