@@ -4,8 +4,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -15,7 +16,11 @@ use crate::AppState;
 
 const MAX_DIFF_BYTES: usize = 32 * 1024;
 const MAX_FILES: usize = 250;
+const CONTENT_FINGERPRINT_CHUNK_BYTES: usize = 64 * 1024;
+const CONTENT_FINGERPRINT_CHUNKS: u64 = 8;
 const REFRESH_TTL_MS: u64 = 750;
+const SNAPSHOT_CHANGED_MESSAGE: &str =
+    "Files changed while the review snapshot was being read; refreshing";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ReviewSelection {
@@ -155,6 +160,17 @@ impl ReviewSnapshot {
         }
     }
 
+    fn loading(selection: ReviewSelection) -> Self {
+        Self {
+            selection,
+            repository: None,
+            files: Vec::new(),
+            captured_at_ms: 0,
+            message: Some("Loading the selected worktree review…".to_string()),
+            truncated_files: 0,
+        }
+    }
+
     fn renders_same_as(&self, other: &Self) -> bool {
         self.selection == other.selection
             && self.repository == other.repository
@@ -267,7 +283,15 @@ fn link_button(text: &str) -> gtk::Button {
     button.add_css_class("task-panel-action-button");
     button.set_halign(gtk::Align::Fill);
     button.set_sensitive(false);
+    configure_link_button_label(&button);
     button
+}
+
+fn configure_link_button_label(button: &gtk::Button) {
+    if let Some(label) = button.child().and_downcast::<gtk::Label>() {
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.set_max_width_chars(1);
+    }
 }
 
 impl ReviewPanel {
@@ -296,6 +320,8 @@ impl ReviewPanel {
             .ok()
             .and_then(|state| selection_from_state(&state));
         let Some(selection) = selection else {
+            self.generation.set(self.generation.get().wrapping_add(1));
+            self.in_flight.set(false);
             self.render(ReviewSnapshot::unavailable(
                 ReviewSelection {
                     machine: local_machine_identity(),
@@ -308,7 +334,12 @@ impl ReviewPanel {
             ));
             return;
         };
-        if self.in_flight.get() {
+        let selection_changed = self
+            .snapshot
+            .borrow()
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.selection != selection);
+        if self.in_flight.get() && !selection_changed {
             return;
         }
         if self.snapshot.borrow().as_ref().is_some_and(|snapshot| {
@@ -316,6 +347,10 @@ impl ReviewPanel {
                 && now_ms().saturating_sub(snapshot.captured_at_ms) < REFRESH_TTL_MS
         }) {
             return;
+        }
+
+        if selection_changed {
+            self.render(ReviewSnapshot::loading(selection.clone()));
         }
 
         self.in_flight.set(true);
@@ -332,10 +367,10 @@ impl ReviewPanel {
             key,
             move || collect_review(request),
             move |result| {
-                panel.in_flight.set(false);
                 if panel.generation.get() != generation {
                     return;
                 }
+                panel.in_flight.set(false);
                 let current = state
                     .try_borrow()
                     .ok()
@@ -345,6 +380,15 @@ impl ReviewPanel {
                 }
                 match result {
                     Ok(snapshot) => panel.render(snapshot),
+                    Err(error)
+                        if should_preserve_rows_for_error(
+                            panel.snapshot.borrow().as_ref(),
+                            &selection,
+                            &error,
+                        ) =>
+                    {
+                        panel.status.set_text(&error);
+                    }
                     Err(error) => panel.render(ReviewSnapshot::unavailable(selection, error)),
                 }
             },
@@ -367,7 +411,12 @@ impl ReviewPanel {
             return;
         }
         let identity = snapshot.repository.as_ref().map_or_else(
-            || format!("{} · no repository", snapshot.selection.machine),
+            || {
+                snapshot.selection.checkout_hint().map_or_else(
+                    || format!("{} · no repository", snapshot.selection.machine),
+                    |path| format!("{} · {}", snapshot.selection.machine, path.display()),
+                )
+            },
             |repo| {
                 format!(
                     "{} · {} · {}",
@@ -503,6 +552,17 @@ impl ReviewPanel {
     }
 }
 
+fn should_preserve_rows_for_error(
+    previous: Option<&ReviewSnapshot>,
+    selection: &ReviewSelection,
+    error: &str,
+) -> bool {
+    error == SNAPSHOT_CHANGED_MESSAGE
+        && previous.is_some_and(|snapshot| {
+            snapshot.selection == *selection && snapshot.repository.is_some()
+        })
+}
+
 fn set_link_button(
     button: &gtk::Button,
     stored_url: &Rc<RefCell<Option<String>>>,
@@ -510,6 +570,7 @@ fn set_link_button(
     url: Option<&str>,
 ) {
     button.set_label(summary);
+    configure_link_button_label(button);
     button.set_sensitive(url.is_some());
     *stored_url.borrow_mut() = url.map(str::to_string);
 }
@@ -550,14 +611,12 @@ fn collect_review(selection: ReviewSelection) -> Result<ReviewSnapshot, String> 
     let head_revision = git_text(&worktree, &["rev-parse", "HEAD"])?
         .trim()
         .to_string();
-    let (base_ref, base_revision) = resolve_base(&worktree, &head_revision);
+    let (base_ref, base_revision) = resolve_base(&worktree, &branch, &head_revision);
     let before = capture_change_fingerprint(&worktree)?;
     let mut files = collect_changed_files(&worktree, base_revision.as_deref(), &head_revision)?;
     let after = capture_change_fingerprint(&worktree)?;
     if before != after {
-        return Err(
-            "Files changed while the review snapshot was being read; refreshing".to_string(),
-        );
+        return Err(SNAPSHOT_CHANGED_MESSAGE.to_string());
     }
     let repository = RepositoryIdentity {
         machine: selection.machine.clone(),
@@ -580,23 +639,23 @@ fn collect_review(selection: ReviewSelection) -> Result<ReviewSnapshot, String> 
     })
 }
 
-fn resolve_base(worktree: &Path, head: &str) -> (Option<String>, Option<String>) {
-    let candidates = [
-        git_text(worktree, &["rev-parse", "--abbrev-ref", "@{upstream}"])
-            .ok()
-            .map(|value| value.trim().to_string()),
-        git_text(
-            worktree,
-            &[
-                "symbolic-ref",
-                "--quiet",
-                "--short",
-                "refs/remotes/origin/HEAD",
-            ],
-        )
+fn resolve_base(worktree: &Path, branch: &str, head: &str) -> (Option<String>, Option<String>) {
+    let origin_head = git_text(
+        worktree,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    )
+    .ok()
+    .map(|value| value.trim().to_string());
+    let upstream = git_text(worktree, &["rev-parse", "--abbrev-ref", "@{upstream}"])
         .ok()
-        .map(|value| value.trim().to_string()),
-    ];
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.ends_with(&format!("/{branch}")));
+    let candidates = [origin_head, upstream];
     for candidate in candidates
         .into_iter()
         .flatten()
@@ -805,6 +864,8 @@ fn finish_file(
     layers.hash(&mut hasher);
     kind.hash(&mut hasher);
     diff.hash(&mut hasher);
+    git_bytes_path(worktree, &["ls-files", "--stage", "-z"], &path)?.hash(&mut hasher);
+    hash_worktree_content(&absolute, &mut hasher)?;
     Ok(ReviewFile {
         path: file.path,
         previous_path: file.previous_path,
@@ -823,9 +884,8 @@ struct BoundedDiff {
 }
 
 fn bounded_git_diff(worktree: &Path, args: &[&str], path: &OsStr) -> Result<BoundedDiff, String> {
-    let mut command = Command::new("git");
+    let mut command = review_git_command(worktree);
     command
-        .current_dir(worktree)
         .args(args)
         .arg("--")
         .arg(path)
@@ -898,8 +958,7 @@ fn git_text(worktree: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 fn git_bytes(worktree: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = Command::new("git")
-        .current_dir(worktree)
+    let output = review_git_command(worktree)
         .args(args)
         .output()
         .map_err(|_| "Could not start Git".to_string())?;
@@ -908,6 +967,85 @@ fn git_bytes(worktree: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     } else {
         Err("Git could not read the selected worktree".to_string())
     }
+}
+
+fn git_bytes_path(worktree: &Path, args: &[&str], path: &OsStr) -> Result<Vec<u8>, String> {
+    let output = review_git_command(worktree)
+        .args(args)
+        .arg("--")
+        .arg(path)
+        .output()
+        .map_err(|_| "Could not start Git".to_string())?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err("Git could not read the selected worktree".to_string())
+    }
+}
+
+fn review_git_command(worktree: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(worktree).arg("--no-optional-locks");
+    crate::child_env::prepare_child_command(&mut command, &[]);
+    command
+}
+
+fn hash_worktree_content(path: &Path, hasher: &mut DefaultHasher) -> Result<(), String> {
+    let Ok(metadata) = path.symlink_metadata() else {
+        return Ok(());
+    };
+    metadata.file_type().is_symlink().hash(hasher);
+    metadata.len().hash(hasher);
+    metadata.ino().hash(hasher);
+    metadata.mtime().hash(hasher);
+    metadata.mtime_nsec().hash(hasher);
+    metadata.ctime().hash(hasher);
+    metadata.ctime_nsec().hash(hasher);
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|_| "Could not fingerprint a changed file".to_string())?;
+    let mut buffer = [0_u8; CONTENT_FINGERPRINT_CHUNK_BYTES];
+    for offset in content_fingerprint_offsets(metadata.len()) {
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|_| "Could not fingerprint a changed file".to_string())?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| "Could not fingerprint a changed file".to_string())?;
+        offset.hash(hasher);
+        hasher.write(&buffer[..read]);
+    }
+    let after = file
+        .metadata()
+        .map_err(|_| "Could not fingerprint a changed file".to_string())?;
+    if metadata.len() != after.len()
+        || metadata.mtime() != after.mtime()
+        || metadata.mtime_nsec() != after.mtime_nsec()
+        || metadata.ctime() != after.ctime()
+        || metadata.ctime_nsec() != after.ctime_nsec()
+    {
+        return Err(SNAPSHOT_CHANGED_MESSAGE.to_string());
+    }
+    Ok(())
+}
+
+fn content_fingerprint_offsets(length: u64) -> Vec<u64> {
+    let chunk_size = CONTENT_FINGERPRINT_CHUNK_BYTES as u64;
+    let chunk_count = length.div_ceil(chunk_size).min(CONTENT_FINGERPRINT_CHUNKS);
+    let max_offset = length.saturating_sub(chunk_size);
+    (0..chunk_count)
+        .map(|chunk| {
+            if chunk_count <= 1 {
+                0
+            } else {
+                max_offset.saturating_mul(chunk) / (chunk_count - 1)
+            }
+        })
+        .collect()
 }
 
 fn split_nul(mut raw: Vec<u8>) -> Vec<Vec<u8>> {
@@ -1094,6 +1232,48 @@ mod tests {
     }
 
     #[test]
+    fn pushed_task_branch_uses_origin_head_instead_of_its_own_upstream() {
+        let repo = TempRepo::new("pushed-base");
+        let remote = std::env::temp_dir().join(format!(
+            "taarof-review-pushed-base-remote-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&remote).unwrap();
+        run(&remote, &["init", "--bare"]);
+        run(
+            &repo.0,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run(&repo.0, &["push", "-u", "origin", "main"]);
+        run(
+            &repo.0,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        run(&repo.0, &["switch", "-c", "task/review"]);
+        std::fs::write(repo.0.join("committed.txt"), "review\n").unwrap();
+        run(&repo.0, &["add", "committed.txt"]);
+        run(&repo.0, &["commit", "-m", "review change"]);
+        run(&repo.0, &["push", "-u", "origin", "HEAD"]);
+
+        let snapshot = collect_review(repo.selection("pushed-base")).unwrap();
+        let identity = snapshot.repository.as_ref().unwrap();
+        assert_eq!(identity.base_ref.as_deref(), Some("origin/main"));
+        assert_ne!(
+            identity.base_revision.as_deref(),
+            Some(identity.head_revision.as_str())
+        );
+        assert!(snapshot.files.iter().any(|file| {
+            file.path == b"committed.txt" && file.layers.contains(&ChangeLayer::Committed)
+        }));
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
     fn binary_oversized_and_symlink_content_are_bounded() {
         let repo = TempRepo::new("bounded");
         std::fs::write(repo.0.join("binary.bin"), [0, 1, 2, 3]).unwrap();
@@ -1130,6 +1310,56 @@ mod tests {
     }
 
     #[test]
+    fn equal_size_binary_oversized_and_index_edits_invalidate_viewed_markers() {
+        let repo = TempRepo::new("bounded-fingerprint");
+        let binary = repo.0.join("binary.bin");
+        let large = repo.0.join("large.bin");
+        let staged = repo.0.join("staged.bin");
+        std::fs::write(&binary, [0, 1, 2, 3]).unwrap();
+        let large_size =
+            CONTENT_FINGERPRINT_CHUNK_BYTES * (CONTENT_FINGERPRINT_CHUNKS as usize + 2);
+        std::fs::write(&large, vec![b'x'; large_size]).unwrap();
+        std::fs::write(&staged, [0, 9, 8, 7]).unwrap();
+        run(&repo.0, &["add", "staged.bin"]);
+        std::fs::write(&staged, [0, 4, 4, 4]).unwrap();
+        let before = collect_review(repo.selection("bounded-fingerprint")).unwrap();
+
+        std::fs::write(&binary, [0, 3, 2, 1]).unwrap();
+        std::fs::write(&large, vec![b'y'; large_size]).unwrap();
+        std::fs::write(&staged, [0, 6, 6, 6]).unwrap();
+        run(&repo.0, &["add", "staged.bin"]);
+        std::fs::write(&staged, [0, 4, 4, 4]).unwrap();
+        let after = collect_review(repo.selection("bounded-fingerprint")).unwrap();
+
+        for path in [
+            b"binary.bin".as_slice(),
+            b"large.bin".as_slice(),
+            b"staged.bin".as_slice(),
+        ] {
+            let before_file = before.files.iter().find(|file| file.path == path).unwrap();
+            let after_file = after.files.iter().find(|file| file.path == path).unwrap();
+            assert_ne!(
+                viewed_key(before.repository.as_ref().unwrap(), before_file),
+                viewed_key(after.repository.as_ref().unwrap(), after_file),
+                "same-size content edit must invalidate {}",
+                String::from_utf8_lossy(path)
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_content_fingerprint_reads_at_most_eight_distributed_chunks() {
+        let length = (CONTENT_FINGERPRINT_CHUNK_BYTES as u64) * 1_000;
+        let offsets = content_fingerprint_offsets(length);
+        assert_eq!(offsets.len(), CONTENT_FINGERPRINT_CHUNKS as usize);
+        assert_eq!(offsets.first(), Some(&0));
+        assert_eq!(
+            offsets.last(),
+            Some(&(length - CONTENT_FINGERPRINT_CHUNK_BYTES as u64))
+        );
+    }
+
+    #[test]
     fn unsafe_git_paths_are_never_accepted_as_worktree_relative_content() {
         assert!(!safe_relative_bytes(b"../outside"));
         assert!(!safe_relative_bytes(b"/absolute"));
@@ -1147,5 +1377,42 @@ mod tests {
         assert!(earlier.renders_same_as(&later));
         earlier.message = Some("repository unavailable".to_string());
         assert!(!earlier.renders_same_as(&later));
+    }
+
+    #[test]
+    fn review_git_commands_disable_optional_locks_and_sanitize_child_environment() {
+        let command = review_git_command(Path::new("/tmp"));
+        assert_eq!(
+            command.get_args().next().and_then(OsStr::to_str),
+            Some("--no-optional-locks")
+        );
+        let removed = command
+            .get_envs()
+            .filter_map(|(name, value)| value.is_none().then_some(name))
+            .collect::<Vec<_>>();
+        assert!(removed.contains(&OsStr::new("INFISICAL_TOKEN")));
+        assert!(removed.contains(&OsStr::new("INFISICAL_SERVICE_TOKEN")));
+    }
+
+    #[test]
+    fn torn_snapshot_preserves_only_same_selection_verified_rows() {
+        let repo = TempRepo::new("torn-snapshot");
+        std::fs::write(repo.0.join("tracked.txt"), "changed\n").unwrap();
+        let snapshot = collect_review(repo.selection("workspace-a")).unwrap();
+        assert!(should_preserve_rows_for_error(
+            Some(&snapshot),
+            &snapshot.selection,
+            SNAPSHOT_CHANGED_MESSAGE
+        ));
+        assert!(!should_preserve_rows_for_error(
+            Some(&snapshot),
+            &repo.selection("workspace-b"),
+            SNAPSHOT_CHANGED_MESSAGE
+        ));
+        assert!(!should_preserve_rows_for_error(
+            Some(&snapshot),
+            &snapshot.selection,
+            "repository unavailable"
+        ));
     }
 }

@@ -70,6 +70,14 @@ impl PullRequestKey {
         key.head_revision.clone_from(&target.head_revision);
         key
     }
+
+    fn same_branch_identity(&self, other: &Self) -> bool {
+        self.checkout_root == other.checkout_root
+            && self.remote_connection == other.remote_connection
+            && self.base_repository == other.base_repository
+            && self.head_owner == other.head_owner
+            && self.branch == other.branch
+    }
 }
 
 /// A cached remote `.plan/tasks.json` fetch result with its capture time.
@@ -138,6 +146,7 @@ fn record_pull_request_fetch(
     fetched_at_ms: u64,
 ) {
     let previous = cache.remove(&key);
+    cache.retain(|existing, _| !existing.same_branch_identity(&key));
     let entry = match result {
         Ok(data) => PullRequestsEntry {
             fetched_at_ms,
@@ -1282,7 +1291,7 @@ impl TaskPanel {
         window: &adw::ApplicationWindow,
     ) {
         let agent_count = self.refresh_agent_cards(state, tab_list, term_stack);
-        let context = self.view_context(state);
+        let context = self.view_context(state, tab_list, term_stack, window);
         self.sync_mode_switch(
             context.mode,
             context.show_task_modes,
@@ -1678,7 +1687,13 @@ impl TaskPanel {
         })
     }
 
-    fn ensure_local_pull_request_identity(&self, state: &Rc<RefCell<AppState>>) {
+    fn ensure_local_pull_request_identity(
+        &self,
+        state: &Rc<RefCell<AppState>>,
+        tab_list: &gtk::Box,
+        term_stack: &gtk::Stack,
+        window: &adw::ApplicationWindow,
+    ) {
         let Some(request) = local_pull_request_probe_request(state) else {
             return;
         };
@@ -1706,6 +1721,9 @@ impl TaskPanel {
         let worker_request = request.clone();
         let panel = self.clone();
         let state_for_apply = state.clone();
+        let tab_list_for_apply = tab_list.clone();
+        let term_stack_for_apply = term_stack.clone();
+        let window_for_apply = window.clone();
         let submission = crate::git::spawn_async_result(
             format!(
                 "task-panel-local-pr:{}:{}:{}:{}:{}:{}",
@@ -1722,9 +1740,7 @@ impl TaskPanel {
                 // A local path may have changed, a tab may have been restored,
                 // or the binding may have been replaced while the worker was
                 // blocked.  In all those cases, drop rather than apply.
-                if !local_pull_request_probe_request(&state_for_apply)
-                    .is_some_and(|current| current.key == key)
-                {
+                if !local_pull_request_probe_is_current(&state_for_apply, &key) {
                     return;
                 }
                 let result = match result {
@@ -1751,6 +1767,14 @@ impl TaskPanel {
                         fetched_at_ms: now_ms(),
                         result,
                     },
+                );
+                drop(cache);
+                schedule_task_panel_refresh(
+                    &panel,
+                    &state_for_apply,
+                    &tab_list_for_apply,
+                    &term_stack_for_apply,
+                    &window_for_apply,
                 );
             },
         );
@@ -1898,7 +1922,13 @@ impl TaskPanel {
         }
     }
 
-    fn view_context(&self, state: &Rc<RefCell<AppState>>) -> TaskPanelViewContext {
+    fn view_context(
+        &self,
+        state: &Rc<RefCell<AppState>>,
+        tab_list: &gtk::Box,
+        term_stack: &gtk::Stack,
+        window: &adw::ApplicationWindow,
+    ) -> TaskPanelViewContext {
         let runtime_policy = task_panel_runtime_policy(self.tasks_enabled);
         if !runtime_policy.load_task_sources {
             let mode = self.mode_selection.borrow().mode_for_context("global");
@@ -1924,7 +1954,7 @@ impl TaskPanel {
         if remote_target.is_none()
             && (self.pull_request_mode_enabled || preliminary_mode == TaskPanelMode::Review)
         {
-            self.ensure_local_pull_request_identity(state);
+            self.ensure_local_pull_request_identity(state, tab_list, term_stack, window);
         }
         let pull_request_target = remote_target
             .as_ref()
@@ -2002,7 +2032,7 @@ impl TaskPanel {
             && (self.pull_request_mode_enabled
                 || matches!(intent, TaskPanelIntent::Select(TaskPanelMode::Review)))
         {
-            self.ensure_local_pull_request_identity(state);
+            self.ensure_local_pull_request_identity(state, tab_list, term_stack, window);
         }
         let target = remote_target
             .as_ref()
@@ -2325,7 +2355,7 @@ impl TaskPanel {
             let verified_for_ledger = result.as_ref().ok().cloned();
 
             let active_key = panel
-                .view_context(&state)
+                .view_context(&state, &tab_list, &term_stack, &window)
                 .pull_request_target
                 .as_ref()
                 .map(PullRequestKey::for_target);
@@ -2432,7 +2462,7 @@ impl TaskPanel {
             }
         }
 
-        self.ensure_local_pull_request_identity(state);
+        self.ensure_local_pull_request_identity(state, tab_list, term_stack, window);
         let Some(target) = self
             .cached_local_pull_request_target(state)
             .filter(|target| target.pane_identity.tab_id == tab_id)
@@ -3018,6 +3048,13 @@ fn local_pull_request_probe_request(
     })
 }
 
+fn local_pull_request_probe_is_current(
+    state: &Rc<RefCell<AppState>>,
+    key: &LocalPullRequestProbeKey,
+) -> bool {
+    local_pull_request_probe_request(state).is_some_and(|current| current.key == *key)
+}
+
 /// Blocking half of local pull-request discovery.  It is called only by the
 /// bounded Git worker; state identity is captured before spawn and rechecked
 /// by the GTK apply phase.
@@ -3357,10 +3394,10 @@ fn review_forge_projection(
         };
     };
     let freshness = entry.verified_at_ms.map_or_else(
-        || "never verified".to_string(),
+        || "PR/check data never fetched".to_string(),
         |verified| {
             format!(
-                "verified {}s ago",
+                "PR/check data fetched {}s ago",
                 now_ms().saturating_sub(verified) / 1_000
             )
         },
@@ -4698,19 +4735,20 @@ mod tests {
     use super::{
         active_current_task_summary, aggregate_progress_text, bind_pane_task_mutation,
         build_pull_request_snapshot, classify_local_gh_failure, clear_pane_task_mutation,
-        local_pull_request_cache_result_for_request, local_pull_request_probe_request,
-        local_task_probe_is_current, local_task_probe_request, next_remote_failure_streak,
-        next_remote_git_failure_streak, probe_local_pull_request_target, progress_for_unavailable,
-        project_all_agent_panes, pull_request_discovery_feedback, pull_request_target_for_tab,
-        record_pull_request_fetch, register_pull_request_fetch, remote_cache_key,
-        remote_pull_request_identity_ttl_ms, remote_tasks_error_summary, remote_tasks_ttl_ms,
-        review_forge_projection, state_available_for_refresh, task_markdown_path,
-        task_panel_runtime_policy, task_row_from_entry, task_truth_axis_labels,
-        verify_pull_request_bound_task, visible_task_rows, LocalPullRequestCacheEntry,
-        PullRequestBoundTask, PullRequestDiscoveryFeedback, PullRequestKey, PullRequestTarget,
-        PullRequestsEntry, TaskBindingContext, TaskPanelIntent, TaskPanelMode,
-        TaskPanelModeSelection, TaskPanelRuntimePolicy, LOCAL_PULL_REQUEST_TTL_MS,
-        PULL_REQUESTS_TTL_MS, REMOTE_TASKS_FAILURE_TTL_CAP_MS, REMOTE_TASKS_TTL_MS,
+        local_pull_request_cache_result_for_request, local_pull_request_probe_is_current,
+        local_pull_request_probe_request, local_task_probe_is_current, local_task_probe_request,
+        next_remote_failure_streak, next_remote_git_failure_streak,
+        probe_local_pull_request_target, progress_for_unavailable, project_all_agent_panes,
+        pull_request_discovery_feedback, pull_request_target_for_tab, record_pull_request_fetch,
+        register_pull_request_fetch, remote_cache_key, remote_pull_request_identity_ttl_ms,
+        remote_tasks_error_summary, remote_tasks_ttl_ms, review_forge_projection,
+        state_available_for_refresh, task_markdown_path, task_panel_runtime_policy,
+        task_row_from_entry, task_truth_axis_labels, verify_pull_request_bound_task,
+        visible_task_rows, LocalPullRequestCacheEntry, PullRequestBoundTask,
+        PullRequestDiscoveryFeedback, PullRequestKey, PullRequestTarget, PullRequestsEntry,
+        TaskBindingContext, TaskPanelIntent, TaskPanelMode, TaskPanelModeSelection,
+        TaskPanelRuntimePolicy, LOCAL_PULL_REQUEST_TTL_MS, PULL_REQUESTS_TTL_MS,
+        REMOTE_TASKS_FAILURE_TTL_CAP_MS, REMOTE_TASKS_TTL_MS,
     };
     use crate::tracking::{
         BranchPullRequestEntry, BranchPullRequestsData, PlanTaskEntry, PlanTasksData,
@@ -4789,18 +4827,22 @@ mod tests {
                 "probe",
                 crate::HeadlessPaneSeed {
                     cwd: Some(first_root.to_string_lossy().into_owned()),
-                    cwd_host: Some("local".into()),
                     ..crate::HeadlessPaneSeed::default()
                 },
             )
             .expect("headless pane");
             st.active_ws_mut().expect("active workspace").repo_root =
                 Some(first_root.to_string_lossy().into_owned());
+            st.active_ws_mut()
+                .expect("active workspace")
+                .working_tree_path = Some(first_root.to_string_lossy().into_owned());
             st.find_tab_mut(tab_id).expect("seeded tab").discovery_cwd =
                 Some(first_root.to_string_lossy().into_owned());
             (tab_id, pane_id)
         };
         let in_flight = local_task_probe_request(&state).expect("initial probe request");
+        let pr_in_flight =
+            local_pull_request_probe_request(&state).expect("initial PR identity request");
 
         {
             let mut st = state.borrow_mut();
@@ -4830,6 +4872,10 @@ mod tests {
             "a completion captured before cwd/host/remote/binding/candidate transition must not apply"
         );
         assert!(local_task_probe_is_current(&state, &current.key));
+        assert!(
+            !local_pull_request_probe_is_current(&state, &pr_in_flight.key),
+            "a PR identity completion from the previous pane selection must be dropped"
+        );
 
         let _ = fs::remove_dir_all(first_root);
         let _ = fs::remove_dir_all(second_root);
@@ -5539,6 +5585,43 @@ mod tests {
                 "Tasks discovered; refreshed 2 pull requests".to_string()
             )
         );
+    }
+
+    #[test]
+    fn pull_request_cache_evicts_prior_revisions_of_the_same_branch_only() {
+        let mut old = PullRequestKey::new(
+            PathBuf::from("/repo"),
+            "owner/repo",
+            "owner",
+            "feature/review",
+        );
+        old.head_revision = Some("1111111111111111111111111111111111111111".into());
+        let mut current = old.clone();
+        current.head_revision = Some("2222222222222222222222222222222222222222".into());
+        let other = PullRequestKey::new(
+            PathBuf::from("/other"),
+            "owner/other",
+            "owner",
+            "feature/review",
+        );
+        let data = |total| BranchPullRequestsData {
+            total,
+            open: total,
+            draft: 0,
+            merged: 0,
+            closed: 0,
+            pull_requests: Vec::new(),
+            query_complete: true,
+        };
+        let mut cache = HashMap::new();
+        record_pull_request_fetch(&mut cache, old.clone(), Ok(data(1)), 10);
+        record_pull_request_fetch(&mut cache, other.clone(), Ok(data(2)), 20);
+        record_pull_request_fetch(&mut cache, current.clone(), Ok(data(3)), 30);
+
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.contains_key(&old));
+        assert_eq!(cache[&current].verified.as_ref().unwrap().total, 3);
+        assert_eq!(cache[&other].verified.as_ref().unwrap().total, 2);
     }
 
     #[test]
@@ -6299,6 +6382,7 @@ mod tests {
         let failed = review_forge_projection(Some(&target), &cache);
         assert!(failed.detail.contains("checks failed"));
         assert!(failed.detail.contains("head 111111111111"));
+        assert!(failed.detail.contains("PR/check data fetched"));
 
         let moved = "2222222222222222222222222222222222222222";
         cache
