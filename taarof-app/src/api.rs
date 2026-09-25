@@ -603,12 +603,10 @@ fn pane_payload(tab: &Tab, leaf: &PaneLeaf, ingredients: &StateSnapshotIngredien
         &leaf.process_state,
         live_pane_process_states,
     );
-    let leaf_kind = if leaf.tmux_backing.is_some() {
-        PaneAttachWireKind::Tmux
-    } else {
-        PaneAttachWireKind::Vte
-    };
-    let (attach_supported, attach_kind) = pane_attach_metadata(leaf_kind);
+    let (attach_supported, attach_kind) = live_pane_attach_metadata(
+        leaf.tmux_backing.is_some(),
+        leaf.restore_unavailable_reason.is_some(),
+    );
     // Broker-owned panes expose the raw PTY adapter; every other live pane is
     // represented by the legacy snapshot capability.
     let pty_capability = if leaf.broker.is_some() {
@@ -648,9 +646,11 @@ fn pane_payload(tab: &Tab, leaf: &PaneLeaf, ingredients: &StateSnapshotIngredien
         tmux_probe,
         attach_supported,
         attach_kind,
-        attach_unavailable_reason: (!attach_supported).then(|| {
-            "Browser viewer reconnect unavailable: this live pane has no supported viewer target."
-                .to_string()
+        attach_unavailable_reason: leaf.restore_unavailable_reason.clone().or_else(|| {
+            (!attach_supported).then(|| {
+                "Browser viewer reconnect unavailable: this live pane has no supported viewer target."
+                    .to_string()
+            })
         }),
         pty_capability,
         cols,
@@ -903,6 +903,20 @@ fn pane_attach_metadata(kind: PaneAttachWireKind) -> (bool, &'static str) {
         PaneAttachWireKind::Vte => (true, "vte"),
         PaneAttachWireKind::Unsupported => (false, "unsupported"),
     }
+}
+
+fn live_pane_attach_metadata(
+    has_tmux_backing: bool,
+    restore_unavailable: bool,
+) -> (bool, &'static str) {
+    let kind = if restore_unavailable {
+        PaneAttachWireKind::Unsupported
+    } else if has_tmux_backing {
+        PaneAttachWireKind::Tmux
+    } else {
+        PaneAttachWireKind::Vte
+    };
+    pane_attach_metadata(kind)
 }
 
 fn live_terminal_size(terminal: &vte::Terminal) -> Option<(Option<u32>, Option<u32>)> {
@@ -2092,6 +2106,18 @@ mod tests {
         assert_eq!(
             pane_attach_metadata(PaneAttachWireKind::Unsupported),
             (false, "unsupported")
+        );
+    }
+
+    #[test]
+    fn failed_exact_restore_is_not_projected_as_a_live_tmux_viewer_target() {
+        assert_eq!(
+            super::live_pane_attach_metadata(true, true),
+            (false, "unsupported")
+        );
+        assert_eq!(
+            super::live_pane_attach_metadata(true, false),
+            (true, "tmux")
         );
     }
 

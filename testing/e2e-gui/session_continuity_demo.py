@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import time
 
@@ -50,6 +51,35 @@ def tmux_attachment_check():
 def tmux_clients():
     result, count = tmux_attachment_check()
     return count if result.returncode == 0 else None
+
+
+def query_native_state():
+    registry = json.loads((Path("/tmp/runtime") / "taarof-current.json").read_text())
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(registry["socket_path"])
+        client.sendall(b'{"action":"query-state"}')
+        client.shutdown(socket.SHUT_WR)
+        response = bytearray()
+        while chunk := client.recv(65536):
+            response.extend(chunk)
+    return json.loads(response)["data"]
+
+
+def replacement_unavailable_state():
+    try:
+        state = query_native_state()
+    except (FileNotFoundError, ConnectionError, json.JSONDecodeError, KeyError, OSError):
+        return False
+    return any(
+        pane.get("tmux_session") == SESSION
+        and pane.get("shell_running") is False
+        and pane.get("attach_supported") is False
+        and pane.get("attach_unavailable_reason")
+        == "Reattach unavailable: the exact saved tmux target no longer exists."
+        for workspace in state.get("workspaces", [])
+        for tab in workspace.get("tabs", [])
+        for pane in tab.get("panes", [])
+    )
 
 
 def write_provider_fixture():
@@ -195,9 +225,11 @@ def main():
     replacement = tmux_identity()
     second = start_app(env)
     second_window_mapped = wait_until(lambda: taarof_window_mapped(env))
-    time.sleep(0.3)
+    replacement_unavailable_observed = wait_until(replacement_unavailable_state)
+    # The state transition runs on GTK's main thread. Give the next frame one
+    # bounded interval to paint the already-retained terminal checkpoint.
+    time.sleep(0.2)
     screenshot("replacement-generation.png", env)
-    time.sleep(3.2)
     replacement_attachment_result, replacement_attached_count = tmux_attachment_check()
     replacement_rejected = (
         replacement_attachment_result.returncode == 0
@@ -241,11 +273,12 @@ def main():
         "replacement_post_app_cleanup_attached_count": post_cleanup_attached_count,
         "replacement_survived_app_cleanup": replacement_survived_app_cleanup,
         "replacement_generation_rejected": replacement_rejected,
+        "replacement_unavailable_state_observed": replacement_unavailable_observed,
         "tmux_survived_desktop_shutdown": tmux_survived_desktop,
         "tmux_loss_observed": tmux_loss_observed,
         "reopen_workspace_layout_observation": "screenshots captured; owner review required",
         "replacement_rejection_visual_observation": (
-            "screenshot captured while the refusal was displayed; owner review required"
+            "screenshot captured after native unavailable state; owner review required"
         ),
         "owner_attended_status": "pending",
         "command_exits": {
@@ -264,6 +297,7 @@ def main():
         resume_observed, exact_attach_observed, replacement_rejected,
         tmux_survived_desktop, tmux_loss_observed, parent_exe_missing_after_exit,
         receipt["embedded_channel_match"], first_window_mapped, second_window_mapped,
+        replacement_unavailable_observed,
     ]) else "fail"
     (EVIDENCE / "receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
     print("Continuity demo automated checks complete; owner screenshot observation remains pending.")

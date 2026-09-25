@@ -1487,6 +1487,7 @@ fn build_pane_leaf(
         launch_command,
         output_tracker: Rc::new(Cell::new(None)),
         tmux_backing: None,
+        restore_unavailable_reason: None,
         location_state: PaneLocationState::default(),
         process_state: PaneProcessState::default(),
         current_task: None,

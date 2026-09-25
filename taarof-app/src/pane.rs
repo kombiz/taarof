@@ -109,6 +109,10 @@ pub struct PaneLeaf {
     /// Used for output-activity-based idle detection on SSH panes.
     pub output_tracker: Rc<Cell<Option<Instant>>>,
     pub tmux_backing: Option<TmuxBacking>,
+    /// Concrete reason a restored execution target could not be reacquired.
+    /// Keep the saved backing separately so a later restart can retry the same
+    /// exact identity without treating a same-named replacement as authority.
+    pub restore_unavailable_reason: Option<String>,
     pub location_state: PaneLocationState,
     pub process_state: PaneProcessState,
     pub current_task: Option<crate::task_binding::PaneTaskBinding>,

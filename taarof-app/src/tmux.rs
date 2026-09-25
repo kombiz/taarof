@@ -60,6 +60,8 @@ const PLAIN_SESSION_OPTIONS: [(&str, &str); 2] = [("status", "off"), ("mouse", "
 /// quotes it back into a literal for the remote shell.
 const TMUX_COMMAND_SEPARATOR: &str = ";";
 const CONTINUITY_OPTION: &str = "@taarof-continuity-id";
+pub const EXACT_ATTACH_UNAVAILABLE_REASON: &str =
+    "Reattach unavailable: the exact saved tmux target no longer exists.";
 
 const PANE_INFO_SEPARATOR: &str = "__TAAROF_PANE_INFO_V1__";
 const LEGACY_PANE_INFO_SEPARATOR: &str = "\u{1f}";
@@ -642,8 +644,10 @@ pub fn exact_attach_command(
         "-F".to_string(),
         condition,
         format!("attach-session -t {escaped_name}"),
-        "display-message -p 'Reattach unavailable: the exact saved tmux target no longer exists.' ; run-shell 'sleep 3'"
-            .to_string(),
+        format!(
+            "display-message -p '{}' ; run-shell 'exit 75'",
+            EXACT_ATTACH_UNAVAILABLE_REASON
+        ),
     ];
     Some(wrap_for_target(target, tmux_args))
 }
@@ -2413,7 +2417,8 @@ mod tests {
         assert_eq!(original[1], "if-shell");
         assert_eq!(original[6], "attach-session -t same-name");
         assert!(original[7].contains("Reattach unavailable:"));
-        assert!(original[7].contains("sleep 3"));
+        assert!(original[7].contains("exit 75"));
+        assert!(!original[7].contains("sleep"));
         assert!(exact_attach_command(
             &TmuxTarget::Local,
             "same-name",
