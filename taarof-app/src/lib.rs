@@ -3198,7 +3198,7 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
         show_error_toast(diagnostic);
     } else if startup_session.state.is_some() {
         show_toast(
-            "Reopened workspace layout. Saved display checkpoints are visual context; live terminal and provider resume authority are validated separately.",
+            "Reopened layout. Display checkpoints are context only; live terminal and agent resume validate separately.",
         );
     }
     let saved = startup_session.state;

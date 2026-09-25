@@ -68,7 +68,7 @@ else: raise SystemExit(2)
 print(json.dumps(out))
 """)
     (HOME / "provider_resume.py").write_text(
-        "from pathlib import Path\nPath('/home/laddy/resume-observed').write_text('exact synthetic provider identity')\nprint('RESUME AGENT CONVERSATION: synthetic provider identity accepted')\n"
+        "from pathlib import Path\nimport time\nmarker=Path('/home/laddy/resume-observed')\nfirst=not marker.exists()\nmarker.write_text('exact synthetic provider identity')\nprint('RESUME AGENT CONVERSATION: synthetic provider identity accepted', flush=True)\nprint('DISPLAY CHECKPOINT: visual context only; it does not prove liveness', flush=True)\nif first: time.sleep(300)\n"
     )
     (providers / "continuity-fixture.toml").write_text(
         "schema = 1\nid = 'continuity-fixture'\ndisplay_name = 'Continuity Fixture'\n"
@@ -112,7 +112,6 @@ def app_environment():
         "XDG_STATE_HOME": str(HOME / ".local/state"), "XDG_RUNTIME_DIR": "/tmp/runtime",
         "TMUX_TMPDIR": "/tmp/tmux", "TAAROF_AGENT_BINARY": str(AGENT),
         "TAAROF_INSTALLED_BINARY": str(APP),
-        "GTK_USE_PORTAL": "0",
     }
 
 
@@ -146,6 +145,11 @@ def wait_until(predicate, timeout=15):
     return False
 
 
+def taarof_window_mapped(env):
+    result = run("xdotool", "search", "--onlyvisible", "--name", "taarof", check=False, env=env)
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
 def main():
     (HOME / ".local/share/taarof").mkdir(parents=True)
     Path("/tmp/runtime").mkdir(mode=0o700, exist_ok=True)
@@ -166,6 +170,7 @@ def main():
     agent_build = json.loads(agent_build_result.stdout)
 
     first = start_app(env)
+    first_window_mapped = wait_until(lambda: taarof_window_mapped(env))
     resume_observed = wait_until(lambda: (HOME / "resume-observed").exists())
     exact_attach_observed = wait_until(lambda: tmux_clients() == 1)
     original_client_result, original_client_count = tmux_client_check()
@@ -184,7 +189,8 @@ def main():
     run("tmux", "set-option", "-t", SESSION, "@taarof-continuity-id", NONCE_B)
     replacement = tmux_identity()
     second = start_app(env)
-    time.sleep(3)
+    second_window_mapped = wait_until(lambda: taarof_window_mapped(env))
+    time.sleep(1)
     replacement_client_result, replacement_client_count = tmux_client_check()
     replacement_rejected = replacement_client_count == 0
     screenshot("replacement-generation.png", env)
@@ -206,6 +212,8 @@ def main():
         ),
         "running_app_executable": first_exe,
         "parent_executable_missing_after_exit": parent_exe_missing_after_exit,
+        "first_window_mapped_before_screenshot": first_window_mapped,
+        "replacement_window_mapped_before_screenshot": second_window_mapped,
         "home_inside_fixture": str(HOME), "synthetic_history_only": True,
         "http_enabled": False, "browser_profile_created": False,
         "original_tmux_identity": original, "replacement_tmux_identity": replacement,
@@ -230,7 +238,7 @@ def main():
     receipt["automated_status"] = "pass" if all([
         resume_observed, exact_attach_observed, replacement_rejected,
         tmux_survived_desktop, tmux_loss_observed, parent_exe_missing_after_exit,
-        receipt["embedded_channel_match"],
+        receipt["embedded_channel_match"], first_window_mapped, second_window_mapped,
     ]) else "fail"
     (EVIDENCE / "receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
     print("Continuity demo automated checks complete; owner screenshot observation remains pending.")

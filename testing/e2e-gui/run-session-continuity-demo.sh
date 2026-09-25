@@ -25,6 +25,7 @@ done
 command -v bwrap >/dev/null
 command -v dbus-run-session >/dev/null
 command -v xvfb-run >/dev/null
+command -v xdotool >/dev/null
 
 mkdir -p "$evidence"
 [[ -z $(find "$evidence" -mindepth 1 -maxdepth 1 -print -quit) ]] || {
