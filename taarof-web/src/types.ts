@@ -19,6 +19,16 @@ export interface AgentActivitySnapshot {
   text?: string | null;
   source?: string | null;
   origin?: string | null;
+  observed_at_unix_ms?: number | null;
+}
+
+export interface AttentionEvidenceSnapshot {
+  reason: "waiting_input" | "error" | "unknown";
+  provider: string | null;
+  provenance: "socket" | "termprop" | "output_scan" | "native_transcript" | "system_notification" | "conflicting";
+  authority: "provider_explicit" | "provider_native" | "terminal_heuristic" | "system";
+  freshness: "fresh" | "stale" | "conflicting" | "unknown";
+  last_verified_unix_ms: number | null;
 }
 
 export interface AgentJobSnapshot {
@@ -335,6 +345,8 @@ export interface TabAgentSnapshot {
   state?: AgentLifecycleSnapshot | null;
   /** Uppercase badge text matching the native sidebar, e.g. `WORKING`. */
   state_label?: string | null;
+  /** Canonical intervention evidence for this exact pane. */
+  attention?: AttentionEvidenceSnapshot | null;
 }
 
 export interface TabSnapshot {
@@ -384,6 +396,8 @@ export interface PaneSnapshot {
   cols?: number;
   rows?: number;
   transcript?: PaneTranscriptSnapshot | null;
+  /** Canonical intervention evidence for this exact pane. */
+  attention?: AttentionEvidenceSnapshot | null;
 }
 
 export interface RecentFileSnapshot {

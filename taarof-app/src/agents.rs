@@ -317,6 +317,7 @@ mod tests {
             source: Some("claude".to_string()),
             origin: AgentActivityOrigin::Termprop,
             updated_at: Instant::now(),
+            observed_at_unix_ms: crate::events::unix_time_ms(),
         }
     }
 

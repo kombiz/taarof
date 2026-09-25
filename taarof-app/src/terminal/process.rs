@@ -291,7 +291,7 @@ fn run_child_exit_cleanup(
             leaf.was_busy = false;
             leaf.launch_command = None;
         }
-        tab.clear_pane_agent_activity(pane_id);
+        tab.reset_pane_agent_activity_evidence(pane_id);
         let leaf_count = tab.panes.leaf_count();
         let close_on_exit = tab.close_on_exit;
         let respawn_on_exit = if leaf_count <= 1 && !close_on_exit {

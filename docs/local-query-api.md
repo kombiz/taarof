@@ -71,7 +71,7 @@ Top-level fields:
 | `diagnostics` | object | Durable local diagnostics metadata and recent records |
 | `workspaces` | array | All workspaces with nested tabs and panes |
 | `active_ports` | array | All listening ports across tabs |
-| `alerts` | array | Tabs currently needing attention |
+| `alerts` | array | Exact pane targets currently needing attention, in workspace/tab/pane order |
 | `recent_alerts` | array | Recent alert events from the event store |
 | `saved_views` | array | Persisted dashboard saved views from `~/.config/taarof/views.json` |
 | `saved_views_error` | string \| null | Load failure for saved views; null when the snapshot loaded successfully |
@@ -183,7 +183,7 @@ an installed update does not change `health.state` from `ok`.
 | `agent_session_id` | string \| null | Provider session identifier for that primary agent when taarof can determine it safely |
 | `agent_pane_id` | number \| null | Stable pane ID for that primary agent |
 | `agent_activity` | object \| null | Primary per-pane activity from socket, VTE termprop, or output scan |
-| `agents` | array | Per-pane agent observations, including stable `pane_id`, disambiguated `instance_label`, identity, session, and activity |
+| `agents` | array | Per-pane agent observations, including stable `pane_id`, disambiguated `instance_label`, identity, session, activity, and canonical `attention` evidence |
 | `needs_attention` | bool | Alert flag |
 | `notification_msg` | string \| null | Notification message |
 | `listening_ports` | array | Port numbers this tab is listening on |
@@ -195,6 +195,11 @@ per-pane activity (alerts before fresh running work before completion); if no
 pane has activity, the tab-level identity falls back to the detected agent
 process. Consumers that display multiple agents should use `agents` rather than
 assigning the aggregate to the focused pane.
+
+`agent_activity.observed_at_unix_ms` is the wall-clock time of the real signal
+that last changed that observation. Projection and polling do not refresh it.
+Each per-pane agent's `attention` field is either null or the same canonical
+attention object exposed on its pane and in the matching top-level alert.
 
 #### Pane object
 
@@ -213,6 +218,7 @@ assigning the aggregate to the focused pane.
 | `cols` | number \| null | Current visible terminal width when known |
 | `rows` | number \| null | Current visible terminal height when known |
 | `transcript` | object \| null | Live agent transcript summary when a transcript resolves (see below) |
+| `attention` | object \| null | Canonical attention evidence for this exact pane |
 
 `has_child_process` is deliberately local-only. The local runtime can inspect
 `/proc` for a local pane, but an SSH client does not expose the remote shell's
@@ -223,6 +229,30 @@ also forces `null` even when that probe flag is false. Remote panes therefore
 use `null` rather than a misleading `false`. Consumers
 must treat `null` as unknown, not idle or complete; agent activity and tmux
 probe fields remain independent signals when available.
+
+#### Pane attention object
+
+The same object is exposed as `pane.attention`, `agent.attention`, and
+`alert.attention`. An alert also carries `repository`, `worktree`, `machine`,
+`workspace_id`, `tab_id`, and `pane_id`, so clients can identify and focus the
+exact requester. Rows retain workspace, tab, and pane order; terminal output
+volume does not affect their ordering.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `reason` | string | `waiting_input` or `error` only when supported by current evidence; otherwise `unknown` |
+| `provider` | string \| null | Provider identity carried by the pane's explicit or native evidence when known |
+| `provenance` | string | `socket`, `termprop`, `output_scan`, `native_transcript`, `conflicting`, or `system_notification` |
+| `authority` | string | `provider_explicit`, `provider_native`, `terminal_heuristic`, or `system` |
+| `freshness` | string | `fresh`, `stale`, `conflicting`, or `unknown` |
+| `last_verified_unix_ms` | number \| null | Original verified observation time; null for missing or future wall-clock evidence |
+
+Expired evidence stays visible as `unknown`/`stale` until replaced or removed.
+Disagreeing fresh signals stay visible as `unknown`/`conflicting`. A generic
+notification has system authority, no inferred provider, and unknown freshness.
+When a tab-scoped generic notification has no recorded pane origin, its
+`pane_id` is the tab's focused pane as a navigation fallback; it is not proof
+that the notification originated in that pane.
 
 #### Pane transcript object
 

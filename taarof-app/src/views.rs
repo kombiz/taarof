@@ -577,90 +577,82 @@ struct AttentionListEntry {
     pane_id: u32,
     title: String,
     subtitle: String,
-    sort_seq: u64,
 }
 
 fn attention_list_entries(state: &crate::AppState) -> Vec<AttentionListEntry> {
-    use std::collections::HashMap;
-
-    let latest_alerts: HashMap<u32, (u64, String, String)> = state
-        .event_store
-        .entries()
+    crate::attention::attention_targets_at(state, crate::events::unix_time_ms())
         .into_iter()
-        .rev()
-        .filter(|event| event.event_type.starts_with("alert_"))
-        .filter_map(|event| {
-            let tab_id = event
-                .payload
-                .get("tab_id")
-                .and_then(|value| value.as_u64())
-                .and_then(|value| u32::try_from(value).ok())?;
-            let message = event
-                .payload
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or(&event.event_type)
-                .to_string();
-            let source = event
-                .payload
-                .get("source")
-                .and_then(|value| value.as_str())
-                .unwrap_or("system")
-                .to_string();
-            Some((tab_id, (event.seq, message, source)))
-        })
-        .fold(HashMap::new(), |mut alerts, (tab_id, alert)| {
-            alerts.entry(tab_id).or_insert(alert);
-            alerts
-        });
-
-    let mut entries = Vec::new();
-    for workspace in &state.workspaces {
-        for tab in &workspace.tabs {
-            if !state.tab_needs_attention(tab) {
-                continue;
+        .map(|target| {
+            let reason = match target.evidence.freshness {
+                crate::attention::AttentionFreshness::Fresh => {
+                    target.evidence.reason.label().to_string()
+                }
+                crate::attention::AttentionFreshness::Stale => "Unknown reason (stale)".into(),
+                crate::attention::AttentionFreshness::Conflicting => {
+                    "Unknown reason (conflicting)".into()
+                }
+                crate::attention::AttentionFreshness::Unknown => "Unknown reason".into(),
+            };
+            let provider = target.evidence.provider.as_deref().unwrap_or("unknown provider");
+            let verified = target
+                .evidence
+                .last_verified_unix_ms
+                .map(format_event_age)
+                .map(|age| format!("verified {age}"))
+                .unwrap_or_else(|| "verification time unknown".into());
+            AttentionListEntry {
+                tab_id: target.tab_id,
+                pane_id: target.pane_id,
+                title: format!(
+                    "{} / {} · pane {}",
+                    target.workspace_name, target.tab_name, target.pane_id
+                ),
+                subtitle: format!(
+                    "{reason} · {provider} · {} · repository {} · worktree {} · {} via {} · {verified}",
+                    target.machine,
+                    target.repository,
+                    target.worktree,
+                    target.evidence.authority.wire(),
+                    target.evidence.provenance,
+                ),
             }
-
-            let (sort_seq, message, source) =
-                latest_alerts.get(&tab.id).cloned().unwrap_or_else(|| {
-                    (
-                        0,
-                        state
-                            .tab_notification_message(tab)
-                            .unwrap_or(&tab.name)
-                            .to_string(),
-                        "system".to_string(),
-                    )
-                });
-            let subtitle = format!("{message} · {source}");
-            entries.push(AttentionListEntry {
-                tab_id: tab.id,
-                pane_id: tab.focused_pane_id,
-                title: format!("{} / {}", workspace.name, tab.name),
-                subtitle,
-                sort_seq,
-            });
-        }
-    }
-
-    entries.sort_by(|left, right| {
-        right
-            .sort_seq
-            .cmp(&left.sort_seq)
-            .then_with(|| left.title.cmp(&right.title))
-            .then_with(|| left.tab_id.cmp(&right.tab_id))
-    });
-    entries
+        })
+        .collect()
 }
 
-fn jump_to_attention_target(state: &mut crate::AppState, tab_id: u32, pane_id: u32) -> bool {
+pub(crate) fn first_attention_target(state: &crate::AppState) -> Option<(u32, u32)> {
+    crate::attention::attention_targets_at(state, crate::events::unix_time_ms())
+        .first()
+        .map(|target| (target.tab_id, target.pane_id))
+}
+
+pub(crate) fn jump_to_attention_target(
+    state: &mut crate::AppState,
+    tab_id: u32,
+    pane_id: u32,
+) -> bool {
     let Some(tab) = state.find_tab_mut(tab_id) else {
         return false;
     };
-    if tab.panes.leaf(pane_id).is_some() {
-        tab.focused_pane_id = pane_id;
+    if !tab.panes.contains_pane(pane_id) {
+        return false;
     }
+    tab.focused_pane_id = pane_id;
     state.activate_tab(tab_id).is_some()
+}
+
+pub(crate) fn focus_attention_target(
+    state: &std::rc::Rc<std::cell::RefCell<crate::AppState>>,
+    tab_list: &gtk::Box,
+    term_stack: &gtk::Stack,
+    tab_id: u32,
+    pane_id: u32,
+) -> bool {
+    let target_exists = {
+        let mut state = state.borrow_mut();
+        jump_to_attention_target(&mut state, tab_id, pane_id)
+    };
+    target_exists && crate::sidebar::focus_agent_pane(state, tab_list, term_stack, tab_id, pane_id)
 }
 
 fn populate_attention_list_view(
@@ -773,22 +765,9 @@ fn append_attention_row(
         let tab_id = entry.tab_id;
         let pane_id = entry.pane_id;
         jump_button.connect_clicked(move |_| {
-            let activated = {
-                let mut st = state.borrow_mut();
-                jump_to_attention_target(&mut st, tab_id, pane_id)
-            };
-            if !activated {
+            if !focus_attention_target(&state, &tab_list, &term_stack, tab_id, pane_id) {
                 crate::show_error_toast("Attention target is no longer available");
                 return;
-            }
-
-            if !crate::sidebar::activate_tab(&tab_list, &state, &term_stack, tab_id) {
-                crate::show_error_toast("Attention target is no longer available");
-                return;
-            }
-
-            if let Some(terminal) = crate::get_active_terminal(&state) {
-                terminal.grab_focus();
             }
             crate::dashboard::refresh_dashboard_if_open(&state, &term_stack);
         });
@@ -1010,6 +989,7 @@ mod tests {
             listening_ports_updated_at_unix_ms: None,
             socket_agent_activity: None,
             pane_agent_activity: HashMap::new(),
+            pane_explicit_observation: HashMap::new(),
             agent_activity: None,
             needs_attention: false,
             notified: false,
@@ -1333,6 +1313,7 @@ mod tests {
             source: Some("copilot".to_string()),
             origin: AgentActivityOrigin::Socket,
             updated_at: Instant::now(),
+            observed_at_unix_ms: crate::events::unix_time_ms(),
         });
         assert_eq!(agent_activity_fallback_subtitle(&tab), None);
     }
@@ -1350,11 +1331,86 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tab_id, 11);
         assert_eq!(rows[0].pane_id, 111);
-        assert_eq!(rows[0].title, "default / editor");
-        assert!(rows[0].subtitle.contains("Build done"));
+        assert_eq!(rows[0].title, "default / editor · pane 111");
+        assert!(rows[0].subtitle.contains("Unknown reason"));
+        assert!(rows[0].subtitle.contains("system"));
         assert_eq!(
             ViewPreset::CurrentlyFlaggedPanes.default_name(),
             "Currently Flagged Panes"
+        );
+    }
+
+    #[test]
+    fn attention_list_shows_exact_identity_and_canonical_evidence() {
+        let mut state = state_with_attention_tabs();
+        state.workspaces[0].repo_root = Some("/src/taarof".into());
+        state.workspaces[0].working_tree_path = Some("/worktrees/TAAROF-27".into());
+        state.workspaces[0].host_config_name = Some("workstation".into());
+        let tab = state.find_tab_mut(11).expect("editor tab");
+        tab.set_pane_agent_activity(
+            111,
+            AgentActivity::socket(
+                AgentActivityState::WaitingInput,
+                "waiting for input",
+                Some("codex".into()),
+            ),
+        );
+
+        let rows = attention_list_entries(&state);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pane_id, 111);
+        assert!(rows[0].title.contains("editor"));
+        assert!(rows[0].title.contains("pane 111"));
+        for expected in [
+            "Waiting for input",
+            "codex",
+            "workstation",
+            "/src/taarof",
+            "/worktrees/TAAROF-27",
+            "provider_explicit",
+            "socket",
+            "verified",
+        ] {
+            assert!(rows[0].subtitle.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn attention_list_order_ignores_alert_event_volume() {
+        let mut state = state_with_attention_tabs();
+        let logs = state.find_tab_mut(12).expect("logs tab");
+        logs.needs_attention = true;
+        logs.notification_msg = Some("Logs ready".into());
+        state.event_store.emit(
+            "alert_raised",
+            serde_json::json!({
+                "tab_id": 12,
+                "tab_name": "logs",
+                "message": "Logs ready",
+                "source": "socket-agent-status",
+            }),
+        );
+
+        assert_eq!(
+            attention_list_entries(&state)
+                .iter()
+                .map(|entry| entry.tab_id)
+                .collect::<Vec<_>>(),
+            vec![11, 12]
+        );
+    }
+
+    #[test]
+    fn keyboard_attention_target_uses_the_same_exact_pane_as_the_first_row() {
+        let mut state = state_with_attention_tabs();
+        let tab = state.find_tab_mut(11).expect("editor tab");
+        tab.notification_pane_id = Some(111);
+
+        let first = attention_list_entries(&state).remove(0);
+        assert_eq!(
+            first_attention_target(&state),
+            Some((first.tab_id, first.pane_id))
         );
     }
 
@@ -1383,6 +1439,15 @@ mod tests {
         assert_eq!(tab.focused_pane_id, target.pane_id);
         assert!(!tab.needs_attention);
         assert!(tab.notification_msg.is_none());
+    }
+
+    #[test]
+    fn attention_jump_refuses_a_removed_pane_without_switching_tabs() {
+        let mut state = state_with_attention_tabs();
+        let original_tab = state.workspaces[0].active_tab;
+
+        assert!(!jump_to_attention_target(&mut state, 11, 999));
+        assert_eq!(state.workspaces[0].active_tab, original_tab);
     }
 
     #[test]

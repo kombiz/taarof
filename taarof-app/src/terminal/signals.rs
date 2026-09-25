@@ -264,14 +264,11 @@ fn schedule_termprop_done_clear(
                 return;
             };
             let before = tab.pane_lifecycle(pane_id);
-            let changed = tab.clear_pane_agent_activity_if(pane_id, |activity| {
-                matches!(activity.state, crate::workspace::AgentActivityState::Done)
-                    && matches!(
-                        activity.origin,
-                        crate::workspace::AgentActivityOrigin::Termprop
-                    )
-                    && activity.updated_at == done_at
-            });
+            let changed = tab.prune_done_pane_agent_activity(
+                pane_id,
+                crate::workspace::AgentActivityOrigin::Termprop,
+                done_at,
+            );
             (changed, before != tab.pane_lifecycle(pane_id))
         };
 
@@ -282,6 +279,25 @@ fn schedule_termprop_done_clear(
             emit_agent_activity_transition(&state, tab_id, pane_id);
         }
     });
+}
+
+fn clear_termprop_activity_for_state(
+    tab: &mut crate::workspace::Tab,
+    pane_id: u32,
+    parsed_state: Option<crate::workspace::AgentActivityState>,
+    source: Option<String>,
+) -> bool {
+    if matches!(
+        parsed_state,
+        Some(crate::workspace::AgentActivityState::Idle)
+    ) {
+        tab.note_explicit_pane_idle(
+            pane_id,
+            source,
+            crate::workspace::AgentActivityOrigin::Termprop,
+        );
+    }
+    tab.clear_pane_agent_activity(pane_id)
 }
 
 fn sync_agent_activity_from_termprops(
@@ -314,7 +330,12 @@ fn sync_agent_activity_from_termprops(
         let fallback_source = tab.agent_name.clone();
         let changed = match parsed_state {
             Some(crate::workspace::AgentActivityState::Idle) | None => {
-                tab.clear_pane_agent_activity(pane_id)
+                clear_termprop_activity_for_state(
+                    tab,
+                    pane_id,
+                    parsed_state,
+                    raw_source.or(fallback_source),
+                )
             }
             Some(crate::workspace::AgentActivityState::Running) => {
                 let summary = crate::agents::summarize_activity_text(
@@ -767,7 +788,10 @@ pub(super) fn connect_output_tracking(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_scanned_output_activity, apply_scanned_output_activity_for_pane};
+    use super::{
+        apply_scanned_output_activity, apply_scanned_output_activity_for_pane,
+        clear_termprop_activity_for_state, parse_termprop_activity_state,
+    };
     use crate::agents::ScannedActivity;
     use crate::pane::PaneNode;
     use crate::workspace::{
@@ -796,6 +820,7 @@ mod tests {
             listening_ports_updated_at_unix_ms: None,
             socket_agent_activity: None,
             pane_agent_activity: HashMap::new(),
+            pane_explicit_observation: HashMap::new(),
             agent_activity: None,
             needs_attention: false,
             notified: false,
@@ -823,6 +848,76 @@ mod tests {
             state: AgentActivityState::WaitingInput,
             summary: "waiting for input".to_string(),
         }
+    }
+
+    #[test]
+    fn only_explicit_termprop_idle_records_retirement_evidence() {
+        for raw in [None, Some("not-a-state")] {
+            let mut tab = stub_tab(1);
+            let pane_id = tab.focused_pane_id;
+            tab.set_pane_agent_activity(
+                pane_id,
+                AgentActivity::output_scan(
+                    AgentActivityState::Running,
+                    "working",
+                    Some("codex".into()),
+                ),
+            );
+            let parsed = parse_termprop_activity_state(raw);
+            assert_eq!(parsed, None);
+            assert!(clear_termprop_activity_for_state(
+                &mut tab,
+                pane_id,
+                parsed,
+                Some("codex".into()),
+            ));
+            assert!(tab.pane_explicit_observation(pane_id).is_none());
+        }
+
+        let mut tab = stub_tab(2);
+        let pane_id = tab.focused_pane_id;
+        tab.set_pane_agent_activity(
+            pane_id,
+            AgentActivity::termprop(AgentActivityState::Done, "done", Some("claude".into())),
+        );
+        let done_observed_at = tab
+            .pane_explicit_observation(pane_id)
+            .expect("done observation")
+            .observed_at_unix_ms;
+        assert!(clear_termprop_activity_for_state(
+            &mut tab,
+            pane_id,
+            None,
+            Some("claude".into()),
+        ));
+        let retained = tab
+            .pane_explicit_observation(pane_id)
+            .expect("missing state must not erase prior observation");
+        assert_eq!(retained.state, AgentActivityState::Done);
+        assert_eq!(retained.observed_at_unix_ms, done_observed_at);
+
+        let mut tab = stub_tab(3);
+        let pane_id = tab.focused_pane_id;
+        tab.set_pane_agent_activity(
+            pane_id,
+            AgentActivity::termprop(
+                AgentActivityState::Running,
+                "working",
+                Some("claude".into()),
+            ),
+        );
+        assert!(clear_termprop_activity_for_state(
+            &mut tab,
+            pane_id,
+            Some(AgentActivityState::Idle),
+            Some("claude".into()),
+        ));
+        let observation = tab
+            .pane_explicit_observation(pane_id)
+            .expect("explicit idle observation");
+        assert_eq!(observation.state, AgentActivityState::Idle);
+        assert_eq!(observation.source.as_deref(), Some("claude"));
+        assert_eq!(observation.origin, AgentActivityOrigin::Termprop);
     }
 
     #[test]

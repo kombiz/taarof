@@ -3196,6 +3196,11 @@ fn handle_agent_status_message(
 
         match activity_state {
             SocketActivityState::Idle => {
+                tab.note_explicit_pane_idle(
+                    pane_id,
+                    source.map(str::to_string),
+                    crate::workspace::AgentActivityOrigin::Socket,
+                );
                 tab.set_pane_agent_activity(pane_id, None);
                 tab.clear_pane_notification(pane_id);
                 if should_clear_tab_attention && !retarget_tab_attention_to_remaining_activity(tab)
@@ -3301,14 +3306,11 @@ fn schedule_done_activity_clear(
             let Some(tab) = st.find_tab_mut(tab_id) else {
                 return;
             };
-            tab.clear_pane_agent_activity_if(pane_id, |activity| {
-                matches!(activity.state, AgentActivityState::Done)
-                    && matches!(
-                        activity.origin,
-                        crate::workspace::AgentActivityOrigin::Socket
-                    )
-                    && activity.updated_at == done_at
-            })
+            tab.prune_done_pane_agent_activity(
+                pane_id,
+                crate::workspace::AgentActivityOrigin::Socket,
+                done_at,
+            )
         };
 
         if should_refresh {
@@ -5251,174 +5253,198 @@ mod tests {
     #[test]
     fn delayed_agent_workspace_keeps_glib_and_dispatched_query_responsive() {
         let _glib_guard = crate::glib_main_context_test_guard();
-        let context = glib::MainContext::default();
-        let _acquire = context.acquire().expect("test owns the main context");
-        let state = Rc::new(RefCell::new(stub_app_state(
-            vec![stub_workspace_with_id(
-                11,
-                "default",
-                vec![stub_terminal_tab(101, "Shell", None)],
-                101,
-            )],
-            11,
-        )));
-        let (tx, mut rx) =
-            tokio::sync::mpsc::channel::<(SocketMessage, mpsc::Sender<SocketResponse>)>(8);
-        let receiver_done = Rc::new(Cell::new(false));
-        let receiver_done_for_task = receiver_done.clone();
-        let (fake_started_tx, fake_started_rx) = mpsc::channel();
-        let state_for_dispatch = state.clone();
+        // Keep every local source on this test thread. A failed observation
+        // must never leave a thread-guarded task on the process default context
+        // for a later parallel test to finalize.
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let _acquire = context.acquire().expect("test owns the private context");
+                let state = Rc::new(RefCell::new(stub_app_state(
+                    vec![stub_workspace_with_id(
+                        11,
+                        "default",
+                        vec![stub_terminal_tab(101, "Shell", None)],
+                        101,
+                    )],
+                    11,
+                )));
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<(SocketMessage, mpsc::Sender<SocketResponse>)>(8);
+                let receiver_done = Rc::new(Cell::new(false));
+                let receiver_done_for_task = receiver_done.clone();
+                let (fake_started_tx, fake_started_rx) = mpsc::channel();
+                let (fake_release_tx, fake_release_rx) = mpsc::channel();
+                let state_for_dispatch = state.clone();
 
-        // This is the same socket bridge shape used by start_notify_server:
-        // the delayed fake adapter is independently spawned, so the receiver
-        // can dispatch a real QueryState before it completes.
-        glib::MainContext::default().spawn_local(async move {
-            while let Some((message, response_tx)) = rx.recv().await {
-                match message {
-                    SocketMessage::AgentWorkspace { .. } => {
-                        let fake_started_tx = fake_started_tx.clone();
-                        glib::spawn_future_local(async move {
-                            let response = gio::spawn_blocking(move || {
-                                fake_started_tx
-                                    .send(())
-                                    .expect("fake adapter start should be observed");
-                                std::thread::sleep(Duration::from_millis(150));
-                                SocketResponse::ok()
-                            })
-                            .await
-                            .unwrap_or_else(|_| SocketResponse::err("fake adapter failed"));
-                            let _ = response_tx.send(response);
-                        });
+                // This is the same socket bridge shape used by start_notify_server.
+                // The explicit release barrier keeps the mutation unfinished
+                // regardless of scheduler speed while QueryState is dispatched.
+                context.spawn_local(async move {
+                    let mut fake_release_rx = Some(fake_release_rx);
+                    while let Some((message, response_tx)) = rx.recv().await {
+                        match message {
+                            SocketMessage::AgentWorkspace { .. } => {
+                                let fake_started_tx = fake_started_tx.clone();
+                                let release_rx = fake_release_rx
+                                    .take()
+                                    .expect("test sends one delayed agent request");
+                                glib::spawn_future_local(async move {
+                                    let response = gio::spawn_blocking(move || {
+                                        let _ = fake_started_tx.send(());
+                                        release_rx
+                                            .recv_timeout(Duration::from_secs(15))
+                                            .map(|()| SocketResponse::ok())
+                                            .unwrap_or_else(|_| {
+                                                SocketResponse::err(
+                                                    "fake adapter release timed out",
+                                                )
+                                            })
+                                    })
+                                    .await
+                                    .unwrap_or_else(|_| SocketResponse::err("fake adapter failed"));
+                                    let _ = response_tx.send(response);
+                                });
+                            }
+                            SocketMessage::QueryState => {
+                                let _ = response_tx.send(handle_query_state(&state_for_dispatch));
+                            }
+                            _ => {
+                                let _ =
+                                    response_tx.send(SocketResponse::err("unexpected test action"));
+                            }
+                        }
+                        glib::timeout_future(Duration::from_millis(0)).await;
                     }
-                    SocketMessage::QueryState => {
-                        let _ = response_tx.send(handle_query_state(&state_for_dispatch));
+                    receiver_done_for_task.set(true);
+                });
+
+                let heartbeat = Rc::new(Cell::new(0));
+                let heartbeat_for_source = heartbeat.clone();
+                context.spawn_local(async move {
+                    glib::timeout_future(Duration::from_millis(1)).await;
+                    heartbeat_for_source.set(heartbeat_for_source.get() + 1);
+                });
+
+                let (agent_server, mut agent_client) =
+                    UnixStream::pair().expect("agent socket pair");
+                let agent_tx = tx.clone();
+                let agent_handler = std::thread::spawn(move || {
+                    handle_socket_connection(
+                        agent_server,
+                        agent_tx,
+                        crate::history::HistoryReader::disabled(),
+                        Duration::from_secs(2),
+                        Duration::from_secs(15),
+                    );
+                });
+                agent_client
+                    .write_all(br#"{"action":"agent-workspace","branch":"feature/delayed"}"#)
+                    .expect("agent request should write");
+                agent_client
+                    .shutdown(Shutdown::Write)
+                    .expect("agent write side should close");
+                let (agent_response_tx, agent_response_rx) = mpsc::channel();
+                let agent_reader = std::thread::spawn(move || {
+                    let mut response = String::new();
+                    let _ = agent_client.read_to_string(&mut response);
+                    let _ = agent_response_tx.send(response);
+                });
+
+                let started_deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut fake_started = false;
+                while std::time::Instant::now() < started_deadline {
+                    if fake_started_rx.try_recv().is_ok() {
+                        fake_started = true;
+                        break;
                     }
-                    _ => {
-                        let _ = response_tx.send(SocketResponse::err("unexpected test action"));
-                    }
+                    context.iteration(false);
+                    std::thread::sleep(Duration::from_millis(1));
                 }
-                glib::timeout_future(Duration::from_millis(0)).await;
-            }
-            receiver_done_for_task.set(true);
-        });
 
-        let heartbeat = Rc::new(std::cell::Cell::new(0));
-        let heartbeat_for_source = heartbeat.clone();
-        glib::timeout_add_local_once(Duration::from_millis(1), move || {
-            heartbeat_for_source.set(heartbeat_for_source.get() + 1)
-        });
+                let (query_server, mut query_client) =
+                    UnixStream::pair().expect("query socket pair");
+                let query_handler_tx = tx.clone();
+                let query_handler = std::thread::spawn(move || {
+                    handle_socket_connection(
+                        query_server,
+                        query_handler_tx,
+                        crate::history::HistoryReader::disabled(),
+                        Duration::from_secs(2),
+                        Duration::from_secs(5),
+                    );
+                });
+                query_client
+                    .write_all(br#"{"action":"query-state"}"#)
+                    .expect("query request should write");
+                query_client
+                    .shutdown(Shutdown::Write)
+                    .expect("query write side should close");
+                let (query_response_tx, query_response_rx) = mpsc::channel();
+                let query_reader = std::thread::spawn(move || {
+                    let mut response = String::new();
+                    let _ = query_client.read_to_string(&mut response);
+                    let _ = query_response_tx.send(response);
+                });
 
-        let (agent_server, mut agent_client) = UnixStream::pair().expect("agent socket pair");
-        let agent_tx = tx.clone();
-        let agent_handler = std::thread::spawn(move || {
-            handle_socket_connection(
-                agent_server,
-                agent_tx,
-                crate::history::HistoryReader::disabled(),
-                Duration::from_millis(100),
-                Duration::from_millis(500),
-            );
-        });
-        agent_client
-            .write_all(br#"{"action":"agent-workspace","branch":"feature/delayed"}"#)
-            .expect("agent request should write");
-        agent_client
-            .shutdown(Shutdown::Write)
-            .expect("agent write side should close");
-        let (agent_response_tx, agent_response_rx) = mpsc::channel();
-        let agent_reader = std::thread::spawn(move || {
-            let mut response = String::new();
-            agent_client
-                .read_to_string(&mut response)
-                .expect("agent response should read");
-            agent_response_tx
-                .send(response)
-                .expect("agent response should forward");
-        });
+                let query_deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut query_response = None;
+                while std::time::Instant::now() < query_deadline {
+                    if let Ok(response) = query_response_rx.try_recv() {
+                        query_response = Some(response);
+                        break;
+                    }
+                    context.iteration(false);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let heartbeat_ran_while_blocked = heartbeat.get() > 0;
+                let mutation_was_blocked = agent_response_rx.try_recv().is_err();
 
-        let started_deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while fake_started_rx.try_recv().is_err() {
-            assert!(
-                std::time::Instant::now() < started_deadline,
-                "delayed fake adapter did not start"
-            );
-            context.iteration(false);
-            std::thread::sleep(Duration::from_millis(1));
-        }
+                // Release and drain every source before asserting observations.
+                let _ = fake_release_tx.send(());
+                let completion_deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut mutation_completed = false;
+                while std::time::Instant::now() < completion_deadline {
+                    if agent_response_rx.try_recv().is_ok() {
+                        mutation_completed = true;
+                        break;
+                    }
+                    context.iteration(false);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                drop(tx);
+                agent_handler.join().expect("agent handler should finish");
+                agent_reader.join().expect("agent reader should finish");
+                query_handler.join().expect("query handler should finish");
+                query_reader.join().expect("query reader should finish");
+                let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !receiver_done.get() && std::time::Instant::now() < cleanup_deadline {
+                    context.iteration(false);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
 
-        let (query_server, mut query_client) = UnixStream::pair().expect("query socket pair");
-        let query_handler_tx = tx.clone();
-        let query_handler = std::thread::spawn(move || {
-            handle_socket_connection(
-                query_server,
-                query_handler_tx,
-                crate::history::HistoryReader::disabled(),
-                Duration::from_millis(100),
-                Duration::from_millis(200),
-            );
-        });
-        query_client
-            .write_all(br#"{"action":"query-state"}"#)
-            .expect("query request should write");
-        query_client
-            .shutdown(Shutdown::Write)
-            .expect("query write side should close");
-        let (query_response_tx, query_response_rx) = mpsc::channel();
-        let query_reader = std::thread::spawn(move || {
-            let mut response = String::new();
-            query_client
-                .read_to_string(&mut response)
-                .expect("query response should read");
-            query_response_tx
-                .send(response)
-                .expect("query response should forward");
-        });
-
-        let query_deadline = std::time::Instant::now() + Duration::from_millis(100);
-        let query_response = loop {
-            if let Ok(response) = query_response_rx.try_recv() {
-                break response;
-            }
-            assert!(
-                std::time::Instant::now() < query_deadline,
-                "query-state was starved by the delayed agent adapter"
-            );
-            context.iteration(false);
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        assert!(query_response.contains(r#""ok":true"#));
-        assert!(
-            heartbeat.get() > 0,
-            "a real GLib timeout source must run while the adapter is delayed"
-        );
-        assert!(
-            agent_response_rx.try_recv().is_err(),
-            "the delayed mutation should not have completed before query-state"
-        );
-
-        let completion_deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while agent_response_rx.try_recv().is_err() {
-            assert!(
-                std::time::Instant::now() < completion_deadline,
-                "delayed mutation did not complete"
-            );
-            context.iteration(false);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        drop(tx);
-        agent_handler.join().expect("agent handler should finish");
-        agent_reader.join().expect("agent reader should finish");
-        query_handler.join().expect("query handler should finish");
-        query_reader.join().expect("query reader should finish");
-        let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !receiver_done.get() {
-            assert!(
-                std::time::Instant::now() < cleanup_deadline,
-                "delayed agent socket receiver did not release its GLib source"
-            );
-            context.iteration(false);
-            std::thread::sleep(Duration::from_millis(1));
-        }
+                assert!(fake_started, "delayed fake adapter did not start");
+                assert!(
+                    query_response
+                        .as_deref()
+                        .is_some_and(|response| response.contains(r#""ok":true"#)),
+                    "query-state was starved by the blocked agent adapter"
+                );
+                assert!(
+                    heartbeat_ran_while_blocked,
+                    "a real GLib timeout source must run while the adapter is blocked"
+                );
+                assert!(
+                    mutation_was_blocked,
+                    "the mutation completed before its release barrier"
+                );
+                assert!(mutation_completed, "released mutation did not complete");
+                assert!(
+                    receiver_done.get(),
+                    "delayed agent socket receiver did not release its GLib source"
+                );
+            })
+            .expect("test installs the private thread-default context");
     }
 
     #[test]
@@ -5774,6 +5800,7 @@ mod tests {
             listening_ports_updated_at_unix_ms: None,
             socket_agent_activity: None,
             pane_agent_activity: HashMap::new(),
+            pane_explicit_observation: HashMap::new(),
             agent_activity: None,
             needs_attention: false,
             notified: false,
@@ -5809,6 +5836,7 @@ mod tests {
             listening_ports_updated_at_unix_ms: None,
             socket_agent_activity: None,
             pane_agent_activity: HashMap::new(),
+            pane_explicit_observation: HashMap::new(),
             agent_activity: None,
             needs_attention: false,
             notified: false,

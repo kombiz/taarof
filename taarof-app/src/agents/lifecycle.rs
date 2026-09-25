@@ -184,11 +184,11 @@ impl PaneTurn {
 
     /// Age of the evidence. Clock skew that puts a record in the future reads
     /// as zero age rather than as a wildly stale turn.
-    fn age_ms(self, now_unix_ms: u64) -> u64 {
+    pub(crate) fn age_ms(self, now_unix_ms: u64) -> u64 {
         now_unix_ms.saturating_sub(self.at_unix_ms)
     }
 
-    fn is_fresh(self, now_unix_ms: u64) -> bool {
+    pub(crate) fn is_fresh(self, now_unix_ms: u64) -> bool {
         self.age_ms(now_unix_ms) < TRANSCRIPT_TURN_FRESHNESS.as_millis() as u64
     }
 }

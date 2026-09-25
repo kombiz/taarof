@@ -76,6 +76,10 @@ test("event classification isolates known state events and safely refreshes ambi
     "state",
   );
   assertEqual(
+    classifyEventRefreshDomains(JSON.stringify({ event_type: "agent_attention_changed" })).join(","),
+    "state",
+  );
+  assertEqual(
     classifyEventRefreshDomains(JSON.stringify({ event_type: "runtime_probe_state_changed" })).join(","),
     "state,agent-sessions",
     "runtime probe changes can affect catalog live-binding status",

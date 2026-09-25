@@ -3,6 +3,8 @@ import {
   isAttentionTarget,
   isBusyTarget,
   isLiveTarget,
+  paneAgent,
+  paneAttention,
   type PaneTarget,
 } from "../monitorBoard.js";
 import type {
@@ -53,8 +55,22 @@ export function paneStatusLabel(target: PaneTarget): string {
 }
 
 export function activityLabel(target: PaneTarget): string {
+  const attention = paneAttention(target);
+  if (attention) {
+    const reason = attention.reason === "waiting_input"
+      ? "Waiting for input"
+      : attention.reason === "error"
+        ? "Error"
+        : "Unknown reason";
+    const provider = attention.provider ?? "unknown provider";
+    const authority = attention.authority.replace(/_/g, " ");
+    return `${reason} · ${provider} · ${authority} · ${attention.freshness}`;
+  }
+  const agent = paneAgent(target.tab, target.pane.pane_id);
   const tab = target.tab;
   return (
+    agent?.activity?.text ??
+    agent?.activity?.state ??
     tab.agent_activity?.text ??
     tab.notification_msg ??
     tab.workspace_action ??

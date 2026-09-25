@@ -269,6 +269,50 @@ test("filter predicates classify attention, live, busy, done, and watch panes", 
   assertEqual(options.find((option) => option.id === "signal")?.count, 3);
 });
 
+test("per-pane canonical attention keeps a waiting sibling distinct from a running sibling", () => {
+  const siblingTab = tab(60, [pane(1), pane(2)], {
+    agent_running: true,
+    agent_activity: { state: "running", text: "working" },
+    agents: [
+      {
+        pane_id: 1,
+        agent_name: "codex",
+        state: "working",
+        attention: null,
+      },
+      {
+        pane_id: 2,
+        agent_name: "claude",
+        state: "waiting_input",
+        attention: {
+          reason: "waiting_input",
+          provider: "claude",
+          provenance: "termprop",
+          authority: "provider_explicit",
+          freshness: "fresh",
+          last_verified_unix_ms: 1_800_000_000_000,
+        },
+      },
+    ],
+  });
+  siblingTab.panes[1].attention = siblingTab.agents?.[1].attention;
+  const targets = buildPaneTargets(
+    snapshot({ workspaces: [workspace(1, [siblingTab])] }),
+  );
+  const running = targetByKey(targets, "1:60:1");
+  const waiting = targetByKey(targets, "1:60:2");
+
+  assertEqual(isLiveTarget(running), true);
+  assertEqual(isAttentionTarget(running), false);
+  assertEqual(isLiveTarget(waiting), false);
+  assertEqual(isAttentionTarget(waiting), true);
+  assertEqual(matchesMonitorFilter(waiting, "attention"), true);
+  assert(
+    waiting.priority > running.priority,
+    "the exact waiting pane should rank above its running sibling",
+  );
+});
+
 test("remote tmux panes remain neither busy nor done when SSH probing is missed", () => {
   const remoteTab = tab(50, [pane(5, {
     has_child_process: null,

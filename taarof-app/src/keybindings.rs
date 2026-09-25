@@ -168,7 +168,6 @@ impl Action {
         match self {
             Action::NewTab
             | Action::SearchToggle
-            | Action::JumpAttention
             | Action::ShortcutHelp
             | Action::NewWorkspace
             | Action::DiscoverTab => ActionScope::Window,
@@ -177,6 +176,7 @@ impl Action {
             // ShortcutController sees them.
             Action::NewTmuxTab
             | Action::CommandPalette
+            | Action::JumpAttention
             | Action::RegisterProject
             | Action::WorkspaceInspector
             | Action::HistoryView
@@ -820,6 +820,20 @@ impl KeybindingConfig {
 
     fn shortcuts_for_scopes(&self, include: impl Fn(ActionScope) -> bool) -> Vec<TerminalBinding> {
         let mut bindings = Vec::new();
+        for (action, trigger) in self.shortcut_triggers_for_scopes(include) {
+            let Some((key, mods)) = gtk::accelerator_parse(trigger) else {
+                continue;
+            };
+            bindings.push(TerminalBinding { action, key, mods });
+        }
+        bindings
+    }
+
+    fn shortcut_triggers_for_scopes(
+        &self,
+        include: impl Fn(ActionScope) -> bool,
+    ) -> Vec<(Action, &str)> {
+        let mut triggers = Vec::new();
         for (&action, trigger) in &self.shortcuts {
             if trigger.is_empty() {
                 continue;
@@ -827,12 +841,9 @@ impl KeybindingConfig {
             if !include(action.scope()) {
                 continue;
             }
-            let Some((key, mods)) = gtk::accelerator_parse(trigger) else {
-                continue;
-            };
-            bindings.push(TerminalBinding { action, key, mods });
+            triggers.push((action, trigger.as_str()));
         }
-        bindings
+        triggers
     }
 
     fn write_default_file(&self, path: &PathBuf) -> Result<(), std::io::Error> {
@@ -2100,5 +2111,22 @@ shortcut-help = "none"
                 action
             );
         }
+    }
+
+    #[test]
+    fn jump_attention_is_registered_for_focused_terminals_and_the_window() {
+        assert_eq!(Action::JumpAttention.scope(), ActionScope::Both);
+
+        let config = KeybindingConfig::defaults();
+        assert!(config
+            .window_shortcuts()
+            .iter()
+            .any(|(action, _)| *action == Action::JumpAttention));
+        assert!(config
+            .shortcut_triggers_for_scopes(|scope| {
+                matches!(scope, ActionScope::Terminal | ActionScope::Both)
+            })
+            .iter()
+            .any(|(action, _)| *action == Action::JumpAttention));
     }
 }

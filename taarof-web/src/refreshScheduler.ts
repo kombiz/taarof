@@ -14,6 +14,7 @@ const STATE_REFRESH_DOMAIN: readonly RefreshDomain[] = ["state"];
 
 const STATE_ONLY_EVENT_TYPES = new Set([
   "alert_raised",
+  "agent_attention_changed",
   "work_recorded",
   "work_preferences_changed",
   "work_ledger_cleared",
