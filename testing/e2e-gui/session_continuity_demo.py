@@ -73,7 +73,7 @@ else: raise SystemExit(2)
 print(json.dumps(out))
 """)
     (HOME / "provider_resume.py").write_text(
-        "from pathlib import Path\nimport time\nmarker=Path('/home/laddy/resume-observed')\nfirst=not marker.exists()\nmarker.write_text('exact synthetic provider identity')\nprint('RESUME AGENT CONVERSATION: synthetic provider identity accepted', flush=True)\nprint('DISPLAY CHECKPOINT: visual context only; it does not prove liveness', flush=True)\nif first: time.sleep(300)\n"
+        "from pathlib import Path\nimport time\nmarker=Path('/home/laddy/resume-observed')\nmarker.write_text('exact synthetic provider identity')\nprint('RESUME AGENT CONVERSATION: synthetic provider identity accepted', flush=True)\nprint('DISPLAY CHECKPOINT: visual context only; it does not prove liveness', flush=True)\ntime.sleep(300)\n"
     )
     (providers / "continuity-fixture.toml").write_text(
         "schema = 1\nid = 'continuity-fixture'\ndisplay_name = 'Continuity Fixture'\n"
@@ -195,14 +195,15 @@ def main():
     replacement = tmux_identity()
     second = start_app(env)
     second_window_mapped = wait_until(lambda: taarof_window_mapped(env))
-    time.sleep(1)
+    time.sleep(0.3)
+    screenshot("replacement-generation.png", env)
+    time.sleep(3.2)
     replacement_attachment_result, replacement_attached_count = tmux_attachment_check()
     replacement_rejected = (
         replacement_attachment_result.returncode == 0
         and replacement_attached_count == 0
         and replacement["continuity_id"] != original["continuity_id"]
     )
-    screenshot("replacement-generation.png", env)
     stop_app(second)
     post_cleanup_attachment_result, post_cleanup_attached_count = tmux_attachment_check()
     replacement_survived_app_cleanup = (
@@ -243,6 +244,9 @@ def main():
         "tmux_survived_desktop_shutdown": tmux_survived_desktop,
         "tmux_loss_observed": tmux_loss_observed,
         "reopen_workspace_layout_observation": "screenshots captured; owner review required",
+        "replacement_rejection_visual_observation": (
+            "screenshot captured while the refusal was displayed; owner review required"
+        ),
         "owner_attended_status": "pending",
         "command_exits": {
             "app_build_info": app_build_result.returncode,

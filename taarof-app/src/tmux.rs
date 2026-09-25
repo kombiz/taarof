@@ -642,7 +642,7 @@ pub fn exact_attach_command(
         "-F".to_string(),
         condition,
         format!("attach-session -t {escaped_name}"),
-        "display-message -p 'Reattach unavailable: the exact saved tmux target no longer exists.'"
+        "display-message -p 'Reattach unavailable: the exact saved tmux target no longer exists.' ; run-shell 'sleep 3'"
             .to_string(),
     ];
     Some(wrap_for_target(target, tmux_args))
@@ -2412,6 +2412,8 @@ mod tests {
         assert!(original[5].contains(TEST_CONTINUITY_ID));
         assert_eq!(original[1], "if-shell");
         assert_eq!(original[6], "attach-session -t same-name");
+        assert!(original[7].contains("Reattach unavailable:"));
+        assert!(original[7].contains("sleep 3"));
         assert!(exact_attach_command(
             &TmuxTarget::Local,
             "same-name",
