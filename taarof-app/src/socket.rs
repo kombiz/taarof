@@ -1822,13 +1822,13 @@ fn dispatch_resize_pane_control(
         {
             leaf.tmux_backing
                 .clone()
-                .map(PaneControlTarget::Tmux)
+                .map(|backing| PaneControlTarget::Tmux(Box::new(backing)))
                 .unwrap_or_else(|| PaneControlTarget::Vte(leaf.terminal.clone()))
         } else if let Some(backing) = st
             .headless_pane(tab_id, pane_id)
             .and_then(|pane| pane.tmux_backing.clone())
         {
-            PaneControlTarget::Tmux(backing)
+            PaneControlTarget::Tmux(Box::new(backing))
         } else {
             reply.send(SocketResponse::err("pane not found"));
             return;
@@ -2449,7 +2449,7 @@ fn finish_http_control_response(
 
 enum PaneControlTarget {
     Vte(vte::Terminal),
-    Tmux(crate::pane::TmuxBacking),
+    Tmux(Box<crate::pane::TmuxBacking>),
 }
 
 fn record_socket_message_event(state: &Rc<RefCell<AppState>>, msg: &SocketMessage) {

@@ -289,7 +289,7 @@ pub fn build_send_to_pane_payload(
 /// resolver.
 pub(crate) enum PaneSendTarget {
     Vte(vte::Terminal),
-    Tmux(crate::pane::TmuxBacking),
+    Tmux(Box<crate::pane::TmuxBacking>),
 }
 
 /// Resolve a `(tab_id, pane_id)` to its delivery endpoint. A live leaf prefers
@@ -311,13 +311,13 @@ pub(crate) fn resolve_pane_send_target(
         Some(
             leaf.tmux_backing
                 .clone()
-                .map(PaneSendTarget::Tmux)
+                .map(|backing| PaneSendTarget::Tmux(Box::new(backing)))
                 .unwrap_or_else(|| PaneSendTarget::Vte(leaf.terminal.clone())),
         )
     } else {
         st.headless_pane(tab_id, pane_id)
             .and_then(|pane| pane.tmux_backing.clone())
-            .map(PaneSendTarget::Tmux)
+            .map(|backing| PaneSendTarget::Tmux(Box::new(backing)))
     }
 }
 
