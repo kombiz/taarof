@@ -122,7 +122,7 @@ def tmux_pane_coordinates():
         for tab in workspace.get("tabs", []):
             for pane in tab.get("panes", []):
                 if pane.get("tmux_session") == SESSION:
-                    return tab["id"], pane["pane_id"]
+                    return tab["tab_id"], pane["pane_id"]
     raise RuntimeError("synthetic tmux pane was not projected")
 
 
