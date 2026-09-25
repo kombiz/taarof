@@ -1211,6 +1211,26 @@ pub fn build_task_panel(
         });
     }
 
+    {
+        let panel = panel.clone();
+        let state = state.clone();
+        let tab_list = tab_list.clone();
+        let term_stack_for_refresh = term_stack.clone();
+        let window = window.clone();
+        let review_button = panel.review_button.clone();
+        term_stack.connect_visible_child_notify(move |_| {
+            if review_button.is_active() {
+                schedule_task_panel_refresh(
+                    &panel,
+                    &state,
+                    &tab_list,
+                    &term_stack_for_refresh,
+                    &window,
+                );
+            }
+        });
+    }
+
     if runtime_policy.install_task_poll {
         let panel = panel.clone();
         let state = state.clone();
@@ -3344,11 +3364,7 @@ fn pull_request_target_for_tab(
 }
 
 fn local_head_revision(checkout_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .current_dir(checkout_root)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
+    let output = local_head_revision_command(checkout_root).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -3358,6 +3374,16 @@ fn local_head_revision(checkout_root: &Path) -> Option<String> {
         .filter(|revision| {
             revision.len() == 40 && revision.chars().all(|ch| ch.is_ascii_hexdigit())
         })
+}
+
+fn local_head_revision_command(checkout_root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(checkout_root)
+        .arg("--no-optional-locks")
+        .args(["rev-parse", "HEAD"]);
+    crate::child_env::prepare_child_command(&mut command, &[]);
+    command
 }
 
 fn verify_pull_request_bound_task(bound: PullRequestBoundTask) -> Option<PullRequestBoundTask> {
@@ -3389,6 +3415,7 @@ fn review_forge_projection(
                 detail: "Reading the selected worktree's repository, branch, and HEAD before querying the forge."
                     .to_string(),
                 url: None,
+                identity: None,
             };
         }
         return crate::review::ReviewForgeProjection {
@@ -3396,8 +3423,15 @@ fn review_forge_projection(
             detail: "Repository, branch, or forge identity is unavailable or ambiguous."
                 .to_string(),
             url: None,
+            identity: None,
         };
     };
+    let identity = Some(crate::review::ReviewForgeIdentity {
+        checkout_root: target.checkout_root.clone(),
+        branch: target.branch.clone(),
+        head_revision: target.head_revision.clone(),
+        remote: target.remote_connection.is_some(),
+    });
     let Some(entry) = cache.get(&PullRequestKey::for_target(target)) else {
         return crate::review::ReviewForgeProjection {
             summary: "Checking for an associated PR…".to_string(),
@@ -3412,6 +3446,7 @@ fn review_forge_projection(
                     .unwrap_or("unavailable")
             ),
             url: None,
+            identity: identity.clone(),
         };
     };
     let freshness = entry.verified_at_ms.map_or_else(
@@ -3431,6 +3466,7 @@ fn review_forge_projection(
                 .clone()
                 .unwrap_or_else(|| "No verified GitHub result is available.".to_string()),
             url: None,
+            identity: identity.clone(),
         };
     };
     if data.pull_requests.is_empty() {
@@ -3447,6 +3483,7 @@ fn review_forge_projection(
                     .unwrap_or_default()
             ),
             url: None,
+            identity: identity.clone(),
         };
     }
     if data.pull_requests.len() != 1 {
@@ -3457,6 +3494,7 @@ fn review_forge_projection(
             ),
             detail: format!("{}:{} · {freshness}", target.head_owner, target.branch),
             url: None,
+            identity: identity.clone(),
         };
     }
     let pr = &data.pull_requests[0];
@@ -3487,6 +3525,7 @@ fn review_forge_projection(
                 remote_head.map(short_revision).unwrap_or("unavailable")
             ),
             url: pr.url.clone(),
+            identity: identity.clone(),
         };
     }
     crate::review::ReviewForgeProjection {
@@ -3496,6 +3535,7 @@ fn review_forge_projection(
             short_revision(local_head.expect("exact revision requires local head"))
         ),
         url: pr.url.clone(),
+        identity,
     }
 }
 
@@ -4756,20 +4796,20 @@ mod tests {
     use super::{
         active_current_task_summary, aggregate_progress_text, bind_pane_task_mutation,
         build_pull_request_snapshot, classify_local_gh_failure, clear_pane_task_mutation,
-        local_pull_request_cache_result_for_request, local_pull_request_probe_is_current,
-        local_pull_request_probe_request, local_task_probe_is_current, local_task_probe_request,
-        next_remote_failure_streak, next_remote_git_failure_streak,
-        probe_local_pull_request_target, progress_for_unavailable, project_all_agent_panes,
-        pull_request_discovery_feedback, pull_request_target_for_tab, record_pull_request_fetch,
-        register_pull_request_fetch, remote_cache_key, remote_pull_request_identity_ttl_ms,
-        remote_tasks_error_summary, remote_tasks_ttl_ms, review_forge_projection,
-        state_available_for_refresh, task_markdown_path, task_panel_runtime_policy,
-        task_row_from_entry, task_truth_axis_labels, verify_pull_request_bound_task,
-        visible_task_rows, LocalPullRequestCacheEntry, PullRequestBoundTask,
-        PullRequestDiscoveryFeedback, PullRequestKey, PullRequestTarget, PullRequestsEntry,
-        TaskBindingContext, TaskPanelIntent, TaskPanelMode, TaskPanelModeSelection,
-        TaskPanelRuntimePolicy, LOCAL_PULL_REQUEST_TTL_MS, PULL_REQUESTS_TTL_MS,
-        REMOTE_TASKS_FAILURE_TTL_CAP_MS, REMOTE_TASKS_TTL_MS,
+        local_head_revision_command, local_pull_request_cache_result_for_request,
+        local_pull_request_probe_is_current, local_pull_request_probe_request,
+        local_task_probe_is_current, local_task_probe_request, next_remote_failure_streak,
+        next_remote_git_failure_streak, probe_local_pull_request_target, progress_for_unavailable,
+        project_all_agent_panes, pull_request_discovery_feedback, pull_request_target_for_tab,
+        record_pull_request_fetch, register_pull_request_fetch, remote_cache_key,
+        remote_pull_request_identity_ttl_ms, remote_tasks_error_summary, remote_tasks_ttl_ms,
+        review_forge_projection, state_available_for_refresh, task_markdown_path,
+        task_panel_runtime_policy, task_row_from_entry, task_truth_axis_labels,
+        verify_pull_request_bound_task, visible_task_rows, LocalPullRequestCacheEntry,
+        PullRequestBoundTask, PullRequestDiscoveryFeedback, PullRequestKey, PullRequestTarget,
+        PullRequestsEntry, TaskBindingContext, TaskPanelIntent, TaskPanelMode,
+        TaskPanelModeSelection, TaskPanelRuntimePolicy, LOCAL_PULL_REQUEST_TTL_MS,
+        PULL_REQUESTS_TTL_MS, REMOTE_TASKS_FAILURE_TTL_CAP_MS, REMOTE_TASKS_TTL_MS,
     };
     use crate::tracking::{
         BranchPullRequestEntry, BranchPullRequestsData, PlanTaskEntry, PlanTasksData,
@@ -4778,6 +4818,7 @@ mod tests {
     };
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
+    use std::ffi::OsStr;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -6424,5 +6465,20 @@ mod tests {
         assert!(moved
             .detail
             .contains("local 111111111111 · PR 222222222222"));
+    }
+
+    #[test]
+    fn local_head_revision_disables_optional_locks_and_sanitizes_child_environment() {
+        let command = local_head_revision_command(Path::new("/tmp"));
+        assert_eq!(
+            command.get_args().next().and_then(OsStr::to_str),
+            Some("--no-optional-locks")
+        );
+        let removed = command
+            .get_envs()
+            .filter_map(|(name, value)| value.is_none().then_some(name))
+            .collect::<Vec<_>>();
+        assert!(removed.contains(&OsStr::new("INFISICAL_TOKEN")));
+        assert!(removed.contains(&OsStr::new("INFISICAL_SERVICE_TOKEN")));
     }
 }

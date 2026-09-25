@@ -10,7 +10,11 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::AppState;
 
@@ -18,6 +22,8 @@ const MAX_DIFF_BYTES: usize = 32 * 1024;
 const MAX_FILES: usize = 250;
 const CONTENT_FINGERPRINT_CHUNK_BYTES: usize = 64 * 1024;
 const CONTENT_FINGERPRINT_CHUNKS: u64 = 8;
+const MAX_GIT_METADATA_BYTES: usize = 1024 * 1024;
+const REVIEW_COLLECTION_DEADLINE: Duration = Duration::from_secs(6);
 const REFRESH_TTL_MS: u64 = 750;
 const SNAPSHOT_CHANGED_MESSAGE: &str =
     "Files changed while the review snapshot was being read; refreshing";
@@ -55,6 +61,15 @@ pub(crate) struct ReviewForgeProjection {
     pub summary: String,
     pub detail: String,
     pub url: Option<String>,
+    pub identity: Option<ReviewForgeIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewForgeIdentity {
+    pub checkout_root: PathBuf,
+    pub branch: String,
+    pub head_revision: Option<String>,
+    pub remote: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -194,8 +209,10 @@ pub(crate) struct ReviewPanel {
     viewed: Rc<RefCell<HashSet<ViewedFileKey>>>,
     task_url: Rc<RefCell<Option<String>>>,
     forge_url: Rc<RefCell<Option<String>>>,
+    forge_projection: Rc<RefCell<ReviewForgeProjection>>,
     in_flight: Rc<Cell<bool>>,
     generation: Rc<Cell<u64>>,
+    cancellation: Rc<RefCell<Option<Arc<AtomicBool>>>>,
 }
 
 pub(crate) fn build_review_panel() -> ReviewPanel {
@@ -264,8 +281,10 @@ pub(crate) fn build_review_panel() -> ReviewPanel {
         viewed: Rc::new(RefCell::new(HashSet::new())),
         task_url,
         forge_url,
+        forge_projection: Rc::new(RefCell::new(ReviewForgeProjection::default())),
         in_flight: Rc::new(Cell::new(false)),
         generation: Rc::new(Cell::new(0)),
+        cancellation: Rc::new(RefCell::new(None)),
     }
 }
 
@@ -294,6 +313,31 @@ fn configure_link_button_label(button: &gtk::Button) {
     }
 }
 
+#[derive(Clone)]
+struct ReviewBudget {
+    cancelled: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+impl ReviewBudget {
+    fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            deadline: Instant::now() + REVIEW_COLLECTION_DEADLINE,
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            Err("Review refresh was superseded".to_string())
+        } else if Instant::now() >= self.deadline {
+            Err("Review refresh exceeded the six-second read deadline".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl ReviewPanel {
     pub(crate) fn refresh(
         &self,
@@ -301,13 +345,7 @@ impl ReviewPanel {
         forge: ReviewForgeProjection,
         task: ReviewTaskProjection,
     ) {
-        set_link_button(
-            &self.forge_button,
-            &self.forge_url,
-            &forge.summary,
-            forge.url.as_deref(),
-        );
-        self.forge_button.set_tooltip_text(Some(&forge.detail));
+        *self.forge_projection.borrow_mut() = forge.clone();
         set_link_button(
             &self.task_button,
             &self.task_url,
@@ -320,8 +358,12 @@ impl ReviewPanel {
             .ok()
             .and_then(|state| selection_from_state(&state));
         let Some(selection) = selection else {
+            if let Some(cancelled) = self.cancellation.borrow_mut().take() {
+                cancelled.store(true, Ordering::Relaxed);
+            }
             self.generation.set(self.generation.get().wrapping_add(1));
             self.in_flight.set(false);
+            self.render_forge(validated_forge_projection(&forge, None));
             self.render(ReviewSnapshot::unavailable(
                 ReviewSelection {
                     machine: local_machine_identity(),
@@ -339,6 +381,14 @@ impl ReviewPanel {
             .borrow()
             .as_ref()
             .is_none_or(|snapshot| snapshot.selection != selection);
+        let current_snapshot = self.snapshot.borrow();
+        let verified_repository = current_snapshot.as_ref().and_then(|snapshot| {
+            (snapshot.selection == selection)
+                .then_some(snapshot.repository.as_ref())
+                .flatten()
+        });
+        self.render_forge(validated_forge_projection(&forge, verified_repository));
+        drop(current_snapshot);
         if self.in_flight.get() && !selection_changed {
             return;
         }
@@ -351,26 +401,34 @@ impl ReviewPanel {
 
         if selection_changed {
             self.render(ReviewSnapshot::loading(selection.clone()));
+            self.render_forge(validated_forge_projection(&forge, None));
         }
 
+        if let Some(cancelled) = self.cancellation.borrow_mut().take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *self.cancellation.borrow_mut() = Some(cancelled.clone());
         self.in_flight.set(true);
         let generation = self.generation.get().wrapping_add(1);
         self.generation.set(generation);
         let request = selection.clone();
         let panel = self.clone();
         let state = state.clone();
+        let worker_budget = ReviewBudget::new(cancelled.clone());
         let key = format!(
             "review-panel:{}:{}:{generation}",
             request.machine, request.workspace_origin
         );
         let submission = crate::git::spawn_async_result(
             key,
-            move || collect_review(request),
+            move || collect_review_with_budget(request, worker_budget),
             move |result| {
                 if panel.generation.get() != generation {
                     return;
                 }
                 panel.in_flight.set(false);
+                panel.cancellation.borrow_mut().take();
                 let current = state
                     .try_borrow()
                     .ok()
@@ -379,7 +437,14 @@ impl ReviewPanel {
                     return;
                 }
                 match result {
-                    Ok(snapshot) => panel.render(snapshot),
+                    Ok(snapshot) => {
+                        let current_forge = panel.forge_projection.borrow().clone();
+                        panel.render_forge(validated_forge_projection(
+                            &current_forge,
+                            snapshot.repository.as_ref(),
+                        ));
+                        panel.render(snapshot);
+                    }
                     Err(error)
                         if should_preserve_rows_for_error(
                             panel.snapshot.borrow().as_ref(),
@@ -389,18 +454,57 @@ impl ReviewPanel {
                     {
                         panel.status.set_text(&error);
                     }
-                    Err(error) => panel.render(ReviewSnapshot::unavailable(selection, error)),
+                    Err(error) => {
+                        let current_forge = panel.forge_projection.borrow().clone();
+                        panel.render_forge(validated_forge_projection(&current_forge, None));
+                        panel.render(ReviewSnapshot::unavailable(selection, error));
+                    }
                 }
             },
         );
         if !matches!(submission, crate::git::GitAsyncSubmission::Started) {
+            cancelled.store(true, Ordering::Relaxed);
+            self.cancellation.borrow_mut().take();
             self.in_flight.set(false);
             self.status
                 .set_text("Review refresh is queued behind other Git work");
         }
     }
 
+    fn render_forge(&self, forge: ReviewForgeProjection) {
+        set_link_button(
+            &self.forge_button,
+            &self.forge_url,
+            &forge.summary,
+            forge.url.as_deref(),
+        );
+        self.forge_button.set_tooltip_text(Some(&forge.detail));
+    }
+
     fn render(&self, snapshot: ReviewSnapshot) {
+        let message = snapshot.message.clone().unwrap_or_else(|| {
+            let viewed = snapshot
+                .repository
+                .as_ref()
+                .map(|repository| {
+                    snapshot
+                        .files
+                        .iter()
+                        .filter(|file| self.viewed.borrow().contains(&viewed_key(repository, file)))
+                        .count()
+                })
+                .unwrap_or(0);
+            let suffix = if snapshot.truncated_files == 0 {
+                String::new()
+            } else {
+                format!(" · {} more files omitted", snapshot.truncated_files)
+            };
+            format!(
+                "{} changed files · {viewed} viewed at this exact content{suffix}",
+                snapshot.files.len()
+            )
+        });
+        self.status.set_text(&message);
         if self
             .snapshot
             .borrow()
@@ -446,30 +550,6 @@ impl ReviewPanel {
         } else {
             self.revisions.set_text("Base/current revision unavailable");
         }
-        let message = snapshot.message.clone().unwrap_or_else(|| {
-            let viewed = snapshot
-                .repository
-                .as_ref()
-                .map(|repository| {
-                    snapshot
-                        .files
-                        .iter()
-                        .filter(|file| self.viewed.borrow().contains(&viewed_key(repository, file)))
-                        .count()
-                })
-                .unwrap_or(0);
-            let suffix = if snapshot.truncated_files == 0 {
-                String::new()
-            } else {
-                format!(" · {} more files omitted", snapshot.truncated_files)
-            };
-            format!(
-                "{} changed files · {viewed} viewed at this exact content{suffix}",
-                snapshot.files.len()
-            )
-        });
-        self.status.set_text(&message);
-
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
@@ -575,6 +655,65 @@ fn set_link_button(
     *stored_url.borrow_mut() = url.map(str::to_string);
 }
 
+fn validated_forge_projection(
+    forge: &ReviewForgeProjection,
+    repository: Option<&RepositoryIdentity>,
+) -> ReviewForgeProjection {
+    let Some(identity) = forge.identity.as_ref() else {
+        return forge.clone();
+    };
+    if identity.remote {
+        return ReviewForgeProjection {
+            summary: "PR association unavailable for the remote pane".to_string(),
+            detail: "Review files belong to the selected local workspace, while the focused pane has a remote Git identity."
+                .to_string(),
+            url: None,
+            identity: forge.identity.clone(),
+        };
+    }
+    let Some(repository) = repository else {
+        return ReviewForgeProjection {
+            summary: "Checking Review and PR checkout agreement…".to_string(),
+            detail: "Waiting for the selected workspace's worktree, branch, and HEAD before showing PR/check state."
+                .to_string(),
+            url: None,
+            identity: forge.identity.clone(),
+        };
+    };
+    let Some(target_head) = identity.head_revision.as_deref() else {
+        return ReviewForgeProjection {
+            summary: "PR association unavailable: pane HEAD unverified".to_string(),
+            detail: format!(
+                "Review {} @ {} has a verified HEAD, but the focused pane's local HEAD is unavailable.",
+                repository.branch,
+                short_revision(&repository.head_revision)
+            ),
+            url: None,
+            identity: forge.identity.clone(),
+        };
+    };
+    if identity.checkout_root != repository.worktree
+        || identity.branch != repository.branch
+        || target_head != repository.head_revision
+    {
+        return ReviewForgeProjection {
+            summary: "PR association is for a different checkout".to_string(),
+            detail: format!(
+                "Review: {} · {} @ {}. Pane PR identity: {} · {} @ {}.",
+                repository.worktree.display(),
+                repository.branch,
+                short_revision(&repository.head_revision),
+                identity.checkout_root.display(),
+                identity.branch,
+                short_revision(target_head)
+            ),
+            url: None,
+            identity: forge.identity.clone(),
+        };
+    }
+    forge.clone()
+}
+
 fn viewed_key(repository: &RepositoryIdentity, file: &ReviewFile) -> ViewedFileKey {
     ViewedFileKey {
         repository: repository.clone(),
@@ -583,7 +722,19 @@ fn viewed_key(repository: &RepositoryIdentity, file: &ReviewFile) -> ViewedFileK
     }
 }
 
+#[cfg(test)]
 fn collect_review(selection: ReviewSelection) -> Result<ReviewSnapshot, String> {
+    collect_review_with_budget(
+        selection,
+        ReviewBudget::new(Arc::new(AtomicBool::new(false))),
+    )
+}
+
+fn collect_review_with_budget(
+    selection: ReviewSelection,
+    budget: ReviewBudget,
+) -> Result<ReviewSnapshot, String> {
+    budget.check()?;
     let Some(checkout_hint) = selection.checkout_hint() else {
         return Ok(ReviewSnapshot::unavailable(
             selection,
@@ -593,7 +744,7 @@ fn collect_review(selection: ReviewSelection) -> Result<ReviewSnapshot, String> 
     let checkout = checkout_hint
         .canonicalize()
         .map_err(|_| "The selected worktree is unavailable".to_string())?;
-    let root = git_text(&checkout, &["rev-parse", "--show-toplevel"])?;
+    let root = git_text(&checkout, &["rev-parse", "--show-toplevel"], &budget)?;
     let worktree = PathBuf::from(root.trim());
     if worktree != checkout && !checkout.starts_with(&worktree) {
         return Err("Git resolved a worktree outside the selected workspace".to_string());
@@ -602,19 +753,25 @@ fn collect_review(selection: ReviewSelection) -> Result<ReviewSnapshot, String> 
         git_text(
             &worktree,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            &budget,
         )?
         .trim(),
     );
-    let branch = git_text(&worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map_err(|_| "Detached HEAD: review state needs a named branch".to_string())?;
+    let branch = git_text(
+        &worktree,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        &budget,
+    )
+    .map_err(|_| "Detached HEAD: review state needs a named branch".to_string())?;
     let branch = branch.trim().to_string();
-    let head_revision = git_text(&worktree, &["rev-parse", "HEAD"])?
+    let head_revision = git_text(&worktree, &["rev-parse", "HEAD"], &budget)?
         .trim()
         .to_string();
-    let (base_ref, base_revision) = resolve_base(&worktree, &branch, &head_revision);
-    let before = capture_change_fingerprint(&worktree)?;
-    let mut files = collect_changed_files(&worktree, base_revision.as_deref(), &head_revision)?;
-    let after = capture_change_fingerprint(&worktree)?;
+    let (base_ref, base_revision) = resolve_base(&worktree, &branch, &head_revision, &budget);
+    let before = capture_change_fingerprint(&worktree, &budget)?;
+    let collected =
+        collect_changed_files(&worktree, base_revision.as_deref(), &head_revision, &budget)?;
+    let after = capture_change_fingerprint(&worktree, &budget)?;
     if before != after {
         return Err(SNAPSHOT_CHANGED_MESSAGE.to_string());
     }
@@ -627,19 +784,22 @@ fn collect_review(selection: ReviewSelection) -> Result<ReviewSnapshot, String> 
         base_revision,
         head_revision,
     };
-    let truncated_files = files.len().saturating_sub(MAX_FILES);
-    files.truncate(MAX_FILES);
     Ok(ReviewSnapshot {
         selection,
         repository: Some(repository),
-        files,
+        files: collected.files,
         captured_at_ms: now_ms(),
         message: None,
-        truncated_files,
+        truncated_files: collected.truncated_files,
     })
 }
 
-fn resolve_base(worktree: &Path, branch: &str, head: &str) -> (Option<String>, Option<String>) {
+fn resolve_base(
+    worktree: &Path,
+    branch: &str,
+    head: &str,
+    budget: &ReviewBudget,
+) -> (Option<String>, Option<String>) {
     let origin_head = git_text(
         worktree,
         &[
@@ -648,20 +808,25 @@ fn resolve_base(worktree: &Path, branch: &str, head: &str) -> (Option<String>, O
             "--short",
             "refs/remotes/origin/HEAD",
         ],
+        budget,
     )
     .ok()
     .map(|value| value.trim().to_string());
-    let upstream = git_text(worktree, &["rev-parse", "--abbrev-ref", "@{upstream}"])
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.ends_with(&format!("/{branch}")));
+    let upstream = git_text(
+        worktree,
+        &["rev-parse", "--abbrev-ref", "@{upstream}"],
+        budget,
+    )
+    .ok()
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.ends_with(&format!("/{branch}")));
     let candidates = [origin_head, upstream];
     for candidate in candidates
         .into_iter()
         .flatten()
         .filter(|value| !value.is_empty())
     {
-        if let Ok(base) = git_text(worktree, &["merge-base", head, &candidate]) {
+        if let Ok(base) = git_text(worktree, &["merge-base", head, &candidate], budget) {
             return (Some(candidate), Some(base.trim().to_string()));
         }
     }
@@ -676,11 +841,17 @@ struct MutableFile {
     layers: HashSet<ChangeLayer>,
 }
 
+struct CollectedFiles {
+    files: Vec<ReviewFile>,
+    truncated_files: usize,
+}
+
 fn collect_changed_files(
     worktree: &Path,
     base_revision: Option<&str>,
     head_revision: &str,
-) -> Result<Vec<ReviewFile>, String> {
+    budget: &ReviewBudget,
+) -> Result<CollectedFiles, String> {
     let mut files: BTreeMap<Vec<u8>, MutableFile> = BTreeMap::new();
     if let Some(base) = base_revision {
         let range = format!("{base}..{head_revision}");
@@ -689,6 +860,7 @@ fn collect_changed_files(
             git_bytes(
                 worktree,
                 &["diff", "--name-status", "-z", "--find-renames", &range],
+                budget,
             )?,
             ChangeLayer::Committed,
         )?;
@@ -698,17 +870,23 @@ fn collect_changed_files(
         git_bytes(
             worktree,
             &["diff", "--cached", "--name-status", "-z", "--find-renames"],
+            budget,
         )?,
         ChangeLayer::Staged,
     )?;
     add_name_status(
         &mut files,
-        git_bytes(worktree, &["diff", "--name-status", "-z", "--find-renames"])?,
+        git_bytes(
+            worktree,
+            &["diff", "--name-status", "-z", "--find-renames"],
+            budget,
+        )?,
         ChangeLayer::Unstaged,
     )?;
     for path in split_nul(git_bytes(
         worktree,
         &["ls-files", "--others", "--exclude-standard", "-z"],
+        budget,
     )?) {
         if safe_relative_bytes(&path) {
             let entry = files.entry(path.clone()).or_default();
@@ -718,10 +896,22 @@ fn collect_changed_files(
         }
     }
 
-    files
-        .into_values()
-        .map(|file| finish_file(worktree, base_revision, head_revision, file))
-        .collect()
+    let truncated_files = files.len().saturating_sub(MAX_FILES);
+    let mut finished = Vec::with_capacity(files.len().min(MAX_FILES));
+    for file in files.into_values().take(MAX_FILES) {
+        budget.check()?;
+        finished.push(finish_file(
+            worktree,
+            base_revision,
+            head_revision,
+            file,
+            budget,
+        )?);
+    }
+    Ok(CollectedFiles {
+        files: finished,
+        truncated_files,
+    })
 }
 
 fn add_name_status(
@@ -768,19 +958,25 @@ fn finish_file(
     base_revision: Option<&str>,
     head_revision: &str,
     file: MutableFile,
+    budget: &ReviewBudget,
 ) -> Result<ReviewFile, String> {
+    budget.check()?;
     let path = OsString::from_vec(file.path.clone());
     let absolute = worktree.join(&path);
     let deleted = file.statuses.iter().any(|status| status.starts_with('D')) && !absolute.exists();
     let mut diff_parts = Vec::new();
     let mut oversized = false;
     let mut binary = false;
-    if let Some(base) = base_revision {
+    if file.layers.contains(&ChangeLayer::Committed) {
+        let Some(base) = base_revision else {
+            return Err("Committed changes have no verified base revision".to_string());
+        };
         let range = format!("{base}..{head_revision}");
         let output = bounded_git_diff(
             worktree,
             &["diff", "--no-color", "--no-ext-diff", &range],
             &path,
+            budget,
         )?;
         oversized |= output.truncated;
         binary |= output.binary;
@@ -788,31 +984,42 @@ fn finish_file(
             diff_parts.push(format!("Committed\n{}", output.text));
         }
     }
-    let staged = bounded_git_diff(
-        worktree,
-        &["diff", "--cached", "--no-color", "--no-ext-diff"],
-        &path,
-    )?;
-    oversized |= staged.truncated;
-    binary |= staged.binary;
-    if !staged.text.is_empty() {
-        diff_parts.push(format!("Staged\n{}", staged.text));
+    if file.layers.contains(&ChangeLayer::Staged) {
+        let staged = bounded_git_diff(
+            worktree,
+            &["diff", "--cached", "--no-color", "--no-ext-diff"],
+            &path,
+            budget,
+        )?;
+        oversized |= staged.truncated;
+        binary |= staged.binary;
+        if !staged.text.is_empty() {
+            diff_parts.push(format!("Staged\n{}", staged.text));
+        }
     }
-    let unstaged = bounded_git_diff(worktree, &["diff", "--no-color", "--no-ext-diff"], &path)?;
-    oversized |= unstaged.truncated;
-    binary |= unstaged.binary;
-    if !unstaged.text.is_empty() {
-        diff_parts.push(format!("Unstaged\n{}", unstaged.text));
+    if file.layers.contains(&ChangeLayer::Unstaged) {
+        let unstaged = bounded_git_diff(
+            worktree,
+            &["diff", "--no-color", "--no-ext-diff"],
+            &path,
+            budget,
+        )?;
+        oversized |= unstaged.truncated;
+        binary |= unstaged.binary;
+        if !unstaged.text.is_empty() {
+            diff_parts.push(format!("Unstaged\n{}", unstaged.text));
+        }
     }
 
     let symlink = absolute
         .symlink_metadata()
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false);
+    let mut untracked_content = None;
     if file.layers.contains(&ChangeLayer::Untracked) && !deleted {
         if symlink {
             diff_parts.push("Untracked symlink content is intentionally hidden.".to_string());
-        } else if let Ok(metadata) = absolute.metadata() {
+        } else if let Ok(metadata) = absolute.symlink_metadata() {
             if metadata.len() > MAX_DIFF_BYTES as u64 {
                 oversized = true;
                 diff_parts.push(format!(
@@ -821,16 +1028,28 @@ fn finish_file(
                     MAX_DIFF_BYTES
                 ));
             } else if metadata.is_file() {
-                let mut bytes = Vec::new();
+                budget.check()?;
+                let mut bytes = Vec::with_capacity(metadata.len() as usize);
                 std::fs::File::open(&absolute)
-                    .and_then(|mut file| file.read_to_end(&mut bytes))
+                    .and_then(|file| {
+                        file.take((MAX_DIFF_BYTES + 1) as u64)
+                            .read_to_end(&mut bytes)
+                    })
                     .map_err(|_| "Could not read an untracked file".to_string())?;
+                budget.check()?;
+                let after = absolute
+                    .symlink_metadata()
+                    .map_err(|_| SNAPSHOT_CHANGED_MESSAGE.to_string())?;
+                if !same_file_metadata(&metadata, &after) || bytes.len() > MAX_DIFF_BYTES {
+                    return Err(SNAPSHOT_CHANGED_MESSAGE.to_string());
+                }
                 if bytes.contains(&0) {
                     binary = true;
                     diff_parts.push("Untracked binary file; content hidden.".to_string());
                 } else {
                     diff_parts.push(format!("Untracked\n{}", String::from_utf8_lossy(&bytes)));
                 }
+                untracked_content = Some((metadata, bytes));
             }
         }
     }
@@ -854,6 +1073,7 @@ fn finish_file(
     } else {
         diff_parts.join("\n\n")
     };
+    let has_index_entry = !file.layers.contains(&ChangeLayer::Untracked) || file.layers.len() > 1;
     let mut layers = file.layers.into_iter().collect::<Vec<_>>();
     layers.sort();
     let status = file.statuses.join("/");
@@ -864,8 +1084,15 @@ fn finish_file(
     layers.hash(&mut hasher);
     kind.hash(&mut hasher);
     diff.hash(&mut hasher);
-    git_bytes_path(worktree, &["ls-files", "--stage", "-z"], &path)?.hash(&mut hasher);
-    hash_worktree_content(&absolute, &mut hasher)?;
+    if has_index_entry {
+        git_bytes_path(worktree, &["ls-files", "--stage", "-z"], &path, budget)?.hash(&mut hasher);
+    }
+    if let Some((metadata, bytes)) = untracked_content {
+        hash_file_metadata(&metadata, &mut hasher);
+        bytes.hash(&mut hasher);
+    } else {
+        hash_worktree_content(&absolute, &mut hasher, budget)?;
+    }
     Ok(ReviewFile {
         path: file.path,
         previous_path: file.previous_path,
@@ -883,41 +1110,18 @@ struct BoundedDiff {
     binary: bool,
 }
 
-fn bounded_git_diff(worktree: &Path, args: &[&str], path: &OsStr) -> Result<BoundedDiff, String> {
-    let mut command = review_git_command(worktree);
-    command
-        .args(args)
-        .arg("--")
-        .arg(path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    // This worker owns the child and always reaps it with `wait()` below; it
-    // needs the live stdout handle so oversized diffs can be killed at the cap.
-    #[allow(clippy::disallowed_methods)]
-    let mut child = command
-        .spawn()
-        .map_err(|_| "Could not start Git diff".to_string())?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Could not read Git diff".to_string())?;
-    let mut bytes = Vec::with_capacity(MAX_DIFF_BYTES + 1);
-    stdout
-        .by_ref()
-        .take((MAX_DIFF_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "Could not read Git diff".to_string())?;
-    let truncated = bytes.len() > MAX_DIFF_BYTES;
-    if truncated {
-        let _ = child.kill();
-        bytes.truncate(MAX_DIFF_BYTES);
-    }
-    let status = child
-        .wait()
-        .map_err(|_| "Could not finish Git diff".to_string())?;
-    if !status.success() && !truncated {
+fn bounded_git_diff(
+    worktree: &Path,
+    args: &[&str],
+    path: &OsStr,
+    budget: &ReviewBudget,
+) -> Result<BoundedDiff, String> {
+    let output = run_git_bounded(worktree, args, Some(path), MAX_DIFF_BYTES, budget)?;
+    if !output.success && !output.truncated {
         return Err("Git could not produce a file diff".to_string());
     }
+    let bytes = output.bytes;
+    let truncated = output.truncated;
     let binary = bytes.contains(&0)
         || bytes
             .windows("Binary files".len())
@@ -939,48 +1143,132 @@ fn bounded_git_diff(worktree: &Path, args: &[&str], path: &OsStr) -> Result<Boun
     })
 }
 
-fn capture_change_fingerprint(worktree: &Path) -> Result<u64, String> {
+fn capture_change_fingerprint(worktree: &Path, budget: &ReviewBudget) -> Result<u64, String> {
     let mut hasher = DefaultHasher::new();
-    git_bytes(worktree, &["rev-parse", "HEAD"])?.hash(&mut hasher);
+    git_bytes(worktree, &["rev-parse", "HEAD"], budget)?.hash(&mut hasher);
     git_bytes(
         worktree,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        budget,
     )?
     .hash(&mut hasher);
-    git_bytes(worktree, &["diff", "--cached", "--binary"])?.hash(&mut hasher);
-    git_bytes(worktree, &["diff", "--binary"])?.hash(&mut hasher);
+    git_bytes(
+        worktree,
+        &["diff", "--cached", "--raw", "-z", "--no-renames"],
+        budget,
+    )?
+    .hash(&mut hasher);
+    git_bytes(worktree, &["diff", "--raw", "-z", "--no-renames"], budget)?.hash(&mut hasher);
     Ok(hasher.finish())
 }
 
-fn git_text(worktree: &Path, args: &[&str]) -> Result<String, String> {
-    String::from_utf8(git_bytes(worktree, args)?)
+fn git_text(worktree: &Path, args: &[&str], budget: &ReviewBudget) -> Result<String, String> {
+    String::from_utf8(git_bytes(worktree, args, budget)?)
         .map_err(|_| "Git returned non-text repository metadata".to_string())
 }
 
-fn git_bytes(worktree: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = review_git_command(worktree)
-        .args(args)
-        .output()
-        .map_err(|_| "Could not start Git".to_string())?;
-    if output.status.success() {
-        Ok(output.stdout)
+fn git_bytes(worktree: &Path, args: &[&str], budget: &ReviewBudget) -> Result<Vec<u8>, String> {
+    let output = run_git_bounded(worktree, args, None, MAX_GIT_METADATA_BYTES, budget)?;
+    if output.truncated {
+        Err(format!(
+            "Git metadata exceeded the {MAX_GIT_METADATA_BYTES} byte review limit"
+        ))
+    } else if output.success {
+        Ok(output.bytes)
     } else {
         Err("Git could not read the selected worktree".to_string())
     }
 }
 
-fn git_bytes_path(worktree: &Path, args: &[&str], path: &OsStr) -> Result<Vec<u8>, String> {
-    let output = review_git_command(worktree)
-        .args(args)
-        .arg("--")
-        .arg(path)
-        .output()
-        .map_err(|_| "Could not start Git".to_string())?;
-    if output.status.success() {
-        Ok(output.stdout)
+fn git_bytes_path(
+    worktree: &Path,
+    args: &[&str],
+    path: &OsStr,
+    budget: &ReviewBudget,
+) -> Result<Vec<u8>, String> {
+    let output = run_git_bounded(worktree, args, Some(path), MAX_GIT_METADATA_BYTES, budget)?;
+    if output.truncated {
+        Err(format!(
+            "Git metadata exceeded the {MAX_GIT_METADATA_BYTES} byte review limit"
+        ))
+    } else if output.success {
+        Ok(output.bytes)
     } else {
         Err("Git could not read the selected worktree".to_string())
     }
+}
+
+struct BoundedGitOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+    success: bool,
+}
+
+fn run_git_bounded(
+    worktree: &Path,
+    args: &[&str],
+    path: Option<&OsStr>,
+    byte_limit: usize,
+    budget: &ReviewBudget,
+) -> Result<BoundedGitOutput, String> {
+    budget.check()?;
+    let mut command = review_git_command(worktree);
+    command.args(args);
+    if let Some(path) = path {
+        command.arg("--").arg(path);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    // This worker owns the child, closes its bounded pipe, and always waits.
+    #[allow(clippy::disallowed_methods)]
+    let mut child = command
+        .spawn()
+        .map_err(|_| "Could not start Git".to_string())?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("Could not read Git output".to_string());
+    };
+    let (reader_tx, reader_rx) = mpsc::sync_channel(1);
+    let _reader = thread::spawn(move || {
+        let mut bytes = Vec::with_capacity(byte_limit.min(64 * 1024).saturating_add(1));
+        let result = stdout
+            .take(byte_limit.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = reader_tx.send(result);
+    });
+
+    let status = loop {
+        match child.try_wait() {
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader_rx.recv_timeout(Duration::from_millis(100));
+                return Err("Could not poll Git".to_string());
+            }
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if let Err(error) = budget.check() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader_rx.recv_timeout(Duration::from_millis(100));
+                    return Err(error);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    };
+    let mut bytes = reader_rx
+        .recv_timeout(Duration::from_millis(250))
+        .map_err(|_| "Git output reader did not finish".to_string())?
+        .map_err(|_| "Could not read Git output".to_string())?;
+    let truncated = bytes.len() > byte_limit;
+    bytes.truncate(byte_limit);
+    Ok(BoundedGitOutput {
+        bytes,
+        truncated,
+        success: status.success(),
+    })
 }
 
 fn review_git_command(worktree: &Path) -> Command {
@@ -990,17 +1278,16 @@ fn review_git_command(worktree: &Path) -> Command {
     command
 }
 
-fn hash_worktree_content(path: &Path, hasher: &mut DefaultHasher) -> Result<(), String> {
+fn hash_worktree_content(
+    path: &Path,
+    hasher: &mut DefaultHasher,
+    budget: &ReviewBudget,
+) -> Result<(), String> {
+    budget.check()?;
     let Ok(metadata) = path.symlink_metadata() else {
         return Ok(());
     };
-    metadata.file_type().is_symlink().hash(hasher);
-    metadata.len().hash(hasher);
-    metadata.ino().hash(hasher);
-    metadata.mtime().hash(hasher);
-    metadata.mtime_nsec().hash(hasher);
-    metadata.ctime().hash(hasher);
-    metadata.ctime_nsec().hash(hasher);
+    hash_file_metadata(&metadata, hasher);
     if metadata.file_type().is_symlink() {
         return Ok(());
     }
@@ -1011,6 +1298,7 @@ fn hash_worktree_content(path: &Path, hasher: &mut DefaultHasher) -> Result<(), 
         .map_err(|_| "Could not fingerprint a changed file".to_string())?;
     let mut buffer = [0_u8; CONTENT_FINGERPRINT_CHUNK_BYTES];
     for offset in content_fingerprint_offsets(metadata.len()) {
+        budget.check()?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|_| "Could not fingerprint a changed file".to_string())?;
         let read = file
@@ -1022,15 +1310,32 @@ fn hash_worktree_content(path: &Path, hasher: &mut DefaultHasher) -> Result<(), 
     let after = file
         .metadata()
         .map_err(|_| "Could not fingerprint a changed file".to_string())?;
-    if metadata.len() != after.len()
-        || metadata.mtime() != after.mtime()
-        || metadata.mtime_nsec() != after.mtime_nsec()
-        || metadata.ctime() != after.ctime()
-        || metadata.ctime_nsec() != after.ctime_nsec()
-    {
+    if !same_file_metadata(&metadata, &after) {
         return Err(SNAPSHOT_CHANGED_MESSAGE.to_string());
     }
     Ok(())
+}
+
+fn hash_file_metadata(metadata: &std::fs::Metadata, hasher: &mut DefaultHasher) {
+    metadata.file_type().is_symlink().hash(hasher);
+    metadata.len().hash(hasher);
+    metadata.ino().hash(hasher);
+    metadata.mtime().hash(hasher);
+    metadata.mtime_nsec().hash(hasher);
+    metadata.ctime().hash(hasher);
+    metadata.ctime_nsec().hash(hasher);
+}
+
+fn same_file_metadata(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    before.file_type().is_file() == after.file_type().is_file()
+        && before.file_type().is_dir() == after.file_type().is_dir()
+        && before.file_type().is_symlink() == after.file_type().is_symlink()
+        && before.len() == after.len()
+        && before.ino() == after.ino()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
 }
 
 fn content_fingerprint_offsets(length: u64) -> Vec<u64> {
@@ -1220,6 +1525,34 @@ mod tests {
     }
 
     #[test]
+    fn same_size_untracked_edit_recollects_rendered_bytes_and_invalidates_viewed_key() {
+        let repo = TempRepo::new("untracked-recollect");
+        let path = repo.0.join("untracked.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let before = collect_review(repo.selection("untracked-recollect")).unwrap();
+        let before_file = before
+            .files
+            .iter()
+            .find(|file| file.path == b"untracked.txt")
+            .unwrap();
+        let before_key = viewed_key(before.repository.as_ref().unwrap(), before_file);
+
+        std::fs::write(&path, "two\n").unwrap();
+        let after = collect_review(repo.selection("untracked-recollect")).unwrap();
+        let after_file = after
+            .files
+            .iter()
+            .find(|file| file.path == b"untracked.txt")
+            .unwrap();
+
+        assert!(after_file.diff.contains("two"));
+        assert_ne!(
+            before_key,
+            viewed_key(after.repository.as_ref().unwrap(), after_file)
+        );
+    }
+
+    #[test]
     fn branch_or_base_revision_change_invalidates_viewed_marker() {
         let repo = TempRepo::new("branch");
         std::fs::write(repo.0.join("tracked.txt"), "two\n").unwrap();
@@ -1357,6 +1690,127 @@ mod tests {
             offsets.last(),
             Some(&(length - CONTENT_FINGERPRINT_CHUNK_BYTES as u64))
         );
+    }
+
+    #[test]
+    fn changed_file_collection_truncates_before_per_file_work() {
+        let repo = TempRepo::new("many-files");
+        let bulk = repo.0.join("bulk");
+        std::fs::create_dir_all(&bulk).unwrap();
+        for index in 0..320 {
+            std::fs::write(bulk.join(format!("{index:03}.txt")), "changed\n").unwrap();
+        }
+
+        let snapshot = collect_review(repo.selection("many-files")).unwrap();
+
+        assert_eq!(snapshot.files.len(), MAX_FILES);
+        assert_eq!(snapshot.truncated_files, 70);
+        assert_eq!(snapshot.files[0].path, b"bulk/000.txt");
+        assert_eq!(snapshot.files[MAX_FILES - 1].path, b"bulk/249.txt");
+    }
+
+    #[test]
+    fn large_tracked_binary_and_text_diffs_stay_bounded_without_hiding_other_files() {
+        let repo = TempRepo::new("large-tracked");
+        let binary = repo.0.join("large.bin");
+        let text = repo.0.join("large.txt");
+        let mut binary_file = std::fs::File::create(&binary).unwrap();
+        binary_file.set_len(20 * 1024 * 1024).unwrap();
+        binary_file.seek(SeekFrom::Start(10 * 1024 * 1024)).unwrap();
+        std::io::Write::write_all(&mut binary_file, &[0, 1, 2, 3]).unwrap();
+        std::fs::write(&text, vec![b'a'; 1024 * 1024 + 128]).unwrap();
+        run(&repo.0, &["add", "large.bin", "large.txt"]);
+        run(&repo.0, &["commit", "-m", "large baselines"]);
+
+        let mut binary_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&binary)
+            .unwrap();
+        binary_file.seek(SeekFrom::Start(10 * 1024 * 1024)).unwrap();
+        std::io::Write::write_all(&mut binary_file, &[0, 4, 5, 6]).unwrap();
+        std::fs::write(&text, vec![b'b'; 1024 * 1024 + 128]).unwrap();
+        std::fs::write(repo.0.join("small.txt"), "still visible\n").unwrap();
+
+        let snapshot = collect_review(repo.selection("large-tracked")).unwrap();
+        let binary = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == b"large.bin")
+            .unwrap();
+        let text = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == b"large.txt")
+            .unwrap();
+        assert_eq!(binary.kind, FileKind::Binary);
+        assert_eq!(text.kind, FileKind::Oversized);
+        assert!(text.diff.contains("diff truncated at 32768 bytes"));
+        assert!(snapshot.files.iter().any(|file| file.path == b"small.txt"));
+    }
+
+    #[test]
+    fn cancelled_collection_stops_before_git_work() {
+        let repo = TempRepo::new("cancelled");
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let error =
+            collect_review_with_budget(repo.selection("cancelled"), ReviewBudget::new(cancelled))
+                .unwrap_err();
+        assert_eq!(error, "Review refresh was superseded");
+    }
+
+    #[test]
+    fn forge_projection_requires_exact_review_checkout_branch_and_head() {
+        let repo = TempRepo::new("forge-identity");
+        let snapshot = collect_review(repo.selection("forge-identity")).unwrap();
+        let repository = snapshot.repository.as_ref().unwrap();
+        let exact = ReviewForgeProjection {
+            summary: "PR #29 · open".into(),
+            detail: "verified".into(),
+            url: Some("https://github.com/owner/repo/pull/29".into()),
+            identity: Some(ReviewForgeIdentity {
+                checkout_root: repository.worktree.clone(),
+                branch: repository.branch.clone(),
+                head_revision: Some(repository.head_revision.clone()),
+                remote: false,
+            }),
+        };
+        assert_eq!(
+            validated_forge_projection(&exact, Some(repository)).url,
+            exact.url
+        );
+
+        let mut mismatched = exact.clone();
+        mismatched.identity.as_mut().unwrap().checkout_root = PathBuf::from("/tmp/other-worktree");
+        let projected = validated_forge_projection(&mismatched, Some(repository));
+        assert_eq!(
+            projected.summary,
+            "PR association is for a different checkout"
+        );
+        assert_eq!(projected.url, None);
+
+        mismatched.identity.as_mut().unwrap().checkout_root = repository.worktree.clone();
+        mismatched.identity.as_mut().unwrap().branch = "other-branch".into();
+        assert_eq!(
+            validated_forge_projection(&mismatched, Some(repository)).url,
+            None
+        );
+
+        mismatched.identity.as_mut().unwrap().branch = repository.branch.clone();
+        mismatched.identity.as_mut().unwrap().head_revision = Some("f".repeat(40));
+        assert_eq!(
+            validated_forge_projection(&mismatched, Some(repository)).url,
+            None
+        );
+
+        mismatched.identity.as_mut().unwrap().head_revision = None;
+        assert!(validated_forge_projection(&mismatched, Some(repository))
+            .summary
+            .contains("HEAD unverified"));
+
+        mismatched.identity.as_mut().unwrap().remote = true;
+        assert!(validated_forge_projection(&mismatched, Some(repository))
+            .summary
+            .contains("remote pane"));
     }
 
     #[test]
