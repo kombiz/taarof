@@ -353,11 +353,18 @@ or treated as a normally disabled history store.
 
 | Key | Type | Default | Accepted values | Effect |
 | --- | --- | --- | --- | --- |
-| `visible` | Boolean | `false` | `true`, `false` | Shows the right-hand Session/Agents/Tasks dock at startup. |
+| `visible` | Boolean | `false` | `true`, `false` | Shows the right-hand Session/Agents/Tasks/Review dock at startup. |
 
 Use the keybindable `toggle-dock` action or **Toggle Right Dock** in the command
 palette to change visibility for the current run. The runtime toggle does not
 rewrite `config.toml`; a live config reload reapplies `dock.visible`.
+
+The Review view is always available in the dock. It reads the selected local
+workspace on a bounded worker and pins each result to the machine, repository,
+worktree, branch, base revision, HEAD revision, and uncommitted content. It
+shows bounded file diffs and exact-content viewed markers. Missing repositories,
+ambiguous or unavailable forge identity, absent PRs/checks, and moved PR heads
+remain explicit. The view does not commit, approve, merge, or change task state.
 
 ### `[tasks]`
 

@@ -1940,6 +1940,7 @@ fn task_bound_work_report_socket_roundtrip_is_scoped_and_observational() {
             review_decision: None,
             url: Some("https://github.com/owner/repo/pull/112".into()),
             head_ref_name: "agent/EXAMPLE-112".into(),
+            head_ref_oid: None,
             head_repository_owner: "owner".into(),
             base_ref_name: "main".into(),
             updated_at: None,

@@ -134,6 +134,7 @@ pub struct BranchPullRequestEntry {
     pub review_decision: Option<String>,
     pub url: Option<String>,
     pub head_ref_name: String,
+    pub head_ref_oid: Option<String>,
     pub head_repository_owner: String,
     pub base_ref_name: String,
     pub updated_at: Option<String>,
@@ -432,6 +433,8 @@ struct RawBranchPullRequest {
     url: Option<String>,
     #[serde(default)]
     head_ref_name: String,
+    #[serde(default)]
+    head_ref_oid: Option<String>,
     #[serde(default)]
     head_repository_owner: serde_json::Value,
     #[serde(default)]
@@ -783,6 +786,14 @@ impl BranchPullRequestsData {
                     .filter(|value| !value.is_empty())
                     .map(str::to_string),
                 head_ref_name: pr.head_ref_name.trim().to_string(),
+                head_ref_oid: pr
+                    .head_ref_oid
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| {
+                        value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+                    })
+                    .map(str::to_string),
                 head_repository_owner,
                 base_ref_name: pr.base_ref_name.trim().to_string(),
                 updated_at: pr
@@ -856,7 +867,7 @@ pub fn branch_pull_requests_command(base_repository: &str, branch: &str) -> Vec<
         "--head".to_string(),
         branch.to_string(),
         "--json".to_string(),
-        "number,title,state,isDraft,url,reviewDecision,updatedAt,headRefName,headRepositoryOwner,baseRefName,body,statusCheckRollup"
+        "number,title,state,isDraft,url,reviewDecision,updatedAt,headRefName,headRefOid,headRepositoryOwner,baseRefName,body,statusCheckRollup"
             .to_string(),
         "--limit".to_string(),
         PULL_REQUEST_QUERY_LIMIT.to_string(),
@@ -1824,7 +1835,7 @@ mod tests {
                 "--head",
                 "feature/task-panel",
                 "--json",
-                "number,title,state,isDraft,url,reviewDecision,updatedAt,headRefName,headRepositoryOwner,baseRefName,body,statusCheckRollup",
+                "number,title,state,isDraft,url,reviewDecision,updatedAt,headRefName,headRefOid,headRepositoryOwner,baseRefName,body,statusCheckRollup",
                 "--limit",
                 "1000",
             ]
@@ -2251,6 +2262,7 @@ mod tests {
           "reviewDecision": "APPROVED",
           "url": "https://github.com/Example-Org/Example-Repo/pull/321",
           "headRefName": "agent/EXAMPLE-113-task-pr-correlation",
+          "headRefOid": "1111111111111111111111111111111111111111",
           "headRepositoryOwner": {"login":"Example-Org"},
           "baseRefName": "main",
           "updatedAt": "2026-07-14T12:00:00Z",
@@ -2264,6 +2276,10 @@ mod tests {
         let data = BranchPullRequestsData::from_gh_json_str(json).unwrap();
         let pr = &data.pull_requests[0];
         assert_eq!(pr.checks, PullRequestChecks::Ready);
+        assert_eq!(
+            pr.head_ref_oid.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
         assert_eq!(pr.correlation.as_ref().unwrap().task_id, "EXAMPLE-113");
         assert_eq!(
             pr.correlation.as_ref().unwrap().repo,
@@ -2317,6 +2333,7 @@ mod tests {
                 review_decision: None,
                 url: Some(format!("https://github.com/owner/repo/pull/{number}")),
                 head_ref_name: "agent/work".into(),
+                head_ref_oid: None,
                 head_repository_owner: "owner".into(),
                 base_ref_name: "main".into(),
                 updated_at: None,
@@ -2522,6 +2539,7 @@ mod tests {
                 review_decision: None,
                 url: Some(format!("https://github.com/owner/repo/pull/{number}")),
                 head_ref_name: "agent/work".into(),
+                head_ref_oid: None,
                 head_repository_owner: "owner".into(),
                 base_ref_name: "main".into(),
                 updated_at: None,

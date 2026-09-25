@@ -44,6 +44,7 @@ struct PullRequestKey {
     base_repository: String,
     head_owner: String,
     branch: String,
+    head_revision: Option<String>,
 }
 
 impl PullRequestKey {
@@ -54,6 +55,7 @@ impl PullRequestKey {
             base_repository: base_repository.to_ascii_lowercase(),
             head_owner: head_owner.to_ascii_lowercase(),
             branch: branch.to_string(),
+            head_revision: None,
         }
     }
 
@@ -65,7 +67,16 @@ impl PullRequestKey {
             &target.branch,
         );
         key.remote_connection = target.remote_connection.clone();
+        key.head_revision.clone_from(&target.head_revision);
         key
+    }
+
+    fn same_branch_identity(&self, other: &Self) -> bool {
+        self.checkout_root == other.checkout_root
+            && self.remote_connection == other.remote_connection
+            && self.base_repository == other.base_repository
+            && self.head_owner == other.head_owner
+            && self.branch == other.branch
     }
 }
 
@@ -132,9 +143,16 @@ fn record_pull_request_fetch(
     cache: &mut HashMap<PullRequestKey, PullRequestsEntry>,
     key: PullRequestKey,
     result: Result<BranchPullRequestsData, String>,
+    request_started_at_ms: u64,
     fetched_at_ms: u64,
 ) {
     let previous = cache.remove(&key);
+    // A fetch for an older HEAD can finish after a newer revision's fetch.
+    // Keep sibling entries that completed after this request started so the
+    // stale completion cannot evict the current revision's verified result.
+    cache.retain(|existing, entry| {
+        !existing.same_branch_identity(&key) || entry.fetched_at_ms >= request_started_at_ms
+    });
     let entry = match result {
         Ok(data) => PullRequestsEntry {
             fetched_at_ms,
@@ -188,6 +206,7 @@ enum TaskPanelMode {
     Agents,
     Tasks,
     PullRequests,
+    Review,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +235,18 @@ fn task_panel_runtime_policy(tasks_enabled: bool) -> TaskPanelRuntimePolicy {
         load_task_sources: tasks_enabled,
         install_task_poll: tasks_enabled,
     }
+}
+
+fn loads_task_snapshot(tasks_enabled: bool, mode: TaskPanelMode) -> bool {
+    tasks_enabled && matches!(mode, TaskPanelMode::Tasks | TaskPanelMode::Review)
+}
+
+fn resolves_local_pull_request_identity(
+    tasks_enabled: bool,
+    pull_request_mode_enabled: bool,
+    mode: TaskPanelMode,
+) -> bool {
+    mode == TaskPanelMode::Review || (tasks_enabled && pull_request_mode_enabled)
 }
 
 impl TaskPanelModeSelection {
@@ -259,6 +290,10 @@ impl TaskPanelModeSelection {
             self.global_mode = Some(mode);
             return;
         }
+        if matches!(intent, TaskPanelIntent::Select(TaskPanelMode::Review)) {
+            self.global_mode = Some(TaskPanelMode::Review);
+            return;
+        }
         if !self.tasks_enabled {
             return;
         }
@@ -291,6 +326,7 @@ impl From<TaskPanelDefaultView> for TaskPanelMode {
 struct PullRequestTarget {
     checkout_root: PathBuf,
     branch: String,
+    head_revision: Option<String>,
     head_repository: String,
     base_repository: String,
     head_owner: String,
@@ -335,6 +371,7 @@ struct LocalPullRequestProbeRequest {
 struct LocalPullRequestProbeResult {
     checkout_root: PathBuf,
     branch: String,
+    head_revision: Option<String>,
     repositories: crate::git::GitHubRepositoryIdentities,
     bound_task: Option<PullRequestBoundTask>,
     loop_runner_availability: Option<LoopRunnerAvailability>,
@@ -404,6 +441,26 @@ struct TaskPanelViewContext {
     show_pull_requests: bool,
     remote_target: Option<RemoteTaskTarget>,
     pull_request_target: Option<PullRequestTarget>,
+    local_pull_request_identity_checking: bool,
+}
+
+fn task_panel_context_without_task_sources(
+    mode: TaskPanelMode,
+    pull_request_target: Option<PullRequestTarget>,
+    local_pull_request_identity_checking: bool,
+) -> TaskPanelViewContext {
+    TaskPanelViewContext {
+        mode: match mode {
+            TaskPanelMode::Agents => TaskPanelMode::Agents,
+            TaskPanelMode::Review => TaskPanelMode::Review,
+            _ => TaskPanelMode::Session,
+        },
+        show_task_modes: false,
+        show_pull_requests: false,
+        remote_target: None,
+        pull_request_target,
+        local_pull_request_identity_checking,
+    }
 }
 
 use crate::agent_projection::{project_all_agent_panes, AgentPaneProjection};
@@ -520,6 +577,7 @@ pub struct TaskPanel {
     agents_list: gtk::ListBox,
     agents_empty: gtk::Label,
     task_content: gtk::Box,
+    review_panel: crate::review::ReviewPanel,
     revealer: gtk::Revealer,
     title: gtk::Label,
     chevron: gtk::Label,
@@ -539,6 +597,7 @@ pub struct TaskPanel {
     agents_button: gtk::ToggleButton,
     tasks_button: gtk::ToggleButton,
     pull_requests_button: gtk::ToggleButton,
+    review_button: gtk::ToggleButton,
     expanded: Rc<Cell<bool>>,
     tasks_enabled: bool,
     pull_request_mode_enabled: bool,
@@ -839,11 +898,15 @@ pub fn build_task_panel(
     pull_requests_button.add_css_class("task-panel-mode-button");
     pull_requests_button.set_group(Some(&tasks_button));
     pull_requests_button.set_visible(tasks_config.enabled && tasks_config.pull_requests);
+    let review_button = gtk::ToggleButton::with_label("Review");
+    review_button.add_css_class("task-panel-mode-button");
+    review_button.set_group(Some(&pull_requests_button));
     if tasks_config.enabled {
         match default_mode {
             TaskPanelMode::Session | TaskPanelMode::Agents => session_button.set_active(true),
             TaskPanelMode::Tasks => tasks_button.set_active(true),
             TaskPanelMode::PullRequests => pull_requests_button.set_active(true),
+            TaskPanelMode::Review => review_button.set_active(true),
         }
     } else {
         session_button.set_active(true);
@@ -852,6 +915,7 @@ pub fn build_task_panel(
     mode_switch.append(&agents_button);
     mode_switch.append(&tasks_button);
     mode_switch.append(&pull_requests_button);
+    mode_switch.append(&review_button);
     body.append(&mode_switch);
 
     let session_content = crate::sidebar::build_session_work_panel(
@@ -896,6 +960,8 @@ pub fn build_task_panel(
     body.append(&session_content);
     body.append(&agents_content);
     body.append(&task_content);
+    let review_panel = crate::review::build_review_panel();
+    body.append(&review_panel.container);
 
     let current_task_card = gtk::Box::new(gtk::Orientation::Vertical, 6);
     current_task_card.add_css_class("task-panel-row");
@@ -978,6 +1044,7 @@ pub fn build_task_panel(
         agents_list,
         agents_empty,
         task_content,
+        review_panel,
         revealer,
         title,
         chevron,
@@ -997,6 +1064,7 @@ pub fn build_task_panel(
         agents_button,
         tasks_button,
         pull_requests_button,
+        review_button,
         expanded: Rc::new(Cell::new(true)),
         tasks_enabled: tasks_config.enabled,
         pull_request_mode_enabled: tasks_config.enabled && tasks_config.pull_requests,
@@ -1160,6 +1228,46 @@ pub fn build_task_panel(
         });
     }
 
+    {
+        let panel = panel.clone();
+        let state = state.clone();
+        let tab_list = tab_list.clone();
+        let term_stack = term_stack.clone();
+        let window = window.clone();
+        let button = panel.review_button.clone();
+        button.connect_toggled(move |button| {
+            if button.is_active() {
+                panel.select_mode_for_active_context(
+                    &state,
+                    &tab_list,
+                    &term_stack,
+                    &window,
+                    TaskPanelIntent::Select(TaskPanelMode::Review),
+                );
+            }
+        });
+    }
+
+    {
+        let panel = panel.clone();
+        let state = state.clone();
+        let tab_list = tab_list.clone();
+        let term_stack_for_refresh = term_stack.clone();
+        let window = window.clone();
+        let review_button = panel.review_button.clone();
+        term_stack.connect_visible_child_notify(move |_| {
+            if review_button.is_active() {
+                schedule_task_panel_refresh(
+                    &panel,
+                    &state,
+                    &tab_list,
+                    &term_stack_for_refresh,
+                    &window,
+                );
+            }
+        });
+    }
+
     if runtime_policy.install_task_poll {
         let panel = panel.clone();
         let state = state.clone();
@@ -1241,7 +1349,7 @@ impl TaskPanel {
         window: &adw::ApplicationWindow,
     ) {
         let agent_count = self.refresh_agent_cards(state, tab_list, term_stack);
-        let context = self.view_context(state);
+        let context = self.view_context(state, tab_list, term_stack, window);
         self.sync_mode_switch(
             context.mode,
             context.show_task_modes,
@@ -1255,12 +1363,20 @@ impl TaskPanel {
             context.mode,
             TaskPanelMode::Tasks | TaskPanelMode::PullRequests
         ));
+        self.review_panel
+            .container
+            .set_visible(context.mode == TaskPanelMode::Review);
         let active_pr_target = context.pull_request_target.clone();
         let active_remote_target = context.remote_target.clone();
-        if context.mode == TaskPanelMode::Tasks && active_remote_target.is_none() {
+        if loads_task_snapshot(self.tasks_enabled, context.mode) && active_remote_target.is_none() {
             self.ensure_local_task_snapshot(state, tab_list, term_stack, window);
         }
-        if self.pull_request_mode_enabled {
+        if context.mode == TaskPanelMode::Review {
+            if let Some(remote) = active_remote_target.as_ref() {
+                self.ensure_remote_fetch(state, tab_list, term_stack, window, remote);
+            }
+        }
+        if self.pull_request_mode_enabled || context.mode == TaskPanelMode::Review {
             if let Some(remote) = active_remote_target.as_ref() {
                 self.ensure_remote_pull_request_identity(
                     state,
@@ -1347,6 +1463,10 @@ impl TaskPanel {
                         self.remote_pull_request_snapshot(remote)
                     }),
             },
+            TaskPanelMode::Review => active_remote_target.as_ref().map_or_else(
+                || self.snapshot_task_panel(state),
+                |target| self.remote_snapshot(target),
+            ),
         };
         next.current_task = self
             .tasks_enabled
@@ -1362,6 +1482,15 @@ impl TaskPanel {
             (next.current_task.as_mut(), active_pr_target.as_ref())
         {
             current.pull_request = self.correlated_current_task_pr(current, target);
+        }
+        if context.mode == TaskPanelMode::Review {
+            let forge = review_forge_projection(
+                active_pr_target.as_ref(),
+                context.local_pull_request_identity_checking,
+                &self.pull_request_cache.borrow(),
+            );
+            let task = review_task_projection(state, &next, active_pr_target.as_ref());
+            self.review_panel.refresh(state, forge, task);
         }
         {
             let st = state.borrow();
@@ -1600,6 +1729,7 @@ impl TaskPanel {
         Some(PullRequestTarget {
             checkout_root: PathBuf::from(&identity.checkout_root),
             branch: identity.branch.clone(),
+            head_revision: None,
             head_repository: identity.head_repository.clone(),
             base_repository: identity.base_repository.clone(),
             head_owner: identity.head_owner.clone(),
@@ -1614,7 +1744,14 @@ impl TaskPanel {
         })
     }
 
-    fn ensure_local_pull_request_identity(&self, state: &Rc<RefCell<AppState>>) {
+    fn ensure_local_pull_request_identity(
+        &self,
+        state: &Rc<RefCell<AppState>>,
+        tab_list: &gtk::Box,
+        term_stack: &gtk::Stack,
+        window: &adw::ApplicationWindow,
+        include_task_context: bool,
+    ) {
         let Some(request) = local_pull_request_probe_request(state) else {
             return;
         };
@@ -1642,6 +1779,9 @@ impl TaskPanel {
         let worker_request = request.clone();
         let panel = self.clone();
         let state_for_apply = state.clone();
+        let tab_list_for_apply = tab_list.clone();
+        let term_stack_for_apply = term_stack.clone();
+        let window_for_apply = window.clone();
         let submission = crate::git::spawn_async_result(
             format!(
                 "task-panel-local-pr:{}:{}:{}:{}:{}:{}",
@@ -1652,15 +1792,18 @@ impl TaskPanel {
                 key.candidates.join("\u{1f}"),
                 key.reporting_token.as_deref().unwrap_or("unbound"),
             ),
-            move || Ok(probe_local_pull_request_target(&worker_request)),
+            move || {
+                Ok(probe_local_pull_request_target(
+                    &worker_request,
+                    include_task_context,
+                ))
+            },
             move |result| {
                 panel.local_pull_request_inflight.borrow_mut().remove(&key);
                 // A local path may have changed, a tab may have been restored,
                 // or the binding may have been replaced while the worker was
                 // blocked.  In all those cases, drop rather than apply.
-                if !local_pull_request_probe_request(&state_for_apply)
-                    .is_some_and(|current| current.key == key)
-                {
+                if !local_pull_request_probe_is_current(&state_for_apply, &key) {
                     return;
                 }
                 let result = match result {
@@ -1687,6 +1830,14 @@ impl TaskPanel {
                         fetched_at_ms: now_ms(),
                         result,
                     },
+                );
+                drop(cache);
+                schedule_task_panel_refresh(
+                    &panel,
+                    &state_for_apply,
+                    &tab_list_for_apply,
+                    &term_stack_for_apply,
+                    &window_for_apply,
                 );
             },
         );
@@ -1715,6 +1866,7 @@ impl TaskPanel {
         Some(PullRequestTarget {
             checkout_root: result.checkout_root,
             branch: result.branch,
+            head_revision: result.head_revision,
             head_owner: result.repositories.head.split_once('/')?.0.to_string(),
             head_repository: result.repositories.head,
             base_repository: result.repositories.base,
@@ -1833,26 +1985,56 @@ impl TaskPanel {
         }
     }
 
-    fn view_context(&self, state: &Rc<RefCell<AppState>>) -> TaskPanelViewContext {
+    fn view_context(
+        &self,
+        state: &Rc<RefCell<AppState>>,
+        tab_list: &gtk::Box,
+        term_stack: &gtk::Stack,
+        window: &adw::ApplicationWindow,
+    ) -> TaskPanelViewContext {
         let runtime_policy = task_panel_runtime_policy(self.tasks_enabled);
         if !runtime_policy.load_task_sources {
             let mode = self.mode_selection.borrow().mode_for_context("global");
-            return TaskPanelViewContext {
-                mode: if mode == TaskPanelMode::Agents {
-                    TaskPanelMode::Agents
-                } else {
-                    TaskPanelMode::Session
-                },
-                show_task_modes: false,
-                show_pull_requests: false,
-                remote_target: None,
-                pull_request_target: None,
-            };
+            let review_mode = mode == TaskPanelMode::Review;
+            if review_mode {
+                self.ensure_local_pull_request_identity(state, tab_list, term_stack, window, false);
+            }
+            let pull_request_target = review_mode
+                .then(|| self.cached_local_pull_request_target(state))
+                .flatten();
+            let local_pull_request_identity_checking = review_mode
+                && local_pull_request_probe_request(state).is_some_and(|request| {
+                    self.local_pull_request_inflight
+                        .borrow()
+                        .contains(&request.key)
+                });
+            return task_panel_context_without_task_sources(
+                mode,
+                pull_request_target,
+                local_pull_request_identity_checking,
+            );
         }
 
         let remote_target = remote_task_target(state);
-        if remote_target.is_none() && self.pull_request_mode_enabled {
-            self.ensure_local_pull_request_identity(state);
+        let preliminary_key = active_mode_key(state, None, remote_target.as_ref());
+        let preliminary_mode = self
+            .mode_selection
+            .borrow()
+            .mode_for_context(&preliminary_key);
+        if remote_target.is_none()
+            && resolves_local_pull_request_identity(
+                self.tasks_enabled,
+                self.pull_request_mode_enabled,
+                preliminary_mode,
+            )
+        {
+            self.ensure_local_pull_request_identity(
+                state,
+                tab_list,
+                term_stack,
+                window,
+                self.tasks_enabled,
+            );
         }
         let pull_request_target = remote_target
             .as_ref()
@@ -1865,10 +2047,16 @@ impl TaskPanel {
             });
         let mode_key = active_mode_key(state, pull_request_target.as_ref(), remote_target.as_ref());
         let selected_mode = self.mode_selection.borrow().mode_for_context(&mode_key);
+        let local_pull_request_identity_checking = remote_target.is_none()
+            && local_pull_request_probe_request(state).is_some_and(|request| {
+                self.local_pull_request_inflight
+                    .borrow()
+                    .contains(&request.key)
+            });
 
         if matches!(
             selected_mode,
-            TaskPanelMode::Session | TaskPanelMode::Agents
+            TaskPanelMode::Session | TaskPanelMode::Agents | TaskPanelMode::Review
         ) || !self.tasks_enabled
         {
             return TaskPanelViewContext {
@@ -1877,6 +2065,7 @@ impl TaskPanel {
                 show_pull_requests: self.pull_request_mode_enabled,
                 remote_target,
                 pull_request_target,
+                local_pull_request_identity_checking,
             };
         }
 
@@ -1887,6 +2076,7 @@ impl TaskPanel {
                 show_pull_requests: self.pull_request_mode_enabled,
                 remote_target,
                 pull_request_target,
+                local_pull_request_identity_checking,
             };
         }
 
@@ -1896,6 +2086,7 @@ impl TaskPanel {
             show_pull_requests: self.pull_request_mode_enabled,
             remote_target: None,
             pull_request_target,
+            local_pull_request_identity_checking,
         }
     }
 
@@ -1913,7 +2104,9 @@ impl TaskPanel {
         if !self.tasks_enabled
             && !matches!(
                 intent,
-                TaskPanelIntent::Select(TaskPanelMode::Session | TaskPanelMode::Agents)
+                TaskPanelIntent::Select(
+                    TaskPanelMode::Session | TaskPanelMode::Agents | TaskPanelMode::Review
+                )
             )
         {
             return;
@@ -1924,8 +2117,17 @@ impl TaskPanel {
             return;
         }
         let remote_target = remote_task_target(state);
-        if remote_target.is_none() && self.pull_request_mode_enabled {
-            self.ensure_local_pull_request_identity(state);
+        if remote_target.is_none()
+            && (self.pull_request_mode_enabled
+                || matches!(intent, TaskPanelIntent::Select(TaskPanelMode::Review)))
+        {
+            self.ensure_local_pull_request_identity(
+                state,
+                tab_list,
+                term_stack,
+                window,
+                self.tasks_enabled,
+            );
         }
         let target = remote_target
             .as_ref()
@@ -1959,6 +2161,7 @@ impl TaskPanel {
             TaskPanelMode::Agents => "Agent Activity",
             TaskPanelMode::Tasks => "Tasks",
             TaskPanelMode::PullRequests => "Pull Requests",
+            TaskPanelMode::Review => "Review",
         });
         self.syncing_mode_switch.set(true);
         match mode {
@@ -1966,6 +2169,7 @@ impl TaskPanel {
             TaskPanelMode::Agents => self.agents_button.set_active(true),
             TaskPanelMode::Tasks => self.tasks_button.set_active(true),
             TaskPanelMode::PullRequests => self.pull_requests_button.set_active(true),
+            TaskPanelMode::Review => self.review_button.set_active(true),
         }
         self.syncing_mode_switch.set(false);
     }
@@ -2246,7 +2450,7 @@ impl TaskPanel {
             let verified_for_ledger = result.as_ref().ok().cloned();
 
             let active_key = panel
-                .view_context(&state)
+                .view_context(&state, &tab_list, &term_stack, &window)
                 .pull_request_target
                 .as_ref()
                 .map(PullRequestKey::for_target);
@@ -2269,6 +2473,7 @@ impl TaskPanel {
                 &mut panel.pull_request_cache.borrow_mut(),
                 key.clone(),
                 result,
+                now,
                 now_ms(),
             );
             let current_local_target = (!remote)
@@ -2353,7 +2558,7 @@ impl TaskPanel {
             }
         }
 
-        self.ensure_local_pull_request_identity(state);
+        self.ensure_local_pull_request_identity(state, tab_list, term_stack, window, true);
         let Some(target) = self
             .cached_local_pull_request_target(state)
             .filter(|target| target.pane_identity.tab_id == tab_id)
@@ -2939,18 +3144,30 @@ fn local_pull_request_probe_request(
     })
 }
 
+fn local_pull_request_probe_is_current(
+    state: &Rc<RefCell<AppState>>,
+    key: &LocalPullRequestProbeKey,
+) -> bool {
+    local_pull_request_probe_request(state).is_some_and(|current| current.key == *key)
+}
+
 /// Blocking half of local pull-request discovery.  It is called only by the
 /// bounded Git worker; state identity is captured before spawn and rechecked
 /// by the GTK apply phase.
 fn probe_local_pull_request_target(
     request: &LocalPullRequestProbeRequest,
+    include_task_context: bool,
 ) -> Option<LocalPullRequestProbeResult> {
-    let status = crate::task_binding::current_task_status(
-        Some(&request.key.cwd),
-        None,
-        false,
-        request.binding.as_ref(),
-    );
+    let status = include_task_context
+        .then(|| {
+            crate::task_binding::current_task_status(
+                Some(&request.key.cwd),
+                None,
+                false,
+                request.binding.as_ref(),
+            )
+        })
+        .flatten();
     let pinned = status
         .as_ref()
         .filter(|status| status.resolved)
@@ -2963,6 +3180,7 @@ fn probe_local_pull_request_target(
         .map(str::trim)
         .filter(|value| !value.is_empty())?
         .to_string();
+    let head_revision = local_head_revision(&checkout_root);
     let repositories = crate::git::github_repository_identities(&checkout_root)?;
     let bound_task = status.filter(|status| status.resolved).and_then(|status| {
         let binding = request.binding.as_ref()?;
@@ -2973,10 +3191,13 @@ fn probe_local_pull_request_target(
             reporting_token: binding.reporting_token.clone(),
         })
     });
-    let loop_runner_availability = loop_runner_availability(Some(&checkout_root));
+    let loop_runner_availability = include_task_context
+        .then(|| loop_runner_availability(Some(&checkout_root)))
+        .flatten();
     Some(LocalPullRequestProbeResult {
         checkout_root,
         branch,
+        head_revision,
         repositories,
         bound_task,
         loop_runner_availability,
@@ -3187,6 +3408,7 @@ fn pull_request_target_for_tab(
         .filter(|value| !value.is_empty())?
         .to_string();
     let repositories = crate::git::github_repository_identities(&checkout_root)?;
+    let head_revision = local_head_revision(&checkout_root);
     let head_owner = repositories.head.split_once('/')?.0.to_string();
     let pane_identity = crate::work_ledger::identity_for_pane(&st, tab_id, pane_id, binding)?;
     let bound_task = status.filter(|status| status.resolved).and_then(|status| {
@@ -3201,6 +3423,7 @@ fn pull_request_target_for_tab(
     Some(PullRequestTarget {
         checkout_root,
         branch,
+        head_revision,
         head_repository: repositories.head,
         base_repository: repositories.base,
         head_owner,
@@ -3209,6 +3432,29 @@ fn pull_request_target_for_tab(
         bound_task,
         loop_runner_availability: None,
     })
+}
+
+fn local_head_revision(checkout_root: &Path) -> Option<String> {
+    let output = local_head_revision_command(checkout_root).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|revision| revision.trim().to_string())
+        .filter(|revision| {
+            revision.len() == 40 && revision.chars().all(|ch| ch.is_ascii_hexdigit())
+        })
+}
+
+fn local_head_revision_command(checkout_root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(checkout_root)
+        .arg("--no-optional-locks")
+        .args(["rev-parse", "HEAD"]);
+    crate::child_env::prepare_child_command(&mut command, &[]);
+    command
 }
 
 fn verify_pull_request_bound_task(bound: PullRequestBoundTask) -> Option<PullRequestBoundTask> {
@@ -3226,6 +3472,185 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn review_forge_projection(
+    target: Option<&PullRequestTarget>,
+    identity_checking: bool,
+    cache: &HashMap<PullRequestKey, PullRequestsEntry>,
+) -> crate::review::ReviewForgeProjection {
+    let Some(target) = target else {
+        if identity_checking {
+            return crate::review::ReviewForgeProjection {
+                summary: "Checking repository and PR identity…".to_string(),
+                detail: "Reading the selected worktree's repository, branch, and HEAD before querying the forge."
+                    .to_string(),
+                url: None,
+                identity: None,
+            };
+        }
+        return crate::review::ReviewForgeProjection {
+            summary: "PR association unavailable".to_string(),
+            detail: "Repository, branch, or forge identity is unavailable or ambiguous."
+                .to_string(),
+            url: None,
+            identity: None,
+        };
+    };
+    let identity = Some(crate::review::ReviewForgeIdentity {
+        checkout_root: target.checkout_root.clone(),
+        branch: target.branch.clone(),
+        head_revision: target.head_revision.clone(),
+        remote: target.remote_connection.is_some(),
+    });
+    let Some(entry) = cache.get(&PullRequestKey::for_target(target)) else {
+        return crate::review::ReviewForgeProjection {
+            summary: "Checking for an associated PR…".to_string(),
+            detail: format!(
+                "{} · {} · local HEAD {}",
+                target.base_repository,
+                target.branch,
+                target
+                    .head_revision
+                    .as_deref()
+                    .map(short_revision)
+                    .unwrap_or("unavailable")
+            ),
+            url: None,
+            identity: identity.clone(),
+        };
+    };
+    let freshness = entry.verified_at_ms.map_or_else(
+        || "PR/check data never fetched".to_string(),
+        |verified| {
+            format!(
+                "PR/check data fetched {}s ago",
+                now_ms().saturating_sub(verified) / 1_000
+            )
+        },
+    );
+    let Some(data) = entry.verified.as_ref() else {
+        return crate::review::ReviewForgeProjection {
+            summary: "Forge unavailable".to_string(),
+            detail: entry
+                .error
+                .clone()
+                .unwrap_or_else(|| "No verified GitHub result is available.".to_string()),
+            url: None,
+            identity: identity.clone(),
+        };
+    };
+    if data.pull_requests.is_empty() {
+        return crate::review::ReviewForgeProjection {
+            summary: "No PR for this exact branch".to_string(),
+            detail: format!(
+                "{}:{} · {freshness}{}",
+                target.head_owner,
+                target.branch,
+                entry
+                    .error
+                    .as_deref()
+                    .map(|error| format!(" · latest refresh failed: {error}"))
+                    .unwrap_or_default()
+            ),
+            url: None,
+            identity: identity.clone(),
+        };
+    }
+    if data.pull_requests.len() != 1 {
+        return crate::review::ReviewForgeProjection {
+            summary: format!(
+                "Ambiguous: {} PRs match this branch",
+                data.pull_requests.len()
+            ),
+            detail: format!("{}:{} · {freshness}", target.head_owner, target.branch),
+            url: None,
+            identity: identity.clone(),
+        };
+    }
+    let pr = &data.pull_requests[0];
+    let local_head = target.head_revision.as_deref();
+    let remote_head = pr.head_ref_oid.as_deref();
+    let exact_revision = local_head.is_some() && local_head == remote_head;
+    let check = match pr.checks {
+        crate::tracking::PullRequestChecks::None => "checks absent",
+        crate::tracking::PullRequestChecks::Pending => "checks pending",
+        crate::tracking::PullRequestChecks::Failed => "checks failed",
+        crate::tracking::PullRequestChecks::Ready => "checks passing",
+    };
+    let review = pr
+        .review_decision
+        .as_deref()
+        .unwrap_or("review not recorded");
+    let stale = entry
+        .error
+        .as_deref()
+        .map(|error| format!(" · stale: latest refresh failed ({error})"))
+        .unwrap_or_default();
+    if !exact_revision {
+        return crate::review::ReviewForgeProjection {
+            summary: format!("PR #{} head does not match this checkout", pr.number),
+            detail: format!(
+                "local {} · PR {} · {check} · {review} · {freshness}{stale}",
+                local_head.map(short_revision).unwrap_or("unavailable"),
+                remote_head.map(short_revision).unwrap_or("unavailable")
+            ),
+            url: pr.url.clone(),
+            identity: identity.clone(),
+        };
+    }
+    crate::review::ReviewForgeProjection {
+        summary: format!("PR #{} · {}", pr.number, pr.status_label()),
+        detail: format!(
+            "head {} · {check} · {review} · {freshness}{stale}",
+            short_revision(local_head.expect("exact revision requires local head"))
+        ),
+        url: pr.url.clone(),
+        identity,
+    }
+}
+
+fn review_task_projection(
+    state: &Rc<RefCell<AppState>>,
+    snapshot: &TaskPanelSnapshot,
+    target: Option<&PullRequestTarget>,
+) -> crate::review::ReviewTaskProjection {
+    let linked = state.try_borrow().ok().and_then(|state| {
+        state
+            .active_ws()
+            .and_then(|workspace| workspace.linked_issue.clone())
+    });
+    let current = snapshot.current_task.as_ref();
+    let label = match (linked.as_deref(), current) {
+        (Some(link), Some(current)) => {
+            format!("Task {link} · {} · {}", current.id, snapshot.progress)
+        }
+        (Some(link), None) => format!("Task {link} · {}", snapshot.progress),
+        (None, Some(current)) => format!("Task {} · {}", current.id, snapshot.progress),
+        (None, None) => format!("No authoritative task link · {}", snapshot.progress),
+    };
+    let url = linked.as_deref().and_then(|value| {
+        if value.starts_with("https://") || value.starts_with("http://") {
+            return Some(value.to_string());
+        }
+        let issue = value.strip_prefix('#').unwrap_or(value);
+        (issue.chars().all(|ch| ch.is_ascii_digit()) && !issue.is_empty()).then(|| {
+            target.map(|target| {
+                format!(
+                    "https://github.com/{}/issues/{issue}",
+                    target.base_repository
+                )
+            })
+        })?
+    });
+    crate::review::ReviewTaskProjection {
+        summary: label,
+        url,
+    }
+}
+
+fn short_revision(revision: &str) -> &str {
+    revision.get(..12).unwrap_or(revision)
 }
 
 /// Assemble a [`TaskPanelSnapshot`] from parsed [`PlanTasksData`]. Shared by the
@@ -4442,26 +4867,30 @@ mod tests {
     use super::{
         active_current_task_summary, aggregate_progress_text, bind_pane_task_mutation,
         build_pull_request_snapshot, classify_local_gh_failure, clear_pane_task_mutation,
-        local_pull_request_cache_result_for_request, local_pull_request_probe_request,
-        local_task_probe_is_current, local_task_probe_request, next_remote_failure_streak,
-        next_remote_git_failure_streak, probe_local_pull_request_target, progress_for_unavailable,
-        project_all_agent_panes, pull_request_discovery_feedback, pull_request_target_for_tab,
-        record_pull_request_fetch, register_pull_request_fetch, remote_cache_key,
-        remote_pull_request_identity_ttl_ms, remote_tasks_error_summary, remote_tasks_ttl_ms,
-        state_available_for_refresh, task_markdown_path, task_panel_runtime_policy,
-        task_row_from_entry, task_truth_axis_labels, verify_pull_request_bound_task,
-        visible_task_rows, LocalPullRequestCacheEntry, PullRequestBoundTask,
-        PullRequestDiscoveryFeedback, PullRequestKey, TaskBindingContext, TaskPanelIntent,
+        loads_task_snapshot, local_head_revision_command,
+        local_pull_request_cache_result_for_request, local_pull_request_probe_is_current,
+        local_pull_request_probe_request, local_task_probe_is_current, local_task_probe_request,
+        next_remote_failure_streak, next_remote_git_failure_streak,
+        probe_local_pull_request_target, progress_for_unavailable, project_all_agent_panes,
+        pull_request_discovery_feedback, pull_request_target_for_tab, record_pull_request_fetch,
+        register_pull_request_fetch, remote_cache_key, remote_pull_request_identity_ttl_ms,
+        remote_tasks_error_summary, remote_tasks_ttl_ms, resolves_local_pull_request_identity,
+        review_forge_projection, state_available_for_refresh, task_markdown_path,
+        task_panel_context_without_task_sources, task_panel_runtime_policy, task_row_from_entry,
+        task_truth_axis_labels, verify_pull_request_bound_task, visible_task_rows,
+        LocalPullRequestCacheEntry, PullRequestBoundTask, PullRequestDiscoveryFeedback,
+        PullRequestKey, PullRequestTarget, PullRequestsEntry, TaskBindingContext, TaskPanelIntent,
         TaskPanelMode, TaskPanelModeSelection, TaskPanelRuntimePolicy, LOCAL_PULL_REQUEST_TTL_MS,
         PULL_REQUESTS_TTL_MS, REMOTE_TASKS_FAILURE_TTL_CAP_MS, REMOTE_TASKS_TTL_MS,
     };
     use crate::tracking::{
         BranchPullRequestEntry, BranchPullRequestsData, PlanTaskEntry, PlanTasksData,
-        RemoteGitIdentityError, RemoteGitIdentityOutcome, RemoteTaskTarget, RemoteTasksError,
-        RemoteTasksOutcome,
+        PullRequestChecks, RemoteGitIdentityError, RemoteGitIdentityOutcome, RemoteTaskTarget,
+        RemoteTasksError, RemoteTasksOutcome,
     };
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
+    use std::ffi::OsStr;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -4532,18 +4961,22 @@ mod tests {
                 "probe",
                 crate::HeadlessPaneSeed {
                     cwd: Some(first_root.to_string_lossy().into_owned()),
-                    cwd_host: Some("local".into()),
                     ..crate::HeadlessPaneSeed::default()
                 },
             )
             .expect("headless pane");
             st.active_ws_mut().expect("active workspace").repo_root =
                 Some(first_root.to_string_lossy().into_owned());
+            st.active_ws_mut()
+                .expect("active workspace")
+                .working_tree_path = Some(first_root.to_string_lossy().into_owned());
             st.find_tab_mut(tab_id).expect("seeded tab").discovery_cwd =
                 Some(first_root.to_string_lossy().into_owned());
             (tab_id, pane_id)
         };
         let in_flight = local_task_probe_request(&state).expect("initial probe request");
+        let pr_in_flight =
+            local_pull_request_probe_request(&state).expect("initial PR identity request");
 
         {
             let mut st = state.borrow_mut();
@@ -4573,6 +5006,10 @@ mod tests {
             "a completion captured before cwd/host/remote/binding/candidate transition must not apply"
         );
         assert!(local_task_probe_is_current(&state, &current.key));
+        assert!(
+            !local_pull_request_probe_is_current(&state, &pr_in_flight.key),
+            "a PR identity completion from the previous pane selection must be dropped"
+        );
 
         let _ = fs::remove_dir_all(first_root);
         let _ = fs::remove_dir_all(second_root);
@@ -4601,9 +5038,11 @@ mod tests {
                 Some(checkout.to_string_lossy().into_owned());
         }
         let request = local_pull_request_probe_request(&state).expect("local checkout request");
-        let main_result =
-            probe_local_pull_request_target(&request).expect("main branch should be discovered");
+        let main_result = probe_local_pull_request_target(&request, false)
+            .expect("main branch should be discovered");
         assert_eq!(main_result.branch, "main");
+        assert!(main_result.bound_task.is_none());
+        assert!(main_result.loop_runner_availability.is_none());
         let fetched_at_ms = 100;
         let mut cache = HashMap::from([(
             request.key.clone(),
@@ -4641,7 +5080,7 @@ mod tests {
         let same_checkout_request =
             local_pull_request_probe_request(&state).expect("same checkout request");
         assert_eq!(same_checkout_request.key, request.key);
-        let refreshed_result = probe_local_pull_request_target(&same_checkout_request)
+        let refreshed_result = probe_local_pull_request_target(&same_checkout_request, false)
             .expect("feature branch should be rediscovered off-thread");
         assert_eq!(refreshed_result.branch, "feature/next");
 
@@ -4848,6 +5287,18 @@ mod tests {
 
         assert_eq!(selection.mode_for_context(first), TaskPanelMode::Agents);
         assert_eq!(selection.mode_for_context(second), TaskPanelMode::Agents);
+    }
+
+    #[test]
+    fn review_mode_remains_selected_across_workspace_switches_without_task_or_pr_sources() {
+        let first = "repo:/workspace#main";
+        let second = "repo:/other#feature";
+        let mut selection = TaskPanelModeSelection::new(false, false, TaskPanelMode::Tasks);
+
+        selection.apply_intent(first, TaskPanelIntent::Select(TaskPanelMode::Review));
+
+        assert_eq!(selection.mode_for_context(first), TaskPanelMode::Review);
+        assert_eq!(selection.mode_for_context(second), TaskPanelMode::Review);
     }
 
     #[test]
@@ -5085,6 +5536,40 @@ mod tests {
     }
 
     #[test]
+    fn disabled_task_sources_keep_on_demand_review_pr_identity_without_loading_tasks() {
+        let target = review_pr_target("1111111111111111111111111111111111111111");
+        let context = task_panel_context_without_task_sources(
+            TaskPanelMode::Review,
+            Some(target.clone()),
+            true,
+        );
+
+        assert_eq!(context.mode, TaskPanelMode::Review);
+        assert!(!context.show_task_modes);
+        assert!(!context.show_pull_requests);
+        assert!(context.remote_target.is_none());
+        assert_eq!(context.pull_request_target, Some(target));
+        assert!(context.local_pull_request_identity_checking);
+        assert!(resolves_local_pull_request_identity(
+            false,
+            false,
+            TaskPanelMode::Review
+        ));
+        assert!(!resolves_local_pull_request_identity(
+            false,
+            false,
+            TaskPanelMode::Session
+        ));
+        assert!(!resolves_local_pull_request_identity(
+            false,
+            false,
+            TaskPanelMode::Agents
+        ));
+        assert!(!loads_task_snapshot(false, TaskPanelMode::Review));
+        assert!(!loads_task_snapshot(false, TaskPanelMode::Tasks));
+    }
+
+    #[test]
     fn pr_ledger_event_intent_selects_existing_pull_request_action_surface() {
         let context = "local:/workspace:agent/work";
         let mut selection = TaskPanelModeSelection::new(true, true, TaskPanelMode::Tasks);
@@ -5254,8 +5739,8 @@ mod tests {
             query_complete: true,
         };
         let mut cache = HashMap::new();
-        record_pull_request_fetch(&mut cache, key.clone(), Ok(initial), 10);
-        record_pull_request_fetch(&mut cache, key.clone(), Ok(refreshed), 20);
+        record_pull_request_fetch(&mut cache, key.clone(), Ok(initial), 10, 10);
+        record_pull_request_fetch(&mut cache, key.clone(), Ok(refreshed), 20, 20);
 
         assert_eq!(cache.len(), 1, "a refresh must replace the branch entry");
         let entry = cache.get(&key).expect("refreshed branch entry");
@@ -5270,6 +5755,81 @@ mod tests {
                 "Tasks discovered; refreshed 2 pull requests".to_string()
             )
         );
+    }
+
+    #[test]
+    fn pull_request_cache_evicts_prior_revisions_of_the_same_branch_only() {
+        let mut old = PullRequestKey::new(
+            PathBuf::from("/repo"),
+            "owner/repo",
+            "owner",
+            "feature/review",
+        );
+        old.head_revision = Some("1111111111111111111111111111111111111111".into());
+        let mut current = old.clone();
+        current.head_revision = Some("2222222222222222222222222222222222222222".into());
+        let other = PullRequestKey::new(
+            PathBuf::from("/other"),
+            "owner/other",
+            "owner",
+            "feature/review",
+        );
+        let data = |total| BranchPullRequestsData {
+            total,
+            open: total,
+            draft: 0,
+            merged: 0,
+            closed: 0,
+            pull_requests: Vec::new(),
+            query_complete: true,
+        };
+        let mut cache = HashMap::new();
+        record_pull_request_fetch(&mut cache, old.clone(), Ok(data(1)), 10, 10);
+        record_pull_request_fetch(&mut cache, other.clone(), Ok(data(2)), 20, 20);
+        record_pull_request_fetch(&mut cache, current.clone(), Ok(data(3)), 30, 30);
+
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.contains_key(&old));
+        assert_eq!(cache[&current].verified.as_ref().unwrap().total, 3);
+        assert_eq!(cache[&other].verified.as_ref().unwrap().total, 2);
+    }
+
+    #[test]
+    fn stale_revision_fetch_completion_does_not_evict_newer_head_cache() {
+        let mut old = PullRequestKey::new(
+            PathBuf::from("/repo"),
+            "owner/repo",
+            "owner",
+            "feature/review",
+        );
+        old.head_revision = Some("1111111111111111111111111111111111111111".into());
+        let mut current = old.clone();
+        current.head_revision = Some("2222222222222222222222222222222222222222".into());
+        let data = |total| BranchPullRequestsData {
+            total,
+            open: total,
+            draft: 0,
+            merged: 0,
+            closed: 0,
+            pull_requests: Vec::new(),
+            query_complete: true,
+        };
+        let mut cache = HashMap::new();
+
+        // The old revision's query starts first but finishes after the current
+        // revision's query. Its completion must not remove the current result.
+        record_pull_request_fetch(&mut cache, current.clone(), Ok(data(2)), 20, 30);
+        record_pull_request_fetch(&mut cache, old.clone(), Ok(data(1)), 10, 40);
+
+        assert_eq!(cache[&current].verified.as_ref().unwrap().total, 2);
+        assert_eq!(cache[&old].verified.as_ref().unwrap().total, 1);
+
+        // A later fetch started after both completions can prune prior revisions.
+        let mut next = current.clone();
+        next.head_revision = Some("3333333333333333333333333333333333333333".into());
+        record_pull_request_fetch(&mut cache, next.clone(), Ok(data(3)), 50, 60);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[&next].verified.as_ref().unwrap().total, 3);
     }
 
     #[test]
@@ -5293,9 +5853,9 @@ mod tests {
             query_complete: true,
         };
         let mut cache = HashMap::new();
-        record_pull_request_fetch(&mut cache, first.clone(), Ok(data(1)), 10);
-        record_pull_request_fetch(&mut cache, first.clone(), Ok(data(2)), 20);
-        record_pull_request_fetch(&mut cache, second.clone(), Ok(data(3)), 30);
+        record_pull_request_fetch(&mut cache, first.clone(), Ok(data(1)), 10, 10);
+        record_pull_request_fetch(&mut cache, first.clone(), Ok(data(2)), 20, 20);
+        record_pull_request_fetch(&mut cache, second.clone(), Ok(data(3)), 30, 30);
 
         assert_eq!(cache.len(), 2);
         assert_eq!(cache[&first].verified.as_ref().unwrap().total, 2);
@@ -5346,8 +5906,8 @@ mod tests {
             query_complete: true,
         };
         let mut cache = HashMap::new();
-        record_pull_request_fetch(&mut cache, key.clone(), Ok(verified), 10);
-        record_pull_request_fetch(&mut cache, key.clone(), Err("offline".into()), 20);
+        record_pull_request_fetch(&mut cache, key.clone(), Ok(verified), 10, 10);
+        record_pull_request_fetch(&mut cache, key.clone(), Err("offline".into()), 20, 20);
         let entry = cache.get(&key).unwrap();
         assert_eq!(entry.fetched_at_ms, 20);
         assert_eq!(entry.verified_at_ms, Some(10));
@@ -5379,8 +5939,8 @@ mod tests {
             query_complete: true,
         };
         let mut cache = HashMap::new();
-        record_pull_request_fetch(&mut cache, old_key.clone(), Ok(verified), 10);
-        record_pull_request_fetch(&mut cache, new_key.clone(), Err("offline".into()), 20);
+        record_pull_request_fetch(&mut cache, old_key.clone(), Ok(verified), 10, 10);
+        record_pull_request_fetch(&mut cache, new_key.clone(), Err("offline".into()), 20, 20);
 
         assert_eq!(cache.len(), 2);
         assert!(cache.get(&old_key).unwrap().verified.is_some());
@@ -5413,8 +5973,8 @@ mod tests {
             query_complete: true,
         };
         let mut cache = HashMap::new();
-        record_pull_request_fetch(&mut cache, old_key.clone(), Ok(verified), 10);
-        record_pull_request_fetch(&mut cache, new_key.clone(), Err("offline".into()), 20);
+        record_pull_request_fetch(&mut cache, old_key.clone(), Ok(verified), 10, 10);
+        record_pull_request_fetch(&mut cache, new_key.clone(), Err("offline".into()), 20, 20);
 
         assert_eq!(old_key.base_repository, "owner/repo");
         assert_eq!(
@@ -5832,6 +6392,7 @@ mod tests {
                     url: Some("https://github.com/Example-Org/Example-Repo/pull/41".into()),
                     head_repository_owner: "example-org".into(),
                     head_ref_name: "feature/task-panel".into(),
+                    head_ref_oid: None,
                     base_ref_name: "main".into(),
                     updated_at: Some("2026-06-19T15:00:00Z".into()),
                     checks: crate::tracking::PullRequestChecks::Ready,
@@ -5852,6 +6413,7 @@ mod tests {
                     url: Some("https://github.com/Example-Org/Example-Repo/pull/42".into()),
                     head_repository_owner: "example-org".into(),
                     head_ref_name: "feature/task-panel".into(),
+                    head_ref_oid: None,
                     base_ref_name: "main".into(),
                     updated_at: Some("2026-06-18T15:00:00Z".into()),
                     checks: crate::tracking::PullRequestChecks::Pending,
@@ -5867,6 +6429,7 @@ mod tests {
                     url: Some("https://github.com/Example-Org/Example-Repo/pull/40".into()),
                     head_repository_owner: "example-org".into(),
                     head_ref_name: "feature/task-panel".into(),
+                    head_ref_oid: None,
                     base_ref_name: "main".into(),
                     updated_at: Some("2026-06-17T15:00:00Z".into()),
                     checks: crate::tracking::PullRequestChecks::None,
@@ -5913,5 +6476,155 @@ mod tests {
             ambiguous.tasks[3].note.as_deref(),
             Some("unlinked (ambiguous marker) · feature/task-panel -> main")
         );
+    }
+
+    fn review_pr_target(head: &str) -> PullRequestTarget {
+        PullRequestTarget {
+            checkout_root: PathBuf::from("/tmp/review-worktree"),
+            branch: "task/review".into(),
+            head_revision: Some(head.into()),
+            head_repository: "owner/repo".into(),
+            base_repository: "owner/repo".into(),
+            head_owner: "owner".into(),
+            remote_connection: None,
+            pane_identity: crate::work_ledger::WorkIdentity {
+                session: "test".into(),
+                workspace_origin: "workspace".into(),
+                tab_origin: "tab".into(),
+                pane_origin: "pane".into(),
+                workspace_id: 1,
+                workspace_name: "Review".into(),
+                tab_id: 2,
+                tab_name: "Shell".into(),
+                pane_id: 3,
+                task_id: Some("#29".into()),
+                task_title: Some("Review panel".into()),
+            },
+            bound_task: None,
+            loop_runner_availability: None,
+        }
+    }
+
+    fn review_pr(head: &str, checks: PullRequestChecks) -> BranchPullRequestEntry {
+        BranchPullRequestEntry {
+            number: 29,
+            title: "Review panel".into(),
+            state: "open".into(),
+            is_draft: true,
+            review_decision: None,
+            url: Some("https://github.com/owner/repo/pull/29".into()),
+            head_ref_name: "task/review".into(),
+            head_ref_oid: Some(head.into()),
+            head_repository_owner: "owner".into(),
+            base_ref_name: "kmux".into(),
+            updated_at: Some("2026-09-25T00:00:00Z".into()),
+            checks,
+            correlation: None,
+            correlation_marker_present: false,
+        }
+    }
+
+    #[test]
+    fn review_pr_projection_keeps_no_pr_unavailable_failed_checks_and_head_movement_explicit() {
+        let head = "1111111111111111111111111111111111111111";
+        let target = review_pr_target(head);
+        let key = PullRequestKey::for_target(&target);
+
+        let checking_identity = review_forge_projection(None, true, &HashMap::new());
+        assert!(checking_identity.summary.contains("Checking repository"));
+
+        let unavailable_identity = review_forge_projection(None, false, &HashMap::new());
+        assert_eq!(unavailable_identity.summary, "PR association unavailable");
+
+        let unavailable = review_forge_projection(Some(&target), false, &HashMap::new());
+        assert!(unavailable.summary.contains("Checking"));
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            key.clone(),
+            PullRequestsEntry {
+                fetched_at_ms: 1,
+                verified_at_ms: None,
+                verified: None,
+                error: Some("GitHub CLI unavailable".into()),
+            },
+        );
+        assert_eq!(
+            review_forge_projection(Some(&target), false, &cache).summary,
+            "Forge unavailable"
+        );
+
+        cache.insert(
+            key.clone(),
+            PullRequestsEntry {
+                fetched_at_ms: 2,
+                verified_at_ms: Some(2),
+                verified: Some(BranchPullRequestsData {
+                    total: 0,
+                    open: 0,
+                    draft: 0,
+                    merged: 0,
+                    closed: 0,
+                    pull_requests: Vec::new(),
+                    query_complete: true,
+                }),
+                error: None,
+            },
+        );
+        assert_eq!(
+            review_forge_projection(Some(&target), false, &cache).summary,
+            "No PR for this exact branch"
+        );
+
+        cache.insert(
+            key.clone(),
+            PullRequestsEntry {
+                fetched_at_ms: 3,
+                verified_at_ms: Some(3),
+                verified: Some(BranchPullRequestsData {
+                    total: 1,
+                    open: 1,
+                    draft: 1,
+                    merged: 0,
+                    closed: 0,
+                    pull_requests: vec![review_pr(head, PullRequestChecks::Failed)],
+                    query_complete: true,
+                }),
+                error: None,
+            },
+        );
+        let failed = review_forge_projection(Some(&target), false, &cache);
+        assert!(failed.detail.contains("checks failed"));
+        assert!(failed.detail.contains("head 111111111111"));
+        assert!(failed.detail.contains("PR/check data fetched"));
+
+        let moved = "2222222222222222222222222222222222222222";
+        cache
+            .get_mut(&key)
+            .unwrap()
+            .verified
+            .as_mut()
+            .unwrap()
+            .pull_requests[0] = review_pr(moved, PullRequestChecks::Ready);
+        let moved = review_forge_projection(Some(&target), false, &cache);
+        assert!(moved.summary.contains("head does not match"));
+        assert!(moved
+            .detail
+            .contains("local 111111111111 · PR 222222222222"));
+    }
+
+    #[test]
+    fn local_head_revision_disables_optional_locks_and_sanitizes_child_environment() {
+        let command = local_head_revision_command(Path::new("/tmp"));
+        assert_eq!(
+            command.get_args().next().and_then(OsStr::to_str),
+            Some("--no-optional-locks")
+        );
+        let removed = command
+            .get_envs()
+            .filter_map(|(name, value)| value.is_none().then_some(name))
+            .collect::<Vec<_>>();
+        assert!(removed.contains(&OsStr::new("INFISICAL_TOKEN")));
+        assert!(removed.contains(&OsStr::new("INFISICAL_SERVICE_TOKEN")));
     }
 }
