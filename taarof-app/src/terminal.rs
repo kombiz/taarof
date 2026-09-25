@@ -1487,10 +1487,13 @@ fn build_pane_leaf(
         launch_command,
         output_tracker: Rc::new(Cell::new(None)),
         tmux_backing: None,
+        restored_tmux: None,
+        restore_unavailable_reason: None,
         location_state: PaneLocationState::default(),
         process_state: PaneProcessState::default(),
         current_task: None,
         restored_agent_session: None,
+        restored_spawn_kind: None,
         agent_resume: None,
         command_marks: Vec::new(),
         broker: None,
@@ -3377,6 +3380,7 @@ pub fn register_lazy_restored_tab(
         ssh_command: None,
         tmux_session: None,
         tmux_host: None,
+        tmux_identity: None,
         current_task: None,
         agent_session: None,
     });
@@ -4015,6 +4019,7 @@ mod tests {
             ssh_command: ssh_command.map(|argv| argv.into_iter().map(str::to_string).collect()),
             tmux_session: None,
             tmux_host: None,
+            tmux_identity: None,
             current_task: None,
             agent_session: None,
         }
@@ -6227,6 +6232,7 @@ mod tests {
         let backing = crate::pane::TmuxBacking {
             session_name: "still-attached".to_string(),
             target: TmuxTarget::Local,
+            expected_generation: None,
             pane_info: crate::probe::ProbeSnapshot::default(),
         };
 
@@ -6255,6 +6261,7 @@ mod tests {
             target: TmuxTarget::Remote {
                 ssh_target: "builder@example".to_string(),
             },
+            expected_generation: None,
             pane_info: crate::probe::ProbeSnapshot::default(),
         };
 
@@ -6292,6 +6299,7 @@ mod tests {
         let backing = crate::pane::TmuxBacking {
             session_name: "live-with-stale-entry".to_string(),
             target: TmuxTarget::Local,
+            expected_generation: None,
             pane_info: crate::probe::ProbeSnapshot::default(),
         };
         let original_detached_at = Instant::now();
@@ -6339,6 +6347,7 @@ mod tests {
             target: TmuxTarget::Remote {
                 ssh_target: "builder@example".to_string(),
             },
+            expected_generation: None,
             pane_info: crate::probe::ProbeSnapshot::default(),
         };
 
@@ -6368,6 +6377,7 @@ mod tests {
             let backing = crate::pane::TmuxBacking {
                 session_name: "preserved-after-failure".to_string(),
                 target: target.clone(),
+                expected_generation: None,
                 pane_info: crate::probe::ProbeSnapshot::default(),
             };
             state.borrow_mut().dashboard_state = crate::dashboard::aggregate_dashboard_state(
@@ -6412,6 +6422,7 @@ mod tests {
         let backing = crate::pane::TmuxBacking {
             session_name: "finished-after-failure".to_string(),
             target: TmuxTarget::Local,
+            expected_generation: None,
             pane_info: crate::probe::ProbeSnapshot::default(),
         };
         let original_detached_at = Instant::now() - Duration::from_secs(60);
@@ -6446,11 +6457,13 @@ mod tests {
         let finished_backing = crate::pane::TmuxBacking {
             session_name: "finished-after-failure".to_string(),
             target: TmuxTarget::Local,
+            expected_generation: None,
             pane_info: crate::probe::ProbeSnapshot::default(),
         };
         let unfinished_backing = crate::pane::TmuxBacking {
             session_name: "first-finish".to_string(),
             target: TmuxTarget::Local,
+            expected_generation: None,
             pane_info: crate::probe::ProbeSnapshot::default(),
         };
         let original_detached_at = Instant::now() - Duration::from_secs(60);
@@ -6522,6 +6535,7 @@ mod tests {
         let backing = crate::pane::TmuxBacking {
             session_name: "preserved-inactive-pane".to_string(),
             target: TmuxTarget::Local,
+            expected_generation: None,
             pane_info: crate::probe::ProbeSnapshot::default(),
         };
         let error = apply_tmux_kill_result_in_workspace(
@@ -6553,6 +6567,7 @@ mod tests {
             let backing = crate::pane::TmuxBacking {
                 session_name: "closed-pane".to_string(),
                 target: TmuxTarget::Local,
+                expected_generation: None,
                 pane_info: crate::probe::ProbeSnapshot::default(),
             };
             state.borrow_mut().detached_sessions.push(DetachedSession {
@@ -6579,6 +6594,7 @@ mod tests {
         let backing = crate::pane::TmuxBacking {
             session_name: "test-nonexistent-session".to_string(),
             target: crate::tmux::TmuxTarget::Local,
+            expected_generation: None,
             pane_info: crate::probe::ProbeSnapshot::default(),
         };
         let state = std::rc::Rc::new(std::cell::RefCell::new(AppState::new()));
@@ -6642,6 +6658,7 @@ mod tests {
         let backing = crate::pane::TmuxBacking {
             session_name: "test-detach-session".to_string(),
             target: crate::tmux::TmuxTarget::Local,
+            expected_generation: None,
             pane_info: crate::probe::ProbeSnapshot::default(),
         };
         let state = std::rc::Rc::new(std::cell::RefCell::new(AppState::new()));
@@ -6681,11 +6698,13 @@ mod tests {
             crate::pane::TmuxBacking {
                 session_name: "tab-local".to_string(),
                 target: TmuxTarget::Local,
+                expected_generation: None,
                 pane_info: crate::probe::ProbeSnapshot::default(),
             },
             crate::pane::TmuxBacking {
                 session_name: "tab-local-second-pane".to_string(),
                 target: TmuxTarget::Local,
+                expected_generation: None,
                 pane_info: crate::probe::ProbeSnapshot::default(),
             },
         ];

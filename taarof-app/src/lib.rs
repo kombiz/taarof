@@ -240,6 +240,7 @@ pub fn seed_headless_terminal_tab(
             Some(ssh_target) => tmux::TmuxTarget::Remote { ssh_target },
             None => tmux::TmuxTarget::Local,
         },
+        expected_generation: None,
         pane_info: probe::ProbeSnapshot::default(),
     });
     let workspace_idx = state
@@ -842,6 +843,153 @@ fn gdk_wayland_disable_with_presentation(existing: &str) -> Option<String> {
     } else {
         Some(format!("{existing},wp_presentation"))
     }
+}
+
+fn validate_agent_launcher_identity(
+    agent: &std::path::Path,
+    app: &runtime_identity::BuildIdentity,
+) -> Result<(), &'static str> {
+    let mut identity_command = std::process::Command::new(agent);
+    identity_command.arg("--build-info");
+    child_env::prepare_child_command(&mut identity_command, &[]);
+    let output = match identity_command.output() {
+        Ok(output) if output.status.success() => output.stdout,
+        _ => return Err("the channel-matched agent launcher identity is unreadable"),
+    };
+    let launcher: serde_json::Value = serde_json::from_slice(&output)
+        .map_err(|_| "the channel-matched agent launcher identity is malformed")?;
+    let launcher_revision = launcher
+        .get("source_revision")
+        .and_then(|value| value.as_str());
+    let launcher_dirty = launcher
+        .get("source_dirty")
+        .and_then(|value| value.as_bool());
+    if app.source_revision.as_deref().is_none()
+        || app.source_revision.as_deref() != launcher_revision
+        || app.source_dirty.is_none()
+        || app.source_dirty != launcher_dirty
+    {
+        return Err("the agent launcher does not match the running app build");
+    }
+    Ok(())
+}
+
+fn validate_resume_helper_identity(
+    actual: &runtime_identity::BuildIdentity,
+    expected: &runtime_identity::BuildIdentity,
+) -> Result<(), &'static str> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err("the resume helper does not match the parent app build")
+    }
+}
+
+fn app_build_info() -> serde_json::Value {
+    serde_json::json!({
+        "schema": "taarof.app-build.v1",
+        "app_version": env!("CARGO_PKG_VERSION"),
+        "build": runtime_identity::build_identity(),
+    })
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedAgentResumeHandoff {
+    reference: agent_session_core::StableRef,
+    expected_app_build: runtime_identity::BuildIdentity,
+}
+
+pub(crate) fn saved_agent_resume_handoff(
+    reference: agent_session_core::StableRef,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&SavedAgentResumeHandoff {
+        reference,
+        expected_app_build: runtime_identity::build_identity(),
+    })
+}
+
+/// Print the build identity embedded in this exact app artifact. The
+/// continuity fixture uses this headless path before GTK starts so its receipt
+/// can bind both the app and launcher artifacts to their compiled provenance.
+pub fn run_build_info_cli(args: &[String]) -> Option<i32> {
+    if args.len() != 1 || args[0] != "--build-info" {
+        return None;
+    }
+    println!("{}", app_build_info());
+    Some(0)
+}
+
+/// Execute a saved Resume action through the channel-matched standalone
+/// launcher. This runs in a child copy of the exact parent app artifact, before
+/// GTK initialization, so provider discovery cannot block the GTK main thread.
+pub fn run_saved_agent_resume_cli(args: &[String]) -> Option<i32> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+
+    if args.first().map(String::as_str) != Some("--resume-saved-agent") {
+        return None;
+    }
+    let fail = |message: &str| {
+        eprintln!("taarof: Resume agent conversation unavailable: {message}");
+        Some(2)
+    };
+    if args.len() != 2 {
+        return fail("exact provider session identity is missing");
+    }
+    let handoff: SavedAgentResumeHandoff = match serde_json::from_str(&args[1]) {
+        Ok(handoff) => handoff,
+        Err(_) => return fail("exact provider session identity is malformed"),
+    };
+    let reference = handoff.reference;
+    if reference.provider_id.is_empty()
+        || reference.host_identity.is_empty()
+        || reference.session_id.is_empty()
+    {
+        return fail("exact provider session identity is incomplete");
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("TAAROF_AGENT_BINARY") {
+        candidates.push(std::path::PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os("TAAROF_INSTALLED_BINARY") {
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            candidates.push(parent.join("agent"));
+        }
+    }
+    if let Ok(path) = std::env::current_exe() {
+        if let Some(parent) = path.parent() {
+            candidates.push(parent.join("agent"));
+        }
+    }
+    candidates.dedup();
+    let Some(agent) = candidates.into_iter().find(|path| {
+        path.is_absolute()
+            && std::fs::metadata(path).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+    }) else {
+        return fail("the channel-matched agent launcher is missing");
+    };
+
+    let app = runtime_identity::build_identity();
+    if let Err(error) = validate_resume_helper_identity(&app, &handoff.expected_app_build) {
+        return fail(error);
+    }
+    if let Err(error) = validate_agent_launcher_identity(&agent, &app) {
+        return fail(error);
+    }
+
+    let selector = match serde_json::to_string(&reference) {
+        Ok(selector) => selector,
+        Err(_) => return fail("exact provider session identity could not be encoded"),
+    };
+    let mut command = std::process::Command::new(agent);
+    command.args(["--resume", &selector]);
+    child_env::prepare_child_command(&mut command, &[]);
+    let error = command.exec();
+    eprintln!("taarof: Resume agent conversation failed: {error}");
+    Some(2)
 }
 
 pub fn run() {
@@ -3045,7 +3193,17 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
         config::should_auto_resume_agents_on_session_restore(),
         resume_agents_after_reload,
     );
-    let saved = session::load_v2();
+    let startup_session = session::load_v2_for_startup();
+    let persistence_block = startup_session.writer_block_reason.clone();
+    if let Some(diagnostic) = startup_session.diagnostic.as_deref() {
+        diagnostics::record_session_recovery(diagnostic);
+        show_toast(diagnostic);
+    } else if startup_session.state.is_some() {
+        show_toast(
+            "Reopened layout. Display checkpoints are context only; live terminal and agent resume validate separately.",
+        );
+    }
+    let saved = startup_session.state;
     if let Some(ref sess) = saved {
         window.set_default_size(sess.window_width, sess.window_height);
     }
@@ -3377,8 +3535,13 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
 
     // This is deliberately initialized after restore/default-tab creation: it
     // affects persistence after the first usable tab, never the launch window.
-    let session_writer =
-        Rc::new(session::SessionWriter::start().expect("session persistence writer should start"));
+    let session_writer = Rc::new(
+        match persistence_block {
+            Some(reason) => session::SessionWriter::blocked(reason),
+            None => session::SessionWriter::start(),
+        }
+        .expect("session persistence writer should start"),
+    );
     let auto_save_source = install_periodic_pollers(
         &state,
         &session_writer,
@@ -3703,7 +3866,67 @@ pub fn get_active_terminal(state: &Rc<RefCell<AppState>>) -> Option<vte::Termina
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    fn synthetic_agent_build_info(revision: &str, dirty: bool) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "taarof-agent-build-info-{}-{revision}",
+            std::process::id()
+        ));
+        let value = serde_json::json!({
+            "source_revision": revision,
+            "source_dirty": dirty,
+        });
+        std::fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", value)).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[test]
+    fn saved_resume_helper_rejects_a_replaced_channel_launcher() {
+        let mut app = runtime_identity::build_identity();
+        app.source_revision = Some("original-revision".into());
+        app.source_dirty = Some(false);
+        let matching = synthetic_agent_build_info("original-revision", false);
+        assert_eq!(validate_agent_launcher_identity(&matching, &app), Ok(()));
+
+        let replacement = synthetic_agent_build_info("replacement-revision", false);
+        assert_eq!(
+            validate_agent_launcher_identity(&replacement, &app),
+            Err("the agent launcher does not match the running app build")
+        );
+        std::fs::remove_file(matching).unwrap();
+        std::fs::remove_file(replacement).unwrap();
+    }
+
+    #[test]
+    fn saved_resume_helper_rejects_replacement_app_build() {
+        let original = runtime_identity::build_identity();
+        let mut replacement = original.clone();
+        replacement.build_id = Some("replacement-build".into());
+        assert_eq!(
+            validate_resume_helper_identity(&original, &original),
+            Ok(())
+        );
+        assert_eq!(
+            validate_resume_helper_identity(&replacement, &original),
+            Err("the resume helper does not match the parent app build")
+        );
+    }
+
+    #[test]
+    fn app_build_info_reports_the_embedded_app_identity() {
+        let value = app_build_info();
+        assert_eq!(value["schema"], "taarof.app-build.v1");
+        assert_eq!(value["app_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            value["build"],
+            serde_json::to_value(runtime_identity::build_identity()).unwrap()
+        );
+    }
 
     #[test]
     fn left_sidebar_policy_allows_sidebar_to_shrink() {

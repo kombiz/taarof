@@ -4,6 +4,12 @@ fn main() {
     // work in a plain shell with no display. When the first argument is not a
     // config subcommand, fall through to the normal GUI launch.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(exit_code) = taarof_app::run_saved_agent_resume_cli(&args) {
+        std::process::exit(exit_code);
+    }
+    if let Some(exit_code) = taarof_app::run_build_info_cli(&args) {
+        std::process::exit(exit_code);
+    }
     if let Some(exit_code) = taarof_app::config::run_config_cli(&args) {
         std::process::exit(exit_code);
     }

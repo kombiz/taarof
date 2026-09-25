@@ -2304,7 +2304,7 @@ fn show_tab_row_menu(
     layout.append(Some("Discover Tasks"), Some("tab.discover"));
     if let Some(offer) = agent_resume.as_ref() {
         layout.append(
-            Some(&format!("Resume {} session", offer.agent_name)),
+            Some(&format!("Resume agent conversation ({})", offer.agent_name)),
             Some("tab.resume-agent"),
         );
     }
@@ -5057,9 +5057,7 @@ fn close_tab(
         let worker = crate::tmux::default_worker();
         let commands = tmux_backings
             .iter()
-            .map(|backing| {
-                crate::tmux::kill_session_command(&backing.target, &backing.session_name)
-            })
+            .map(crate::tmux::kill_backing_command)
             .collect();
         let tab_list = tab_list.clone();
         let term_stack = term_stack.clone();
@@ -5397,9 +5395,7 @@ pub fn close_workspace_by_id(
         let worker = crate::tmux::default_worker();
         let commands = tmux_backings
             .iter()
-            .map(|backing| {
-                crate::tmux::kill_session_command(&backing.target, &backing.session_name)
-            })
+            .map(crate::tmux::kill_backing_command)
             .collect();
         let tab_list = tab_list.clone();
         let term_stack = term_stack.clone();
@@ -6463,6 +6459,7 @@ mod tests {
                 ssh_command: None,
                 tmux_session: None,
                 tmux_host: None,
+                tmux_identity: None,
                 current_task: None,
                 agent_session: None,
             },
@@ -6647,6 +6644,7 @@ mod tests {
                         ssh_command: None,
                         tmux_session: None,
                         tmux_host: None,
+                        tmux_identity: None,
                         current_task: None,
                         agent_session: None,
                     },

@@ -38,6 +38,28 @@ fn persisted_agent_session(
     }
 }
 
+fn persisted_tmux_metadata(
+    backing: Option<&crate::pane::TmuxBacking>,
+    restored: Option<&crate::pane::RestoredTmuxMetadata>,
+) -> (Option<String>, Option<String>) {
+    backing
+        .map(|backing| {
+            (
+                Some(backing.session_name.clone()),
+                backing.target.ssh_target_string(),
+            )
+        })
+        .or_else(|| {
+            restored.map(|saved| {
+                (
+                    Some(saved.session_name.clone()),
+                    saved.target.ssh_target_string(),
+                )
+            })
+        })
+        .unwrap_or_default()
+}
+
 #[allow(deprecated)] // VTE 0.78 deprecated current_directory_uri; termprop migration is future scope
 pub(super) fn save_pane_tree_with_zoom(
     node: &crate::pane::PaneNode,
@@ -59,6 +81,7 @@ pub(super) fn save_pane_tree_with_zoom(
                 ssh_command: None,
                 tmux_session: None,
                 tmux_host: None,
+                tmux_identity: None,
                 current_task,
                 agent_session,
             }
@@ -69,29 +92,35 @@ pub(super) fn save_pane_tree_with_zoom(
             ssh_command: None,
             tmux_session: None,
             tmux_host: None,
+            tmux_identity: None,
             current_task: None,
             agent_session: None,
         },
-        crate::pane::PaneNode::Leaf(leaf) => SavedPaneNode::Leaf {
-            work_origin: Some(leaf.work_origin.clone()),
-            cwd: leaf.saved_cwd(),
-            ssh_command: leaf.ssh_command(),
-            tmux_session: leaf.tmux_backing.as_ref().map(|b| b.session_name.clone()),
-            tmux_host: leaf
-                .tmux_backing
-                .as_ref()
-                .and_then(|b| b.target.ssh_target_string()),
-            current_task: leaf.current_task.clone(),
-            agent_session: {
-                let (detected_agent_running, detected) = agent_metadata(leaf.pane_id);
-                persisted_agent_session(
-                    leaf.tmux_backing.is_some(),
-                    detected_agent_running,
-                    detected,
-                    leaf.restored_agent_session.as_ref(),
-                )
-            },
-        },
+        crate::pane::PaneNode::Leaf(leaf) => {
+            let (tmux_session, tmux_host) =
+                persisted_tmux_metadata(leaf.tmux_backing.as_ref(), leaf.restored_tmux.as_ref());
+            SavedPaneNode::Leaf {
+                work_origin: Some(leaf.work_origin.clone()),
+                cwd: leaf.saved_cwd(),
+                ssh_command: leaf.ssh_command(),
+                tmux_session,
+                tmux_host,
+                tmux_identity: leaf
+                    .tmux_backing
+                    .as_ref()
+                    .and_then(crate::pane::TmuxBacking::authoritative_generation),
+                current_task: leaf.current_task.clone(),
+                agent_session: {
+                    let (detected_agent_running, detected) = agent_metadata(leaf.pane_id);
+                    persisted_agent_session(
+                        leaf.tmux_backing.is_some() || leaf.restored_tmux.is_some(),
+                        detected_agent_running,
+                        detected,
+                        leaf.restored_agent_session.as_ref(),
+                    )
+                },
+            }
+        }
         crate::pane::PaneNode::Split {
             direction,
             first,
@@ -413,6 +442,7 @@ pub(super) fn split_pane_for_tab(
             let backing = crate::pane::TmuxBacking {
                 session_name: session_name.clone(),
                 target: target.clone(),
+                expected_generation: None,
                 pane_info: ProbeSnapshot::default(),
             };
             (argv, Some(backing))
@@ -530,10 +560,7 @@ pub(crate) fn close_pane_async(
         let completion = worker
             .submit_coalesced(
                 crate::tmux::TmuxJobKey::ClosePane { tab_id, pane_id },
-                vec![crate::tmux::kill_session_command(
-                    &backing.target,
-                    &backing.session_name,
-                )],
+                vec![crate::tmux::kill_backing_command(&backing)],
                 std::time::Duration::from_secs(10),
             )
             .await;
@@ -545,10 +572,7 @@ pub(crate) fn close_pane_async(
                         .find_tab(tab_id)
                         .and_then(|(_, tab)| tab.panes.leaf(pane_id))
                         .and_then(|leaf| leaf.tmux_backing.as_ref())
-                        .is_some_and(|live| {
-                            live.session_name == backing.session_name
-                                && live.target == backing.target
-                        });
+                        .is_some_and(|live| live.same_execution_target(&backing));
                     if !still_same {
                         Err("pane close was superseded".to_string())
                     } else {
@@ -795,14 +819,17 @@ pub fn detach_pane(
 }
 
 #[cfg(test)]
-mod agent_session_tests {
-    use super::persisted_agent_session;
+mod persistence_tests {
+    use super::{persisted_agent_session, persisted_tmux_metadata};
+    use crate::pane::RestoredTmuxMetadata;
     use crate::session::{SavedAgentSession, SavedAgentSessionSource};
+    use crate::tmux::TmuxTarget;
 
     fn saved(session_id: &str) -> SavedAgentSession {
         SavedAgentSession {
             agent_name: "codex".into(),
             session_id: session_id.into(),
+            host_identity: Some("build.ts".into()),
             source: SavedAgentSessionSource::Argv,
         }
     }
@@ -836,6 +863,20 @@ mod agent_session_tests {
         assert_eq!(
             persisted_agent_session(false, true, None, Some(&restored)),
             None
+        );
+    }
+
+    #[test]
+    fn legacy_tmux_display_metadata_survives_materialized_autosave() {
+        let restored = RestoredTmuxMetadata {
+            session_name: "saved-name".into(),
+            target: TmuxTarget::Remote {
+                ssh_target: "builder@host".into(),
+            },
+        };
+        assert_eq!(
+            persisted_tmux_metadata(None, Some(&restored)),
+            (Some("saved-name".into()), Some("builder@host".into()))
         );
     }
 }

@@ -949,9 +949,9 @@ fn strip_prepared_tmux_backings(
     backings: &[crate::pane::TmuxBacking],
 ) {
     let matches = |backing: &crate::pane::TmuxBacking| {
-        backings.iter().any(|expected| {
-            expected.session_name == backing.session_name && expected.target == backing.target
-        })
+        backings
+            .iter()
+            .any(|expected| expected.same_execution_target(backing))
     };
     let mut st = state.borrow_mut();
     if let Some(tab) = st.find_tab_mut(tab_id) {
@@ -1172,7 +1172,7 @@ fn dispatch_close_tab_socket(
     let commands = prepared
         .tmux_backings_to_close
         .iter()
-        .map(|backing| crate::tmux::kill_session_command(&backing.target, &backing.session_name))
+        .map(crate::tmux::kill_backing_command)
         .collect();
     let pending_apply = pending_socket_tab_close(state, dispatch);
     let worker = dispatch.worker();
@@ -1253,11 +1253,7 @@ fn dispatch_send_keys_socket(
             glib::spawn_future_local(async move {
                 let response = match worker
                     .submit(
-                        vec![crate::tmux::send_keys_command(
-                            &backing.target,
-                            &backing.session_name,
-                            &keys,
-                        )],
+                        vec![crate::tmux::send_keys_backing_command(&backing, &keys)],
                         crate::tmux::TMUX_CONTROL_DEADLINE,
                     )
                     .await
@@ -1822,13 +1818,13 @@ fn dispatch_resize_pane_control(
         {
             leaf.tmux_backing
                 .clone()
-                .map(PaneControlTarget::Tmux)
+                .map(|backing| PaneControlTarget::Tmux(Box::new(backing)))
                 .unwrap_or_else(|| PaneControlTarget::Vte(leaf.terminal.clone()))
         } else if let Some(backing) = st
             .headless_pane(tab_id, pane_id)
             .and_then(|pane| pane.tmux_backing.clone())
         {
-            PaneControlTarget::Tmux(backing)
+            PaneControlTarget::Tmux(Box::new(backing))
         } else {
             reply.send(SocketResponse::err("pane not found"));
             return;
@@ -1870,12 +1866,7 @@ fn dispatch_resize_pane_control(
                             cols,
                             rows,
                         ),
-                        vec![crate::tmux::resize_pane_command(
-                            &backing.target,
-                            &backing.session_name,
-                            cols,
-                            rows,
-                        )],
+                        vec![crate::tmux::resize_backing_command(&backing, cols, rows)],
                         crate::tmux::TMUX_CONTROL_DEADLINE,
                     )
                     .await
@@ -2449,7 +2440,7 @@ fn finish_http_control_response(
 
 enum PaneControlTarget {
     Vte(vte::Terminal),
-    Tmux(crate::pane::TmuxBacking),
+    Tmux(Box<crate::pane::TmuxBacking>),
 }
 
 fn record_socket_message_event(state: &Rc<RefCell<AppState>>, msg: &SocketMessage) {

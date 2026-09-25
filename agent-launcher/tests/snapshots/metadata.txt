@@ -11,12 +11,12 @@ Provider: all   Scope: Local   Sort: Repository
 │                                                     ││Repository: /tmp/project                             │
 │                                                     ││Confidence: ExactLiveBinding                         │
 │                                                     ││Source: LocalHistory                                 │
-│                                                     ││Attach: focus or reconnect to the existing live      │
-│                                                     ││process                                              │
-│                                                     ││Resume: relaunch the provider using its saved history│
-│                                                     ││Fork: create a separate session from saved history   │
-│                                                     ││                                                     │
-│                                                     ││                                                     │
+│                                                     ││Reattach live terminal: reconnects to the exact      │
+│                                                     ││current live process target                          │
+│                                                     ││Resume agent conversation: relaunches the provider   │
+│                                                     ││using an exact saved provider session identity       │
+│                                                     ││Fork agent conversation: creates a distinct          │
+│                                                     ││conversation from saved history                      │
 │                                                     ││                                                     │
 │                                                     ││                                                     │
 │                                                     ││                                                     │

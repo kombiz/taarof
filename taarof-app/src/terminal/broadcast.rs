@@ -289,7 +289,7 @@ pub fn build_send_to_pane_payload(
 /// resolver.
 pub(crate) enum PaneSendTarget {
     Vte(vte::Terminal),
-    Tmux(crate::pane::TmuxBacking),
+    Tmux(Box<crate::pane::TmuxBacking>),
 }
 
 /// Resolve a `(tab_id, pane_id)` to its delivery endpoint. A live leaf prefers
@@ -311,13 +311,13 @@ pub(crate) fn resolve_pane_send_target(
         Some(
             leaf.tmux_backing
                 .clone()
-                .map(PaneSendTarget::Tmux)
+                .map(|backing| PaneSendTarget::Tmux(Box::new(backing)))
                 .unwrap_or_else(|| PaneSendTarget::Vte(leaf.terminal.clone())),
         )
     } else {
         st.headless_pane(tab_id, pane_id)
             .and_then(|pane| pane.tmux_backing.clone())
-            .map(PaneSendTarget::Tmux)
+            .map(|backing| PaneSendTarget::Tmux(Box::new(backing)))
     }
 }
 
@@ -349,11 +349,7 @@ pub(crate) fn send_bytes_to_pane(
             glib::spawn_future_local(async move {
                 let error = match worker
                     .submit(
-                        vec![crate::tmux::send_keys_command(
-                            &backing.target,
-                            &backing.session_name,
-                            &payload,
-                        )],
+                        vec![crate::tmux::send_keys_backing_command(&backing, &payload)],
                         std::time::Duration::from_secs(10),
                     )
                     .await

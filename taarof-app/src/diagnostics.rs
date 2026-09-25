@@ -623,6 +623,25 @@ pub fn record_config_error(message: impl Into<String>, details: Option<Value>) {
 #[cfg(test)]
 pub fn record_config_error(_message: impl Into<String>, _details: Option<Value>) {}
 
+fn session_recovery_record(message: impl Into<String>) -> DiagnosticRecord {
+    make_record(
+        DiagnosticLevel::Error,
+        "session_recovery",
+        "session-layout",
+        "startup-load",
+        message,
+        None,
+    )
+}
+
+#[cfg(not(test))]
+pub fn record_session_recovery(message: impl Into<String>) {
+    record_global(session_recovery_record(message));
+}
+
+#[cfg(test)]
+pub fn record_session_recovery(_message: impl Into<String>) {}
+
 #[cfg(all(not(test), feature = "history"))]
 pub fn record_history_maintenance(
     level: DiagnosticLevel,
@@ -1095,6 +1114,32 @@ mod tests {
         assert_eq!(snapshot.recent.len(), 2);
         assert_eq!(snapshot.recent[0].action, "tmux-pane-info");
         assert_eq!(snapshot.recent[1].action, "startup");
+    }
+
+    #[test]
+    fn session_recovery_record_uses_durable_layout_category() {
+        let dir = unique_temp_dir("session-recovery");
+        let log_path = dir.join("diagnostics.jsonl");
+        let mut journal = DiagnosticJournal::new_with_paths(
+            Some(log_path.clone()),
+            None,
+            DiagnosticRetention::default(),
+        );
+        super::record_to_sinks(
+            super::session_recovery_record("saved layout preserved for recovery"),
+            |_| {},
+            |record| journal.record(record.clone()),
+            |_| {},
+        );
+
+        let snapshot = journal.snapshot();
+        let record = snapshot.recent.last().expect("recovery diagnostic");
+        assert_eq!(record.category, "session_recovery");
+        assert_eq!(record.source, "session-layout");
+        assert_eq!(record.action, "startup-load");
+        let persisted = std::fs::read_to_string(log_path).unwrap();
+        assert!(persisted.contains("saved layout preserved for recovery"));
+        assert!(persisted.contains("session_recovery"));
     }
 
     #[test]

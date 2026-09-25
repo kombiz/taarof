@@ -196,6 +196,7 @@ pub(super) fn kill_session_by_name_with_hint_using(
     let backing = crate::pane::TmuxBacking {
         session_name: session_name.to_string(),
         target: kill_target.clone(),
+        expected_generation: None,
         pane_info: crate::probe::ProbeSnapshot::default(),
     };
     let result = kill(&kill_target, session_name);
@@ -231,6 +232,7 @@ pub fn kill_session_by_name_with_hint_async(
     let backing = crate::pane::TmuxBacking {
         session_name: session_name.to_string(),
         target: kill_target.clone(),
+        expected_generation: None,
         pane_info: crate::probe::ProbeSnapshot::default(),
     };
     let guard = crate::tmux::TmuxGtkApplyGuard::new(state, window);
@@ -403,6 +405,7 @@ fn attach_session_after_validation(
                                 leaf.tmux_backing = Some(crate::pane::TmuxBacking {
                                     session_name: session_name.clone(),
                                     target: target.clone(),
+                                    expected_generation: None,
                                     pane_info: ProbeSnapshot::default(),
                                 });
                             }

@@ -24,7 +24,7 @@
 //! module may be called from a GTK callback except [`cached`] and
 //! [`build_identity`], which only read memory.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -40,7 +40,7 @@ const INSTALL_MANIFEST_RELATIVE: &str = "share/taarof/install-manifest.json";
 /// Build-time provenance stamped in by `build.rs`. An empty compile-time string
 /// means the builder could not determine the value; it becomes `None` here and
 /// `null` on the wire. It never becomes a guess.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildIdentity {
     pub build_id: Option<String>,
     pub source_revision: Option<String>,

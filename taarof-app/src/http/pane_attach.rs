@@ -14,6 +14,7 @@ pub enum PaneAttachKind {
     Tmux {
         session_name: String,
         target: crate::tmux::TmuxTarget,
+        expected_generation: Option<crate::session::SavedTmuxIdentity>,
     },
     Vte,
 }
@@ -241,21 +242,12 @@ fn resolve_pane_attach_target_for_tab(
             }
 
             if let Some(leaf) = tab.panes.leaf(pane_id) {
-                return match leaf.tmux_backing.as_ref() {
-                    Some(backing) => PaneAttachLookup::Attachable(PaneAttachTarget {
-                        tab_id: tab.id,
-                        pane_id,
-                        kind: PaneAttachKind::Tmux {
-                            session_name: backing.session_name.clone(),
-                            target: backing.target.clone(),
-                        },
-                    }),
-                    None => PaneAttachLookup::Attachable(PaneAttachTarget {
-                        tab_id: tab.id,
-                        pane_id,
-                        kind: PaneAttachKind::Vte,
-                    }),
-                };
+                return resolve_live_pane_attach_target(
+                    tab.id,
+                    pane_id,
+                    leaf.tmux_backing.as_ref(),
+                    leaf.restore_unavailable_reason.is_some(),
+                );
             }
 
             if let Some(headless) = state.headless_pane(tab.id, pane_id) {
@@ -266,6 +258,7 @@ fn resolve_pane_attach_target_for_tab(
                         kind: PaneAttachKind::Tmux {
                             session_name: backing.session_name.clone(),
                             target: backing.target.clone(),
+                            expected_generation: backing.expected_generation.clone(),
                         },
                     }),
                     None => PaneAttachLookup::Unsupported,
@@ -275,6 +268,38 @@ fn resolve_pane_attach_target_for_tab(
     }
 
     PaneAttachLookup::NotFound
+}
+
+pub(super) fn resolve_live_pane_attach_target(
+    tab_id: u32,
+    pane_id: u32,
+    tmux_backing: Option<&crate::pane::TmuxBacking>,
+    restore_unavailable: bool,
+) -> PaneAttachLookup {
+    // A retained failed-restore pane is a display checkpoint. Refuse before
+    // consulting its old backing so the websocket path cannot capture a
+    // same-named replacement during the interval before child cleanup.
+    if restore_unavailable
+        || tmux_backing.is_some_and(|backing| !backing.expected_generation_is_verified())
+    {
+        return PaneAttachLookup::Unsupported;
+    }
+    match tmux_backing {
+        Some(backing) => PaneAttachLookup::Attachable(PaneAttachTarget {
+            tab_id,
+            pane_id,
+            kind: PaneAttachKind::Tmux {
+                session_name: backing.session_name.clone(),
+                target: backing.target.clone(),
+                expected_generation: backing.expected_generation.clone(),
+            },
+        }),
+        None => PaneAttachLookup::Attachable(PaneAttachTarget {
+            tab_id,
+            pane_id,
+            kind: PaneAttachKind::Vte,
+        }),
+    }
 }
 
 pub(crate) fn capture_vte_pane_snapshot_sync(
@@ -520,6 +545,14 @@ pub(super) fn default_pane_snapshotter(bridge: BridgeSender) -> Arc<PaneSnapshot
             }
         })
     })
+}
+
+fn pane_snapshot_failure_message(error: &str) -> &'static str {
+    if error == crate::tmux::EXACT_ATTACH_UNAVAILABLE_REASON {
+        crate::tmux::EXACT_ATTACH_UNAVAILABLE_REASON
+    } else {
+        "tmux snapshot failed; pane may have exited"
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -824,7 +857,7 @@ impl PaneAttachHub {
                         Err(error) => {
                             trace_attach_capture_error(&target, &error);
                             let _ = updates.send(PaneAttachUpdate::Error(
-                                "tmux snapshot failed; pane may have exited".to_string(),
+                                pane_snapshot_failure_message(&error).to_string(),
                             ));
                             break;
                         }
@@ -884,7 +917,7 @@ impl PaneAttachHub {
                 Err(error) => {
                     trace_attach_capture_error(&target, &error);
                     let _ = updates.send(PaneAttachUpdate::Error(
-                        "tmux snapshot failed; pane may have exited".to_string(),
+                        pane_snapshot_failure_message(&error).to_string(),
                     ));
                     break;
                 }
@@ -1017,11 +1050,8 @@ async fn handle_pane_attach_socket(
             trace_attach_capture_error(&target, &error);
             let _ = socket
                 .send(Message::text(
-                    pane_attach_error_frame(
-                        target.pane_id,
-                        "tmux snapshot failed; pane may have exited",
-                    )
-                    .to_string(),
+                    pane_attach_error_frame(target.pane_id, pane_snapshot_failure_message(&error))
+                        .to_string(),
                 ))
                 .await;
             let _ = socket.send(Message::Close(None)).await;
@@ -1502,12 +1532,18 @@ async fn capture_tmux_snapshot(
     let PaneAttachKind::Tmux {
         session_name,
         target: tmux_target,
+        expected_generation,
     } = target.kind
     else {
         return Err("capture_tmux_snapshot called with non-tmux target".to_string());
     };
     tokio::task::spawn_blocking(move || {
-        crate::tmux::capture_pane_snapshot(&tmux_target, &session_name, preserve_ansi)
+        crate::tmux::capture_pane_snapshot(
+            &tmux_target,
+            &session_name,
+            preserve_ansi,
+            expected_generation.as_ref(),
+        )
     })
     .await
     .map_err(|error| format!("pane attach worker failed: {error}"))?
@@ -1696,6 +1732,7 @@ mod tab_cleanup_tests {
                 PaneAttachKind::Tmux {
                     session_name: "inert".into(),
                     target: crate::tmux::TmuxTarget::Local,
+                    expected_generation: None,
                 },
             ),
             (
@@ -1703,6 +1740,7 @@ mod tab_cleanup_tests {
                 PaneAttachKind::Tmux {
                     session_name: "inert".into(),
                     target: crate::tmux::TmuxTarget::Local,
+                    expected_generation: None,
                 },
             ),
         ] {

@@ -476,9 +476,10 @@ Before an upgrade, back up:
 
 Re-run the chosen installer, then use the **Update → Reload into update** action
 or restart Taarof manually before repeating the validation and live-binary
-checks. The reload action saves the pane layout, reconnects tmux panes, and
-runs saved resume commands for detected non-tmux agents in the active tab that
-is restored eagerly. Tabs restored lazily later follow
+checks. The reload action saves the pane layout. It reattaches a tmux pane only
+when the exact saved tmux generation still exists, and passes exact saved
+provider identities from eagerly restored non-tmux agent panes to the
+build-matched channel launcher. Tabs restored lazily later follow
 `[session] auto_resume_agents`; ordinary non-tmux shell processes do not
 survive. For rollback, stop Taarof, restore the previous
 binary and configuration, and relaunch. If the gateway is enabled, re-pin its
@@ -575,7 +576,7 @@ opens session rows.
 | --- | --- |
 | Type / Backspace | Fuzzy search provider, title, repository, directory, host and session name |
 | Up / Down | Move selection |
-| Enter | Run the declared default: New, or Attach when available for an exact live row, otherwise Resume |
+| Enter | Run the declared default: Start new agent conversation, or Reattach live terminal when available for an exact live row, otherwise Resume agent conversation |
 | Tab | Cycle local, all hosts and active-only scope |
 | Ctrl+N | Clear filters and focus New rows |
 | Ctrl+P | Cycle provider filter, including all providers |
@@ -585,8 +586,11 @@ opens session rows.
 | ? | Toggle keyboard help |
 | Esc / Ctrl+C | Exit without launching |
 
-Attach uses the existing live process; Resume launches the provider using saved
-history; New starts a new session; Fork creates a separate session from history.
+Reattach live terminal uses the exact current live process target; Resume agent
+conversation launches the provider using an exact saved provider identity;
+Start new agent conversation starts a new session; Fork creates a separate
+session from history. New or Resume support does not imply queue, steer,
+interrupt, or rewind support.
 Unsupported actions have no key action. Preview content is bounded metadata,
 action meaning, confidence and degraded-source warnings. It excludes transcript
 bodies and execution arguments. Labels cannot emit terminal control sequences.

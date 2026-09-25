@@ -115,12 +115,16 @@ export function previewPhaseLabel(phase: PaneAttachPhase): string {
 
 export function describePreviewCapability(pane: PaneSnapshot): string {
   if (pane.attach_supported) {
-    return "live attach available";
+    return "live browser viewer available";
+  }
+
+  if (pane.attach_unavailable_reason) {
+    return pane.attach_unavailable_reason;
   }
 
   return pane.attach_kind === "unsupported"
-    ? "live attach not available for this pane type"
-    : "attach capability unknown";
+    ? "live browser viewer unavailable for this pane type"
+    : "browser viewer capability unknown";
 }
 
 export function paneDimensions(pane: PaneSnapshot, size: { cols: number; rows: number } | null): string {

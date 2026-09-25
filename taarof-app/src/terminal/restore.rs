@@ -251,9 +251,25 @@ pub(super) fn remote_split_respawn(
 pub(super) fn restored_leaf_label(
     cwd: Option<&str>,
     ssh_command: Option<&Vec<String>>,
+    tmux_session: Option<&str>,
+    tmux_host: Option<&str>,
+    tmux_identity: Option<&crate::session::SavedTmuxIdentity>,
+    agent_session: Option<&crate::session::SavedAgentSession>,
 ) -> (String, bool) {
     let is_ssh = ssh_command.is_some();
     let (path, cwd_host) = saved_cwd_location(cwd);
+
+    if let Some(session_name) = tmux_session {
+        let authority = if tmux_identity.is_some() {
+            "Reattach live terminal"
+        } else {
+            "Reattach unavailable: saved layout lacks exact tmux generation"
+        };
+        return (
+            format!("tmux {session_name} · {authority}"),
+            tmux_host.is_some(),
+        );
+    }
 
     if is_ssh {
         let host = ssh_command
@@ -267,10 +283,37 @@ pub(super) fn restored_leaf_label(
         return (label, true);
     }
 
-    match path {
-        Some(path) => (display_local_restore_path(&path), false),
-        None => ("shell".to_string(), false),
+    let label = match path {
+        Some(path) => display_local_restore_path(&path),
+        None => "shell".to_string(),
+    };
+    if agent_session.is_some_and(|saved| saved.host_identity.is_none()) {
+        return (
+            format!("{label} · Resume unavailable: saved layout lacks original host identity"),
+            false,
+        );
     }
+    (label, false)
+}
+
+pub(super) const LEGACY_TMUX_UNAVAILABLE_REASON: &str =
+    "Reattach unavailable: saved layout lacks exact tmux generation.";
+
+fn restored_tmux_display_metadata(
+    tmux_session: Option<&String>,
+    tmux_host: Option<&String>,
+    has_exact_backing: bool,
+) -> Option<crate::pane::RestoredTmuxMetadata> {
+    let session_name = tmux_session.filter(|_| !has_exact_backing)?;
+    Some(crate::pane::RestoredTmuxMetadata {
+        session_name: session_name.clone(),
+        target: match tmux_host {
+            Some(ssh_target) => crate::tmux::TmuxTarget::Remote {
+                ssh_target: ssh_target.clone(),
+            },
+            None => crate::tmux::TmuxTarget::Local,
+        },
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -298,11 +341,24 @@ pub(super) fn collect_restored_pane_hints(
 ) {
     match node {
         SavedPaneNode::Leaf {
-            cwd, ssh_command, ..
+            cwd,
+            ssh_command,
+            tmux_session,
+            tmux_host,
+            tmux_identity,
+            agent_session,
+            ..
         } => {
             let current_index = *traversal_index;
             *traversal_index += 1;
-            let (label, is_ssh) = restored_leaf_label(cwd.as_deref(), ssh_command.as_ref());
+            let (label, is_ssh) = restored_leaf_label(
+                cwd.as_deref(),
+                ssh_command.as_ref(),
+                tmux_session.as_deref(),
+                tmux_host.as_deref(),
+                tmux_identity.as_ref(),
+                agent_session.as_ref(),
+            );
             leaves.push(CollectedRestoredPaneHint {
                 traversal_index: current_index,
                 left: rect.left,
@@ -481,39 +537,11 @@ pub(crate) fn classify_tmux_kill_result(
 }
 
 /// Kill a tmux session. Used when close_behavior is Close (the default).
-#[cfg(test)]
-pub(crate) fn kill_tmux_session(
-    target: &crate::tmux::TmuxTarget,
-    session_name: &str,
-) -> TmuxKillResult {
-    let argv = crate::tmux::kill_session_command(target, session_name);
-    let output = match std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) => {
-            return TmuxKillResult::TransientFailure(format!(
-                "could not execute tmux kill-session: {error}"
-            ));
-        }
-    };
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    classify_tmux_kill_result(output.status.success(), &stderr, || {
-        let detail = stderr.trim();
-        if detail.is_empty() {
-            format!("tmux kill-session exited with {}", output.status)
-        } else {
-            format!("tmux kill-session failed: {detail}")
-        }
-    })
-}
-
 fn backing_matches(
     candidate: &crate::pane::TmuxBacking,
     backing: &crate::pane::TmuxBacking,
 ) -> bool {
-    candidate.session_name == backing.session_name && candidate.target == backing.target
+    candidate.same_execution_target(backing)
 }
 
 fn workspace_holding_backing<'a>(
@@ -742,7 +770,26 @@ fn cleanup_tmux_backing_with_behavior_in_workspace(
 ) -> Result<(), String> {
     match close_behavior {
         crate::config::TmuxCloseBehavior::Close => {
-            let result = kill_tmux_session(&backing.target, &backing.session_name);
+            let argv = crate::tmux::kill_backing_command(backing);
+            let output = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .output();
+            let result = match output {
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    classify_tmux_kill_result(output.status.success(), &stderr, || {
+                        let detail = stderr.trim();
+                        if detail.is_empty() {
+                            format!("tmux kill-session exited with {}", output.status)
+                        } else {
+                            format!("tmux kill-session failed: {detail}")
+                        }
+                    })
+                }
+                Err(error) => TmuxKillResult::TransientFailure(format!(
+                    "could not execute tmux kill-session: {error}"
+                )),
+            };
             apply_tmux_kill_result_in_workspace(state, backing, result, workspace_hint)
         }
         crate::config::TmuxCloseBehavior::Detach => {
@@ -833,6 +880,15 @@ fn remote_tmux_location(
     (!cwd.is_empty()).then(|| (cwd.to_string(), ssh_target.clone()))
 }
 
+fn tmux_matches_expected_generation(
+    expected: &crate::session::SavedTmuxIdentity,
+    info: &crate::tmux::TmuxPaneInfo,
+) -> bool {
+    info.session_id == expected.session_id
+        && info.session_created == expected.session_created
+        && info.continuity_id.as_deref() == Some(expected.continuity_id.as_str())
+}
+
 /// Poll all tmux-backed panes and update their pane_info metadata.
 pub fn poll_tmux_metadata(state: &Rc<RefCell<AppState>>, tab_list: &gtk::Box) {
     // Collect (tab_id, pane_id, argv) for all tmux-backed panes — lightweight, on main thread
@@ -878,7 +934,7 @@ pub fn poll_tmux_metadata(state: &Rc<RefCell<AppState>>, tab_list: &gtk::Box) {
             .unwrap_or_default();
 
         let mut any_changed = false;
-        for (tab_id, pane_id, result) in results {
+        for (tab_id, pane_id, mut result) in results {
             let mut st = state.borrow_mut();
             let mut event = None;
             if let Some(tab) = st.find_tab_mut(tab_id) {
@@ -893,6 +949,20 @@ pub fn poll_tmux_metadata(state: &Rc<RefCell<AppState>>, tab_list: &gtk::Box) {
                             probe_error,
                         ) = {
                             let backing = leaf.tmux_backing.as_mut().expect("checked above");
+                            let replacement_generation = backing
+                                .expected_generation
+                                .as_ref()
+                                .is_some_and(|expected| {
+                                    result.as_ref().is_ok_and(|info| {
+                                        !tmux_matches_expected_generation(expected, info)
+                                    })
+                                });
+                            if replacement_generation {
+                                result = Err(
+                                    "exact saved tmux target no longer exists; same-name replacement refused"
+                                        .to_string(),
+                                );
+                            }
                             let location_update = result
                                 .as_ref()
                                 .ok()
@@ -1447,6 +1517,7 @@ fn restored_leaf_spawn(
     ssh_command: Option<&Vec<String>>,
     tmux_session: Option<&str>,
     tmux_host: Option<&str>,
+    tmux_identity: Option<&crate::session::SavedTmuxIdentity>,
     agent_session: Option<&crate::session::SavedAgentSession>,
     auto_resume_agents: bool,
 ) -> (
@@ -1455,7 +1526,8 @@ fn restored_leaf_spawn(
     Option<crate::pane::TmuxBacking>,
     Option<AgentResumeOffer>,
 ) {
-    // If this leaf had tmux backing, try to reattach.
+    // A saved name is display metadata only. Reattach requires the exact tmux
+    // server/session generation observed while the layout was saved.
     if let Some(session_name) = tmux_session {
         let target = match tmux_host {
             Some(ssh) => crate::tmux::TmuxTarget::Remote {
@@ -1463,18 +1535,22 @@ fn restored_leaf_spawn(
             },
             None => crate::tmux::TmuxTarget::Local,
         };
-        // Restore reattaches a session taarof itself created (and recreates it
-        // via `-A` when it is gone), so it is styled like any other
-        // taarof-created session.
-        let argv = crate::tmux::create_attach_command(
+        let Some(identity) = tmux_identity else {
+            return (saved_cwd_to_path(cwd), None, None, None);
+        };
+        let Some(argv) = crate::tmux::exact_attach_command(
             &target,
             session_name,
-            saved_cwd_to_path(cwd).as_deref(),
-            crate::config::tmux_session_style(),
-        );
+            &identity.session_id,
+            identity.session_created,
+            &identity.continuity_id,
+        ) else {
+            return (saved_cwd_to_path(cwd), None, None, None);
+        };
         let backing = crate::pane::TmuxBacking {
             session_name: session_name.to_string(),
             target,
+            expected_generation: Some(identity.clone()),
             pane_info: ProbeSnapshot::default(),
         };
         // For tmux, cwd is handled by tmux itself.
@@ -1487,13 +1563,30 @@ fn restored_leaf_spawn(
         }
         let agent_resume = agent_session.and_then(|saved| {
             let cwd = spawn_cwd.as_deref()?;
+            let reference = agent_session_core::StableRef::new(
+                &saved.agent_name,
+                saved.host_identity.as_deref()?,
+                &saved.session_id,
+            );
+            if reference.host_identity.is_empty() {
+                return None;
+            }
+            let selector = crate::saved_agent_resume_handoff(reference).ok()?;
             Some(AgentResumeOffer {
                 agent_name: saved.agent_name.clone(),
-                action: agent_session_core::plan_resume(
-                    &saved.agent_name,
-                    cwd.into(),
-                    &saved.session_id,
-                ),
+                action: agent_session_core::ActionPlan {
+                    kind: agent_session_core::ActionKind::Resume,
+                    transport: agent_session_core::Transport::Local,
+                    // VTE may resolve `/proc/self/exe` in its spawn helper.
+                    // Bind the exact parent process instead so reload cannot
+                    // substitute a newer app artifact before validation.
+                    program: format!("/proc/{}/exe", std::process::id()),
+                    argv: vec!["--resume-saved-agent".into(), selector],
+                    cwd: cwd.into(),
+                    remote: None,
+                    confirmation: agent_session_core::Confirmation::Required,
+                    attach: None,
+                },
                 command: crate::agent_sessions::build_resume_command(
                     &saved.agent_name,
                     cwd,
@@ -1607,17 +1700,19 @@ fn plan_restored_spawns_inner(
             ssh_command,
             tmux_session,
             tmux_host,
+            tmux_identity,
             current_task,
             agent_session,
             ..
         } => {
             let pane_id = *next_pane_id;
             *next_pane_id += 1;
-            let (spawn_cwd, spawn_cmd, backing, agent_resume) = restored_leaf_spawn(
+            let (spawn_cwd, spawn_cmd, _backing, agent_resume) = restored_leaf_spawn(
                 cwd.as_deref(),
                 ssh_command.as_ref(),
                 tmux_session.as_deref(),
                 tmux_host.as_deref(),
+                tmux_identity.as_ref(),
                 agent_session.as_ref(),
                 auto_resume_agents,
             );
@@ -1629,7 +1724,11 @@ fn plan_restored_spawns_inner(
                 remote_shell: ssh_command.is_some() || tmux_host.is_some(),
                 spawn_cwd,
                 spawn_cmd,
-                tmux_session: backing.as_ref().map(|b| b.session_name.clone()),
+                // Preserve the saved name as display metadata even when a
+                // legacy snapshot lacks exact generation authority. The
+                // absence of `spawn_cmd`/backing remains the fail-closed
+                // execution decision.
+                tmux_session: tmux_session.clone(),
                 tmux_host: tmux_host.clone(),
                 current_task: current_task.clone(),
                 agent_resume,
@@ -1656,6 +1755,7 @@ pub(super) fn build_restored_pane_tree(
             ssh_command,
             tmux_session,
             tmux_host,
+            tmux_identity,
             current_task,
             agent_session,
         } => {
@@ -1668,18 +1768,31 @@ pub(super) fn build_restored_pane_tree(
                 ssh_command.as_ref(),
                 tmux_session.as_deref(),
                 tmux_host.as_deref(),
+                tmux_identity.as_ref(),
                 agent_session.as_ref(),
                 auto_resume_agents,
             );
 
+            let restored_spawn_kind = (spawn_cmd.is_some() && agent_resume.is_some())
+                .then_some(crate::pane::RestoredSpawnKind::AgentResume);
             spawns.push((pane_id, terminal.clone(), spawn_cwd, spawn_cmd));
             let mut leaf = build_pane_leaf(pane_id, &terminal, &container, None);
             leaf.work_origin = work_origin
                 .clone()
                 .unwrap_or_else(crate::pane::new_pane_work_origin);
+            leaf.restored_tmux = restored_tmux_display_metadata(
+                tmux_session.as_ref(),
+                tmux_host.as_ref(),
+                backing.is_some(),
+            );
+            leaf.restore_unavailable_reason = leaf
+                .restored_tmux
+                .as_ref()
+                .map(|_| LEGACY_TMUX_UNAVAILABLE_REASON.to_string());
             leaf.tmux_backing = backing;
             leaf.current_task = current_task.clone();
             leaf.restored_agent_session = agent_session.clone();
+            leaf.restored_spawn_kind = restored_spawn_kind;
             leaf.agent_resume = agent_resume;
             PaneNode::Leaf(leaf)
         }
@@ -1728,7 +1841,9 @@ pub(super) fn build_restored_pane_tree(
 
 #[cfg(test)]
 mod sync_command_tests {
-    use super::{remote_tmux_location, run_tmux_command_sync_result};
+    use super::{
+        remote_tmux_location, run_tmux_command_sync_result, tmux_matches_expected_generation,
+    };
 
     #[test]
     fn remote_tmux_probe_supplies_authoritative_location() {
@@ -1741,6 +1856,9 @@ mod sync_command_tests {
             pid: 42,
             width: 120,
             height: 40,
+            session_id: "$1".into(),
+            session_created: 1,
+            continuity_id: Some("11".repeat(16)),
         };
 
         assert_eq!(
@@ -1751,6 +1869,29 @@ mod sync_command_tests {
             remote_tmux_location(&crate::tmux::TmuxTarget::Local, &info),
             None
         );
+    }
+
+    #[test]
+    fn same_name_probe_cannot_promote_a_replacement_generation() {
+        let expected = crate::session::SavedTmuxIdentity {
+            session_id: "$0".into(),
+            session_created: 1711720000,
+            continuity_id: "11".repeat(16),
+        };
+        let mut info = crate::tmux::TmuxPaneInfo {
+            current_command: "zsh".into(),
+            cwd: "/repo".into(),
+            pid: 42,
+            width: 120,
+            height: 40,
+            session_id: expected.session_id.clone(),
+            session_created: expected.session_created,
+            continuity_id: Some(expected.continuity_id.clone()),
+        };
+        assert!(tmux_matches_expected_generation(&expected, &info));
+
+        info.continuity_id = Some("22".repeat(16));
+        assert!(!tmux_matches_expected_generation(&expected, &info));
     }
 
     #[test]
@@ -1773,7 +1914,10 @@ mod sync_command_tests {
 
 #[cfg(test)]
 mod agent_resume_tests {
-    use super::{plan_restored_spawns, SessionRestoreResumePolicy};
+    use super::{
+        plan_restored_spawns, restored_leaf_label, restored_tmux_display_metadata,
+        SessionRestoreResumePolicy,
+    };
     use crate::session::{SavedAgentSession, SavedAgentSessionSource, SavedPaneNode};
 
     fn leaf(agent_session: Option<SavedAgentSession>) -> SavedPaneNode {
@@ -1783,6 +1927,7 @@ mod agent_resume_tests {
             ssh_command: None,
             tmux_session: None,
             tmux_host: None,
+            tmux_identity: None,
             current_task: None,
             agent_session,
         }
@@ -1792,6 +1937,7 @@ mod agent_resume_tests {
         SavedAgentSession {
             agent_name: "codex".into(),
             session_id: "session-123".into(),
+            host_identity: Some("build.ts".into()),
             source: SavedAgentSessionSource::Argv,
         }
     }
@@ -1828,8 +1974,22 @@ mod agent_resume_tests {
             .spawn_cmd
             .as_ref()
             .expect("auto resume should supply a command");
-        assert_eq!(argv, &["codex", "resume", "session-123"]);
+        assert_eq!(argv[0], format!("/proc/{}/exe", std::process::id()));
+        assert_eq!(argv[1], "--resume-saved-agent");
+        let handoff: serde_json::Value =
+            serde_json::from_str(&argv[2]).expect("resume handoff must be typed JSON");
+        assert_eq!(handoff["reference"]["provider_id"], "codex");
+        assert_eq!(handoff["reference"]["session_id"], "session-123");
+        assert!(!handoff["reference"]["host_identity"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            handoff["expected_app_build"],
+            serde_json::to_value(crate::runtime_identity::build_identity()).unwrap()
+        );
         assert!(!argv.contains(&offer.command));
+        assert!(!argv.iter().any(|word| word == "/proc/self/exe"));
     }
 
     #[test]
@@ -1837,11 +1997,21 @@ mod agent_resume_tests {
         let plan = plan_restored_spawns(&leaf(Some(codex_session())), false);
         let mut offer = plan[0].agent_resume.clone().unwrap();
         offer.command = "must never execute this metadata".into();
-        offer.action.argv = vec!["resume".into(), "id with 'quotes'".into()];
-        assert_eq!(offer.argv(), ["codex", "resume", "id with 'quotes'"]);
+        offer.action.argv = vec!["--resume-saved-agent".into(), "id with 'quotes'".into()];
+        let expected_program = format!("/proc/{}/exe", std::process::id());
+        assert_eq!(
+            offer.argv(),
+            [
+                expected_program.clone(),
+                "--resume-saved-agent".into(),
+                "id with 'quotes'".into()
+            ]
+        );
         assert_eq!(
             offer.shell_input(),
-            "cd '/repo with spaces' && codex resume 'id with '\"'\"'quotes'\"'\"''"
+            format!(
+                "cd '/repo with spaces' && {expected_program} --resume-saved-agent 'id with '\"'\"'quotes'\"'\"''"
+            )
         );
     }
 
@@ -1877,6 +2047,7 @@ mod agent_resume_tests {
             ssh_command: None,
             tmux_session: Some("taarof--repo--0".into()),
             tmux_host: None,
+            tmux_identity: None,
             current_task: None,
             agent_session,
         };
@@ -1884,6 +2055,57 @@ mod agent_resume_tests {
         let after = plan_restored_spawns(&tmux_leaf(Some(codex_session())), false);
         assert_eq!(after, before);
         assert!(after[0].agent_resume.is_none());
+    }
+
+    #[test]
+    fn legacy_agent_without_original_host_cannot_rebind_on_this_machine() {
+        let mut legacy = codex_session();
+        legacy.host_identity = None;
+        let plan = plan_restored_spawns(&leaf(Some(legacy.clone())), true);
+        assert!(plan[0].spawn_cmd.is_none());
+        assert!(plan[0].agent_resume.is_none());
+        let (label, _) = restored_leaf_label(
+            Some("/repo with spaces"),
+            None,
+            None,
+            None,
+            None,
+            Some(&legacy),
+        );
+        assert!(label.contains("Resume unavailable: saved layout lacks original host identity"));
+    }
+
+    #[test]
+    fn legacy_tmux_name_surfaces_exact_generation_failure() {
+        let (label, _) =
+            restored_leaf_label(Some("/repo"), None, Some("same-name"), None, None, None);
+        assert_eq!(
+            label,
+            "tmux same-name · Reattach unavailable: saved layout lacks exact tmux generation"
+        );
+        let plan = plan_restored_spawns(
+            &SavedPaneNode::Leaf {
+                work_origin: None,
+                cwd: Some("/repo".into()),
+                ssh_command: None,
+                tmux_session: Some("same-name".into()),
+                tmux_host: None,
+                tmux_identity: None,
+                current_task: None,
+                agent_session: None,
+            },
+            false,
+        );
+        assert!(plan[0].spawn_cmd.is_none());
+        assert_eq!(plan[0].tmux_session.as_deref(), Some("same-name"));
+        assert_eq!(
+            restored_tmux_display_metadata(Some(&"same-name".into()), None, false),
+            Some(crate::pane::RestoredTmuxMetadata {
+                session_name: "same-name".into(),
+                target: crate::tmux::TmuxTarget::Local,
+            })
+        );
+        assert!(restored_tmux_display_metadata(Some(&"same-name".into()), None, true).is_none());
     }
 }
 

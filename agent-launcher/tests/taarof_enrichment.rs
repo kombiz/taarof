@@ -463,10 +463,10 @@ old=termios.tcgetattr(slave)
 proc=subprocess.Popen([binary,'--session','picker/runtime'],stdin=slave,stdout=slave,stderr=slave,cwd=home,env={'HOME':home,'XDG_RUNTIME_DIR':home,'PATH':home,'TERM':'xterm-256color'})
 try:
     output=b'';deadline=time.monotonic()+7
-    while b'Attach' not in output and proc.poll() is None:
+    while b'Reattach' not in output and proc.poll() is None:
         assert time.monotonic()<deadline
         if select.select([master],[],[],.05)[0]:output+=os.read(master,65536)
-    assert b'Attach' in output
+    assert b'Reattach' in output
     os.write(master,b'\r')
     assert proc.wait(timeout=7)==0
     assert termios.tcgetattr(slave)==old

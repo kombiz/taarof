@@ -40,6 +40,7 @@ pub(super) fn pane_spawn_argv(
             let backing = crate::pane::TmuxBacking {
                 session_name: name.to_string(),
                 target,
+                expected_generation: None,
                 pane_info: ProbeSnapshot::default(),
             };
             return (argv, Some(backing));
@@ -184,6 +185,42 @@ pub(super) fn child_exit_ui_action(
     }
 }
 
+fn restored_child_exit_reason(
+    exit_code: i32,
+    has_exact_tmux_binding: bool,
+    restored_spawn_kind: Option<crate::pane::RestoredSpawnKind>,
+) -> Option<String> {
+    if exit_code == 0 {
+        return None;
+    }
+    if has_exact_tmux_binding {
+        return Some(if exit_code == 75 {
+            crate::tmux::EXACT_ATTACH_UNAVAILABLE_REASON.to_string()
+        } else {
+            format!(
+                "Reattach unavailable: the exact saved tmux target could not be validated (exit status {exit_code})."
+            )
+        });
+    }
+    (restored_spawn_kind == Some(crate::pane::RestoredSpawnKind::AgentResume)).then(|| {
+        format!(
+            "Resume agent conversation failed (exit status {exit_code}); the terminal output was retained for diagnosis."
+        )
+    })
+}
+
+fn child_exit_ui_action_with_restore_reason(
+    restore_unavailable_reason: Option<&str>,
+    leaf_count: usize,
+    close_on_exit: bool,
+    total_tabs: usize,
+) -> ChildExitUiAction {
+    restore_unavailable_reason.map_or_else(
+        || child_exit_ui_action(leaf_count, close_on_exit, total_tabs),
+        |_| ChildExitUiAction::None,
+    )
+}
+
 /// Watch a brokered pane's child for exit. VTE no longer owns the child (the
 /// broker does), so instead of `connect_child_exited` we poll the broker's
 /// reaped exit status from the main loop and run the same cleanup. The poller
@@ -251,6 +288,17 @@ fn run_child_exit_cleanup(
     pane_id: u32,
     exit_code: i32,
 ) {
+    let failure_snippet = if exit_code != 0 {
+        terminal
+            .and_then(|terminal| {
+                super::capture_last_terminal_lines(terminal, FAILING_TEST_SNIPPET_LINES).ok()
+            })
+            .map(|(text, _)| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let command_exit_event = if exit_code == 0 {
         None
     } else {
@@ -262,20 +310,13 @@ fn run_child_exit_cleanup(
             return;
         };
         leaf.launch_command.clone().map(|command| {
-            let snippet = terminal
-                .and_then(|terminal| {
-                    super::capture_last_terminal_lines(terminal, FAILING_TEST_SNIPPET_LINES).ok()
-                })
-                .map(|(text, _)| text.trim().to_string())
-                .filter(|text| !text.is_empty())
-                .unwrap_or_default();
             serde_json::json!({
                 "tab_id": tab_id,
                 "tab_name": tab.name.clone(),
                 "pane_id": pane_id,
                 "command": command,
                 "exit_code": exit_code,
-                "snippet": snippet,
+                "snippet": failure_snippet,
             })
         })
     };
@@ -286,24 +327,45 @@ fn run_child_exit_cleanup(
         let Some(tab) = st.find_tab_mut(tab_id) else {
             return;
         };
+        let restore_unavailable_reason = tab.panes.leaf(pane_id).and_then(|leaf| {
+            restored_child_exit_reason(
+                exit_code,
+                leaf.tmux_backing
+                    .as_ref()
+                    .is_some_and(|backing| backing.expected_generation.is_some()),
+                leaf.restored_spawn_kind,
+            )
+        });
         if let Some(leaf) = tab.panes.leaf_mut(pane_id) {
             leaf.shell_pid = None;
             leaf.was_busy = false;
             leaf.launch_command = None;
+            if let Some(reason) = restore_unavailable_reason.as_ref() {
+                leaf.restore_unavailable_reason = Some(reason.clone());
+                // The child is gone; retain the rendered refusal as a static
+                // checkpoint rather than advertising a live raw PTY.
+                leaf.broker = None;
+            }
         }
         tab.reset_pane_agent_activity_evidence(pane_id);
         let leaf_count = tab.panes.leaf_count();
         let close_on_exit = tab.close_on_exit;
-        let respawn_on_exit = if leaf_count <= 1 && !close_on_exit {
-            tab.respawn_on_exit.take()
-        } else {
-            None
-        };
+        let respawn_on_exit =
+            if restore_unavailable_reason.is_none() && leaf_count <= 1 && !close_on_exit {
+                tab.respawn_on_exit.take()
+            } else {
+                None
+            };
         if respawn_on_exit.is_some() {
             tab.close_on_exit = true;
         }
         (
-            child_exit_ui_action(leaf_count, close_on_exit, total_tabs),
+            child_exit_ui_action_with_restore_reason(
+                restore_unavailable_reason.as_deref(),
+                leaf_count,
+                close_on_exit,
+                total_tabs,
+            ),
             respawn_on_exit,
         )
     };
@@ -410,5 +472,65 @@ fn run_child_exit_cleanup(
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restored_child_exit_reason;
+    use crate::pane::RestoredSpawnKind;
+
+    #[test]
+    fn exact_restore_refusal_becomes_persistent_unavailable_state() {
+        assert_eq!(
+            restored_child_exit_reason(75, true, None).as_deref(),
+            Some(crate::tmux::EXACT_ATTACH_UNAVAILABLE_REASON)
+        );
+        assert!(restored_child_exit_reason(75, false, None).is_none());
+    }
+
+    #[test]
+    fn successful_exact_restore_keeps_normal_exit_behavior() {
+        assert!(restored_child_exit_reason(0, true, None).is_none());
+        assert_eq!(
+            super::child_exit_ui_action(2, true, 1),
+            super::ChildExitUiAction::ClosePane
+        );
+    }
+
+    #[test]
+    fn restored_tmux_transport_failure_reports_its_exit_status() {
+        assert_eq!(
+            restored_child_exit_reason(255, true, None).as_deref(),
+            Some(
+                "Reattach unavailable: the exact saved tmux target could not be validated (exit status 255)."
+            )
+        );
+    }
+
+    #[test]
+    fn failed_automatic_agent_resume_becomes_retained_diagnostic() {
+        let reason = restored_child_exit_reason(2, false, Some(RestoredSpawnKind::AgentResume));
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                "Resume agent conversation failed (exit status 2); the terminal output was retained for diagnosis."
+            )
+        );
+        assert_eq!(
+            super::child_exit_ui_action_with_restore_reason(reason.as_deref(), 1, true, 1,),
+            super::ChildExitUiAction::None
+        );
+    }
+
+    #[test]
+    fn successful_resume_and_ordinary_failures_keep_normal_exit_behavior() {
+        let reason = restored_child_exit_reason(0, false, Some(RestoredSpawnKind::AgentResume));
+        assert!(reason.is_none());
+        assert_eq!(
+            super::child_exit_ui_action_with_restore_reason(reason.as_deref(), 2, true, 1),
+            super::ChildExitUiAction::ClosePane
+        );
+        assert!(restored_child_exit_reason(2, false, None).is_none());
     }
 }

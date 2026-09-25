@@ -167,6 +167,20 @@ impl Picker {
                     format!("Confidence: {:?}", session.confidence),
                     format!("Source: {:?}", session.source),
                 ];
+                for kind in [ActionKind::Attach, ActionKind::Resume] {
+                    if !session.actions.iter().any(|action| action.kind == kind) {
+                        let reason = match kind {
+                            ActionKind::Attach => {
+                                "no exact current live process target was validated"
+                            }
+                            ActionKind::Resume => {
+                                "no exact provider resume authority was validated"
+                            }
+                            _ => unreachable!(),
+                        };
+                        metadata.push(format!("{} unavailable: {reason}.", kind.label()));
+                    }
+                }
                 metadata.extend(
                     session
                         .warnings

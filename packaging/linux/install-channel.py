@@ -63,11 +63,12 @@ def launcher(payload: Path, channel: str, program: str) -> str:
     # Drop inherited control targets so the channel CLI cannot address another app.
     reset = "unset TAAROF_SOCK TAAROF_HTTP TAAROF_HTTP_TOKEN\n"
     app = shlex.quote(str(payload / "bin/taarof-app"))
+    agent = shlex.quote(str(payload / "bin/agent"))
     web = shlex.quote(str(payload / "share/taarof/web"))
     command = shlex.quote(str(payload / "bin" / program))
     session_arg = " --session kmux" if channel == "kmux" and program == "taarof" else ""
     return ("#!/bin/sh\n" + session + reset
-            + f"export TAAROF_APP_BIN={app}\nexport TAAROF_INSTALLED_BINARY={app}\nexport TAAROF_WEB_DIST_DIR={web}\n"
+            + f"export TAAROF_APP_BIN={app}\nexport TAAROF_INSTALLED_BINARY={app}\nexport TAAROF_AGENT_BINARY={agent}\nexport TAAROF_WEB_DIST_DIR={web}\n"
             + f'exec {command}{session_arg} "$@"\n')
 
 

@@ -16,7 +16,91 @@ use crate::tmux::TmuxTarget;
 pub struct TmuxBacking {
     pub session_name: String,
     pub target: TmuxTarget,
+    /// Exact generation this pane was authorized to attach. Restored panes
+    /// keep the saved value even before (or after a failed) live probe so
+    /// cleanup cannot acquire authority over a same-named replacement.
+    pub expected_generation: Option<crate::session::SavedTmuxIdentity>,
     pub pane_info: ProbeSnapshot<crate::tmux::TmuxPaneInfo>,
+}
+
+impl TmuxBacking {
+    fn observed_generation(&self) -> Option<crate::session::SavedTmuxIdentity> {
+        let info = self.pane_info.value()?;
+        Some(crate::session::SavedTmuxIdentity {
+            session_id: info.session_id.clone(),
+            session_created: info.session_created,
+            continuity_id: info.continuity_id.clone()?,
+        })
+    }
+
+    pub fn authoritative_generation(&self) -> Option<crate::session::SavedTmuxIdentity> {
+        self.expected_generation
+            .clone()
+            .or_else(|| self.observed_generation())
+    }
+
+    pub fn same_execution_target(&self, other: &Self) -> bool {
+        if self.session_name != other.session_name
+            || self.target != other.target
+            || self.expected_generation != other.expected_generation
+        {
+            return false;
+        }
+        if self.expected_generation.is_some() {
+            return true;
+        }
+        // A first probe may complete while an async close/detach is in flight;
+        // missing-vs-observed is still the same configured slot. Two distinct
+        // observed generations remain distinct. Commands independently use
+        // `authoritative_generation` and are generation-gated.
+        match (self.observed_generation(), other.observed_generation()) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+    }
+
+    pub fn expected_generation_is_verified(&self) -> bool {
+        let Some(expected) = self.expected_generation.as_ref() else {
+            return true;
+        };
+        if self.pane_info.state != crate::probe::ProbeState::Ok {
+            return false;
+        }
+        self.pane_info.value().is_some_and(|observed| {
+            observed.session_id == expected.session_id
+                && observed.session_created == expected.session_created
+                && observed.continuity_id.as_deref() == Some(expected.continuity_id.as_str())
+        })
+    }
+}
+
+/// Display-only tmux metadata retained from a legacy saved layout. It is never
+/// execution authority: reattach, resize, input, and cleanup all require a
+/// real [`TmuxBacking`] with an exact saved generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoredTmuxMetadata {
+    pub session_name: String,
+    pub target: TmuxTarget,
+}
+
+impl PaneLeaf {
+    pub fn tmux_display_metadata(&self) -> Option<(&str, &TmuxTarget)> {
+        self.tmux_backing
+            .as_ref()
+            .map(|backing| (backing.session_name.as_str(), &backing.target))
+            .or_else(|| {
+                self.restored_tmux
+                    .as_ref()
+                    .map(|saved| (saved.session_name.as_str(), &saved.target))
+            })
+    }
+}
+
+/// Identifies an automatic restored child whose failure should remain visible
+/// as a saved-target diagnostic instead of following ordinary command cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoredSpawnKind {
+    AgentResume,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,6 +170,11 @@ pub struct PaneLeaf {
     /// Used for output-activity-based idle detection on SSH panes.
     pub output_tracker: Rc<Cell<Option<Instant>>>,
     pub tmux_backing: Option<TmuxBacking>,
+    pub restored_tmux: Option<RestoredTmuxMetadata>,
+    /// Concrete reason a restored execution target could not be reacquired.
+    /// Keep the saved backing separately so a later restart can retry the same
+    /// exact identity without treating a same-named replacement as authority.
+    pub restore_unavailable_reason: Option<String>,
     pub location_state: PaneLocationState,
     pub process_state: PaneProcessState,
     pub current_task: Option<crate::task_binding::PaneTaskBinding>,
@@ -93,6 +182,7 @@ pub struct PaneLeaf {
     /// autosaves after restore so the opt-in resume action survives another
     /// application restart; a newly detected live session supersedes it.
     pub restored_agent_session: Option<crate::session::SavedAgentSession>,
+    pub restored_spawn_kind: Option<RestoredSpawnKind>,
     /// Opt-in command offered after restoring a non-tmux agent pane.
     pub agent_resume: Option<crate::terminal::AgentResumeOffer>,
     /// Cursor rows recorded on each shell prompt marker (OSC 133;A, surfaced by
@@ -125,6 +215,120 @@ pub(crate) fn new_pane_work_origin() -> String {
         let _ = write!(rendered, "{byte:02x}");
     }
     rendered
+}
+
+#[cfg(test)]
+mod continuity_tests {
+    use super::TmuxBacking;
+    use crate::probe::ProbeSnapshot;
+    use crate::session::SavedTmuxIdentity;
+    use crate::tmux::{TmuxPaneInfo, TmuxTarget};
+
+    fn saved_identity(nonce: &str) -> SavedTmuxIdentity {
+        SavedTmuxIdentity {
+            session_id: "$1".into(),
+            session_created: 1,
+            continuity_id: nonce.into(),
+        }
+    }
+
+    #[test]
+    fn probe_completion_does_not_supersede_the_same_configured_backing() {
+        let before = TmuxBacking {
+            session_name: "same-name".into(),
+            target: TmuxTarget::Local,
+            expected_generation: None,
+            pane_info: ProbeSnapshot::default(),
+        };
+        let mut after = before.clone();
+        after.pane_info.record_success(TmuxPaneInfo {
+            current_command: "zsh".into(),
+            cwd: "/tmp".into(),
+            pid: 42,
+            width: 80,
+            height: 24,
+            session_id: "$2".into(),
+            session_created: 2,
+            continuity_id: Some("22222222222222222222222222222222".into()),
+        });
+
+        assert!(before.same_execution_target(&after));
+    }
+
+    #[test]
+    fn distinct_saved_generations_are_distinct_execution_slots() {
+        let first = TmuxBacking {
+            session_name: "same-name".into(),
+            target: TmuxTarget::Local,
+            expected_generation: Some(saved_identity("11111111111111111111111111111111")),
+            pane_info: ProbeSnapshot::default(),
+        };
+        let mut replacement = first.clone();
+        replacement.expected_generation = Some(saved_identity("22222222222222222222222222222222"));
+
+        assert!(!first.same_execution_target(&replacement));
+    }
+
+    #[test]
+    fn expected_generation_requires_matching_live_probe() {
+        let expected = saved_identity("11111111111111111111111111111111");
+        let mut backing = TmuxBacking {
+            session_name: "same-name".into(),
+            target: TmuxTarget::Local,
+            expected_generation: Some(expected.clone()),
+            pane_info: ProbeSnapshot::default(),
+        };
+        assert!(!backing.expected_generation_is_verified());
+
+        backing.pane_info.record_success(TmuxPaneInfo {
+            current_command: "zsh".into(),
+            cwd: "/tmp".into(),
+            pid: 42,
+            width: 80,
+            height: 24,
+            session_id: expected.session_id,
+            session_created: expected.session_created,
+            continuity_id: Some(expected.continuity_id),
+        });
+        assert!(backing.expected_generation_is_verified());
+        backing
+            .pane_info
+            .record_failure("same-name replacement refused");
+        assert!(!backing.expected_generation_is_verified());
+    }
+
+    #[test]
+    fn two_distinct_observed_generations_are_not_the_same_slot() {
+        let mut first = TmuxBacking {
+            session_name: "same-name".into(),
+            target: TmuxTarget::Local,
+            expected_generation: None,
+            pane_info: ProbeSnapshot::default(),
+        };
+        let mut replacement = first.clone();
+        for (backing, session_id, created, nonce) in [
+            (&mut first, "$1", 1, "11111111111111111111111111111111"),
+            (
+                &mut replacement,
+                "$2",
+                2,
+                "22222222222222222222222222222222",
+            ),
+        ] {
+            backing.pane_info.record_success(TmuxPaneInfo {
+                current_command: "zsh".into(),
+                cwd: "/tmp".into(),
+                pid: 42,
+                width: 80,
+                height: 24,
+                session_id: session_id.into(),
+                session_created: created,
+                continuity_id: Some(nonce.into()),
+            });
+        }
+
+        assert!(!first.same_execution_target(&replacement));
+    }
 }
 
 impl PaneLeaf {

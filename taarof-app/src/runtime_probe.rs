@@ -1284,6 +1284,7 @@ mod tests {
         let mut backing = crate::pane::TmuxBacking {
             session_name: "fixture".into(),
             target: crate::tmux::TmuxTarget::Local,
+            expected_generation: None,
             pane_info: crate::probe::ProbeSnapshot {
                 state: ProbeState::Ok,
                 value: Some(crate::tmux::TmuxPaneInfo {
@@ -1292,6 +1293,9 @@ mod tests {
                     pid: 77,
                     width: 80,
                     height: 24,
+                    session_id: "$1".into(),
+                    session_created: 1,
+                    continuity_id: Some("11".repeat(16)),
                 }),
                 observed_at_unix_ms: Some(1_000),
                 checked_at_unix_ms: Some(1_000),

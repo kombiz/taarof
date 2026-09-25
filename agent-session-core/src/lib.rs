@@ -21,6 +21,19 @@ mod legacy_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuity_actions_name_their_distinct_authorities() {
+        assert_eq!(ActionKind::Attach.label(), "Reattach live terminal");
+        assert_eq!(ActionKind::Resume.label(), "Resume agent conversation");
+        assert!(ActionKind::Attach
+            .authority_description()
+            .contains("live process target"));
+        assert!(ActionKind::Resume
+            .authority_description()
+            .contains("provider session identity"));
+        assert!(!ActionKind::New.authority_description().contains("resume"));
+    }
     use serde_json::json;
     use std::path::PathBuf;
 

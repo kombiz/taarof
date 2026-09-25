@@ -666,7 +666,7 @@ def control_runtime_implementation_errors(socket_source: str) -> list[str]:
     required = (
         "PaneControlTarget::Tmux",
         "submit_coalesced",
-        "crate::tmux::resize_pane_command",
+        "crate::tmux::resize_backing_command",
         "crate::tmux::TMUX_CONTROL_DEADLINE",
         "PaneControlTarget::Vte",
         "terminal.set_size",

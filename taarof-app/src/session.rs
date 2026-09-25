@@ -16,6 +16,10 @@ use crate::instance;
 pub struct SavedAgentSession {
     pub agent_name: String,
     pub session_id: String,
+    /// Canonical host that owned this opaque provider identity when captured.
+    /// Legacy layouts omit it and cannot authorize Resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_identity: Option<String>,
     pub source: SavedAgentSessionSource,
 }
 
@@ -24,6 +28,13 @@ pub struct SavedAgentSession {
 pub enum SavedAgentSessionSource {
     Argv,
     TranscriptRecency,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SavedTmuxIdentity {
+    pub session_id: String,
+    pub session_created: u64,
+    pub continuity_id: String,
 }
 
 /// Persisted pane tree node — mirrors PaneNode but serializable.
@@ -46,6 +57,12 @@ pub enum SavedPaneNode {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
         tmux_host: Option<String>,
+        /// Exact tmux server/session generation captured by the live metadata
+        /// probe. A legacy name alone is display metadata, never reattach
+        /// authority.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        tmux_identity: Option<SavedTmuxIdentity>,
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
         current_task: Option<crate::task_binding::PaneTaskBinding>,
@@ -453,6 +470,7 @@ impl SessionCapture {
                         SavedAgentSession {
                             agent_name: lookup.agent.clone(),
                             session_id: record.session_id.clone(),
+                            host_identity: crate::agent_sessions::canonical_local_host_identity(),
                             source: SavedAgentSessionSource::TranscriptRecency,
                         },
                     );
@@ -572,6 +590,7 @@ fn layout_matches_session(state: &SessionStateV2, expected_identity: Option<&str
 }
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+static NEXT_RECOVERY_FILE: AtomicU64 = AtomicU64::new(0);
 
 fn next_session_temp_path(path: &Path) -> PathBuf {
     let file_name = path
@@ -583,6 +602,32 @@ fn next_session_temp_path(path: &Path) -> PathBuf {
         ".{file_name}.{}.{}.tmp",
         std::process::id(),
         sequence
+    ))
+}
+
+fn preserve_failed_layout(path: &Path) -> io::Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session.json");
+    for _ in 0..64 {
+        let sequence = NEXT_RECOVERY_FILE.fetch_add(1, Ordering::Relaxed);
+        let recovery = path.with_file_name(format!("{file_name}.recovery.{sequence}"));
+        match fs::hard_link(path, &recovery) {
+            Ok(()) => {
+                // The recovery directory entry now owns the original inode.
+                // Removing the active name cannot destroy those bytes; if the
+                // removal fails, keep both names and still report preservation.
+                let _ = fs::remove_file(path);
+                return Ok(recovery);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "session recovery path collision",
     ))
 }
 
@@ -778,6 +823,21 @@ fn drain_latest_session_capture(
 impl SessionWriter {
     pub(crate) fn start() -> io::Result<Self> {
         Self::start_for_path(state_file())
+    }
+
+    pub(crate) fn blocked(reason: String) -> io::Result<Self> {
+        Self::blocked_at(state_file(), reason)
+    }
+
+    fn blocked_at(path: PathBuf, reason: String) -> io::Result<Self> {
+        let write_reason = reason.clone();
+        let writer = Self::start_at(
+            path,
+            Arc::new(move |_, _| Err(io::Error::other(write_reason.clone()))),
+            SESSION_WRITER_SHUTDOWN_TIMEOUT,
+        )?;
+        writer.0.shared.record_error(reason);
+        Ok(writer)
     }
 
     fn start_for_path(path: PathBuf) -> io::Result<Self> {
@@ -1119,6 +1179,176 @@ pub fn load_v2() -> Option<SessionStateV2> {
     Some(state)
 }
 
+pub struct StartupSessionLoad {
+    pub state: Option<SessionStateV2>,
+    pub diagnostic: Option<String>,
+    pub writer_block_reason: Option<String>,
+}
+
+enum StartupCandidateFailure {
+    Preserve(io::Error),
+    LeaveInPlace(&'static str),
+}
+
+impl StartupCandidateFailure {
+    fn reason(&self) -> String {
+        match self {
+            Self::Preserve(error) => error.to_string(),
+            Self::LeaveInPlace(reason) => (*reason).to_string(),
+        }
+    }
+}
+
+fn load_primary_startup_candidate(
+    path: &Path,
+    expected_identity: Option<&str>,
+) -> Result<Option<SessionStateV2>, StartupCandidateFailure> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StartupCandidateFailure::Preserve(error)),
+    };
+    let state = load_v2_from_str(&content).ok_or_else(|| {
+        StartupCandidateFailure::Preserve(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "layout is corrupt",
+        ))
+    })?;
+    if !layout_matches_session(&state, expected_identity) {
+        return Err(StartupCandidateFailure::LeaveInPlace(
+            "layout belongs to another session identity",
+        ));
+    }
+    Ok(Some(state))
+}
+
+fn load_legacy_startup_candidate(
+    path: &Path,
+    expected_identity: Option<&str>,
+) -> Result<Option<SessionStateV2>, StartupCandidateFailure> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StartupCandidateFailure::Preserve(error)),
+    };
+    let mut state = load_v2_from_str(&content).ok_or_else(|| {
+        StartupCandidateFailure::Preserve(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy layout is corrupt",
+        ))
+    })?;
+    if state.session_namespace.is_some()
+        || state
+            .session_identity
+            .as_deref()
+            .is_some_and(|identity| Some(identity) != expected_identity)
+    {
+        return Err(StartupCandidateFailure::LeaveInPlace(
+            "legacy layout identity is ambiguous",
+        ));
+    }
+    state.session_namespace = expected_identity.map(instance::session_storage_key_for);
+    state.session_identity = expected_identity.map(str::to_string);
+    Ok(Some(state))
+}
+
+fn load_v2_for_startup_at(
+    path: &Path,
+    legacy: Option<&Path>,
+    expected_identity: Option<&str>,
+    preserve: &dyn Fn(&Path) -> io::Result<PathBuf>,
+) -> StartupSessionLoad {
+    let (failed_path, failure) = match load_primary_startup_candidate(path, expected_identity) {
+        Ok(Some(state)) => {
+            return StartupSessionLoad {
+                state: Some(state),
+                diagnostic: None,
+                writer_block_reason: None,
+            };
+        }
+        Ok(None) => match legacy {
+            Some(legacy_path) => {
+                match load_legacy_startup_candidate(legacy_path, expected_identity) {
+                    Ok(Some(state)) => {
+                        return StartupSessionLoad {
+                            state: Some(state),
+                            diagnostic: None,
+                            writer_block_reason: None,
+                        };
+                    }
+                    Ok(None) => {
+                        return StartupSessionLoad {
+                            state: None,
+                            diagnostic: None,
+                            writer_block_reason: None,
+                        };
+                    }
+                    Err(error) => (legacy_path, error),
+                }
+            }
+            None => {
+                return StartupSessionLoad {
+                    state: None,
+                    diagnostic: None,
+                    writer_block_reason: None,
+                };
+            }
+        },
+        Err(error) => (path, error),
+    };
+
+    let failure_reason = failure.reason();
+    if matches!(failure, StartupCandidateFailure::LeaveInPlace(_)) {
+        let reason = format!(
+            "saved workspace layout at {} was not opened ({failure_reason}); the original was left unchanged and session persistence is blocked",
+            failed_path.display(),
+        );
+        return StartupSessionLoad {
+            state: None,
+            diagnostic: Some(reason.clone()),
+            writer_block_reason: Some(reason),
+        };
+    }
+
+    match preserve(failed_path) {
+        Ok(recovery) => StartupSessionLoad {
+            state: None,
+            diagnostic: Some(format!(
+                "Saved workspace layout could not be opened ({failure_reason}). The original was preserved at {}. Reopen workspace layout started empty; live processes and display checkpoints were not inferred.",
+                recovery.display(),
+            )),
+            writer_block_reason: None,
+        },
+        Err(error) => {
+            let reason = format!(
+                "saved workspace layout could not be opened at {} ({failure_reason}) or preserved: {error}; session persistence is blocked",
+                failed_path.display(),
+            );
+            StartupSessionLoad {
+                state: None,
+                diagnostic: Some(reason.clone()),
+                writer_block_reason: Some(reason),
+            }
+        }
+    }
+}
+
+/// Load the desktop layout without ever letting an unreadable or malformed
+/// source be replaced by the default empty session. Recoverable failures move
+/// the original inode under a collision-safe recovery name. If preservation
+/// itself fails, persistence remains blocked for the whole process lifetime.
+pub fn load_v2_for_startup() -> StartupSessionLoad {
+    let path = state_file();
+    let legacy = legacy_state_file();
+    let expected_identity = instance::session_name();
+    load_v2_for_startup_at(
+        &path,
+        legacy.as_deref(),
+        expected_identity.as_deref(),
+        &preserve_failed_layout,
+    )
+}
+
 fn load_v2_from_str(content: &str) -> Option<SessionStateV2> {
     // Try v2 first (has "version" and "workspaces" keys)
     if let Ok(mut v2) = serde_json::from_str::<SessionStateV2>(content) {
@@ -1161,6 +1391,16 @@ fn load_v2_from_str(content: &str) -> Option<SessionStateV2> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recovery_test_dir(label: &str) -> PathBuf {
+        let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "taarof-recovery-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 
     #[test]
     fn named_session_layout_paths_do_not_cross_slug_collisions() {
@@ -1237,6 +1477,7 @@ mod tests {
                 ssh_command: None,
                 tmux_session: None,
                 tmux_host: None,
+                tmux_identity: None,
                 current_task: None,
                 agent_session: None,
             }),
@@ -1246,6 +1487,7 @@ mod tests {
                 ssh_command: None,
                 tmux_session: None,
                 tmux_host: None,
+                tmux_identity: None,
                 current_task: None,
                 agent_session: None,
             }),
@@ -1273,6 +1515,200 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn corrupt_startup_layout_is_preserved_before_an_empty_save() {
+        let dir = recovery_test_dir("corrupt");
+        let path = dir.join("session.json");
+        let original = b"{not valid session json\n";
+        fs::write(&path, original).unwrap();
+
+        let loaded = load_v2_for_startup_at(&path, None, None, &preserve_failed_layout);
+        assert!(loaded.state.is_none());
+        assert!(loaded.writer_block_reason.is_none());
+        assert!(loaded
+            .diagnostic
+            .as_deref()
+            .is_some_and(|message| message.contains("preserved at")));
+        assert!(!path.exists());
+
+        let recovery = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|candidate| candidate.to_string_lossy().contains(".recovery."))
+            .expect("corrupt source must have a recovery entry");
+        assert_eq!(fs::read(&recovery).unwrap(), original);
+
+        write_atomically(&path, r#"{"version":2,"workspaces":[]}"#).unwrap();
+        assert_eq!(fs::read(&recovery).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn foreign_layout_stays_in_place_and_blocks_all_writes() {
+        use std::cell::Cell;
+
+        let dir = recovery_test_dir("foreign");
+        let path = dir.join("session.json");
+        let foreign = SessionStateV2 {
+            version: 2,
+            session_namespace: Some(instance::session_storage_key_for("other-session")),
+            session_identity: Some("other-session".into()),
+            session_name: Some("other-session".into()),
+            workspaces: Vec::new(),
+            active_workspace_index: 0,
+            window_width: 1200,
+            window_height: 800,
+            detached_sessions: Vec::new(),
+            background_section_collapsed: None,
+        };
+        let original = serde_json::to_vec_pretty(&foreign).unwrap();
+        fs::write(&path, &original).unwrap();
+        let original_modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let preserve_called = Cell::new(false);
+        let preserve = |_path: &Path| -> io::Result<PathBuf> {
+            preserve_called.set(true);
+            Err(io::Error::other("foreign layout must not be relocated"))
+        };
+
+        let loaded = load_v2_for_startup_at(&path, None, Some("expected-session"), &preserve);
+        assert!(loaded.state.is_none());
+        assert!(!preserve_called.get());
+        let reason = loaded
+            .writer_block_reason
+            .expect("foreign layout must block persistence");
+        assert!(reason.contains("belongs to another session identity"));
+        assert!(reason.contains("left unchanged"));
+        let writer = SessionWriter::blocked_at(path.clone(), reason).unwrap();
+        writer.schedule_autosave(session_writer_capture("must not overwrite"));
+        assert!(writer.flush().is_err());
+        assert!(writer
+            .shutdown(session_writer_capture("must not overwrite on shutdown"))
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            original_modified
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_legacy_layout_stays_in_place_and_blocks_primary_writer() {
+        use std::cell::Cell;
+
+        let dir = recovery_test_dir("ambiguous-legacy");
+        let primary = dir.join("session.json");
+        let legacy = dir.join("session-legacy.json");
+        let ambiguous = SessionStateV2 {
+            version: 2,
+            session_namespace: Some("already-namespaced".into()),
+            session_identity: Some("other-session".into()),
+            session_name: Some("other-session".into()),
+            workspaces: Vec::new(),
+            active_workspace_index: 0,
+            window_width: 1200,
+            window_height: 800,
+            detached_sessions: Vec::new(),
+            background_section_collapsed: None,
+        };
+        let original = serde_json::to_vec_pretty(&ambiguous).unwrap();
+        fs::write(&legacy, &original).unwrap();
+        let original_modified = fs::metadata(&legacy).unwrap().modified().unwrap();
+        let preserve_called = Cell::new(false);
+        let preserve = |_path: &Path| -> io::Result<PathBuf> {
+            preserve_called.set(true);
+            Err(io::Error::other("ambiguous legacy layout must stay put"))
+        };
+
+        let loaded =
+            load_v2_for_startup_at(&primary, Some(&legacy), Some("expected-session"), &preserve);
+        assert!(!preserve_called.get());
+        let reason = loaded
+            .writer_block_reason
+            .expect("ambiguous legacy layout must block persistence");
+        assert!(reason.contains("legacy layout identity is ambiguous"));
+        let writer = SessionWriter::blocked_at(primary.clone(), reason).unwrap();
+        writer.schedule_autosave(session_writer_capture("must not write primary"));
+        assert!(writer.flush().is_err());
+        assert!(writer
+            .shutdown(session_writer_capture("must not write on shutdown"))
+            .is_err());
+        assert!(!primary.exists());
+        assert_eq!(fs::read(&legacy).unwrap(), original);
+        assert_eq!(
+            fs::metadata(&legacy).unwrap().modified().unwrap(),
+            original_modified
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_preservation_blocks_autosave_and_shutdown() {
+        let dir = recovery_test_dir("blocked");
+        let path = dir.join("session.json");
+        let original = b"unreadable fixture";
+        fs::write(&path, original).unwrap();
+        let deny = |_path: &Path| -> io::Result<PathBuf> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected preservation denial",
+            ))
+        };
+
+        let loaded = load_v2_for_startup_at(&path, None, None, &deny);
+        let reason = loaded
+            .writer_block_reason
+            .expect("failed preservation must block persistence");
+        assert!(reason.contains("injected preservation denial"));
+        let writer = SessionWriter::blocked_at(path.clone(), reason).unwrap();
+        writer.schedule_autosave(session_writer_capture("must not overwrite"));
+        assert!(writer.flush().is_err());
+        assert!(writer
+            .shutdown(session_writer_capture("must not overwrite on shutdown"))
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn empty_valid_layout_is_loaded_without_recovery() {
+        let dir = recovery_test_dir("empty");
+        let path = dir.join("session.json");
+        fs::write(
+            &path,
+            r#"{"version":2,"workspaces":[],"active_workspace_index":0,"window_width":1200,"window_height":800}"#,
+        )
+        .unwrap();
+        let loaded = load_v2_for_startup_at(&path, None, None, &preserve_failed_layout);
+        assert_eq!(loaded.state.unwrap().workspaces.len(), 0);
+        assert!(loaded.diagnostic.is_none());
+        assert!(loaded.writer_block_reason.is_none());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_legacy_layout_is_preserved_when_primary_is_absent() {
+        let dir = recovery_test_dir("legacy");
+        let primary = dir.join("session.json");
+        let legacy = dir.join("session-legacy.json");
+        fs::write(&legacy, "legacy corrupt bytes").unwrap();
+        let loaded = load_v2_for_startup_at(
+            &primary,
+            Some(&legacy),
+            Some("legacy"),
+            &preserve_failed_layout,
+        );
+        assert!(loaded.state.is_none());
+        assert!(loaded.writer_block_reason.is_none());
+        assert!(!legacy.exists());
+        assert!(fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .any(|candidate| candidate.to_string_lossy().contains(".recovery.")));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1391,6 +1827,7 @@ mod tests {
             ssh_command: None,
             tmux_session: Some("taarof--app--editor--0".into()),
             tmux_host: Some("user@devbox".into()),
+            tmux_identity: None,
             current_task: None,
             agent_session: None,
         };
@@ -1437,10 +1874,12 @@ mod tests {
             ssh_command: None,
             tmux_session: None,
             tmux_host: None,
+            tmux_identity: None,
             current_task: None,
             agent_session: Some(SavedAgentSession {
                 agent_name: "codex".into(),
                 session_id: "session-123".into(),
+                host_identity: Some("build.ts".into()),
                 source: SavedAgentSessionSource::TranscriptRecency,
             }),
         };
@@ -1452,6 +1891,7 @@ mod tests {
                 Some(SavedAgentSession {
                     agent_name: "codex".into(),
                     session_id: "session-123".into(),
+                    host_identity: Some("build.ts".into()),
                     source: SavedAgentSessionSource::TranscriptRecency,
                 })
             ),
@@ -1541,6 +1981,7 @@ mod tests {
                 ssh_command: None,
                 tmux_session: None,
                 tmux_host: None,
+                tmux_identity: None,
                 current_task: None,
                 agent_session: None,
             }),
@@ -1553,6 +1994,7 @@ mod tests {
                     ssh_command: None,
                     tmux_session: None,
                     tmux_host: None,
+                    tmux_identity: None,
                     current_task: None,
                     agent_session: None,
                 }),
@@ -1562,6 +2004,7 @@ mod tests {
                     ssh_command: None,
                     tmux_session: None,
                     tmux_host: None,
+                    tmux_identity: None,
                     current_task: None,
                     agent_session: None,
                 }),
@@ -1598,6 +2041,7 @@ mod tests {
             ssh_command: None,
             tmux_session: None,
             tmux_host: None,
+            tmux_identity: None,
             current_task: None,
             agent_session: None,
         };
@@ -1614,6 +2058,7 @@ mod tests {
             ssh_command: None,
             tmux_session: None,
             tmux_host: None,
+            tmux_identity: None,
             current_task: Some(crate::task_binding::PaneTaskBinding {
                 task_id: "EXAMPLE-110".into(),
                 title: "Bind each pane to its current .plan task".into(),
@@ -1662,6 +2107,7 @@ mod tests {
                 ssh_command: None,
                 tmux_session: None,
                 tmux_host: None,
+                tmux_identity: None,
                 current_task: Some(binding(duplicate.clone())),
                 agent_session: None,
             }),
@@ -1674,6 +2120,7 @@ mod tests {
                     ssh_command: None,
                     tmux_session: None,
                     tmux_host: None,
+                    tmux_identity: None,
                     current_task: Some(binding(duplicate.clone())),
                     agent_session: None,
                 }),
@@ -1683,6 +2130,7 @@ mod tests {
                     ssh_command: None,
                     tmux_session: None,
                     tmux_host: None,
+                    tmux_identity: None,
                     current_task: Some(binding(String::new())),
                     agent_session: None,
                 }),
