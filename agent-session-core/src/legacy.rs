@@ -730,6 +730,12 @@ fn read_bounded_jsonl(
         }
         total += count;
         if count as u64 > MAX_LINE_BYTES || total > MAX_TOTAL_BYTES {
+            // A sample is a header read: once records are in hand, an oversized
+            // later record (e.g. a large tool output) ends the sample rather than
+            // failing the store. Exhaustive reads and a bad first record still fail.
+            if !require_eof && !values.is_empty() {
+                return Ok(values);
+            }
             return Err("Session history byte limit exceeded.".into());
         }
         if line.iter().all(u8::is_ascii_whitespace) {
@@ -962,6 +968,50 @@ mod admission_tests {
             "a non-directory store must not be healthy empty"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn codex_history_with_late_records(root: &Path, late: &[String]) -> PathBuf {
+        fs::create_dir_all(root).unwrap();
+        let path = root.join("rollout.jsonl");
+        let mut lines = vec![
+            r#"{"type":"session_meta","payload":{"id":"s-1","cwd":"/tmp"}}"#.to_string(),
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#.to_string(),
+        ];
+        lines.extend(late.iter().cloned());
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        path
+    }
+
+    fn large_tool_output(bytes: usize) -> String {
+        format!(
+            r#"{{"type":"event_msg","payload":{{"type":"item_completed","output":"{}"}}}}"#,
+            "x".repeat(bytes)
+        )
+    }
+
+    #[test]
+    fn codex_oversized_later_record_keeps_session_metadata() {
+        let root =
+            std::env::temp_dir().join(format!("agent-codex-late-line-{}", std::process::id()));
+        codex_history_with_late_records(&root, &[large_tool_output(1_048_576)]);
+        let (status, sessions) = discover_codex_sessions(Some(&root), 50);
+        fs::remove_dir_all(&root).unwrap();
+        assert!(status.ok, "unexpected error: {:?}", status.error);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "s-1");
+        assert_eq!(sessions[0].title, "hello");
+    }
+
+    #[test]
+    fn codex_sample_stops_at_aggregate_budget_without_failing() {
+        let root =
+            std::env::temp_dir().join(format!("agent-codex-aggregate-{}", std::process::id()));
+        let late: Vec<String> = (0..17).map(|_| large_tool_output(1_000_000)).collect();
+        codex_history_with_late_records(&root, &late);
+        let (status, sessions) = discover_codex_sessions(Some(&root), 50);
+        fs::remove_dir_all(&root).unwrap();
+        assert!(status.ok, "unexpected error: {:?}", status.error);
+        assert_eq!(sessions.len(), 1);
     }
 
     #[test]
