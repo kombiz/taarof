@@ -23,6 +23,7 @@ import {
   liveOpenWorkCount,
   visibleWorkTruth,
   workTruthLabels,
+  writeStoredMonitorOrder,
   writeStoredWatchedKeys,
   type PaneTarget,
   type StringArrayStorage,
@@ -367,6 +368,18 @@ test("localStorage string-array adapters ignore bad values and write JSON arrays
 
   assertEqual(storage.getItem(MONITOR_WATCH_STORAGE_KEY), "[\"1:1:1\",\"1:1:2\"]");
   assertDeepEqual(readStoredWatchedKeys(storage), ["1:1:1", "1:1:2"]);
+});
+
+test("monitor preference writers tolerate storage that refuses writes", () => {
+  const refusing = {
+    setItem(): void {
+      throw new Error("quota exceeded");
+    },
+  };
+
+  assertEqual(writeStoredWatchedKeys(refusing, ["1:1:1"]), false);
+  assertEqual(writeStoredMonitorOrder(refusing, ["1:1:1"]), false);
+  assertEqual(writeStoredWatchedKeys(new MemoryStringArrayStorage(), ["1:1:1"]), true);
 });
 
 
