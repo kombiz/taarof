@@ -240,7 +240,7 @@ fn run_writer(
         maintenance_interval,
     );
     let mut deferred = VecDeque::new();
-    let mut last_error: Option<String> = None;
+    let mut unacknowledged_loss = UnacknowledgedLoss::default();
     let mut committed_batches = 0_u64;
     loop {
         // Check the explicit batch trigger before receiving another command.
@@ -309,7 +309,6 @@ fn run_writer(
                         if committed_batches >= MAINTENANCE_AFTER_BATCHES {
                             maintenance.make_due();
                         }
-                        last_error = None;
                         status.available.store(true, Ordering::Release);
                         status.set_state("ok", None);
                     }
@@ -319,7 +318,7 @@ fn run_writer(
                             status.available.store(false, Ordering::Release);
                         }
                         status.set_state("degraded", Some(error.clone()));
-                        last_error = Some(error);
+                        unacknowledged_loss.record(draft_count, error);
                         std::thread::sleep(Duration::from_millis(250));
                     }
                 }
@@ -328,13 +327,41 @@ fn run_writer(
             }
             Some(WriterCommand::Flush(done)) => {
                 report_backpressure(&status, config.queue_capacity.max(1));
-                let result = last_error.clone().map_or(Ok(()), Err);
-                let _ = done.send(result);
+                let _ = done.send(unacknowledged_loss.acknowledge());
             }
             Some(WriterCommand::Shutdown) | None => break,
         }
     }
     status.available.store(false, Ordering::Release);
+}
+
+/// Drafts consumed by failed batches since the last flush that reported them.
+///
+/// A later successful batch restores writer health but must not erase this:
+/// the lost drafts were enqueued before any subsequent flush barrier. The
+/// first flush that observes a loss reports it and acknowledges it, so the
+/// next flush reports only losses that occur after that acknowledgement.
+#[derive(Default)]
+struct UnacknowledgedLoss {
+    records: u64,
+    last_error: Option<String>,
+}
+
+impl UnacknowledgedLoss {
+    fn record(&mut self, records: u64, error: String) {
+        self.records = self.records.saturating_add(records);
+        self.last_error = Some(error);
+    }
+
+    fn acknowledge(&mut self) -> Result<(), String> {
+        let Some(error) = self.last_error.take() else {
+            return Ok(());
+        };
+        let records = std::mem::take(&mut self.records);
+        Err(format!(
+            "history persistence is incomplete: {records} records were dropped by failed batches; last error: {error}"
+        ))
+    }
 }
 
 fn run_maintenance(
@@ -927,6 +954,52 @@ mod tests {
         lock.execute_batch("ROLLBACK").unwrap();
         handle.flush().unwrap();
         assert_eq!(handle.status().last_durable_seq.event, 1);
+        drop(handle);
+        drop(lock);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_batch_stays_reported_until_a_flush_acknowledges_it() {
+        let path = temp_path("sticky-loss");
+        let (handle, reader) = HistoryHandle::open_at(enabled_config(), path.clone());
+        // Let startup maintenance finish before a competing writer holds the lock.
+        handle.flush().unwrap();
+
+        let lock = Connection::open(&path).unwrap();
+        super::super::schema::configure_connection(&lock).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let event = |seq| EventRecord {
+            seq,
+            ts_unix_ms: super::super::now_unix_ms(),
+            event_type: "session_started".to_string(),
+            payload: serde_json::json!({"session_name": "sticky"}),
+        };
+        handle.try_record_event(&event(1));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handle.status().dropped == 0 {
+            assert!(Instant::now() < deadline, "batch A never failed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        lock.execute_batch("ROLLBACK").unwrap();
+
+        handle.try_record_event(&event(2));
+        let error = handle
+            .flush()
+            .expect_err("flush must report the batch lost before the barrier");
+        assert!(error.contains("incomplete"), "{error}");
+        assert_eq!(handle.status().state, "ok");
+        let records = reader
+            .query(None, None, HistoryFilters::default())
+            .unwrap()
+            .records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_seq, Some(2));
+
+        // The failed flush acknowledged the loss; a healthy writer with no new
+        // loss now reports a complete barrier.
+        handle.flush().unwrap();
+
         drop(handle);
         drop(lock);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
