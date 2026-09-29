@@ -378,7 +378,7 @@ pub fn ssh_command(plan: &ActionPlan) -> Result<Command, String> {
             .map(|s| format!(" {}", shell_word(s)))
             .collect::<String>()
     );
-    let mut cmd = Command::new("ssh");
+    let mut cmd = crate::child_command("ssh");
     cmd.args([
         "-tt",
         "-oBatchMode=yes",
@@ -387,6 +387,5 @@ pub fn ssh_command(plan: &ActionPlan) -> Result<Command, String> {
         destination,
         &command,
     ]);
-    crate::clean_child_command(&mut cmd);
     Ok(cmd)
 }

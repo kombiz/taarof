@@ -1,0 +1,9 @@
+# Every child the launcher starts (the provider it execs, `ssh` for remote
+# sessions) is built by `crate::child_command`, which strips the shared ambient
+# Infisical token denylist from `agent_session_core::child_env`. A bare
+# `Command::new` is rejected elsewhere so a new path cannot forward the token.
+# Integration tests drive the built binary as an external harness and opt out
+# at file level with a comment.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "use crate::child_command so ambient Infisical tokens are stripped" },
+]
