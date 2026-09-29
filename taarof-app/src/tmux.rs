@@ -849,25 +849,26 @@ fn run_tmux_command_sync_result(argv: &[String]) -> Result<String, String> {
         return Err("command argv was empty".to_string());
     }
 
-    // Reaped by the try_wait() loop below, which also drains the pipes.
-    #[allow(clippy::disallowed_methods)]
-    let mut child = std::process::Command::new(&argv[0])
+    let mut command = crate::child_process::command(&argv[0]);
+    command
         .args(&argv[1..])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            crate::diagnostics::record_command_failure(
-                "http",
-                "tmux-command",
-                format!("failed to spawn tmux-related command {}", argv[0]),
-                Some(serde_json::json!({
-                    "argv": argv,
-                    "error": error.to_string(),
-                })),
-            );
-            format!("failed to spawn command: {error}")
-        })?;
+        .stderr(std::process::Stdio::piped());
+    // Reaped by the try_wait() loop below, which also drains the pipes.
+    #[allow(clippy::disallowed_methods)]
+    let spawned = command.spawn();
+    let mut child = spawned.map_err(|error| {
+        crate::diagnostics::record_command_failure(
+            "http",
+            "tmux-command",
+            format!("failed to spawn tmux-related command {}", argv[0]),
+            Some(serde_json::json!({
+                "argv": argv,
+                "error": error.to_string(),
+            })),
+        );
+        format!("failed to spawn command: {error}")
+    })?;
 
     let stdout = child.stdout.take().ok_or_else(|| {
         let _ = child.kill();
@@ -1100,13 +1101,12 @@ fn run_process_tmux_command(argv: &[String], timeout: std::time::Duration) -> Tm
         };
     }
 
-    let mut command = std::process::Command::new(&argv[0]);
+    let mut command = crate::child_process::command(&argv[0]);
     command
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    crate::child_env::prepare_child_command(&mut command, &[]);
     // The bounded wait below owns and reaps the child on every path.
     #[allow(clippy::disallowed_methods)]
     let mut child = match command.spawn() {

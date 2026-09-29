@@ -6,6 +6,7 @@ pub use live::*;
 pub use repository::repository_common_dir;
 pub mod adapters;
 mod cache;
+pub mod child_env;
 mod contract;
 pub mod legacy;
 pub mod protocol;

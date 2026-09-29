@@ -1,3 +1,7 @@
+// Integration harness: drives the built `agent` binary and fixtures as an
+// external process, where the crate-private sanitized constructor is not
+// reachable. See agent-launcher/clippy.toml.
+#![allow(clippy::disallowed_methods)]
 use agent_launcher::enrichment::{merge_catalog, ssh_command, storage_key, SocketClient};
 use agent_session_core::*;
 use std::io::{BufRead, BufReader, Read, Write};

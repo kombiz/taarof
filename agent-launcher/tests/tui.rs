@@ -1,3 +1,7 @@
+// Integration harness: drives the built `agent` binary and fixtures as an
+// external process, where the crate-private sanitized constructor is not
+// reachable. See agent-launcher/clippy.toml.
+#![allow(clippy::disallowed_methods)]
 use agent_launcher::tui::{NewProvider, Picker, RowKey};
 use agent_session_core::*;
 fn session(id: &str, time: u64, active: bool) -> SessionRecord {

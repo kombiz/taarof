@@ -28,7 +28,7 @@ pub fn play_attention_sound() -> bool {
         return false;
     }
 
-    let mut command = std::process::Command::new("canberra-gtk-play");
+    let mut command = crate::child_process::command("canberra-gtk-play");
     command.args(["-i", "message-new-instant"]);
     match crate::child_process::spawn_and_reap(&mut command) {
         Ok(_) => {

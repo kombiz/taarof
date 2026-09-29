@@ -1,7 +1,6 @@
 /// Discover mise tasks by shelling out to `mise tasks ls --json`.
 /// Returns an empty vec if mise is not installed or no tasks are found.
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -762,7 +761,9 @@ fn discover_remote_tasks(host: &str, cwd: &str, ssh_argv: &[String]) -> Vec<Mise
         return Vec::new();
     };
 
-    let output = Command::new(&argv[0]).args(&argv[1..]).output();
+    let output = crate::child_process::command(&argv[0])
+        .args(&argv[1..])
+        .output();
     match output {
         Ok(out) => {
             if !out.status.success() {

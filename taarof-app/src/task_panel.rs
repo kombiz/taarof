@@ -3448,12 +3448,8 @@ fn local_head_revision(checkout_root: &Path) -> Option<String> {
 }
 
 fn local_head_revision_command(checkout_root: &Path) -> Command {
-    let mut command = Command::new("git");
-    command
-        .current_dir(checkout_root)
-        .arg("--no-optional-locks")
-        .args(["rev-parse", "HEAD"]);
-    crate::child_env::prepare_child_command(&mut command, &[]);
+    let mut command = crate::git::command(checkout_root);
+    command.args(["rev-parse", "HEAD"]);
     command
 }
 
@@ -4694,12 +4690,17 @@ pub(crate) fn open_external_url(url: &str) {
     crate::browser::open_url(url);
 }
 
+pub(crate) fn local_gh_command(program: &str, args: &[String]) -> Command {
+    let mut command = crate::child_process::command(program);
+    command.args(args);
+    command
+}
+
 fn run_local_gh_command(argv: &[String]) -> Result<String, String> {
     let Some(program) = argv.first().filter(|program| program.as_str() == "gh") else {
         return Err("GitHub CLI command was not safe to run locally".to_string());
     };
-    let output = Command::new(program)
-        .args(&argv[1..])
+    let output = local_gh_command(program, &argv[1..])
         .output()
         .map_err(|_| "GitHub CLI is unavailable on the controlling host".to_string())?;
     if !output.status.success() {

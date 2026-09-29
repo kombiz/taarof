@@ -4725,7 +4725,6 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::rc::Rc;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -6000,7 +5999,7 @@ mod tests {
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = crate::child_process::command("git")
             .args(args)
             .current_dir(cwd)
             .output()
@@ -6188,7 +6187,7 @@ mod tests {
     impl Drop for TempWorktree {
         fn drop(&mut self) {
             let _ = crate::git::remove_worktree_from_repo(Some(&self.repo_root), &self.path);
-            let _ = Command::new("git")
+            let _ = crate::child_process::command("git")
                 .args(["branch", "-D", &self.branch])
                 .current_dir(&self.repo_root)
                 .output();

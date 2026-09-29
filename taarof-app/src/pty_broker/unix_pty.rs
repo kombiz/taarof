@@ -17,7 +17,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Weak;
 use std::sync::{Arc, Mutex};
@@ -541,7 +541,7 @@ fn non_stdio_fd(fd: OwnedFd) -> io::Result<OwnedFd> {
 /// Spawn the child on the PTY slave: a new session with the slave as its
 /// controlling terminal and stdio, with the parent's master closed in the child.
 fn spawn_child(spec: &SpawnSpec, master_raw: RawFd, slave_raw: RawFd) -> io::Result<Child> {
-    let mut command = Command::new(&spec.argv[0]);
+    let mut command = crate::child_process::command(&spec.argv[0]);
     command.args(&spec.argv[1..]);
     if let Some(cwd) = spec.cwd.as_ref() {
         command.current_dir(cwd);

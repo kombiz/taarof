@@ -26,7 +26,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use crate::update_watch::{BinaryIdentity, UpdateState, UpdateStatus};
@@ -294,13 +293,12 @@ fn discover_source(root: Option<&Path>) -> SourceIdentity {
 
 /// Blocking. `git` is read-only here and its absence is a normal outcome.
 fn git(root: &Path, args: &[&str]) -> Option<String> {
-    // Not a pane spawn: no PTY, no child_env seam, and `output()` reaps the
-    // child itself, so `spawn_and_reap` does not apply.
+    // `output()` reaps the child itself, so `spawn_and_reap` does not apply.
     git_output(root, args).filter(|value| !value.is_empty())
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let output = crate::child_process::command("git")
         .arg("-C")
         .arg(root)
         .args(args)

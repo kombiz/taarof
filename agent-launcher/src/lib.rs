@@ -208,12 +208,18 @@ pub fn validate_plan(plan: &ActionPlan) -> Result<PathBuf, String> {
     }
     executable(&plan.program)
 }
-pub(crate) fn clean_child_command(
-    command: &mut std::process::Command,
-) -> &mut std::process::Command {
+/// Build a child command that does not inherit an ambient Infisical token.
+///
+/// Every child the launcher starts is built here; clippy rejects a bare
+/// `std::process::Command::new` elsewhere (`agent-launcher/clippy.toml`).
+pub(crate) fn child_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    // The one blessed constructor: every other site goes through here.
+    #[allow(clippy::disallowed_methods)]
+    let mut command = std::process::Command::new(program);
+    for name in agent_session_core::child_env::AMBIENT_INFISICAL_TOKEN_VARS {
+        command.env_remove(name);
+    }
     command
-        .env_remove("INFISICAL_TOKEN")
-        .env_remove("INFISICAL_SERVICE_TOKEN")
 }
 pub fn execute_plan(plan: &ActionPlan) -> Result<(), String> {
     execute_plan_for_session(plan, None)
@@ -231,11 +237,11 @@ pub fn execute_plan_for_session(plan: &ActionPlan, session: Option<&str>) -> Res
         enrichment::ssh_command(plan)?
     } else {
         let program = validate_plan(plan)?;
-        let mut command = std::process::Command::new(program);
+        let mut command = child_command(program);
         command.args(&plan.argv).current_dir(&plan.cwd);
         command
     };
-    let error = clean_child_command(&mut command).exec();
+    let error = command.exec();
     Err(format!("provider execution failed: {error}"))
 }
 
@@ -274,3 +280,21 @@ pub fn adapter_conformance(id: &str) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({"schema":"agent.adapter-conformance.v1","provider":id,"ok":true}))
 }
 pub mod tui;
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+
+    #[test]
+    fn child_command_strips_the_shared_ambient_token_denylist() {
+        let command = super::child_command("true");
+        let env: HashMap<OsString, Option<OsString>> = command
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(OsString::from)))
+            .collect();
+        for name in agent_session_core::child_env::AMBIENT_INFISICAL_TOKEN_VARS {
+            assert_eq!(env.get(&OsString::from(name)), Some(&None), "{name}");
+        }
+    }
+}

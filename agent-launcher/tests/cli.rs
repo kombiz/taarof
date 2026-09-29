@@ -1,3 +1,7 @@
+// Integration harness: drives the built `agent` binary and fixtures as an
+// external process, where the crate-private sanitized constructor is not
+// reachable. See agent-launcher/clippy.toml.
+#![allow(clippy::disallowed_methods)]
 use std::process::Command;
 use tempfile::TempDir;
 fn command(home: &TempDir) -> Command {

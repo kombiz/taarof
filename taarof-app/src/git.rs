@@ -5,6 +5,17 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 
+/// Build a sanitized `git` child that runs in `cwd` without optional locks.
+///
+/// `--no-optional-locks` keeps status-style reads from refreshing the index
+/// behind a user's concurrent Git operation. It is Git lock policy, separate
+/// from the child-environment sanitizer that `child_process::command` applies.
+pub(crate) fn command(cwd: &Path) -> Command {
+    let mut command = crate::child_process::command("git");
+    command.current_dir(cwd).arg("--no-optional-locks");
+    command
+}
+
 /// A deliberately small, process-wide ceiling for slow Git and worktree
 /// operations submitted from GTK.  A per-key single-flight guard alone still
 /// permits an unbounded number of distinct paths to fill the worker pool.
@@ -405,9 +416,8 @@ fn read_upstream(repo_root: &str, checkout_root: &str, branch: &str) -> Option<S
         // Try reading from config.
         // Use the checkout path so linked worktrees resolve branch-specific config
         // in the same context the user is actually on.
-        Command::new("git")
+        command(Path::new(checkout_root))
             .args(["config", &format!("branch.{branch}.remote")])
-            .current_dir(checkout_root)
             .output()
             .ok()
             .and_then(|o| {
@@ -528,9 +538,8 @@ fn valid_github_repository_component(value: &str) -> bool {
 /// be queried".  UI caches must never turn the latter into a healthy empty
 /// list.
 pub fn list_worktrees_checked(repo_root: &Path) -> Result<Vec<WorktreeInfo>, String> {
-    let output = Command::new("git")
+    let output = command(repo_root)
         .args(["worktree", "list", "--porcelain"])
-        .current_dir(repo_root)
         .output();
 
     match output {
@@ -598,33 +607,25 @@ pub fn create_worktree(repo_root: &Path, branch_name: &str) -> Result<String, St
 
     let worktree_path = build_worktree_path(&top_level, branch_name);
     let existed = branch_exists(&top_level, branch_name);
-    let mut command = Command::new("git");
-    command.args(["worktree", "add"]);
-    if !existed {
-        command.args(["-b", branch_name]);
-    }
-    command.arg(&worktree_path);
-    if existed {
-        command.arg(branch_name);
-    }
-
-    let output = command.current_dir(&top_level).output().map_err(|err| {
-        crate::diagnostics::record_command_failure(
-            "git",
-            "worktree-add",
-            format!("failed to run git worktree add in {}", top_level.display()),
-            Some(serde_json::json!({
-                "repo_root": top_level.display().to_string(),
-                "branch_name": branch_name,
-                "worktree_path": worktree_path.display().to_string(),
-                "error": err.to_string(),
-            })),
-        );
-        format!(
-            "failed to run git worktree add in {}: {err}",
-            top_level.display()
-        )
-    })?;
+    let output = worktree_add_command(&top_level, branch_name, &worktree_path, existed)
+        .output()
+        .map_err(|err| {
+            crate::diagnostics::record_command_failure(
+                "git",
+                "worktree-add",
+                format!("failed to run git worktree add in {}", top_level.display()),
+                Some(serde_json::json!({
+                    "repo_root": top_level.display().to_string(),
+                    "branch_name": branch_name,
+                    "worktree_path": worktree_path.display().to_string(),
+                    "error": err.to_string(),
+                })),
+            );
+            format!(
+                "failed to run git worktree add in {}: {err}",
+                top_level.display()
+            )
+        })?;
 
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -670,10 +671,7 @@ pub fn remove_worktree_from_repo(
             )
         })?;
 
-    let output = Command::new("git")
-        .args(["worktree", "remove"])
-        .arg(worktree_path)
-        .current_dir(&repo_root)
+    let output = worktree_remove_command(&repo_root, worktree_path)
         .output()
         .map_err(|err| {
             crate::diagnostics::record_command_failure(
@@ -715,10 +713,33 @@ pub fn remove_worktree_from_repo(
     Ok(())
 }
 
+pub(crate) fn worktree_add_command(
+    top_level: &Path,
+    branch_name: &str,
+    worktree_path: &Path,
+    existed: bool,
+) -> Command {
+    let mut add = command(top_level);
+    add.args(["worktree", "add"]);
+    if !existed {
+        add.args(["-b", branch_name]);
+    }
+    add.arg(worktree_path);
+    if existed {
+        add.arg(branch_name);
+    }
+    add
+}
+
+pub(crate) fn worktree_remove_command(repo_root: &Path, worktree_path: &Path) -> Command {
+    let mut remove = command(repo_root);
+    remove.args(["worktree", "remove"]).arg(worktree_path);
+    remove
+}
+
 fn resolve_git_toplevel(repo_root: &Path) -> Result<PathBuf, String> {
-    let output = Command::new("git")
+    let output = command(repo_root)
         .args(["rev-parse", "--show-toplevel"])
-        .current_dir(repo_root)
         .output()
         .map_err(|err| {
             format!(
@@ -743,14 +764,13 @@ fn resolve_git_toplevel(repo_root: &Path) -> Result<PathBuf, String> {
 }
 
 fn branch_exists(repo_root: &Path, branch_name: &str) -> bool {
-    Command::new("git")
+    command(repo_root)
         .args([
             "show-ref",
             "--verify",
             "--quiet",
             &format!("refs/heads/{branch_name}"),
         ])
-        .current_dir(repo_root)
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -819,9 +839,8 @@ fn parse_worktree_list_porcelain(output: &str) -> Vec<WorktreeInfo> {
 }
 
 fn check_dirty(repo_root: &Path) -> bool {
-    Command::new("git")
+    command(repo_root)
         .args(["status", "--porcelain", "-uno"])
-        .current_dir(repo_root)
         .output()
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false)
@@ -867,7 +886,7 @@ mod tests {
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = crate::child_process::command("git")
             .args(args)
             .current_dir(cwd)
             .output()
@@ -914,6 +933,25 @@ mod tests {
         let repo_root = find_repo_root(".").expect("current package should be inside a git repo");
         assert!(Path::new(&repo_root).is_absolute());
         assert!(Path::new(&repo_root).join(".git").exists());
+    }
+
+    #[test]
+    fn worktree_commands_skip_optional_locks() {
+        // Git lock policy, independent of the environment sanitizer: mutating
+        // worktree commands must not take optional index locks either.
+        let root = Path::new("/tmp");
+        let first_arg = |command: &Command| {
+            command
+                .get_args()
+                .next()
+                .map(|arg| arg.to_string_lossy().into_owned())
+        };
+        let add = worktree_add_command(root, "feature", &root.join("wt"), false);
+        let remove = worktree_remove_command(root, &root.join("wt"));
+        assert_eq!(first_arg(&add).as_deref(), Some("--no-optional-locks"));
+        assert_eq!(first_arg(&remove).as_deref(), Some("--no-optional-locks"));
+        assert_eq!(add.get_current_dir(), Some(root));
+        assert_eq!(remove.get_current_dir(), Some(root));
     }
 
     #[test]

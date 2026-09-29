@@ -850,9 +850,8 @@ fn validate_agent_launcher_identity(
     agent: &std::path::Path,
     app: &runtime_identity::BuildIdentity,
 ) -> Result<(), &'static str> {
-    let mut identity_command = std::process::Command::new(agent);
+    let mut identity_command = crate::child_process::command(agent);
     identity_command.arg("--build-info");
-    child_env::prepare_child_command(&mut identity_command, &[]);
     let output = match identity_command.output() {
         Ok(output) if output.status.success() => output.stdout,
         _ => return Err("the channel-matched agent launcher identity is unreadable"),
@@ -985,9 +984,8 @@ pub fn run_saved_agent_resume_cli(args: &[String]) -> Option<i32> {
         Ok(selector) => selector,
         Err(_) => return fail("exact provider session identity could not be encoded"),
     };
-    let mut command = std::process::Command::new(agent);
+    let mut command = crate::child_process::command(agent);
     command.args(["--resume", &selector]);
-    child_env::prepare_child_command(&mut command, &[]);
     let error = command.exec();
     eprintln!("taarof: Resume agent conversation failed: {error}");
     Some(2)

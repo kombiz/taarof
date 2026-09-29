@@ -12,7 +12,7 @@ use std::io::{self, Read};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -261,11 +261,8 @@ fn spawn_reload_helper(
 ) -> io::Result<(Child, UnixStream)> {
     let (lifetime, helper_wait) = UnixStream::pair()?;
     let helper_wait = OwnedFd::from(helper_wait);
-    // Deliberately outlives us: the helper blocks until taarof exits, then execs
-    // the installed binary. taarof is on its way down, so it cannot reap this and
-    // there is nothing left to accumulate zombies in.
-    #[allow(clippy::disallowed_methods)]
-    let child = Command::new("/bin/sh")
+    let mut command = crate::child_process::command("/bin/sh");
+    command
         .arg("-c")
         .arg("while IFS= read -r _; do :; done; exec \"$@\"")
         .arg("taarof-reload")
@@ -274,8 +271,12 @@ fn spawn_reload_helper(
         .env(crate::child_env::RELOAD_RESUME_ENV, "1")
         .stdin(Stdio::from(helper_wait))
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    // Deliberately outlives us: the helper blocks until taarof exits, then execs
+    // the installed binary. taarof is on its way down, so it cannot reap this and
+    // there is nothing left to accumulate zombies in.
+    #[allow(clippy::disallowed_methods)]
+    let child = command.spawn()?;
     Ok((child, lifetime))
 }
 

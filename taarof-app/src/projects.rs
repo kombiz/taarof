@@ -535,7 +535,7 @@ pub fn run_guarded_coder_create(command: &[String]) -> Result<(), String> {
     {
         return Err("refusing unguarded Coder creation command".to_string());
     }
-    let output = std::process::Command::new(&command[0])
+    let output = crate::child_process::command(&command[0])
         .args(&command[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -825,7 +825,6 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
     fn sample_project() -> RegisteredProject {
         build_project(
@@ -948,7 +947,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let run = |args: &[&str]| {
-            assert!(Command::new("git")
+            assert!(crate::child_process::command("git")
                 .args(args)
                 .current_dir(&root)
                 .status()

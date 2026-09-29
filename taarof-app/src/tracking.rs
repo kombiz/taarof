@@ -1652,7 +1652,6 @@ mod tests {
     };
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2030,7 +2029,7 @@ mod tests {
         let nested = root.join("src/nested");
         fs::create_dir_all(&nested).unwrap();
         let run = |args: &[&str]| {
-            let output = Command::new("git")
+            let output = crate::child_process::command("git")
                 .args(args)
                 .current_dir(&root)
                 .output()
@@ -2052,7 +2051,7 @@ mod tests {
         ]);
 
         let command = remote_git_identity_command(None, "unused", nested.to_str().unwrap());
-        let output = Command::new("sh")
+        let output = crate::child_process::command("sh")
             .args(["-c", command.last().unwrap()])
             .output()
             .unwrap();
@@ -2088,7 +2087,7 @@ mod tests {
             "git@github.com:fork-owner/legacy-app.git",
         ]);
         run(&["config", "branch.agent/EXAMPLE-130.remote", "fork"]);
-        let output = Command::new("sh")
+        let output = crate::child_process::command("sh")
             .args(["-c", command.last().unwrap()])
             .output()
             .unwrap();
@@ -2115,7 +2114,7 @@ mod tests {
             "remote.fork.pushurl",
             "git@github.com:push-owner/legacy-app.git",
         ]);
-        let output = Command::new("sh")
+        let output = crate::child_process::command("sh")
             .args(["-c", command.last().unwrap()])
             .output()
             .unwrap();
@@ -2139,7 +2138,7 @@ mod tests {
             "remote.fork.pushurl",
             "git@github.com:other-owner/legacy-app.git",
         ]);
-        let output = Command::new("sh")
+        let output = crate::child_process::command("sh")
             .args(["-c", command.last().unwrap()])
             .output()
             .unwrap();
@@ -2151,7 +2150,7 @@ mod tests {
         );
         run(&["config", "--unset-all", "remote.fork.pushurl"]);
         run(&["config", "branch.agent/EXAMPLE-130.pushRemote", "."]);
-        let output = Command::new("sh")
+        let output = crate::child_process::command("sh")
             .args(["-c", command.last().unwrap()])
             .output()
             .unwrap();
@@ -2206,13 +2205,13 @@ mod tests {
         let sentinel = root.join("injected");
         let hostile = root.join("nested'; touch injected; echo '");
         fs::create_dir_all(&hostile).unwrap();
-        let output = Command::new("git")
+        let output = crate::child_process::command("git")
             .args(["init", "-b", "main"])
             .current_dir(&root)
             .output()
             .unwrap();
         assert!(output.status.success());
-        let output = Command::new("git")
+        let output = crate::child_process::command("git")
             .args(["remote", "add", "origin", "git@github.com:owner/repo.git"])
             .current_dir(&root)
             .output()
@@ -2220,7 +2219,7 @@ mod tests {
         assert!(output.status.success());
 
         let command = remote_git_identity_command(None, "unused", &hostile.to_string_lossy());
-        let output = Command::new("sh")
+        let output = crate::child_process::command("sh")
             .args(["-c", command.last().unwrap()])
             .current_dir(&root)
             .output()
@@ -2614,7 +2613,7 @@ mod tests {
     fn run_remote_tasks_probe_script(cwd: &Path) -> RemoteTasksOutcome {
         let command = remote_tasks_fetch_command(None, "unused-host", &cwd.to_string_lossy());
         let script = command.last().expect("remote probe script");
-        let output = Command::new("sh")
+        let output = crate::child_process::command("sh")
             .arg("-c")
             .arg(script)
             .output()
@@ -2628,7 +2627,7 @@ mod tests {
     #[test]
     fn remote_tasks_probe_resolves_nested_checkout_and_quiet_negative_sources() {
         let checkout = temp_repo();
-        Command::new("git")
+        crate::child_process::command("git")
             .args(["init", "-q"])
             .current_dir(&checkout)
             .status()

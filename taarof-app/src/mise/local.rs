@@ -82,7 +82,7 @@ pub(super) fn find_mise() -> Option<PathBuf> {
     }
 
     // Fall back to PATH via which-style lookup.
-    if let Ok(output) = Command::new("which").arg("mise").output() {
+    if let Ok(output) = crate::child_process::command("which").arg("mise").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() {
@@ -198,7 +198,7 @@ fn run_mise_tasks_ls(mise_bin: &Path, cwd: &str) -> std::io::Result<std::process
     const MAX_ATTEMPTS: u32 = 20;
     let mut attempt = 0;
     loop {
-        match Command::new(mise_bin)
+        match crate::child_process::command(mise_bin)
             .args(["tasks", "ls", "--json"])
             .current_dir(cwd)
             .output()

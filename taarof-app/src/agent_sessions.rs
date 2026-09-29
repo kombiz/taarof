@@ -926,13 +926,12 @@ impl RemoteCommandRunner for SshRemoteCommandRunner {
         let Some((program, args)) = argv.split_first() else {
             return Err("remote enumeration argv was empty".to_string());
         };
-        let mut command = std::process::Command::new(program);
+        let mut command = crate::child_process::command(program);
         command
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        crate::child_env::prepare_child_command(&mut command, &[]);
         // The bounded wait below owns and reaps this child on every path.
         #[allow(clippy::disallowed_methods)]
         let mut child = command
@@ -1554,7 +1553,7 @@ mod tests {
             )
             .expect("claude fixture");
 
-            let output = std::process::Command::new("sh")
+            let output = crate::child_process::command("sh")
                 .arg("-c")
                 .arg(remote_enumeration_script())
                 .env("HOME", &home)
@@ -1994,7 +1993,7 @@ mod tests {
             )
             .expect("over-cap fixture");
 
-            let output = std::process::Command::new("sh")
+            let output = crate::child_process::command("sh")
                 .arg("-c")
                 .arg(remote_enumeration_script())
                 .env("HOME", &home)
@@ -2076,7 +2075,7 @@ mod tests {
             )
             .expect("fat-header fixture");
 
-            let output = std::process::Command::new("sh")
+            let output = crate::child_process::command("sh")
                 .arg("-c")
                 .arg(remote_enumeration_script())
                 .env("HOME", &home)
