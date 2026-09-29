@@ -70,7 +70,7 @@ def _registry_data(session: str | None) -> dict[str, Any]:
         hint = "Set TAAROF_SOCK to override."
         named = sorted(reg.parent.glob("taarof-current-*.json")) if not session else []
         if named:
-            # A channel launcher (e.g. kmux) runs the app under TAAROF_SESSION;
+            # A channel launcher may run the app under TAAROF_SESSION;
             # its registry is session-keyed, so the unnamed lookup misses it.
             hint = (
                 f"{len(named)} named-session registr{'y' if len(named) == 1 else 'ies'} "
@@ -3541,7 +3541,7 @@ def _version_requested(argv: list[str]) -> tuple[bool, str | None]:
 def _default_session() -> str | None:
     """The session the app itself derives its registry from.
 
-    A channel launcher (e.g. the kmux install) starts the app with
+    A channel launcher may start the app with
     TAAROF_SESSION set, and the app exports it to every terminal it spawns, so
     an unflagged CLI must resolve that same named registry rather than the
     unnamed `taarof-current.json`.

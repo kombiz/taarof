@@ -123,7 +123,7 @@ class HttpAuthTests(unittest.TestCase):
             return {"ok": True, "data": {}}
 
         with (
-            patch.dict(os.environ, {"TAAROF_SESSION": "kmux"}, clear=True),
+            patch.dict(os.environ, {"TAAROF_SESSION": "dev"}, clear=True),
             patch.object(cli, "http_get", fake_http_get),
             patch.object(cli, "_emit"),
         ):
@@ -137,7 +137,7 @@ class HttpAuthTests(unittest.TestCase):
             self.assertEqual(cli.main(["runtime-identity"]), 0)
 
         self.assertEqual(calls, [
-            ("/api/v1/runtime-identity", "kmux"),
+            ("/api/v1/runtime-identity", "dev"),
             ("/api/v1/runtime-identity", "other"),
             ("/api/v1/runtime-identity", None),
         ])
@@ -149,7 +149,7 @@ class HttpAuthTests(unittest.TestCase):
             with patch.dict(os.environ, {"XDG_RUNTIME_DIR": tmp}, clear=True):
                 with self.assertRaisesRegex(SystemExit, "TAAROF_SOCK"):
                     cli._registry_data(None)
-                (runtime_dir / f"taarof-current-{cli._session_storage_key('kmux')}.json").write_text("{}")
+                (runtime_dir / f"taarof-current-{cli._session_storage_key('dev')}.json").write_text("{}")
                 with self.assertRaisesRegex(SystemExit, "1 named-session registry .*--session NAME"):
                     cli._registry_data(None)
 
@@ -157,12 +157,12 @@ class HttpAuthTests(unittest.TestCase):
         cli = load_cli_module()
         seen = []
         with (
-            patch.dict(os.environ, {"TAAROF_SESSION": "kmux"}, clear=True),
+            patch.dict(os.environ, {"TAAROF_SESSION": "dev"}, clear=True),
             patch.object(cli, "build_version_report", lambda s: seen.append(s) or {}),
             patch.object(cli, "_emit"),
         ):
             self.assertEqual(cli.main(["--version"]), 0)
-        self.assertEqual(seen, ["kmux"])
+        self.assertEqual(seen, ["dev"])
 
 
 class HistoryTests(unittest.TestCase):
