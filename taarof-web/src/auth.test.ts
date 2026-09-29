@@ -2,6 +2,7 @@ import {
   bootstrapTokenFromUrl,
   clearStoredToken,
   getStoredToken,
+  schedulePurgeTokenBearingCacheEntries,
   storeToken,
   type TokenStorage,
 } from "./auth.js";
@@ -161,4 +162,72 @@ test("unavailable storage behaves like empty optional persistence", () => {
   const result = bootstrapTokenFromUrl(environment);
   assert(result?.token === TOKEN && result.persisted === false, "missing storage keeps the token in memory");
   assert(replaced[0] === "/", "missing storage still strips the URL token");
+});
+
+test("an empty first token parameter still strips every token parameter", () => {
+  const { replaced, environment } = urlEnvironment(
+    `http://127.0.0.1:7777/app?token=&view=monitor&token=${TOKEN}`,
+    new MemoryTokenStorage(),
+  );
+
+  const result = bootstrapTokenFromUrl(environment);
+
+  assert(result?.token === TOKEN, "the first non-empty token value is used");
+  assert(replaced.length === 1, "the URL is rewritten once");
+  assert(replaced[0] === "/app?view=monitor", `every token parameter must be stripped: ${replaced[0]}`);
+});
+
+test("only empty token parameters are stripped without authenticating", () => {
+  const { replaced, environment } = urlEnvironment(
+    "http://127.0.0.1:7777/?token=&token=",
+    new MemoryTokenStorage(),
+  );
+
+  assert(bootstrapTokenFromUrl(environment) === null, "empty token values yield no token");
+  assert(replaced.length === 1 && replaced[0] === "/", `empty token parameters must be stripped: ${replaced}`);
+});
+
+async function captureConsoleAsync(fn: () => Promise<void>): Promise<string> {
+  const lines: string[] = [];
+  const original = { log: console.log, warn: console.warn, error: console.error };
+  const record = (...args: unknown[]) => {
+    lines.push(args.map((arg) => (arg instanceof Error ? `${arg.message} ${arg.stack}` : String(arg))).join(" "));
+  };
+  console.log = record;
+  console.warn = record;
+  console.error = record;
+  try {
+    await fn();
+  } finally {
+    Object.assign(console, original);
+  }
+  return lines.join("\n");
+}
+
+async function asyncTest(name: string, fn: () => Promise<void>) {
+  try {
+    await fn();
+    console.log(`PASS ${name}`);
+  } catch (error) {
+    console.error(`FAIL ${name}`);
+    throw error;
+  }
+}
+
+await asyncTest("a rejected cache cleanup logs a fixed message without the token", async () => {
+  const tokenUrl = `http://127.0.0.1:7777/?token=${TOKEN}`;
+  const rejectingCaches = {
+    keys: async () => ["taarof"],
+    open: async () => ({
+      keys: async () => [{ url: tokenUrl }],
+      delete: async () => {
+        throw new Error(`failed to delete ${tokenUrl}`);
+      },
+    }),
+  } as unknown as Parameters<typeof schedulePurgeTokenBearingCacheEntries>[0];
+
+  const output = await captureConsoleAsync(() => schedulePurgeTokenBearingCacheEntries(rejectingCaches));
+
+  assert(output.includes("token cache cleanup failed"), `the failure is still reported: ${output}`);
+  assert(!output.includes(TOKEN), "the token must not appear in console output");
 });

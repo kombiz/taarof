@@ -36,7 +36,7 @@ export function getStoredToken(storage = browserTokenStorage()): string | null {
 
 /** Returns whether the token was persisted for later page loads. */
 export function storeToken(token: string, storage = browserTokenStorage()): boolean {
-  schedulePurgeTokenBearingCacheEntries();
+  void schedulePurgeTokenBearingCacheEntries();
   if (!storage) {
     return false;
   }
@@ -48,21 +48,32 @@ export function storeToken(token: string, storage = browserTokenStorage()): bool
   }
 }
 
-function schedulePurgeTokenBearingCacheEntries() {
-  void purgeTokenBearingCacheEntries().catch((error: unknown) => {
-    console.warn("taarof web: token cache cleanup failed", error);
+function browserCacheStorage(): CacheStorage | null {
+  if (typeof window === "undefined" || !("caches" in window)) {
+    return null;
+  }
+  return window.caches;
+}
+
+/** Resolves once cleanup settles; failures are reported without their details. */
+export function schedulePurgeTokenBearingCacheEntries(
+  caches = browserCacheStorage(),
+): Promise<void> {
+  // The rejection may carry a token-bearing request URL, so it is never logged.
+  return purgeTokenBearingCacheEntries(caches).catch(() => {
+    console.warn("taarof web: token cache cleanup failed");
   });
 }
 
-async function purgeTokenBearingCacheEntries(): Promise<void> {
-  if (typeof window === "undefined" || !("caches" in window)) {
+async function purgeTokenBearingCacheEntries(caches: CacheStorage | null): Promise<void> {
+  if (!caches) {
     return;
   }
 
-  const cacheNames = await window.caches.keys();
+  const cacheNames = await caches.keys();
   await Promise.all(
     cacheNames.map(async (cacheName) => {
-      const cache = await window.caches.open(cacheName);
+      const cache = await caches.open(cacheName);
       const requests = await cache.keys();
       await Promise.all(
         requests
@@ -80,7 +91,7 @@ async function purgeTokenBearingCacheEntries(): Promise<void> {
 }
 
 export function clearStoredToken(storage = browserTokenStorage()): void {
-  schedulePurgeTokenBearingCacheEntries();
+  void schedulePurgeTokenBearingCacheEntries();
   if (!storage) {
     return;
   }
@@ -110,18 +121,21 @@ export function bootstrapTokenFromUrl(
   }
 
   const url = new URL(environment.href);
-  const token = url.searchParams.get("token");
-  if (!token) {
+  if (!url.searchParams.has("token")) {
     return null;
   }
+  // Presence decides cleanup; a usable value decides authentication.
+  const token = url.searchParams.getAll("token").find((value) => value !== "") ?? null;
 
   let persisted = false;
   try {
-    persisted = storeToken(token, environment.storage);
+    if (token) {
+      persisted = storeToken(token, environment.storage);
+    }
   } finally {
     url.searchParams.delete("token");
     const nextUrl = `${url.pathname}${url.search}${url.hash}` || "/";
     environment.replaceUrl(nextUrl);
   }
-  return { token, persisted };
+  return token ? { token, persisted } : null;
 }
