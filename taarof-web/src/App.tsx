@@ -17,12 +17,7 @@ import {
   fetchRuntimeIdentity,
   fetchState,
 } from "./api";
-import {
-  bootstrapTokenFromUrl,
-  clearStoredToken,
-  getStoredToken,
-  storeToken,
-} from "./auth";
+import { resolveInitialAuth, signOut, submitToken, type AuthStateTarget } from "./authSession";
 import { AgentsView } from "./components/AgentsView";
 import { selectPane, selectStage, selectTab, viewModeFromHash } from "./components/PaneStage.helpers";
 import { Sidebar } from "./components/Sidebar";
@@ -156,12 +151,7 @@ function eventStatusLabel(status: EventConnectionStatus) {
 }
 
 export function App() {
-  const [initialAuth] = useState(() => {
-    const bootstrapped = bootstrapTokenFromUrl();
-    if (bootstrapped) return bootstrapped;
-    const stored = getStoredToken();
-    return stored ? { token: stored, persisted: true } : null;
-  });
+  const [initialAuth] = useState(() => resolveInitialAuth());
   const [token, setToken] = useState<string | null>(initialAuth?.token ?? null);
   const [isTokenPersisted, setIsTokenPersisted] = useState(initialAuth?.persisted ?? true);
   const [tokenError, setTokenError] = useState<string | null>(null);
@@ -208,24 +198,32 @@ export function App() {
     return refreshGenerationRef.current;
   }
 
+  const authTarget: AuthStateTarget = {
+    stopConnections() {
+      eventRecoveryRef.current?.stop();
+      eventRecoveryRef.current = null;
+      advanceRefreshGeneration();
+    },
+    setToken,
+    setTokenPersisted: setIsTokenPersisted,
+    setTokenError,
+    clearAuthenticatedState() {
+      setSnapshot(null);
+      setAgentSessions(null);
+      setIsLoading(false);
+      setAreAgentSessionsLoading(false);
+      setLoadError(null);
+      setAgentSessionsError(null);
+      setSelectedWorkspaceId(null);
+      setSelectedTabId(null);
+      setSelectedPaneId(null);
+      setIsNavOpen(false);
+      setViewMode("panes");
+    },
+  };
+
   function handleUnauthorized(message: string) {
-    eventRecoveryRef.current?.stop();
-    eventRecoveryRef.current = null;
-    advanceRefreshGeneration();
-    clearStoredToken();
-    setSnapshot(null);
-    setAgentSessions(null);
-    setToken(null);
-    setTokenError(message);
-    setIsLoading(false);
-    setAreAgentSessionsLoading(false);
-    setLoadError(null);
-    setAgentSessionsError(null);
-    setSelectedWorkspaceId(null);
-    setSelectedTabId(null);
-    setSelectedPaneId(null);
-    setIsNavOpen(false);
-    setViewMode("panes");
+    signOut(authTarget, message);
   }
 
   useEffect(() => {
@@ -483,35 +481,11 @@ export function App() {
   ]);
 
   function handleTokenSubmit(nextToken: string) {
-    if (!nextToken) {
-      setTokenError("A bearer token is required.");
-      return;
-    }
-
-    setIsTokenPersisted(storeToken(nextToken));
-    eventRecoveryRef.current?.stop();
-    eventRecoveryRef.current = null;
-    advanceRefreshGeneration();
-    setToken(nextToken);
-    setTokenError(null);
+    submitToken(authTarget, nextToken);
   }
 
   function handleResetToken() {
-    eventRecoveryRef.current?.stop();
-    eventRecoveryRef.current = null;
-    advanceRefreshGeneration();
-    clearStoredToken();
-    setSnapshot(null);
-    setToken(null);
-    setTokenError(null);
-    setAgentSessions(null);
-    setLoadError(null);
-    setAgentSessionsError(null);
-    setSelectedWorkspaceId(null);
-    setSelectedTabId(null);
-    setSelectedPaneId(null);
-    setIsNavOpen(false);
-    setViewMode("panes");
+    signOut(authTarget, null);
   }
 
   function handleSelectWorkspace(workspaceId: number) {
