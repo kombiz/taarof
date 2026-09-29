@@ -3765,7 +3765,7 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
                 &tab_list,
                 &window_ref,
             );
-            flush_history(&state);
+            flush_persistence_for_shutdown(&state);
             cleanup_socket_once(&socket_cleaned, socket_path.as_deref());
             if let Some(dir) = &http_dir_for_close {
                 http::cleanup_token_file(dir);
@@ -3798,7 +3798,7 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
                     "session_name": crate::instance::session_name(),
                 })),
             );
-            flush_history(&runtime.shared_state());
+            flush_persistence_for_shutdown(&runtime.shared_state());
             cleanup_socket_once(&socket_cleaned, socket_path.as_deref());
             if let Some(dir) = &http_dir_for_shutdown {
                 http::cleanup_token_file(dir);
@@ -3830,10 +3830,41 @@ fn cleanup_socket_once(cleaned: &Cell<bool>, socket_path: Option<&std::path::Pat
     }
 }
 
-pub(crate) fn flush_history(state: &Rc<RefCell<AppState>>) {
+/// Budget for the work ledger's shutdown barrier. History keeps its own
+/// timeout; the two waits run back to back on the GTK thread during exit.
+const WORK_LEDGER_SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+
+/// Shared shutdown persistence for window close, signal cleanup, and
+/// application shutdown. The ledger barrier runs first because ledger appends
+/// feed history, and it executes at most once however many paths call it.
+pub(crate) fn flush_persistence_for_shutdown(state: &Rc<RefCell<AppState>>) {
+    flush_work_ledger_for_shutdown(state, WORK_LEDGER_SHUTDOWN_BUDGET);
     if let Err(error) = state.borrow().history.flush() {
         eprintln!("taarof: could not flush history during shutdown: {error}");
     }
+}
+
+fn flush_work_ledger_for_shutdown(
+    state: &Rc<RefCell<AppState>>,
+    budget: Duration,
+) -> work_ledger::LedgerShutdown {
+    let outcome = state.borrow_mut().work_ledger.shutdown_persistence(budget);
+    if outcome.is_incomplete() {
+        let detail = match &outcome {
+            work_ledger::LedgerShutdown::TimedOut => {
+                format!("timed out after {}ms", budget.as_millis())
+            }
+            work_ledger::LedgerShutdown::Failed(error) => error.clone(),
+            _ => unreachable!("only incomplete outcomes reach here"),
+        };
+        eprintln!("taarof: work ledger persistence incomplete at shutdown: {detail}");
+        crate::diagnostics::record_lifecycle(
+            "work_ledger_shutdown_incomplete",
+            format!("work ledger persistence incomplete at shutdown: {detail}"),
+            None,
+        );
+    }
+    outcome
 }
 
 /// Escape special PCRE2 regex characters in a string for literal matching.
@@ -3867,6 +3898,112 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    fn ledger_shutdown_state(
+        label: &str,
+        write: impl Fn(&Path, &str) -> std::io::Result<()> + Send + 'static,
+    ) -> (Rc<RefCell<AppState>>, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "taarof-ledger-shutdown-{label}-{}-{}.json",
+            std::process::id(),
+            events::unix_time_ms()
+        ));
+        let mut state = AppState::new();
+        state.work_ledger = work_ledger::WorkLedger::with_test_writer("test", path.clone(), write);
+        (Rc::new(RefCell::new(state)), path)
+    }
+
+    fn attention_preferences() -> work_ledger::WorkStreamPreferences {
+        work_ledger::WorkStreamPreferences {
+            filter: work_ledger::WorkStreamFilter::Attention,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shared_shutdown_waits_for_ledger_once_across_close_and_signal() {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (gate, gate_rx) = std::sync::mpsc::channel::<()>();
+        let gate_rx = std::sync::Mutex::new(gate_rx);
+        let (state, path) = ledger_shutdown_state("once", move |path, json| {
+            let _ = entered_tx.send(());
+            let _ = gate_rx.lock().unwrap().recv();
+            std::fs::write(path, json)
+        });
+        state
+            .borrow_mut()
+            .set_work_stream_preferences(attention_preferences());
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer should be held at the latch");
+        let final_view = work_ledger::WorkStreamPreferences {
+            filter: work_ledger::WorkStreamFilter::History,
+            ..Default::default()
+        };
+        state
+            .borrow_mut()
+            .set_work_stream_preferences(final_view.clone());
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            gate.send(()).unwrap();
+            gate.send(()).unwrap();
+        });
+        let started = std::time::Instant::now();
+        // Window close runs the shared cleanup first...
+        assert_eq!(
+            flush_work_ledger_for_shutdown(&state, Duration::from_secs(10)),
+            work_ledger::LedgerShutdown::Durable
+        );
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        releaser.join().unwrap();
+        // ...and a later signal or app shutdown does not run the barrier again.
+        assert_eq!(
+            flush_work_ledger_for_shutdown(&state, Duration::from_secs(10)),
+            work_ledger::LedgerShutdown::AlreadyShutDown
+        );
+        flush_persistence_for_shutdown(&state);
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["view"]["filter"], serde_json::json!("history"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn shared_shutdown_reports_blocked_and_failed_ledger_writes_within_budget() {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (gate, gate_rx) = std::sync::mpsc::channel::<()>();
+        let gate_rx = std::sync::Mutex::new(gate_rx);
+        let (blocked, blocked_path) = ledger_shutdown_state("blocked", move |_, _| {
+            let _ = entered_tx.send(());
+            let _ = gate_rx.lock().unwrap().recv();
+            Ok(())
+        });
+        blocked
+            .borrow_mut()
+            .set_work_stream_preferences(attention_preferences());
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer should be held at the latch");
+        let budget = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let outcome = flush_work_ledger_for_shutdown(&blocked, budget);
+        assert_eq!(outcome, work_ledger::LedgerShutdown::TimedOut);
+        assert!(started.elapsed() < budget + Duration::from_secs(2));
+        drop(gate);
+
+        let (failing, failing_path) = ledger_shutdown_state("failing", |_, _| {
+            Err(std::io::Error::other("injected write failure"))
+        });
+        failing
+            .borrow_mut()
+            .set_work_stream_preferences(attention_preferences());
+        let outcome = flush_work_ledger_for_shutdown(&failing, Duration::from_secs(5));
+        assert!(outcome.is_incomplete(), "unexpected outcome: {outcome:?}");
+        assert!(!blocked_path.exists());
+        assert!(!failing_path.exists());
+    }
 
     fn synthetic_agent_build_info(revision: &str, dirty: bool) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

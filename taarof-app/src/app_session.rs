@@ -390,7 +390,7 @@ pub(crate) fn install_signal_cleanup(
                 source_id.remove();
             }
             save_session_once(&session_saved, &writer, &state, &tab_list, &window);
-            crate::flush_history(&state);
+            crate::flush_persistence_for_shutdown(&state);
             crate::cleanup_socket_once(&socket_cleaned, socket_path.as_deref());
             app.quit();
             return glib::ControlFlow::Break;

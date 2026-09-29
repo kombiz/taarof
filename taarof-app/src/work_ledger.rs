@@ -910,6 +910,25 @@ struct PersistenceWorker {
     join: Option<std::thread::JoinHandle<()>>,
 }
 
+type SnapshotWriter = dyn Fn(&Path, &str) -> io::Result<()> + Send;
+
+/// Result of the once-only shutdown barrier. Anything other than `Durable`,
+/// `AlreadyShutDown`, or `Unavailable` means the newest snapshot may be lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerShutdown {
+    Durable,
+    AlreadyShutDown,
+    Unavailable,
+    Failed(String),
+    TimedOut,
+}
+
+impl LedgerShutdown {
+    pub fn is_incomplete(&self) -> bool {
+        matches!(self, Self::Failed(_) | Self::TimedOut)
+    }
+}
+
 #[derive(Default)]
 struct PersistenceStats {
     snapshot_requests: AtomicUsize,
@@ -920,6 +939,7 @@ struct PersistenceStats {
 
 fn drain_latest_snapshot(
     path: &Path,
+    write: &SnapshotWriter,
     latest: &Mutex<Option<PersistedLedger>>,
     wake_pending: &AtomicBool,
     stats: &PersistenceStats,
@@ -935,7 +955,7 @@ fn drain_latest_snapshot(
                 *thread = Some(std::thread::current().id());
             }
             let write_result = match serde_json::to_string_pretty(&snapshot) {
-                Ok(json) => match write_atomically(path, &json) {
+                Ok(json) => match write(path, &json) {
                     Ok(()) => {
                         stats.writes.fetch_add(1, Ordering::Relaxed);
                         Ok(())
@@ -965,6 +985,10 @@ fn drain_latest_snapshot(
 
 impl PersistenceWorker {
     fn start(path: PathBuf) -> io::Result<Self> {
+        Self::start_with_writer(path, Box::new(write_atomically))
+    }
+
+    fn start_with_writer(path: PathBuf, write: Box<SnapshotWriter>) -> io::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let latest = Arc::new(Mutex::new(None));
         let wake_pending = Arc::new(AtomicBool::new(false));
@@ -981,6 +1005,7 @@ impl PersistenceWorker {
                         PersistCommand::Wake => {
                             let (attempted, result) = drain_latest_snapshot(
                                 &path,
+                                write.as_ref(),
                                 &thread_latest,
                                 &thread_wake_pending,
                                 &thread_stats,
@@ -992,6 +1017,7 @@ impl PersistenceWorker {
                         PersistCommand::Flush(done) => {
                             let (attempted, result) = drain_latest_snapshot(
                                 &path,
+                                write.as_ref(),
                                 &thread_latest,
                                 &thread_wake_pending,
                                 &thread_stats,
@@ -1008,6 +1034,7 @@ impl PersistenceWorker {
                         PersistCommand::Shutdown => {
                             let _ = drain_latest_snapshot(
                                 &path,
+                                write.as_ref(),
                                 &thread_latest,
                                 &thread_wake_pending,
                                 &thread_stats,
@@ -1042,6 +1069,15 @@ impl PersistenceWorker {
             self.wake_pending.store(false, Ordering::Release);
         }
     }
+
+    /// Ask the writer to exit after draining, without joining it. Shutdown
+    /// must stay bounded, so a writer stuck in IO is abandoned to process exit.
+    fn detach(mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(PersistCommand::Shutdown);
+        }
+        drop(self.join.take());
+    }
 }
 
 impl Drop for PersistenceWorker {
@@ -1074,6 +1110,7 @@ pub struct WorkLedger {
     persistence_batch_depth: usize,
     persistence_dirty: bool,
     persistence: Option<PersistenceWorker>,
+    persistence_shut_down: bool,
     history_sink: Option<crate::history::HistoryHandle>,
 }
 
@@ -1122,6 +1159,7 @@ impl WorkLedger {
             persistence_batch_depth: 0,
             persistence_dirty: false,
             persistence,
+            persistence_shut_down: false,
             history_sink: None,
         }
     }
@@ -1304,6 +1342,18 @@ impl WorkLedger {
         Self::load_or_empty(session.to_string(), path, capacity, max_age_ms)
     }
 
+    /// Test seam: persist through `write` instead of the atomic file writer so
+    /// tests can latch, block, or fail the writer thread deterministically.
+    #[cfg(test)]
+    pub(crate) fn with_test_writer<W>(session: &str, path: PathBuf, write: W) -> Self
+    where
+        W: Fn(&Path, &str) -> io::Result<()> + Send + 'static,
+    {
+        Self::load_or_empty_with_start(session.to_string(), path, 10, u64::MAX, |path| {
+            PersistenceWorker::start_with_writer(path, Box::new(write))
+        })
+    }
+
     pub fn append(&mut self, draft: WorkDraft) -> Option<WorkRecord> {
         self.append_at_with_history(crate::events::unix_time_ms(), draft, true)
     }
@@ -1357,7 +1407,7 @@ impl WorkLedger {
         draft: WorkDraft,
         record_history: bool,
     ) -> Option<WorkRecord> {
-        if self.next_seq >= MAX_SAFE_NEXT_SEQ {
+        if self.persistence_shut_down || self.next_seq >= MAX_SAFE_NEXT_SEQ {
             return None;
         }
         let draft = sanitize_work_draft(draft)?;
@@ -1465,6 +1515,9 @@ impl WorkLedger {
     }
 
     fn schedule_persist(&mut self) {
+        if self.persistence_shut_down {
+            return;
+        }
         if self.persistence_batch_depth > 0 {
             self.persistence_dirty = true;
             return;
@@ -1508,6 +1561,9 @@ impl WorkLedger {
     }
 
     pub fn set_view_preferences(&mut self, mut view: WorkStreamPreferences) {
+        if self.persistence_shut_down {
+            return;
+        }
         view.sanitize();
         if self.view != view {
             self.view = view;
@@ -1610,6 +1666,9 @@ impl WorkLedger {
     }
 
     pub fn clear_all(&mut self) -> usize {
+        if self.persistence_shut_down {
+            return 0;
+        }
         let removed = self.records.len();
         self.records.clear();
         self.reconciliation.clear();
@@ -1633,6 +1692,9 @@ impl WorkLedger {
     }
 
     pub fn clear_pane(&mut self, pane_origin: &str) -> usize {
+        if self.persistence_shut_down {
+            return 0;
+        }
         let before = self.records.len();
         let removed_seqs = self
             .records
@@ -2157,6 +2219,43 @@ impl WorkLedger {
             .send(PersistCommand::Flush(tx))
             .ok()?;
         Some(rx)
+    }
+
+    /// Once-only shutdown barrier. Stops accepting mutations, then waits up to
+    /// `timeout` for the writer to acknowledge the newest snapshot. The writer
+    /// is detached rather than joined, so a stuck write cannot hold the GTK
+    /// thread past the budget.
+    pub fn shutdown_persistence(&mut self, timeout: std::time::Duration) -> LedgerShutdown {
+        if self.persistence_shut_down {
+            return LedgerShutdown::AlreadyShutDown;
+        }
+        if self.persistence_batch_depth > 0 {
+            // An unbalanced batch must not strand its changes in memory.
+            self.persistence_batch_depth = 1;
+            self.end_persistence_batch();
+        }
+        self.persistence_shut_down = true;
+        let Some(barrier) = self.persistence_barrier() else {
+            return match self.persistence.take() {
+                Some(worker) => {
+                    worker.detach();
+                    LedgerShutdown::Failed("work ledger writer is not running".to_string())
+                }
+                None => LedgerShutdown::Unavailable,
+            };
+        };
+        let outcome = match barrier.recv_timeout(timeout) {
+            Ok(Ok(())) => LedgerShutdown::Durable,
+            Ok(Err(error)) => LedgerShutdown::Failed(error.to_string()),
+            Err(mpsc::RecvTimeoutError::Timeout) => LedgerShutdown::TimedOut,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                LedgerShutdown::Failed("work ledger writer exited before flushing".to_string())
+            }
+        };
+        if let Some(worker) = self.persistence.take() {
+            worker.detach();
+        }
+        outcome
     }
 
     #[cfg(test)]
@@ -7265,6 +7364,143 @@ mod tests {
             .observe_pull_request("pane:owner/repo:7:TASK", &pr)
             .is_empty());
         let _ = fs::remove_file(path);
+    }
+
+    /// A writer that parks each write until the test opens the gate, and
+    /// reports every entry so the test knows the writer thread is held.
+    fn latched_writer(
+        entered: mpsc::Sender<()>,
+        gate: mpsc::Receiver<()>,
+    ) -> impl Fn(&Path, &str) -> io::Result<()> + Send + 'static {
+        let gate = Mutex::new(gate);
+        move |path, json| {
+            let _ = entered.send(());
+            // A dropped gate releases the writer so abandoned threads finish.
+            let _ = gate.lock().unwrap().recv();
+            write_atomically(path, json)
+        }
+    }
+
+    #[test]
+    fn shutdown_barrier_waits_for_latched_final_snapshot() {
+        let path = temp_path("shutdown-latched");
+        let (entered_tx, entered) = mpsc::channel();
+        let (gate, gate_rx) = mpsc::channel();
+        let mut ledger =
+            WorkLedger::with_test_writer("test", path.clone(), latched_writer(entered_tx, gate_rx));
+        ledger.append_at(10, draft("one", "first"));
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("writer should be held at the latch");
+        // Final changes are queued while the first write is still latched.
+        ledger.append_at(11, draft("two", "final"));
+        let view = WorkStreamPreferences {
+            filter: WorkStreamFilter::Attention,
+            ..ledger.view_preferences()
+        };
+        ledger.set_view_preferences(view.clone());
+
+        let released = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            gate.send(()).unwrap();
+            gate.send(()).unwrap();
+        });
+        let started = std::time::Instant::now();
+        let outcome = ledger.shutdown_persistence(std::time::Duration::from_secs(10));
+        assert_eq!(outcome, LedgerShutdown::Durable);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(100),
+            "shutdown must wait for the writer acknowledgement"
+        );
+        released.join().unwrap();
+
+        let restored = WorkLedger::with_storage("test", path.clone(), 10, u64::MAX);
+        let summaries = restored
+            .records()
+            .into_iter()
+            .map(|record| record.summary)
+            .collect::<Vec<_>>();
+        assert_eq!(summaries, ["first", "final"]);
+        assert_eq!(restored.view_preferences().filter, view.filter);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn shutdown_barrier_stops_accepting_mutations_and_runs_once() {
+        let path = temp_path("shutdown-once");
+        let writes = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&writes);
+        let mut ledger = WorkLedger::with_test_writer("test", path.clone(), move |path, json| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            write_atomically(path, json)
+        });
+        ledger.append_at(10, draft("one", "kept"));
+        assert_eq!(
+            ledger.shutdown_persistence(std::time::Duration::from_secs(5)),
+            LedgerShutdown::Durable
+        );
+        let writes_at_barrier = writes.load(Ordering::SeqCst);
+
+        assert!(ledger.append_at(11, draft("two", "late")).is_none());
+        ledger.set_view_preferences(WorkStreamPreferences {
+            filter: WorkStreamFilter::History,
+            ..ledger.view_preferences()
+        });
+        assert_eq!(ledger.clear_all(), 0);
+        assert_eq!(
+            ledger.shutdown_persistence(std::time::Duration::from_secs(5)),
+            LedgerShutdown::AlreadyShutDown
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), writes_at_barrier);
+
+        let restored = WorkLedger::with_storage("test", path.clone(), 10, u64::MAX);
+        assert_eq!(restored.records().len(), 1);
+        assert_eq!(restored.view_preferences().filter, WorkStreamFilter::All);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn shutdown_barrier_times_out_on_blocked_writer() {
+        let path = temp_path("shutdown-blocked");
+        let (entered_tx, entered) = mpsc::channel();
+        let (gate, gate_rx) = mpsc::channel::<()>();
+        let mut ledger =
+            WorkLedger::with_test_writer("test", path.clone(), latched_writer(entered_tx, gate_rx));
+        ledger.append_at(10, draft("one", "stuck"));
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("writer should be held at the latch");
+
+        let budget = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let outcome = ledger.shutdown_persistence(budget);
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, LedgerShutdown::TimedOut);
+        assert!(outcome.is_incomplete());
+        assert!(elapsed >= budget);
+        assert!(
+            elapsed < budget + std::time::Duration::from_secs(2),
+            "shutdown must not join a blocked writer: {elapsed:?}"
+        );
+        drop(ledger);
+        drop(gate);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn shutdown_barrier_reports_write_error_as_incomplete() {
+        let path = temp_path("shutdown-error");
+        let mut ledger = WorkLedger::with_test_writer("test", path.clone(), |_, _| {
+            Err(io::Error::other("injected write failure"))
+        });
+        ledger.append_at(10, draft("one", "lost"));
+        let outcome = ledger.shutdown_persistence(std::time::Duration::from_secs(5));
+        assert!(
+            matches!(&outcome, LedgerShutdown::Failed(error) if error.contains("injected write failure")),
+            "unexpected outcome: {outcome:?}"
+        );
+        assert!(outcome.is_incomplete());
+        assert!(!path.exists());
     }
 
     #[test]
