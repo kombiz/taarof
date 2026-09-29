@@ -13,7 +13,7 @@ const MAINTENANCE_AFTER_BATCHES: u64 = 64;
 
 enum WriterCommand {
     Draft(Box<HistoryRecordDraft>),
-    Flush(mpsc::Sender<Result<(), String>>),
+    Flush(mpsc::Sender<Result<(), FlushFailure>>),
     Shutdown,
 }
 
@@ -21,6 +21,7 @@ pub(crate) struct WriterClient {
     tx: mpsc::Sender<WriterCommand>,
     status: Arc<HistoryStatusInner>,
     queue_capacity: usize,
+    loss: Arc<Mutex<LossLedger>>,
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -36,14 +37,17 @@ impl WriterClient {
         // park a caller behind a full draft queue.
         let (tx, rx) = mpsc::channel();
         let thread_status = Arc::clone(&status);
+        let loss = Arc::new(Mutex::new(LossLedger::default()));
+        let thread_loss = Arc::clone(&loss);
         let join = std::thread::Builder::new()
             .name("taarof-history-writer".to_string())
-            .spawn(move || run_writer(path, config, thread_status, rx))
+            .spawn(move || run_writer(path, config, thread_status, thread_loss, rx))
             .map_err(|error| format!("could not start history writer: {error}"))?;
         Ok(Self {
             tx,
             status,
             queue_capacity: capacity,
+            loss,
             join: Mutex::new(Some(join)),
         })
     }
@@ -103,9 +107,18 @@ impl WriterClient {
         self.tx
             .send(WriterCommand::Flush(done_tx))
             .map_err(|_| "history writer channel is closed".to_string())?;
-        done_rx
+        let reply = done_rx
             .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| "timed out flushing history".to_string())?
+            .map_err(|_| "timed out flushing history".to_string())?;
+        reply.map_err(|failure| {
+            // Only a caller that received the report acknowledges the loss.
+            // A flush that timed out or was abandoned leaves it pending for
+            // the next barrier.
+            if let Some(through) = failure.loss_through {
+                lock_loss(&self.loss).acknowledge(through);
+            }
+            failure.message
+        })
     }
 }
 
@@ -206,6 +219,7 @@ fn run_writer(
     path: PathBuf,
     config: HistoryConfig,
     status: Arc<HistoryStatusInner>,
+    loss: Arc<Mutex<LossLedger>>,
     rx: mpsc::Receiver<WriterCommand>,
 ) {
     let (mut conn, recovery_reason) = match open_with_recovery(&path) {
@@ -240,7 +254,6 @@ fn run_writer(
         maintenance_interval,
     );
     let mut deferred = VecDeque::new();
-    let mut unacknowledged_loss = UnacknowledgedLoss::default();
     let mut committed_batches = 0_u64;
     loop {
         // Check the explicit batch trigger before receiving another command.
@@ -318,7 +331,7 @@ fn run_writer(
                             status.available.store(false, Ordering::Release);
                         }
                         status.set_state("degraded", Some(error.clone()));
-                        unacknowledged_loss.record(draft_count, error);
+                        lock_loss(&loss).record(draft_count, error);
                         std::thread::sleep(Duration::from_millis(250));
                     }
                 }
@@ -327,7 +340,7 @@ fn run_writer(
             }
             Some(WriterCommand::Flush(done)) => {
                 report_backpressure(&status, config.queue_capacity.max(1));
-                let _ = done.send(unacknowledged_loss.acknowledge());
+                let _ = done.send(lock_loss(&loss).report());
             }
             Some(WriterCommand::Shutdown) | None => break,
         }
@@ -335,33 +348,56 @@ fn run_writer(
     status.available.store(false, Ordering::Release);
 }
 
-/// Drafts consumed by failed batches since the last flush that reported them.
+struct FlushFailure {
+    message: String,
+    /// Cumulative lost-draft count this report covers, acknowledged only
+    /// once the flush caller actually receives it.
+    loss_through: Option<u64>,
+}
+
+/// Drafts consumed by failed batches that no flush caller has received.
 ///
 /// A later successful batch restores writer health but must not erase this:
 /// the lost drafts were enqueued before any subsequent flush barrier. The
-/// first flush that observes a loss reports it and acknowledges it, so the
-/// next flush reports only losses that occur after that acknowledgement.
+/// writer reports loss up to a cumulative count, and the flush caller that
+/// receives the report acknowledges through that count, so the next flush
+/// reports only losses that occur after that acknowledgement. A reply that
+/// no caller receives, such as after a flush timeout, acknowledges nothing.
 #[derive(Default)]
-struct UnacknowledgedLoss {
-    records: u64,
+struct LossLedger {
+    lost: u64,
+    acknowledged: u64,
     last_error: Option<String>,
 }
 
-impl UnacknowledgedLoss {
+impl LossLedger {
     fn record(&mut self, records: u64, error: String) {
-        self.records = self.records.saturating_add(records);
+        self.lost = self.lost.saturating_add(records);
         self.last_error = Some(error);
     }
 
-    fn acknowledge(&mut self) -> Result<(), String> {
-        let Some(error) = self.last_error.take() else {
+    fn report(&self) -> Result<(), FlushFailure> {
+        let records = self.lost.saturating_sub(self.acknowledged);
+        if records == 0 {
             return Ok(());
-        };
-        let records = std::mem::take(&mut self.records);
-        Err(format!(
-            "history persistence is incomplete: {records} records were dropped by failed batches; last error: {error}"
-        ))
+        }
+        let error = self.last_error.as_deref().unwrap_or("unknown error");
+        Err(FlushFailure {
+            message: format!(
+                "history persistence is incomplete: {records} records were dropped by failed batches; last error: {error}"
+            ),
+            loss_through: Some(self.lost),
+        })
     }
+
+    fn acknowledge(&mut self, through: u64) {
+        self.acknowledged = self.acknowledged.max(through);
+    }
+}
+
+fn lock_loss(loss: &Mutex<LossLedger>) -> std::sync::MutexGuard<'_, LossLedger> {
+    loss.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn run_maintenance(
@@ -542,7 +578,10 @@ fn run_unavailable_writer(
             }
             WriterCommand::Flush(done) => {
                 report_backpressure(status, queue_capacity);
-                let _ = done.send(Err(error.clone()));
+                let _ = done.send(Err(FlushFailure {
+                    message: error.clone(),
+                    loss_through: None,
+                }));
             }
             WriterCommand::Shutdown => break,
         }
@@ -998,6 +1037,55 @@ mod tests {
 
         // The failed flush acknowledged the loss; a healthy writer with no new
         // loss now reports a complete barrier.
+        handle.flush().unwrap();
+
+        drop(handle);
+        drop(lock);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn abandoned_flush_does_not_acknowledge_loss() {
+        let path = temp_path("abandoned-flush");
+        let (handle, _reader) = HistoryHandle::open_at(enabled_config(), path.clone());
+        handle.flush().unwrap();
+
+        let lock = Connection::open(&path).unwrap();
+        super::super::schema::configure_connection(&lock).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let event = |seq| EventRecord {
+            seq,
+            ts_unix_ms: super::super::now_unix_ms(),
+            event_type: "session_started".to_string(),
+            payload: serde_json::json!({"session_name": "abandoned"}),
+        };
+        handle.try_record_event(&event(1));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handle.status().dropped == 0 {
+            assert!(Instant::now() < deadline, "batch A never failed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        lock.execute_batch("ROLLBACK").unwrap();
+        handle.try_record_event(&event(2));
+
+        // Two flushes whose callers gave up, as after a flush timeout: one
+        // receiver is gone before the writer replies, the other receives a
+        // reply that is never read.
+        let writer = handle.writer.as_ref().unwrap();
+        let (gone_tx, gone_rx) = mpsc::channel();
+        drop(gone_rx);
+        writer.tx.send(WriterCommand::Flush(gone_tx)).unwrap();
+        let (unread_tx, unread_rx) = mpsc::channel();
+        writer.tx.send(WriterCommand::Flush(unread_tx)).unwrap();
+
+        let error = handle
+            .flush()
+            .expect_err("a live flush must still report loss no caller received");
+        assert!(error.contains("incomplete"), "{error}");
+        assert_eq!(handle.status().state, "ok");
+        drop(unread_rx);
+
+        // Receipt by the live caller acknowledged the loss.
         handle.flush().unwrap();
 
         drop(handle);
