@@ -29,6 +29,8 @@
     "src/api.test.ts",
     "src/runtimeProbe.test.ts",
     "src/agentActivity.test.ts",
+    "src/auth.ts",
+    "src/auth.test.ts",
     "src/components/MonitorView.helpers.test.ts",
     "src/components/AgentsView.helpers.test.ts",
     "src/components/HistoryView.helpers.test.ts",

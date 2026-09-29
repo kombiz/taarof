@@ -156,9 +156,14 @@ function eventStatusLabel(status: EventConnectionStatus) {
 }
 
 export function App() {
-  const [token, setToken] = useState<string | null>(() => {
-    return bootstrapTokenFromUrl() ?? getStoredToken();
+  const [initialAuth] = useState(() => {
+    const bootstrapped = bootstrapTokenFromUrl();
+    if (bootstrapped) return bootstrapped;
+    const stored = getStoredToken();
+    return stored ? { token: stored, persisted: true } : null;
   });
+  const [token, setToken] = useState<string | null>(initialAuth?.token ?? null);
+  const [isTokenPersisted, setIsTokenPersisted] = useState(initialAuth?.persisted ?? true);
   const [tokenError, setTokenError] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<TaarofStateSnapshot | null>(null);
   const [agentSessions, setAgentSessions] = useState<AgentSessionsSnapshot | null>(null);
@@ -483,7 +488,7 @@ export function App() {
       return;
     }
 
-    storeToken(nextToken);
+    setIsTokenPersisted(storeToken(nextToken));
     eventRecoveryRef.current?.stop();
     eventRecoveryRef.current = null;
     advanceRefreshGeneration();
@@ -713,7 +718,16 @@ export function App() {
             >
               {eventStatusLabel(eventStatus)}
             </span>
-            <span className="main-shell__token-state">token cached</span>
+            <span
+              className="main-shell__token-state"
+              title={
+                isTokenPersisted
+                  ? undefined
+                  : "Browser storage is unavailable; re-enter the token after reloading."
+              }
+            >
+              {isTokenPersisted ? "token cached" : "token not saved"}
+            </span>
             <button onClick={handleRefresh} type="button">
               Refresh
             </button>
