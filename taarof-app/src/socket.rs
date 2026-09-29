@@ -826,6 +826,15 @@ fn dispatch_socket_message(
             );
             return;
         }
+        SocketMessage::QueryAgentSessions { schema } => {
+            dispatch_query_agent_sessions_socket(
+                state,
+                crate::agent_sessions::default_catalog(),
+                schema,
+                response_tx,
+            );
+            return;
+        }
         SocketMessage::CreateTmuxTab {
             name,
             host,
@@ -2707,7 +2716,9 @@ fn handle_socket_message(
         SocketMessage::QueryHistory { .. } => {
             SocketResponse::err("query-history must be handled by the socket listener thread")
         }
-        SocketMessage::QueryAgentSessions { schema } => handle_query_agent_sessions(state, schema),
+        SocketMessage::QueryAgentSessions { .. } => {
+            SocketResponse::err("query-agent-sessions must use asynchronous socket dispatch")
+        }
         SocketMessage::AgentWorkspace {
             branch,
             command,
@@ -4531,16 +4542,49 @@ async fn verify_live_attach(
     Ok(())
 }
 
-fn handle_query_agent_sessions(
+/// Collect GTK-owned live bindings, run the provider scan off GTK, then build
+/// live evidence and serialize back on the main context. Evidence is read after
+/// the worker so a pane that changed during the scan is reported as it is now.
+fn dispatch_query_agent_sessions_socket(
     state: &Rc<RefCell<AppState>>,
+    catalog: Arc<crate::agent_sessions::AgentSessionCatalog>,
     schema: crate::agent_sessions::SessionSchema,
+    response_tx: mpsc::Sender<SocketResponse>,
+) {
+    const ACTION: &str = "query-agent-sessions";
+    let mut live_bindings = Vec::new();
+    let collected = run_socket_handler_safely(ACTION, || {
+        live_bindings = crate::agent_sessions::build_live_agent_bindings(&state.borrow());
+        SocketResponse::ok()
+    });
+    if !collected.ok {
+        let _ = response_tx.send(collected);
+        return;
+    }
+    let state = state.clone();
+    glib::spawn_future_local(async move {
+        let scan = gio::spawn_blocking(move || {
+            let snapshot = catalog.snapshot_blocking(live_bindings);
+            let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+            (snapshot, hostname)
+        })
+        .await;
+        let response = match scan {
+            Ok((snapshot, hostname)) => run_socket_handler_safely(ACTION, || {
+                agent_sessions_response(&state, snapshot, schema, &hostname)
+            }),
+            Err(_) => SocketResponse::err("agent session scan failed"),
+        };
+        let _ = response_tx.send(response);
+    });
+}
+
+fn agent_sessions_response(
+    state: &Rc<RefCell<AppState>>,
+    snapshot: crate::agent_sessions::AgentSessionsSnapshot,
+    schema: crate::agent_sessions::SessionSchema,
+    hostname: &str,
 ) -> SocketResponse {
-    let live_bindings = {
-        let st = state.borrow();
-        crate::agent_sessions::build_live_agent_bindings(&st)
-    };
-    let snapshot = crate::agent_sessions::default_catalog().snapshot_blocking(live_bindings);
-    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
     let live = crate::agent_sessions::build_live_session_evidence(&state.borrow(), hostname.trim());
     match crate::agent_sessions::snapshot_value_with_live(snapshot, schema, Some(&live)) {
         Ok(data) => SocketResponse::ok_with_data(data),
@@ -4637,18 +4681,18 @@ mod tests {
         bind_socket_listener, bounded_agent_output, cancel_agent_turn, cleanup_socket,
         cleanup_stale_socket_registry_file, clear_tab_attention, close_tab_plan,
         correlate_native_turn, detached_session_list_payload, dispatch_notify_message,
-        dispatch_socket_message, ensure_agent_worktree, handle_device_revoke, handle_list_tabs,
-        handle_pairing_confirm, handle_pairing_offer, handle_pairing_pending,
-        handle_pairing_reject, handle_query_events, handle_query_state, handle_socket_connection,
-        idempotent_split, preferred_agent_workspace_tab_id, prepare_tab_close, process_exists,
-        record_socket_message_event, registry_path_in, resolve_agent_status_pane_target,
-        resolve_agent_workspace_repo_path, resolve_detached_session_for_attach,
-        resolve_tab_id_for_target_in_state, resolve_workspace_id_for_target_in_state,
-        retarget_tab_attention_to_remaining_activity, route_agent_workspace_socket_message,
-        run_socket_handler_safely, select_runtime_dir, socket_message_action,
-        socket_message_is_read_only, socket_path_in, spawn_socket_dispatch_router,
-        spawn_socket_listener_thread, truncate_utf8_tail, validate_agent_prompt,
-        validate_agent_status_source, validate_agent_turn_output_limit,
+        dispatch_query_agent_sessions_socket, dispatch_socket_message, ensure_agent_worktree,
+        handle_device_revoke, handle_list_tabs, handle_pairing_confirm, handle_pairing_offer,
+        handle_pairing_pending, handle_pairing_reject, handle_query_events, handle_query_state,
+        handle_socket_connection, idempotent_split, preferred_agent_workspace_tab_id,
+        prepare_tab_close, process_exists, record_socket_message_event, registry_path_in,
+        resolve_agent_status_pane_target, resolve_agent_workspace_repo_path,
+        resolve_detached_session_for_attach, resolve_tab_id_for_target_in_state,
+        resolve_workspace_id_for_target_in_state, retarget_tab_attention_to_remaining_activity,
+        route_agent_workspace_socket_message, run_socket_handler_safely, select_runtime_dir,
+        socket_message_action, socket_message_is_read_only, socket_path_in,
+        spawn_socket_dispatch_router, spawn_socket_listener_thread, truncate_utf8_tail,
+        validate_agent_prompt, validate_agent_status_source, validate_agent_turn_output_limit,
         validate_agent_turn_timeout, validate_get_text_scrollback, validate_runtime_dir,
         validate_runtime_dir_attributes, validate_socket_command_input,
         validate_socket_path_length, validate_split_idempotency_key, CloseTabPlan,
@@ -4677,7 +4721,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Mutex,
+        mpsc, Arc, Mutex,
     };
     use std::time::Instant;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -5657,6 +5701,146 @@ mod tests {
                     .expect("bounded test socket listener should finish");
                 cleanup_socket(&socket_path);
                 let _ = std::fs::remove_dir_all(socket_dir);
+            })
+            .expect("test context should become thread-default");
+    }
+
+    /// Scanner that parks until the test releases it, standing in for a cold
+    /// provider walk of a large session store.
+    struct GatedAgentSessionScanner {
+        started: Arc<AtomicBool>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl crate::agent_sessions::AgentSessionScanner for GatedAgentSessionScanner {
+        fn scan(&self) -> crate::agent_sessions::AgentSessionDiscovery {
+            self.started.store(true, Ordering::SeqCst);
+            let _ = self
+                .release
+                .lock()
+                .expect("gate lock should work")
+                .recv_timeout(Duration::from_secs(5));
+            crate::agent_sessions::AgentSessionDiscovery {
+                providers: vec![crate::agent_sessions::AgentSessionProviderStatus {
+                    name: "codex".to_string(),
+                    ok: true,
+                    history_available: true,
+                    warning: None,
+                    error: None,
+                    session_count: 1,
+                }],
+                sessions: vec![crate::agent_sessions::AgentSessionRecord {
+                    agent: "codex".to_string(),
+                    session_id: "session-cold".to_string(),
+                    title: "Cold scan".to_string(),
+                    cwd: "/repo".to_string(),
+                    host: None,
+                    repo_root: Some("/repo".to_string()),
+                    started_at_unix_ms: Some(1),
+                    updated_at_unix_ms: 2,
+                    last_user_message_at_unix_ms: None,
+                    status: "recent".to_string(),
+                    live_binding: None,
+                    resume_command: Some("codex resume session-cold".to_string()),
+                    resume_unavailable_reason: None,
+                }],
+                remote_hosts: Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn query_agent_sessions_scans_off_main_context_and_matches_inline_snapshot() {
+        let _glib_guard = crate::glib_main_context_test_guard();
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let _acquire = context.acquire().expect("test owns the main context");
+                let state = Rc::new(RefCell::new(stub_app_state(
+                    vec![stub_workspace_with_id(
+                        11,
+                        "default",
+                        vec![stub_terminal_tab(101, "Shell", None)],
+                        101,
+                    )],
+                    11,
+                )));
+                let started = Arc::new(AtomicBool::new(false));
+                let (release_tx, release_rx) = mpsc::channel();
+                let catalog = Arc::new(crate::agent_sessions::AgentSessionCatalog::with_scanner(
+                    Arc::new(GatedAgentSessionScanner {
+                        started: started.clone(),
+                        release: Mutex::new(release_rx),
+                    }),
+                ));
+
+                let (response_tx, response_rx) = mpsc::channel();
+                dispatch_query_agent_sessions_socket(
+                    &state,
+                    catalog.clone(),
+                    crate::agent_sessions::SessionSchema::V1,
+                    response_tx,
+                );
+
+                let heartbeat = Rc::new(Cell::new(0));
+                let heartbeat_for_source = heartbeat.clone();
+                context.spawn_local(async move {
+                    loop {
+                        glib::timeout_future(Duration::from_millis(1)).await;
+                        heartbeat_for_source.set(heartbeat_for_source.get() + 1);
+                    }
+                });
+
+                // The dispatch returned while the scan is still parked, and
+                // the main context keeps serving sources during the cold scan.
+                let start_deadline = Instant::now() + Duration::from_secs(2);
+                while !started.load(Ordering::SeqCst) || heartbeat.get() < 3 {
+                    assert!(
+                        Instant::now() < start_deadline,
+                        "main context stalled during the cold agent-session scan"
+                    );
+                    context.iteration(false);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(
+                    response_rx.try_recv().is_err(),
+                    "reply must wait for the off-thread scan"
+                );
+
+                release_tx.send(()).expect("scanner should be waiting");
+                let reply_deadline = Instant::now() + Duration::from_secs(5);
+                let response = loop {
+                    if let Ok(response) = response_rx.try_recv() {
+                        break response;
+                    }
+                    assert!(
+                        Instant::now() < reply_deadline,
+                        "query-agent-sessions reply did not arrive after the scan"
+                    );
+                    context.iteration(false);
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                assert!(response.ok, "reply should succeed: {:?}", response.error);
+
+                // Same inputs through the former inline path: the cache now
+                // holds the discovery, so the synchronous snapshot is warm.
+                // Only the wall-clock generation stamp may differ.
+                let mut inline = crate::agent_sessions::snapshot_value_with_live(
+                    catalog.snapshot_blocking(crate::agent_sessions::build_live_agent_bindings(
+                        &state.borrow(),
+                    )),
+                    crate::agent_sessions::SessionSchema::V1,
+                    Some(&[]),
+                )
+                .expect("inline snapshot should serialize");
+                let mut replied = response.data.expect("reply should carry data");
+                for value in [&mut inline, &mut replied] {
+                    value["generated_at_unix_ms"] = serde_json::json!(0);
+                }
+                assert_eq!(
+                    serde_json::to_string(&replied).expect("reply data should serialize"),
+                    serde_json::to_string(&inline).expect("inline data should serialize"),
+                );
             })
             .expect("test context should become thread-default");
     }
