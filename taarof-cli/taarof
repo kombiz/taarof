@@ -67,10 +67,16 @@ def _registry_path(session: str | None) -> Path:
 def _registry_data(session: str | None) -> dict[str, Any]:
     reg = _registry_path(session)
     if not reg.exists():
-        raise SystemExit(
-            f"taarof registry not found at {reg}. Is the app running? "
-            f"Set TAAROF_SOCK to override."
-        )
+        hint = "Set TAAROF_SOCK to override."
+        named = sorted(reg.parent.glob("taarof-current-*.json")) if not session else []
+        if named:
+            # A channel launcher (e.g. kmux) runs the app under TAAROF_SESSION;
+            # its registry is session-keyed, so the unnamed lookup misses it.
+            hint = (
+                f"{len(named)} named-session registr{'y' if len(named) == 1 else 'ies'} "
+                f"exist in {reg.parent}; pass --session NAME or set TAAROF_SESSION."
+            )
+        raise SystemExit(f"taarof registry not found at {reg}. Is the app running? {hint}")
     try:
         data = json.loads(reg.read_text())
     except json.JSONDecodeError as err:
@@ -2205,7 +2211,7 @@ def _work_context_from_env() -> dict[str, str]:
 def cmd_work_report(args: argparse.Namespace) -> Any:
     context = _work_context_from_env()
     context_session = context["session"]
-    if args.session is not None and args.session != context_session:
+    if args.session_explicit and args.session != context_session:
         raise SystemExit(
             "work-report --session does not match TAAROF_WORK_SESSION; "
             "stop and refresh the bound-pane context"
@@ -2216,11 +2222,13 @@ def cmd_work_report(args: argparse.Namespace) -> Any:
         **context,
     }
     _optional(msg, "note", args.note)
-    return socket_send(msg, session=args.session or context_session)
+    return socket_send(msg, session=args.session if args.session_explicit else context_session)
 
 
 def cmd_work_context(args: argparse.Namespace) -> Any:
-    if not args.session:
+    # A TAAROF_SESSION default does not count: binding work to a pane must name
+    # the session deliberately.
+    if not args.session_explicit or not args.session:
         raise SystemExit(
             "work-context requires explicit --session before the command; "
             "stop and select the intended taarof session"
@@ -3240,7 +3248,7 @@ def build_parser() -> argparse.ArgumentParser:
     # the inherited subparser action's absent default.
     common_base.add_argument(
         "--session", default=argparse.SUPPRESS,
-        help="Named taarof session (defaults to unnamed).",
+        help="Named taarof session (defaults to $TAAROF_SESSION, else unnamed).",
     )
     common_base.add_argument("--pretty", action="store_true", help="Indent JSON output.")
 
@@ -3530,18 +3538,30 @@ def _version_requested(argv: list[str]) -> tuple[bool, str | None]:
     return False, session
 
 
+def _default_session() -> str | None:
+    """The session the app itself derives its registry from.
+
+    A channel launcher (e.g. the kmux install) starts the app with
+    TAAROF_SESSION set, and the app exports it to every terminal it spawns, so
+    an unflagged CLI must resolve that same named registry rather than the
+    unnamed `taarof-current.json`.
+    """
+    return os.environ.get("TAAROF_SESSION", "").strip() or None
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     wants_version, version_session = _version_requested(raw_argv)
     if wants_version:
-        report = build_version_report(version_session)
+        report = build_version_report(version_session or _default_session())
         _emit(report, "--pretty" in raw_argv)
         return 0
 
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not hasattr(args, "session"):
-        args.session = None
+    args.session_explicit = hasattr(args, "session")
+    if not args.session_explicit:
+        args.session = _default_session()
     try:
         result = args.func(args)
     except urllib.error.URLError as err:

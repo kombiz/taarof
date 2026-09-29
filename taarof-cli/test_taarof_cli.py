@@ -13,6 +13,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 
+# The CLI defaults --session from TAAROF_SESSION, and these tests run from
+# inside taarof terminals that export it. Start every test from the unnamed
+# session; tests that exercise the default set it explicitly.
+os.environ.pop("TAAROF_SESSION", None)
+
+
 def load_cli_module():
     cli_path = Path(__file__).with_name("taarof")
     loader = importlib.machinery.SourceFileLoader("taarof_cli_under_test", str(cli_path))
@@ -105,6 +111,58 @@ class HttpAuthTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [("/api/v1/runtime-identity", None)])
+
+    def test_session_defaults_to_taarof_session_like_the_app(self) -> None:
+        # The app publishes a named-session registry whenever TAAROF_SESSION is
+        # set, and exports it to its terminals; the CLI must resolve the same one.
+        cli = load_cli_module()
+        calls = []
+
+        def fake_http_get(path, session=None):
+            calls.append((path, session))
+            return {"ok": True, "data": {}}
+
+        with (
+            patch.dict(os.environ, {"TAAROF_SESSION": "kmux"}, clear=True),
+            patch.object(cli, "http_get", fake_http_get),
+            patch.object(cli, "_emit"),
+        ):
+            self.assertEqual(cli.main(["runtime-identity"]), 0)
+            self.assertEqual(cli.main(["--session", "other", "runtime-identity"]), 0)
+        with (
+            patch.dict(os.environ, {"TAAROF_SESSION": "   "}, clear=True),
+            patch.object(cli, "http_get", fake_http_get),
+            patch.object(cli, "_emit"),
+        ):
+            self.assertEqual(cli.main(["runtime-identity"]), 0)
+
+        self.assertEqual(calls, [
+            ("/api/v1/runtime-identity", "kmux"),
+            ("/api/v1/runtime-identity", "other"),
+            ("/api/v1/runtime-identity", None),
+        ])
+
+    def test_missing_unnamed_registry_points_at_named_sessions(self) -> None:
+        cli = load_cli_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_dir = Path(tmp)
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": tmp}, clear=True):
+                with self.assertRaisesRegex(SystemExit, "TAAROF_SOCK"):
+                    cli._registry_data(None)
+                (runtime_dir / f"taarof-current-{cli._session_storage_key('kmux')}.json").write_text("{}")
+                with self.assertRaisesRegex(SystemExit, "1 named-session registry .*--session NAME"):
+                    cli._registry_data(None)
+
+    def test_version_report_defaults_to_taarof_session(self) -> None:
+        cli = load_cli_module()
+        seen = []
+        with (
+            patch.dict(os.environ, {"TAAROF_SESSION": "kmux"}, clear=True),
+            patch.object(cli, "build_version_report", lambda s: seen.append(s) or {}),
+            patch.object(cli, "_emit"),
+        ):
+            self.assertEqual(cli.main(["--version"]), 0)
+        self.assertEqual(seen, ["kmux"])
 
 
 class HistoryTests(unittest.TestCase):
@@ -1323,6 +1381,12 @@ class WorkReportingTests(unittest.TestCase):
     def test_work_context_requires_session_and_positive_numeric_ids(self) -> None:
         cli = load_cli_module()
         with self.assertRaisesRegex(SystemExit, "requires explicit --session"):
+            cli.main(["work-context", "--tab", "17", "--pane", "3", "--shell"])
+        # The TAAROF_SESSION default must not stand in for a deliberate choice.
+        with (
+            patch.dict(os.environ, {"TAAROF_SESSION": "dev"}),
+            self.assertRaisesRegex(SystemExit, "requires explicit --session"),
+        ):
             cli.main(["work-context", "--tab", "17", "--pane", "3", "--shell"])
         for bad in ("current", "Shell", "0", "-1"):
             with self.assertRaises(SystemExit):
