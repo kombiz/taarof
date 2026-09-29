@@ -40,6 +40,14 @@ pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
+/// Build the GIO launch context for children GIO starts itself (the desktop's
+/// default URI handler), with the same sanitizer applied as [`command`].
+pub(crate) fn launch_context() -> gio::AppLaunchContext {
+    let context = gio::AppLaunchContext::new();
+    crate::child_env::prepare_launch_context(&context);
+    context
+}
+
 /// A spawned fire-and-forget child plus the thread that will reap it.
 ///
 /// Callers ignore this; dropping it detaches the reaper, which still reaps.

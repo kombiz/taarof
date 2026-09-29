@@ -39,7 +39,10 @@ pub(crate) fn open_url(url: &str) {
             }
         }
     }
-    if let Err(e) = gio::AppInfo::launch_default_for_uri(url, None::<&gio::AppLaunchContext>) {
+    // GIO spawns the default handler itself, so it gets a sanitized launch
+    // context instead of a `Command`.
+    let context = crate::child_process::launch_context();
+    if let Err(e) = gio::AppInfo::launch_default_for_uri(url, Some(&context)) {
         eprintln!("taarof: failed to open URL '{url}': {e}");
     }
 }

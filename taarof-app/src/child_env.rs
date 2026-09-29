@@ -113,6 +113,17 @@ pub(crate) fn prepare_child_command(command: &mut Command, overrides: &[(String,
     }
 }
 
+/// Apply the same denylist to a GIO launch context, for children GIO starts
+/// on taarof's behalf (the default URI handler). GIO builds those children's
+/// environment from the context rather than from a `Command`.
+pub(crate) fn prepare_launch_context(context: &gio::AppLaunchContext) {
+    use gio::prelude::AppLaunchContextExt;
+    for name in AMBIENT_INFISICAL_TOKEN_VARS {
+        context.unsetenv(name);
+    }
+    context.unsetenv(RELOAD_RESUME_ENV);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +257,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn gio_launch_context_strips_tokens_set_on_it() {
+        use gio::prelude::AppLaunchContextExt;
+        let context = gio::AppLaunchContext::new();
+        context.setenv("INFISICAL_TOKEN", "synthetic-parent-token");
+        context.setenv("INFISICAL_SERVICE_TOKEN", "synthetic-service-token");
+        context.setenv(RELOAD_RESUME_ENV, "must-not-reach-browser");
+        context.setenv("TAAROF_SAFE_TEST", "kept");
+
+        prepare_launch_context(&context);
+
+        let names: Vec<String> = context
+            .environment()
+            .iter()
+            .filter_map(|entry| entry.to_str()?.split_once('=').map(|(k, _)| k.to_owned()))
+            .collect();
+        for name in AMBIENT_INFISICAL_TOKEN_VARS
+            .iter()
+            .copied()
+            .chain([RELOAD_RESUME_ENV])
+        {
+            assert!(!names.iter().any(|n| n == name), "{name} leaked: {names:?}");
+        }
+        assert!(names.iter().any(|n| n == "TAAROF_SAFE_TEST"));
     }
 }
