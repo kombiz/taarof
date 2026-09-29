@@ -1507,6 +1507,9 @@ impl WorkLedger {
     /// periodic work probe calls this on the main thread; persistence remains
     /// queued to the background writer and performs no GTK-thread disk IO.
     pub fn prune_at(&mut self, now: u64) -> bool {
+        if self.persistence_shut_down {
+            return false;
+        }
         let changed = self.prune(now);
         if changed {
             self.schedule_persist();
@@ -2081,6 +2084,9 @@ impl WorkLedger {
         scope: &str,
         pr: &crate::tracking::BranchPullRequestEntry,
     ) -> Vec<(WorkKind, String)> {
+        if self.persistence_shut_down {
+            return Vec::new();
+        }
         let next = PullRequestStateSnapshot {
             state: pr.state.clone(),
             draft: pr.is_draft,
@@ -2168,7 +2174,7 @@ impl WorkLedger {
     }
 
     fn note_file_ordinal(&mut self, scope: &str, ordinal: u64) -> bool {
-        if !valid_replay_scope(scope) || ordinal == 0 {
+        if self.persistence_shut_down || !valid_replay_scope(scope) || ordinal == 0 {
             return false;
         }
         make_room_for_new_key(&mut self.last_file_ordinals, scope, MAX_REPLAY_WATERMARKS);
@@ -2186,7 +2192,7 @@ impl WorkLedger {
     }
 
     fn note_message_ordinal(&mut self, scope: &str, ordinal: u64) -> bool {
-        if !valid_replay_scope(scope) {
+        if self.persistence_shut_down || !valid_replay_scope(scope) {
             return false;
         }
         make_room_for_new_key(
@@ -7400,19 +7406,26 @@ mod tests {
         };
         ledger.set_view_preferences(view.clone());
 
+        // Release the first write, then hold the final snapshot's write and
+        // check the barrier is still waiting before letting it finish.
+        let returned = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&returned);
         let released = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(100));
             gate.send(()).unwrap();
+            entered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("final snapshot write should start");
+            let waiting = !observed.load(Ordering::SeqCst);
             gate.send(()).unwrap();
+            waiting
         });
-        let started = std::time::Instant::now();
         let outcome = ledger.shutdown_persistence(std::time::Duration::from_secs(10));
+        returned.store(true, Ordering::SeqCst);
         assert_eq!(outcome, LedgerShutdown::Durable);
         assert!(
-            started.elapsed() >= std::time::Duration::from_millis(100),
+            released.join().unwrap(),
             "shutdown must wait for the writer acknowledgement"
         );
-        released.join().unwrap();
 
         let restored = WorkLedger::with_storage("test", path.clone(), 10, u64::MAX);
         let summaries = restored
@@ -7447,6 +7460,35 @@ mod tests {
             ..ledger.view_preferences()
         });
         assert_eq!(ledger.clear_all(), 0);
+        assert_eq!(ledger.clear_pane("pane-test"), 0);
+        // Retention, PR observation, and replay watermarks are frozen too.
+        ledger.max_age_ms = 1;
+        assert!(!ledger.prune_at(1_000));
+        assert_eq!(ledger.records().len(), 1);
+        let pr = crate::tracking::BranchPullRequestEntry {
+            number: 7,
+            title: "Work".into(),
+            state: "open".into(),
+            is_draft: false,
+            review_decision: None,
+            url: Some("https://github.com/owner/repo/pull/7".into()),
+            head_ref_name: "agent/work".into(),
+            head_ref_oid: None,
+            head_repository_owner: "owner".into(),
+            base_ref_name: "main".into(),
+            updated_at: None,
+            checks: crate::tracking::PullRequestChecks::Pending,
+            correlation: None,
+            correlation_marker_present: false,
+        };
+        assert!(ledger
+            .observe_pull_request("pane:owner/repo:7:TASK", &pr)
+            .is_empty());
+        assert!(ledger.pull_request_snapshots.is_empty());
+        assert!(!ledger.note_message_ordinal("pane:session", 7));
+        assert!(!ledger.note_file_ordinal("file:pane:session", 9));
+        assert!(ledger.last_message_ordinals.is_empty());
+        assert!(ledger.last_file_ordinals.is_empty());
         assert_eq!(
             ledger.shutdown_persistence(std::time::Duration::from_secs(5)),
             LedgerShutdown::AlreadyShutDown
@@ -7456,6 +7498,8 @@ mod tests {
         let restored = WorkLedger::with_storage("test", path.clone(), 10, u64::MAX);
         assert_eq!(restored.records().len(), 1);
         assert_eq!(restored.view_preferences().filter, WorkStreamFilter::All);
+        assert!(restored.pull_request_snapshots.is_empty());
+        assert!(restored.last_message_ordinals.is_empty());
         let _ = fs::remove_file(path);
     }
 

@@ -3750,26 +3750,36 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
         let auto_save_source_close = auto_save_source.clone();
         let live_config_watcher_close = live_config_watcher.clone();
         window.connect_close_request(move |_win| {
-            if let Some(watcher) = &live_config_watcher_close {
-                watcher.cancel();
-            }
-            // Cancel the periodic auto-save so it cannot race with the final
-            // shutdown save below.
-            if let Some(source_id) = auto_save_source_close.borrow_mut().take() {
-                source_id.remove();
-            }
-            app_session::save_session_once(
-                &session_saved,
-                &session_writer,
+            run_shutdown_cleanup(
                 &state,
-                &tab_list,
-                &window_ref,
+                &ShutdownHooks {
+                    stop_background: &|| {
+                        if let Some(watcher) = &live_config_watcher_close {
+                            watcher.cancel();
+                        }
+                        // Cancel the periodic auto-save so it cannot race with
+                        // the final shutdown save.
+                        if let Some(source_id) = auto_save_source_close.borrow_mut().take() {
+                            source_id.remove();
+                        }
+                    },
+                    save_session: &|| {
+                        app_session::save_session_once(
+                            &session_saved,
+                            &session_writer,
+                            &state,
+                            &tab_list,
+                            &window_ref,
+                        );
+                    },
+                    release_endpoints: &|| {
+                        cleanup_socket_once(&socket_cleaned, socket_path.as_deref());
+                        if let Some(dir) = &http_dir_for_close {
+                            http::cleanup_token_file(dir);
+                        }
+                    },
+                },
             );
-            flush_persistence_for_shutdown(&state);
-            cleanup_socket_once(&socket_cleaned, socket_path.as_deref());
-            if let Some(dir) = &http_dir_for_close {
-                http::cleanup_token_file(dir);
-            }
             glib::Propagation::Proceed
         });
     }
@@ -3781,28 +3791,38 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
         let http_dir_for_shutdown = http_runtime_dir_for_cleanup.clone();
         let live_config_watcher_shutdown = live_config_watcher.clone();
         app.connect_shutdown(move |_| {
-            if let Some(watcher) = &live_config_watcher_shutdown {
-                watcher.cancel();
-            }
-            runtime.emit_event(
-                "session_stopping",
-                serde_json::json!({
-                    "session_name": crate::instance::session_name(),
-                }),
+            run_shutdown_cleanup(
+                &runtime.shared_state(),
+                &ShutdownHooks {
+                    stop_background: &|| {
+                        if let Some(watcher) = &live_config_watcher_shutdown {
+                            watcher.cancel();
+                        }
+                        runtime.emit_event(
+                            "session_stopping",
+                            serde_json::json!({
+                                "session_name": crate::instance::session_name(),
+                            }),
+                        );
+                        crate::diagnostics::record_lifecycle(
+                            "shutdown",
+                            "taarof session stopping",
+                            Some(serde_json::json!({
+                                "pid": std::process::id(),
+                                "session_name": crate::instance::session_name(),
+                            })),
+                        );
+                    },
+                    // Close or signal cleanup owns the final session save.
+                    save_session: &|| {},
+                    release_endpoints: &|| {
+                        cleanup_socket_once(&socket_cleaned, socket_path.as_deref());
+                        if let Some(dir) = &http_dir_for_shutdown {
+                            http::cleanup_token_file(dir);
+                        }
+                    },
+                },
             );
-            crate::diagnostics::record_lifecycle(
-                "shutdown",
-                "taarof session stopping",
-                Some(serde_json::json!({
-                    "pid": std::process::id(),
-                    "session_name": crate::instance::session_name(),
-                })),
-            );
-            flush_persistence_for_shutdown(&runtime.shared_state());
-            cleanup_socket_once(&socket_cleaned, socket_path.as_deref());
-            if let Some(dir) = &http_dir_for_shutdown {
-                http::cleanup_token_file(dir);
-            }
         });
     }
 
@@ -3834,37 +3854,70 @@ fn cleanup_socket_once(cleaned: &Cell<bool>, socket_path: Option<&std::path::Pat
 /// timeout; the two waits run back to back on the GTK thread during exit.
 const WORK_LEDGER_SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 
-/// Shared shutdown persistence for window close, signal cleanup, and
-/// application shutdown. The ledger barrier runs first because ledger appends
-/// feed history, and it executes at most once however many paths call it.
-pub(crate) fn flush_persistence_for_shutdown(state: &Rc<RefCell<AppState>>) {
-    flush_work_ledger_for_shutdown(state, WORK_LEDGER_SHUTDOWN_BUDGET);
+/// Host-specific steps around the shared persistence barrier. The GTK
+/// handlers supply live closures; tests supply recorders.
+pub(crate) struct ShutdownHooks<'a> {
+    pub(crate) stop_background: &'a dyn Fn(),
+    pub(crate) save_session: &'a dyn Fn(),
+    pub(crate) release_endpoints: &'a dyn Fn(),
+}
+
+/// Cleanup shared by window close, signal cleanup, and application shutdown:
+/// stop background sources, save the session, drain ledger and history, then
+/// release IPC endpoints. The ledger barrier executes at most once however
+/// many paths run, and its outcome is returned for the caller's inspection.
+pub(crate) fn run_shutdown_cleanup(
+    state: &Rc<RefCell<AppState>>,
+    hooks: &ShutdownHooks<'_>,
+) -> work_ledger::LedgerShutdown {
+    run_shutdown_cleanup_within(
+        state,
+        hooks,
+        WORK_LEDGER_SHUTDOWN_BUDGET,
+        &report_ledger_shutdown_incomplete,
+    )
+}
+
+fn run_shutdown_cleanup_within(
+    state: &Rc<RefCell<AppState>>,
+    hooks: &ShutdownHooks<'_>,
+    ledger_budget: Duration,
+    report_incomplete: &dyn Fn(&str),
+) -> work_ledger::LedgerShutdown {
+    (hooks.stop_background)();
+    (hooks.save_session)();
+    // The ledger barrier runs before the history flush because ledger appends
+    // feed history.
+    let ledger = flush_work_ledger_for_shutdown(state, ledger_budget, report_incomplete);
     if let Err(error) = state.borrow().history.flush() {
         eprintln!("taarof: could not flush history during shutdown: {error}");
     }
+    (hooks.release_endpoints)();
+    ledger
 }
 
 fn flush_work_ledger_for_shutdown(
     state: &Rc<RefCell<AppState>>,
     budget: Duration,
+    report_incomplete: &dyn Fn(&str),
 ) -> work_ledger::LedgerShutdown {
     let outcome = state.borrow_mut().work_ledger.shutdown_persistence(budget);
-    if outcome.is_incomplete() {
-        let detail = match &outcome {
-            work_ledger::LedgerShutdown::TimedOut => {
-                format!("timed out after {}ms", budget.as_millis())
-            }
-            work_ledger::LedgerShutdown::Failed(error) => error.clone(),
-            _ => unreachable!("only incomplete outcomes reach here"),
-        };
-        eprintln!("taarof: work ledger persistence incomplete at shutdown: {detail}");
-        crate::diagnostics::record_lifecycle(
-            "work_ledger_shutdown_incomplete",
-            format!("work ledger persistence incomplete at shutdown: {detail}"),
-            None,
-        );
+    match &outcome {
+        work_ledger::LedgerShutdown::TimedOut => report_incomplete(&format!(
+            "work ledger persistence incomplete at shutdown: timed out after {}ms",
+            budget.as_millis()
+        )),
+        work_ledger::LedgerShutdown::Failed(error) => report_incomplete(&format!(
+            "work ledger persistence incomplete at shutdown: {error}"
+        )),
+        _ => {}
     }
     outcome
+}
+
+fn report_ledger_shutdown_incomplete(message: &str) {
+    eprintln!("taarof: {message}");
+    crate::diagnostics::record_lifecycle("work_ledger_shutdown_incomplete", message, None);
 }
 
 /// Escape special PCRE2 regex characters in a string for literal matching.
@@ -3920,12 +3973,50 @@ mod tests {
         }
     }
 
-    #[test]
-    fn shared_shutdown_waits_for_ledger_once_across_close_and_signal() {
+    /// Records which shutdown hooks ran, in order, and whether endpoints
+    /// were released, so latched writers can check the barrier still holds.
+    #[derive(Default)]
+    struct HookLog {
+        steps: RefCell<Vec<&'static str>>,
+        released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl HookLog {
+        fn run<R>(&self, cleanup: impl FnOnce(&ShutdownHooks<'_>) -> R) -> R {
+            cleanup(&ShutdownHooks {
+                stop_background: &|| self.steps.borrow_mut().push("stop"),
+                save_session: &|| self.steps.borrow_mut().push("save"),
+                release_endpoints: &|| {
+                    self.steps.borrow_mut().push("release");
+                    self.released
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                },
+            })
+        }
+    }
+
+    /// A ledger whose writer reports each write and then waits at a gate. The
+    /// first write is already held when this returns; a final preferences
+    /// change is queued behind it.
+    ///
+    /// `gate` is declared first so it drops before `state`: a failing test
+    /// then releases the writer instead of deadlocking the worker join.
+    struct LatchedLedger {
+        gate: std::sync::mpsc::Sender<()>,
+        state: Rc<RefCell<AppState>>,
+        path: PathBuf,
+        entered: Option<std::sync::mpsc::Receiver<()>>,
+        writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn latched_ledger(label: &str) -> LatchedLedger {
         let (entered_tx, entered) = std::sync::mpsc::channel();
         let (gate, gate_rx) = std::sync::mpsc::channel::<()>();
         let gate_rx = std::sync::Mutex::new(gate_rx);
-        let (state, path) = ledger_shutdown_state("once", move |path, json| {
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = writes.clone();
+        let (state, path) = ledger_shutdown_state(label, move |path, json| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = entered_tx.send(());
             let _ = gate_rx.lock().unwrap().recv();
             std::fs::write(path, json)
@@ -3936,73 +4027,202 @@ mod tests {
         entered
             .recv_timeout(Duration::from_secs(5))
             .expect("writer should be held at the latch");
-        let final_view = work_ledger::WorkStreamPreferences {
-            filter: work_ledger::WorkStreamFilter::History,
-            ..Default::default()
-        };
         state
             .borrow_mut()
-            .set_work_stream_preferences(final_view.clone());
+            .set_work_stream_preferences(history_preferences());
+        LatchedLedger {
+            state,
+            path,
+            entered: Some(entered),
+            gate,
+            writes,
+        }
+    }
 
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            gate.send(()).unwrap();
-            gate.send(()).unwrap();
-        });
-        let started = std::time::Instant::now();
-        // Window close runs the shared cleanup first...
-        assert_eq!(
-            flush_work_ledger_for_shutdown(&state, Duration::from_secs(10)),
-            work_ledger::LedgerShutdown::Durable
-        );
-        assert!(started.elapsed() >= Duration::from_millis(100));
-        releaser.join().unwrap();
-        // ...and a later signal or app shutdown does not run the barrier again.
-        assert_eq!(
-            flush_work_ledger_for_shutdown(&state, Duration::from_secs(10)),
-            work_ledger::LedgerShutdown::AlreadyShutDown
-        );
-        flush_persistence_for_shutdown(&state);
+    impl LatchedLedger {
+        /// Releases the held write, waits until the final snapshot's write is
+        /// held, reports whether `released` was still false, then lets it
+        /// finish. Runs on its own thread while the GTK thread sits in cleanup.
+        fn release_after_final_write_starts(
+            &mut self,
+            released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> std::thread::JoinHandle<bool> {
+            let gate = self.gate.clone();
+            let entered = self.entered.take().expect("latch released once");
+            std::thread::spawn(move || {
+                gate.send(()).unwrap();
+                entered
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("final snapshot write should start");
+                let waiting = !released.load(std::sync::atomic::Ordering::SeqCst);
+                gate.send(()).unwrap();
+                waiting
+            })
+        }
 
-        let saved: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(saved["view"]["filter"], serde_json::json!("history"));
-        let _ = std::fs::remove_file(path);
+        fn saved_filter(&self) -> serde_json::Value {
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&self.path).unwrap()).unwrap();
+            saved["view"]["filter"].clone()
+        }
+
+        fn reopened_filter(&self) -> work_ledger::WorkStreamFilter {
+            work_ledger::WorkLedger::with_test_writer("test", self.path.clone(), |_, _| Ok(()))
+                .view_preferences()
+                .filter
+        }
+    }
+
+    fn history_preferences() -> work_ledger::WorkStreamPreferences {
+        work_ledger::WorkStreamPreferences {
+            filter: work_ledger::WorkStreamFilter::History,
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn shared_shutdown_reports_blocked_and_failed_ledger_writes_within_budget() {
-        let (entered_tx, entered) = std::sync::mpsc::channel();
-        let (gate, gate_rx) = std::sync::mpsc::channel::<()>();
-        let gate_rx = std::sync::Mutex::new(gate_rx);
-        let (blocked, blocked_path) = ledger_shutdown_state("blocked", move |_, _| {
-            let _ = entered_tx.send(());
-            let _ = gate_rx.lock().unwrap().recv();
-            Ok(())
-        });
-        blocked
-            .borrow_mut()
-            .set_work_stream_preferences(attention_preferences());
-        entered
-            .recv_timeout(Duration::from_secs(5))
-            .expect("writer should be held at the latch");
+    fn close_first_shutdown_waits_for_final_ledger_snapshot_then_signal_skips_barrier() {
+        let mut ledger = latched_ledger("close-first");
+        let close = HookLog::default();
+        let releaser = ledger.release_after_final_write_starts(close.released.clone());
+
+        // Window close runs the shared cleanup while the final write is held.
+        assert_eq!(
+            close.run(|hooks| run_shutdown_cleanup(&ledger.state, hooks)),
+            work_ledger::LedgerShutdown::Durable
+        );
+        assert!(
+            releaser.join().unwrap(),
+            "close cleanup released endpoints before the ledger acknowledged"
+        );
+        assert_eq!(*close.steps.borrow(), ["stop", "save", "release"]);
+        assert_eq!(ledger.saved_filter(), serde_json::json!("history"));
+        let writes_after_close = ledger.writes.load(std::sync::atomic::Ordering::SeqCst);
+
+        // A later signal runs the same cleanup without a second barrier.
+        let signal = HookLog::default();
+        let requested = std::sync::atomic::AtomicBool::new(true);
+        assert_eq!(
+            signal.run(|hooks| app_session::signal_cleanup_tick(&requested, &ledger.state, hooks)),
+            glib::ControlFlow::Break
+        );
+        assert_eq!(*signal.steps.borrow(), ["stop", "save", "release"]);
+        assert_eq!(
+            ledger.writes.load(std::sync::atomic::Ordering::SeqCst),
+            writes_after_close
+        );
+        assert_eq!(
+            HookLog::default().run(|hooks| run_shutdown_cleanup(&ledger.state, hooks)),
+            work_ledger::LedgerShutdown::AlreadyShutDown
+        );
+        assert_eq!(
+            ledger.reopened_filter(),
+            work_ledger::WorkStreamFilter::History
+        );
+        let _ = std::fs::remove_file(&ledger.path);
+    }
+
+    #[test]
+    fn signal_first_shutdown_waits_for_final_ledger_snapshot_then_close_skips_barrier() {
+        let mut ledger = latched_ledger("signal-first");
+        let signal = HookLog::default();
+        let requested = std::sync::atomic::AtomicBool::new(false);
+
+        // No signal yet: the poll neither cleans up nor stops.
+        assert_eq!(
+            signal.run(|hooks| app_session::signal_cleanup_tick(&requested, &ledger.state, hooks)),
+            glib::ControlFlow::Continue
+        );
+        assert!(signal.steps.borrow().is_empty());
+
+        requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        let releaser = ledger.release_after_final_write_starts(signal.released.clone());
+        assert_eq!(
+            signal.run(|hooks| app_session::signal_cleanup_tick(&requested, &ledger.state, hooks)),
+            glib::ControlFlow::Break
+        );
+        assert!(
+            releaser.join().unwrap(),
+            "signal cleanup released endpoints before the ledger acknowledged"
+        );
+        assert_eq!(*signal.steps.borrow(), ["stop", "save", "release"]);
+        assert_eq!(ledger.saved_filter(), serde_json::json!("history"));
+        let writes_after_signal = ledger.writes.load(std::sync::atomic::Ordering::SeqCst);
+
+        // The window close that app.quit() triggers skips the barrier.
+        let close = HookLog::default();
+        assert_eq!(
+            close.run(|hooks| run_shutdown_cleanup(&ledger.state, hooks)),
+            work_ledger::LedgerShutdown::AlreadyShutDown
+        );
+        assert_eq!(*close.steps.borrow(), ["stop", "save", "release"]);
+        assert_eq!(
+            ledger.writes.load(std::sync::atomic::Ordering::SeqCst),
+            writes_after_signal
+        );
+        assert_eq!(
+            ledger.reopened_filter(),
+            work_ledger::WorkStreamFilter::History
+        );
+        let _ = std::fs::remove_file(&ledger.path);
+    }
+
+    #[test]
+    fn shared_shutdown_reports_blocked_ledger_writer_within_budget() {
+        let ledger = latched_ledger("blocked");
+        let reports = RefCell::new(Vec::new());
+        let hooks = HookLog::default();
         let budget = Duration::from_millis(200);
         let started = std::time::Instant::now();
-        let outcome = flush_work_ledger_for_shutdown(&blocked, budget);
+        let outcome = hooks.run(|hooks| {
+            run_shutdown_cleanup_within(&ledger.state, hooks, budget, &|m| {
+                reports.borrow_mut().push(m.to_string())
+            })
+        });
+        let elapsed = started.elapsed();
         assert_eq!(outcome, work_ledger::LedgerShutdown::TimedOut);
-        assert!(started.elapsed() < budget + Duration::from_secs(2));
-        drop(gate);
+        assert!(elapsed >= budget);
+        assert!(elapsed < budget + Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(*hooks.steps.borrow(), ["stop", "save", "release"]);
+        assert_eq!(
+            *reports.borrow(),
+            ["work ledger persistence incomplete at shutdown: timed out after 200ms"]
+        );
+        // Repeating cleanup neither waits again nor reports again.
+        let outcome = HookLog::default().run(|hooks| {
+            run_shutdown_cleanup_within(&ledger.state, hooks, budget, &|m| {
+                reports.borrow_mut().push(m.to_string())
+            })
+        });
+        assert_eq!(outcome, work_ledger::LedgerShutdown::AlreadyShutDown);
+        assert_eq!(reports.borrow().len(), 1);
+        drop(ledger.gate);
+        let _ = std::fs::remove_file(&ledger.path);
+    }
 
-        let (failing, failing_path) = ledger_shutdown_state("failing", |_, _| {
+    #[test]
+    fn shared_shutdown_reports_failed_ledger_write() {
+        let (state, path) = ledger_shutdown_state("failing", |_, _| {
             Err(std::io::Error::other("injected write failure"))
         });
-        failing
+        state
             .borrow_mut()
             .set_work_stream_preferences(attention_preferences());
-        let outcome = flush_work_ledger_for_shutdown(&failing, Duration::from_secs(5));
+        let reports = RefCell::new(Vec::new());
+        let outcome = HookLog::default().run(|hooks| {
+            run_shutdown_cleanup_within(&state, hooks, Duration::from_secs(5), &|m| {
+                reports.borrow_mut().push(m.to_string())
+            })
+        });
         assert!(outcome.is_incomplete(), "unexpected outcome: {outcome:?}");
-        assert!(!blocked_path.exists());
-        assert!(!failing_path.exists());
+        assert_eq!(reports.borrow().len(), 1);
+        assert!(
+            reports.borrow()[0].starts_with("work ledger persistence incomplete at shutdown: ")
+                && reports.borrow()[0].contains("injected write failure"),
+            "unexpected report: {:?}",
+            reports.borrow()
+        );
+        assert!(!path.exists());
     }
 
     fn synthetic_agent_build_info(revision: &str, dirty: bool) -> PathBuf {
