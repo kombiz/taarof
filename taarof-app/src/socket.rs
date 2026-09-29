@@ -4542,9 +4542,10 @@ async fn verify_live_attach(
     Ok(())
 }
 
-/// Collect GTK-owned live bindings, run the provider scan off GTK, then build
-/// live evidence and serialize back on the main context. Evidence is read after
-/// the worker so a pane that changed during the scan is reported as it is now.
+/// Publish the remote probe inventory from GTK, run the provider scan off GTK,
+/// then read live bindings and evidence and serialize back on the main context.
+/// Both v1 bindings and v2 evidence are read after the worker, so a pane that
+/// changed during the scan is reported as it is now, without rescanning.
 fn dispatch_query_agent_sessions_socket(
     state: &Rc<RefCell<AppState>>,
     catalog: Arc<crate::agent_sessions::AgentSessionCatalog>,
@@ -4552,26 +4553,26 @@ fn dispatch_query_agent_sessions_socket(
     response_tx: mpsc::Sender<SocketResponse>,
 ) {
     const ACTION: &str = "query-agent-sessions";
-    let mut live_bindings = Vec::new();
-    let collected = run_socket_handler_safely(ACTION, || {
-        live_bindings = crate::agent_sessions::build_live_agent_bindings(&state.borrow());
+    // The scan's remote probe reads the ssh targets published from GTK.
+    let published = run_socket_handler_safely(ACTION, || {
+        crate::agent_sessions::publish_live_remote_ssh_targets(&state.borrow());
         SocketResponse::ok()
     });
-    if !collected.ok {
-        let _ = response_tx.send(collected);
+    if !published.ok {
+        let _ = response_tx.send(published);
         return;
     }
     let state = state.clone();
     glib::spawn_future_local(async move {
         let scan = gio::spawn_blocking(move || {
-            let snapshot = catalog.snapshot_blocking(live_bindings);
+            let discovery = catalog.discovery_blocking();
             let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
-            (snapshot, hostname)
+            (discovery, hostname)
         })
         .await;
         let response = match scan {
-            Ok((snapshot, hostname)) => run_socket_handler_safely(ACTION, || {
-                agent_sessions_response(&state, snapshot, schema, &hostname)
+            Ok((discovery, hostname)) => run_socket_handler_safely(ACTION, || {
+                agent_sessions_response(&state, discovery, schema, &hostname)
             }),
             Err(_) => SocketResponse::err("agent session scan failed"),
         };
@@ -4581,11 +4582,18 @@ fn dispatch_query_agent_sessions_socket(
 
 fn agent_sessions_response(
     state: &Rc<RefCell<AppState>>,
-    snapshot: crate::agent_sessions::AgentSessionsSnapshot,
+    discovery: crate::agent_sessions::AgentSessionDiscovery,
     schema: crate::agent_sessions::SessionSchema,
     hostname: &str,
 ) -> SocketResponse {
-    let live = crate::agent_sessions::build_live_session_evidence(&state.borrow(), hostname.trim());
+    let (live_bindings, live) = {
+        let st = state.borrow();
+        (
+            crate::agent_sessions::build_live_agent_bindings(&st),
+            crate::agent_sessions::build_live_session_evidence(&st, hostname.trim()),
+        )
+    };
+    let snapshot = crate::agent_sessions::finalize_snapshot(discovery, &live_bindings);
     match crate::agent_sessions::snapshot_value_with_live(snapshot, schema, Some(&live)) {
         Ok(data) => SocketResponse::ok_with_data(data),
         Err(error) => SocketResponse::err(format!(
@@ -5749,8 +5757,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn query_agent_sessions_scans_off_main_context_and_matches_inline_snapshot() {
+    fn set_stub_codex_running(state: &Rc<RefCell<AppState>>, running: bool) {
+        let mut st = state.borrow_mut();
+        let tab = &mut st.workspaces[0].tabs[0];
+        tab.agent_running = running;
+        tab.agent_name = running.then(|| "codex".to_string());
+        tab.agent_session_id = running.then(|| "session-cold".to_string());
+    }
+
+    /// Dispatch `query-agent-sessions` against a parked cold scan, assert the
+    /// main context stays responsive, flip the pane's agent while the scan is
+    /// parked, then return the reply and the inline projection of the state as
+    /// it is after the flip.
+    fn run_gated_agent_sessions_query(
+        schema: crate::agent_sessions::SessionSchema,
+        running_before_scan: bool,
+    ) -> (serde_json::Value, serde_json::Value) {
         let _glib_guard = crate::glib_main_context_test_guard();
         let context = glib::MainContext::new();
         context
@@ -5765,6 +5787,7 @@ mod tests {
                     )],
                     11,
                 )));
+                set_stub_codex_running(&state, running_before_scan);
                 let started = Arc::new(AtomicBool::new(false));
                 let (release_tx, release_rx) = mpsc::channel();
                 let catalog = Arc::new(crate::agent_sessions::AgentSessionCatalog::with_scanner(
@@ -5775,12 +5798,7 @@ mod tests {
                 ));
 
                 let (response_tx, response_rx) = mpsc::channel();
-                dispatch_query_agent_sessions_socket(
-                    &state,
-                    catalog.clone(),
-                    crate::agent_sessions::SessionSchema::V1,
-                    response_tx,
-                );
+                dispatch_query_agent_sessions_socket(&state, catalog.clone(), schema, response_tx);
 
                 let heartbeat = Rc::new(Cell::new(0));
                 let heartbeat_for_source = heartbeat.clone();
@@ -5807,6 +5825,9 @@ mod tests {
                     "reply must wait for the off-thread scan"
                 );
 
+                // The pane's agent starts or exits while discovery is blocked.
+                set_stub_codex_running(&state, !running_before_scan);
+
                 release_tx.send(()).expect("scanner should be waiting");
                 let reply_deadline = Instant::now() + Duration::from_secs(5);
                 let response = loop {
@@ -5822,27 +5843,65 @@ mod tests {
                 };
                 assert!(response.ok, "reply should succeed: {:?}", response.error);
 
-                // Same inputs through the former inline path: the cache now
-                // holds the discovery, so the synchronous snapshot is warm.
-                // Only the wall-clock generation stamp may differ.
+                // Same inputs through the former inline path, read from the
+                // post-change state: the cache now holds the discovery, so the
+                // synchronous snapshot is warm. Only the wall-clock generation
+                // stamp may differ.
+                let hostname =
+                    std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+                let live = crate::agent_sessions::build_live_session_evidence(
+                    &state.borrow(),
+                    hostname.trim(),
+                );
                 let mut inline = crate::agent_sessions::snapshot_value_with_live(
                     catalog.snapshot_blocking(crate::agent_sessions::build_live_agent_bindings(
                         &state.borrow(),
                     )),
-                    crate::agent_sessions::SessionSchema::V1,
-                    Some(&[]),
+                    schema,
+                    Some(&live),
                 )
                 .expect("inline snapshot should serialize");
                 let mut replied = response.data.expect("reply should carry data");
                 for value in [&mut inline, &mut replied] {
                     value["generated_at_unix_ms"] = serde_json::json!(0);
                 }
-                assert_eq!(
-                    serde_json::to_string(&replied).expect("reply data should serialize"),
-                    serde_json::to_string(&inline).expect("inline data should serialize"),
-                );
+                (replied, inline)
             })
-            .expect("test context should become thread-default");
+            .expect("test context should become thread-default")
+    }
+
+    #[test]
+    fn query_agent_sessions_v1_reports_pane_closed_during_scan_as_recent() {
+        let (replied, inline) =
+            run_gated_agent_sessions_query(crate::agent_sessions::SessionSchema::V1, true);
+        assert_eq!(replied["sessions"][0]["session_id"], "session-cold");
+        assert_eq!(replied["sessions"][0]["status"], "recent");
+        assert!(replied["sessions"][0]["live_binding"].is_null());
+        assert_eq!(replied, inline);
+    }
+
+    #[test]
+    fn query_agent_sessions_v1_reports_pane_started_during_scan_as_active() {
+        let (replied, inline) =
+            run_gated_agent_sessions_query(crate::agent_sessions::SessionSchema::V1, false);
+        assert_eq!(replied["sessions"][0]["status"], "active");
+        assert_eq!(replied["sessions"][0]["live_binding"]["tab_id"], 101);
+        assert_eq!(replied, inline);
+    }
+
+    #[test]
+    fn query_agent_sessions_v2_matches_projection_of_state_after_scan() {
+        // v2 evidence needs a fresh runtime probe over real pane leaves, which
+        // stub panes cannot carry; the reply must still equal the inline
+        // projection of the post-change state.
+        for running_before_scan in [true, false] {
+            let (replied, inline) = run_gated_agent_sessions_query(
+                crate::agent_sessions::SessionSchema::V2,
+                running_before_scan,
+            );
+            assert_eq!(replied["schema"], "agent.sessions.v2");
+            assert_eq!(replied, inline);
+        }
     }
 
     #[test]

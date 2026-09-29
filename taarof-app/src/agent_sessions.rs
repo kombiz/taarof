@@ -110,14 +110,20 @@ impl AgentSessionCatalog {
     }
 
     pub fn snapshot_blocking(&self, live_bindings: Vec<LiveAgentBinding>) -> AgentSessionsSnapshot {
-        let discovery = if let Some(discovery) = self.cached_discovery() {
+        finalize_snapshot(self.discovery_blocking(), &live_bindings)
+    }
+
+    /// Cached or freshly scanned discovery with no live bindings applied, for
+    /// callers that scan off GTK and bind against live state afterwards via
+    /// [`finalize_snapshot`].
+    pub fn discovery_blocking(&self) -> AgentSessionDiscovery {
+        if let Some(discovery) = self.cached_discovery() {
             discovery
         } else {
             let discovery = self.scanner.scan();
             self.store_discovery(discovery.clone());
             discovery
-        };
-        finalize_snapshot(discovery, &live_bindings)
+        }
     }
 
     fn cached_discovery(&self) -> Option<AgentSessionDiscovery> {
@@ -880,7 +886,7 @@ fn live_remote_ssh_targets() -> Vec<String> {
 /// too — it is the case where finding a resumable agent matters most — and the
 /// probe is bounded per host, so including them costs one more ssh round in the
 /// window and nothing else.
-fn publish_live_remote_ssh_targets(state: &AppState) {
+pub(crate) fn publish_live_remote_ssh_targets(state: &AppState) {
     let mut targets: Vec<String> = Vec::new();
     for workspace in &state.workspaces {
         for tab in &workspace.tabs {
@@ -1170,7 +1176,7 @@ fn live_pane_cwd(
         .or_else(|| workspace.repo_root.clone())
 }
 
-fn finalize_snapshot(
+pub fn finalize_snapshot(
     discovery: AgentSessionDiscovery,
     live_bindings: &[LiveAgentBinding],
 ) -> AgentSessionsSnapshot {
