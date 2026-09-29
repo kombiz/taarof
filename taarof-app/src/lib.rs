@@ -3973,21 +3973,36 @@ mod tests {
         }
     }
 
-    /// Records which shutdown hooks ran, in order, and whether endpoints
-    /// were released, so latched writers can check the barrier still holds.
+    /// Records which shutdown hooks ran, in order. When built by
+    /// [`LatchedLedger::hooks`], it also announces cleanup entry from the
+    /// session-save hook and, inside the endpoint-release hook, records how
+    /// many ledger writes had completed and flags the release.
     #[derive(Default)]
     struct HookLog {
         steps: RefCell<Vec<&'static str>>,
         released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        cleanup_entered: Option<std::sync::mpsc::Sender<()>>,
+        ledger_completed: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+        completed_at_release: std::cell::Cell<Option<usize>>,
     }
 
     impl HookLog {
         fn run<R>(&self, cleanup: impl FnOnce(&ShutdownHooks<'_>) -> R) -> R {
             cleanup(&ShutdownHooks {
                 stop_background: &|| self.steps.borrow_mut().push("stop"),
-                save_session: &|| self.steps.borrow_mut().push("save"),
+                save_session: &|| {
+                    self.steps.borrow_mut().push("save");
+                    if let Some(entered) = &self.cleanup_entered {
+                        let _ = entered.send(());
+                    }
+                },
                 release_endpoints: &|| {
                     self.steps.borrow_mut().push("release");
+                    self.completed_at_release.set(
+                        self.ledger_completed
+                            .as_ref()
+                            .map(|done| done.load(std::sync::atomic::Ordering::SeqCst)),
+                    );
                     self.released
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                 },
@@ -4007,6 +4022,7 @@ mod tests {
         path: PathBuf,
         entered: Option<std::sync::mpsc::Receiver<()>>,
         writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        completed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     fn latched_ledger(label: &str) -> LatchedLedger {
@@ -4015,11 +4031,15 @@ mod tests {
         let gate_rx = std::sync::Mutex::new(gate_rx);
         let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = writes.clone();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let finished = completed.clone();
         let (state, path) = ledger_shutdown_state(label, move |path, json| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = entered_tx.send(());
             let _ = gate_rx.lock().unwrap().recv();
-            std::fs::write(path, json)
+            std::fs::write(path, json)?;
+            finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         });
         state
             .borrow_mut()
@@ -4036,25 +4056,47 @@ mod tests {
             entered: Some(entered),
             gate,
             writes,
+            completed,
         }
     }
 
     impl LatchedLedger {
-        /// Releases the held write, waits until the final snapshot's write is
-        /// held, reports whether `released` was still false, then lets it
-        /// finish. Runs on its own thread while the GTK thread sits in cleanup.
-        fn release_after_final_write_starts(
+        /// Hooks that report cleanup entry on `cleanup_entered` and record,
+        /// inside the endpoint-release hook, how many ledger writes finished.
+        fn hooks(&self, cleanup_entered: std::sync::mpsc::Sender<()>) -> HookLog {
+            HookLog {
+                cleanup_entered: Some(cleanup_entered),
+                ledger_completed: Some(self.completed.clone()),
+                ..HookLog::default()
+            }
+        }
+
+        /// Drives the writer from another thread while the GTK thread sits in
+        /// cleanup. Nothing is released until cleanup has started; the final
+        /// snapshot's write is then held while the thread checks that
+        /// cleanup has neither released endpoints nor seen the write finish.
+        /// Returns whether cleanup was still waiting at that point.
+        fn release_once_cleanup_waits(
             &mut self,
+            cleanup_entered: std::sync::mpsc::Receiver<()>,
             released: std::sync::Arc<std::sync::atomic::AtomicBool>,
         ) -> std::thread::JoinHandle<bool> {
             let gate = self.gate.clone();
             let entered = self.entered.take().expect("latch released once");
+            let completed = self.completed.clone();
             std::thread::spawn(move || {
+                cleanup_entered
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("cleanup should start");
+                // The first write is still held, so cleanup cannot have seen
+                // an acknowledgement yet.
+                assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 0);
                 gate.send(()).unwrap();
                 entered
                     .recv_timeout(Duration::from_secs(5))
                     .expect("final snapshot write should start");
-                let waiting = !released.load(std::sync::atomic::Ordering::SeqCst);
+                let waiting = !released.load(std::sync::atomic::Ordering::SeqCst)
+                    && completed.load(std::sync::atomic::Ordering::SeqCst) == 1;
                 gate.send(()).unwrap();
                 waiting
             })
@@ -4083,17 +4125,23 @@ mod tests {
     #[test]
     fn close_first_shutdown_waits_for_final_ledger_snapshot_then_signal_skips_barrier() {
         let mut ledger = latched_ledger("close-first");
-        let close = HookLog::default();
-        let releaser = ledger.release_after_final_write_starts(close.released.clone());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let close = ledger.hooks(entered_tx);
+        let releaser = ledger.release_once_cleanup_waits(entered_rx, close.released.clone());
 
         // Window close runs the shared cleanup while the final write is held.
         assert_eq!(
             close.run(|hooks| run_shutdown_cleanup(&ledger.state, hooks)),
             work_ledger::LedgerShutdown::Durable
         );
+        assert_eq!(
+            close.completed_at_release.get(),
+            Some(2),
+            "close cleanup released endpoints before the final ledger write finished"
+        );
         assert!(
             releaser.join().unwrap(),
-            "close cleanup released endpoints before the ledger acknowledged"
+            "close cleanup returned while the final ledger write was still held"
         );
         assert_eq!(*close.steps.borrow(), ["stop", "save", "release"]);
         assert_eq!(ledger.saved_filter(), serde_json::json!("history"));
@@ -4125,7 +4173,8 @@ mod tests {
     #[test]
     fn signal_first_shutdown_waits_for_final_ledger_snapshot_then_close_skips_barrier() {
         let mut ledger = latched_ledger("signal-first");
-        let signal = HookLog::default();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let signal = ledger.hooks(entered_tx);
         let requested = std::sync::atomic::AtomicBool::new(false);
 
         // No signal yet: the poll neither cleans up nor stops.
@@ -4136,14 +4185,19 @@ mod tests {
         assert!(signal.steps.borrow().is_empty());
 
         requested.store(true, std::sync::atomic::Ordering::SeqCst);
-        let releaser = ledger.release_after_final_write_starts(signal.released.clone());
+        let releaser = ledger.release_once_cleanup_waits(entered_rx, signal.released.clone());
         assert_eq!(
             signal.run(|hooks| app_session::signal_cleanup_tick(&requested, &ledger.state, hooks)),
             glib::ControlFlow::Break
         );
+        assert_eq!(
+            signal.completed_at_release.get(),
+            Some(2),
+            "signal cleanup released endpoints before the final ledger write finished"
+        );
         assert!(
             releaser.join().unwrap(),
-            "signal cleanup released endpoints before the ledger acknowledged"
+            "signal cleanup returned while the final ledger write was still held"
         );
         assert_eq!(*signal.steps.borrow(), ["stop", "save", "release"]);
         assert_eq!(ledger.saved_filter(), serde_json::json!("history"));

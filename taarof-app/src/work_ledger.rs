@@ -7392,8 +7392,14 @@ mod tests {
         let path = temp_path("shutdown-latched");
         let (entered_tx, entered) = mpsc::channel();
         let (gate, gate_rx) = mpsc::channel();
-        let mut ledger =
-            WorkLedger::with_test_writer("test", path.clone(), latched_writer(entered_tx, gate_rx));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let latched = latched_writer(entered_tx, gate_rx);
+        let finished = Arc::clone(&completed);
+        let mut ledger = WorkLedger::with_test_writer("test", path.clone(), move |path, json| {
+            latched(path, json)?;
+            finished.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
         ledger.append_at(10, draft("one", "first"));
         entered
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -7406,24 +7412,41 @@ mod tests {
         };
         ledger.set_view_preferences(view.clone());
 
-        // Release the first write, then hold the final snapshot's write and
-        // check the barrier is still waiting before letting it finish.
+        // Run the barrier on its own thread so this thread can drive the
+        // writer, recording how many writes had finished when it returned.
+        let (barrier_entered_tx, barrier_entered) = mpsc::channel();
         let returned = Arc::new(AtomicBool::new(false));
-        let observed = Arc::clone(&returned);
-        let released = std::thread::spawn(move || {
-            gate.send(()).unwrap();
-            entered
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .expect("final snapshot write should start");
-            let waiting = !observed.load(Ordering::SeqCst);
-            gate.send(()).unwrap();
-            waiting
-        });
-        let outcome = ledger.shutdown_persistence(std::time::Duration::from_secs(10));
-        returned.store(true, Ordering::SeqCst);
-        assert_eq!(outcome, LedgerShutdown::Durable);
+        let barrier = {
+            let completed = Arc::clone(&completed);
+            let returned = Arc::clone(&returned);
+            std::thread::spawn(move || {
+                barrier_entered_tx.send(()).unwrap();
+                let outcome = ledger.shutdown_persistence(std::time::Duration::from_secs(10));
+                let completed_at_return = completed.load(Ordering::SeqCst);
+                returned.store(true, Ordering::SeqCst);
+                (outcome, completed_at_return)
+            })
+        };
+        barrier_entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("barrier should start");
+
+        // Release the first write, hold the final snapshot's write, and check
+        // the barrier has not returned before letting that write finish.
+        gate.send(()).unwrap();
+        entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("final snapshot write should start");
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
         assert!(
-            released.join().unwrap(),
+            !returned.load(Ordering::SeqCst),
+            "shutdown returned while the final snapshot write was held"
+        );
+        gate.send(()).unwrap();
+        let (outcome, completed_at_return) = barrier.join().unwrap();
+        assert_eq!(outcome, LedgerShutdown::Durable);
+        assert_eq!(
+            completed_at_return, 2,
             "shutdown must wait for the writer acknowledgement"
         );
 
