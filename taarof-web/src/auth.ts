@@ -1,3 +1,5 @@
+import { browserLocalStorage } from "./browserStorage.js";
+
 const TOKEN_STORAGE_KEY = "taarof.web.token";
 
 export type TokenStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
@@ -14,19 +16,11 @@ interface UrlTokenEnvironment {
   replaceUrl: (nextUrl: string) => void;
 }
 
-// Browser storage is optional persistence. Reading `window.localStorage` can
-// itself throw (denied by site settings), and every call below can throw
-// (quota, privacy mode), so each access degrades to absence or failure.
-// Caught errors are never logged: their messages may echo the stored value.
+// Every storage call below can throw (quota, privacy mode), so each access
+// degrades to absence or failure. Caught errors are never logged: their
+// messages may echo the stored value.
 function browserTokenStorage(): TokenStorage | null {
-  if (typeof window === "undefined") {
-    return null;
-  }
-  try {
-    return window.localStorage;
-  } catch {
-    return null;
-  }
+  return browserLocalStorage();
 }
 
 export function getStoredToken(storage = browserTokenStorage()): string | null {
