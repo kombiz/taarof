@@ -1136,28 +1136,29 @@ pub(super) fn run_tmux_command_sync_result_with_behavior(
         }
         return Err("command argv was empty".to_string());
     }
-    // Reaped by the try_wait() loop below, including the kill-on-timeout path.
-    #[allow(clippy::disallowed_methods)]
-    let mut child = crate::child_process::command(&argv[0])
+    let mut command = crate::child_process::command(&argv[0]);
+    command
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            if failure_behavior != TmuxCommandFailureBehavior::Silent {
-                crate::diagnostics::record_command_failure(
-                    "terminal",
-                    "tmux-command",
-                    format!("failed to spawn tmux-related command {}", argv[0]),
-                    Some(serde_json::json!({
-                        "argv": argv,
-                        "error": err.to_string(),
-                    })),
-                );
-            }
-            format!("failed to spawn command: {err}")
-        })?;
+        .stderr(std::process::Stdio::piped());
+    // Reaped by the try_wait() loop below, including the kill-on-timeout path.
+    #[allow(clippy::disallowed_methods)]
+    let spawned = command.spawn();
+    let mut child = spawned.map_err(|err| {
+        if failure_behavior != TmuxCommandFailureBehavior::Silent {
+            crate::diagnostics::record_command_failure(
+                "terminal",
+                "tmux-command",
+                format!("failed to spawn tmux-related command {}", argv[0]),
+                Some(serde_json::json!({
+                    "argv": argv,
+                    "error": err.to_string(),
+                })),
+            );
+        }
+        format!("failed to spawn command: {err}")
+    })?;
 
     // Drain stdout/stderr on dedicated threads so a command that writes more than
     // the OS pipe buffer (~64KB) — e.g. a large remote `.plan/tasks.json` fetched

@@ -3434,7 +3434,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::disallowed_methods)] // The test owns the Child and always kills then waits below.
     fn live_codex_process_home_projects_current_turn_as_working() {
         let root = unique_temp_dir("codex-process-home");
         let project = root.join("project");
@@ -3444,12 +3443,15 @@ mod tests {
         fs::create_dir_all(&sessions).unwrap();
         let executable = root.join("codex");
         std::os::unix::fs::symlink("/bin/sleep", &executable).unwrap();
-        let mut child = crate::child_process::command(&executable)
+        let mut command = crate::child_process::command(&executable);
+        command
             .arg("30")
             .current_dir(&project)
-            .env("CODEX_HOME", &custom_home)
-            .spawn()
-            .expect("inert Codex fixture should start");
+            .env("CODEX_HOME", &custom_home);
+        // The test owns the Child and always kills then waits below.
+        #[allow(clippy::disallowed_methods)]
+        let spawned = command.spawn();
+        let mut child = spawned.expect("inert Codex fixture should start");
 
         let observed_at = now_unix_ms();
         let meta = serde_json::json!({"type":"session_meta","payload":{

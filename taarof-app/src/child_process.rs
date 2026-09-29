@@ -140,4 +140,98 @@ mod tests {
             assert_eq!(env.get(&OsString::from(name)), Some(&None), "{name}");
         }
     }
+
+    /// Every `disallowed_methods` allowance in `src/` must cover only a spawn
+    /// of an already-built command, never its construction, so a bare
+    /// `Command::new` cannot hide under a reaping opt-out. The one exception is
+    /// the blessed constructor above.
+    #[test]
+    fn disallowed_method_allowances_never_cover_command_construction() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut violations = Vec::new();
+        let mut pending = vec![src];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("read source");
+                    violations.extend(allowance_violations(&path, &text));
+                }
+            }
+        }
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[test]
+    fn allowance_scan_rejects_construction_under_the_allowance() {
+        let path = std::path::Path::new("fixture.rs");
+        let bad = "#[allow(clippy::disallowed_methods)]\nlet child = Command::new(\"x\")\n    .spawn();\n";
+        assert_eq!(allowance_violations(path, bad).len(), 1);
+        let wrapped = "#[allow(clippy::disallowed_methods)]\nlet child = crate::child_process::command(\"x\")\n    .spawn();\n";
+        assert_eq!(allowance_violations(path, wrapped).len(), 1);
+        let item = "#[allow(clippy::disallowed_methods)]\nfn helper() {\n    let _ = Command::new(\"x\");\n}\n";
+        assert_eq!(allowance_violations(path, item).len(), 1);
+        let module = "#![allow(clippy::disallowed_methods)]\n";
+        assert_eq!(allowance_violations(path, module).len(), 1);
+        let good = "// Reaped below.\n#[allow(clippy::disallowed_methods)]\nlet mut child = command\n    .spawn()?;\n";
+        assert!(allowance_violations(path, good).is_empty());
+    }
+
+    /// Return one entry per allowance whose covered statement is not a bare
+    /// spawn of an existing command.
+    fn allowance_violations(path: &std::path::Path, text: &str) -> Vec<String> {
+        let blessed = path.ends_with("src/child_process.rs");
+        let lines: Vec<&str> = text.lines().collect();
+        let mut violations = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("#![allow(") && trimmed.contains("clippy::disallowed_methods") {
+                violations.push(format!(
+                    "{}:{}: module-wide allowance",
+                    path.display(),
+                    index + 1
+                ));
+                continue;
+            }
+            if !(trimmed.starts_with("#[allow(") && trimmed.contains("clippy::disallowed_methods"))
+            {
+                continue;
+            }
+            // The covered statement runs up to and including the line that
+            // spawns; allow a short builder chain before it.
+            let covered: Vec<&str> = lines[index + 1..]
+                .iter()
+                .take(3)
+                .map(|line| line.trim())
+                .collect();
+            let Some(end) = covered.iter().position(|line| line.contains(".spawn()")) else {
+                if blessed
+                    && covered
+                        .first()
+                        .is_some_and(|line| *line == "let mut command = Command::new(program);")
+                {
+                    continue;
+                }
+                violations.push(format!(
+                    "{}:{}: allowance does not cover a spawn",
+                    path.display(),
+                    index + 1
+                ));
+                continue;
+            };
+            if covered[..=end]
+                .iter()
+                .any(|line| line.contains("Command::new(") || line.contains("command("))
+            {
+                violations.push(format!(
+                    "{}:{}: allowance covers command construction",
+                    path.display(),
+                    index + 1
+                ));
+            }
+        }
+        violations
+    }
 }
