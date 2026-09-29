@@ -42,7 +42,10 @@ fn sibling_and_helper_exec_do_not_inherit_earlier_pty() {
     };
     assert_no_extra_pty(second.child_pid());
     // std::process retains arbitrary inherited fds unless the allocator marks
-    // them close-on-exec; piped stdout does not hide that boundary.
+    // them close-on-exec; piped stdout does not hide that boundary. This
+    // integration test cannot reach the crate-private sanitized constructor
+    // and deliberately exercises a raw `std::process` child.
+    #[allow(clippy::disallowed_methods)]
     let output = Command::new("/bin/sh")
         .args([
             "-c",
@@ -174,6 +177,9 @@ fn closed_stdio_and_partial_allocation() {
         }
         _ => {
             for mode in ["closed-stdio", "partial-allocation"] {
+                // Re-execs this test binary; the sanitized constructor is
+                // crate-private and irrelevant to a test harness child.
+                #[allow(clippy::disallowed_methods)]
                 let result = Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",

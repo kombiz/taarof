@@ -6,6 +6,7 @@
 //! a shared credential in every pane. Consumers that need Infisical should mint
 //! their own token through the configured machine-identity/broker path.
 
+use agent_session_core::child_env::{is_ambient_infisical_token, AMBIENT_INFISICAL_TOKEN_VARS};
 use std::ffi::CStr;
 use std::process::Command;
 
@@ -13,10 +14,6 @@ unsafe extern "C" {
     static mut environ: *mut *mut libc::c_char;
 }
 
-/// Token-shaped Infisical credentials that must never cross taarof's process or
-/// PTY boundary. Machine-identity inputs are intentionally not listed: explicit
-/// consumers may use those to mint their own short-lived token.
-const AMBIENT_INFISICAL_TOKEN_VARS: &[&str] = &["INFISICAL_TOKEN", "INFISICAL_SERVICE_TOKEN"];
 pub(crate) const RELOAD_RESUME_ENV: &str = "TAAROF_RELOAD_RESUME_AGENTS";
 
 #[derive(Debug)]
@@ -34,10 +31,6 @@ impl StartupEnvironment {
     pub(super) fn take_resume_agents_after_reload(&mut self) -> bool {
         std::mem::take(&mut self.resume_agents_after_reload)
     }
-}
-
-pub(crate) fn is_ambient_infisical_token(name: &str) -> bool {
-    AMBIENT_INFISICAL_TOKEN_VARS.contains(&name)
 }
 
 /// Clear inherited tokens and capture the internal reload marker before GTK,
@@ -174,7 +167,7 @@ mod tests {
 
     #[test]
     fn child_command_removes_sensitive_tokens_and_internal_reload_marker() {
-        let mut command = Command::new("true");
+        let mut command = crate::child_process::command("true");
         command.env("INFISICAL_TOKEN", "synthetic-parent-token");
         command.env("INFISICAL_SERVICE_TOKEN", "synthetic-service-token");
 
@@ -209,5 +202,49 @@ mod tests {
             env.get(&OsString::from("TAAROF_SAFE_TEST")),
             Some(&Some(OsString::from("kept")))
         );
+    }
+
+    fn removed_names(command: &Command) -> Vec<String> {
+        command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn gh_and_git_worktree_children_strip_ambient_tokens() {
+        let root = std::path::Path::new("/tmp");
+        let children = [
+            (
+                "gh (task panel)",
+                crate::task_panel::local_gh_command("gh", &["pr".into(), "list".into()]),
+            ),
+            (
+                "gh via timeout (work ledger)",
+                crate::work_ledger::exact_pull_request_command("owner/repo", 7),
+            ),
+            (
+                "git worktree add",
+                crate::git::worktree_add_command(root, "feature", &root.join("wt"), false),
+            ),
+            (
+                "git worktree remove",
+                crate::git::worktree_remove_command(root, &root.join("wt")),
+            ),
+        ];
+        for (label, command) in children {
+            let removed = removed_names(&command);
+            for name in AMBIENT_INFISICAL_TOKEN_VARS
+                .iter()
+                .copied()
+                .chain([RELOAD_RESUME_ENV])
+            {
+                assert!(
+                    removed.iter().any(|removed| removed == name),
+                    "{label} must strip {name}; removed {removed:?}"
+                );
+            }
+        }
     }
 }

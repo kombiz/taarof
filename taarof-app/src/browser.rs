@@ -29,7 +29,7 @@ pub(crate) fn open_url(url: &str) {
     if let Some(command) = crate::config::browser_config().open_command {
         if let Some(argv) = build_browser_argv(&command, url) {
             let (program, args) = argv.split_first().expect("argv is non-empty");
-            let mut command = std::process::Command::new(program);
+            let mut command = crate::child_process::command(program);
             command.args(args);
             match crate::child_process::spawn_and_reap(&mut command) {
                 Ok(_) => return,

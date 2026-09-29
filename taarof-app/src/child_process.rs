@@ -1,4 +1,10 @@
-//! Fire-and-forget child processes.
+//! Child-process construction and fire-and-forget reaping.
+//!
+//! Every child taarof starts is built by [`command`], which applies the
+//! child-environment sanitizer before the caller adds anything else. Clippy
+//! rejects a bare `std::process::Command::new` everywhere else
+//! (`taarof-app/clippy.toml`), so a new helper cannot silently forward an
+//! ambient Infisical token to `gh`, `git`, `coder`, or any other child.
 //!
 //! `std::process::Child` has no `Drop` that reaps, so a helper we spawn and
 //! never `wait()` stays in the process table as a zombie for the rest of the
@@ -14,9 +20,25 @@
 //! reaping: that is process-wide and would make the `wait()`/`try_wait()` calls
 //! in `tmux.rs` and `terminal/restore.rs` fail with `ECHILD`.
 
+use std::ffi::OsStr;
 use std::io;
 use std::process::Command;
 use std::thread::JoinHandle;
+
+/// Build a child command whose inherited environment has already passed
+/// [`crate::child_env::prepare_child_command`].
+///
+/// Callers may still add their own variables afterward; the sanitizer only
+/// guarantees that ambient tokens and the internal reload marker are not
+/// inherited. Callers with an explicit override list (PTY panes) run
+/// `prepare_child_command` again with it so overrides are filtered too.
+pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
+    // The one blessed constructor: every other site goes through here.
+    #[allow(clippy::disallowed_methods)]
+    let mut command = Command::new(program);
+    crate::child_env::prepare_child_command(&mut command, &[]);
+    command
+}
 
 /// A spawned fire-and-forget child plus the thread that will reap it.
 ///
@@ -59,8 +81,9 @@ pub(crate) fn spawn_and_reap(command: &mut Command) -> io::Result<Reaped> {
 
 #[cfg(test)]
 mod tests {
-    use super::spawn_and_reap;
-    use std::process::Command;
+    use super::{command, spawn_and_reap};
+    use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::time::{Duration, Instant};
 
     /// Read the single-character state field from `/proc/<pid>/stat`, or `None`
@@ -88,7 +111,7 @@ mod tests {
 
     #[test]
     fn spawned_child_is_reaped_and_leaves_no_zombie() {
-        let reaped = spawn_and_reap(&mut Command::new("true")).expect("spawn `true`");
+        let reaped = spawn_and_reap(&mut command("true")).expect("spawn `true`");
         let pid = reaped.pid();
         reaped.wait_for_reap();
 
@@ -97,5 +120,24 @@ mod tests {
             None,
             "pid {pid} is still in the process table after reaping (state Z = zombie)"
         );
+    }
+
+    fn envs(command: &std::process::Command) -> HashMap<OsString, Option<OsString>> {
+        command
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(OsString::from)))
+            .collect()
+    }
+
+    #[test]
+    fn constructor_strips_ambient_tokens_and_reload_marker() {
+        let env = envs(&command("true"));
+        for name in [
+            "INFISICAL_TOKEN",
+            "INFISICAL_SERVICE_TOKEN",
+            crate::child_env::RELOAD_RESUME_ENV,
+        ] {
+            assert_eq!(env.get(&OsString::from(name)), Some(&None), "{name}");
+        }
     }
 }

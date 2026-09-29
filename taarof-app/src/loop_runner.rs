@@ -467,7 +467,7 @@ mod tests {
             &result.to_string_lossy(),
             &context_path.to_string_lossy(),
         );
-        let status = std::process::Command::new(&argv[0])
+        let status = crate::child_process::command(&argv[0])
             .args(&argv[1..])
             .status()
             .unwrap();

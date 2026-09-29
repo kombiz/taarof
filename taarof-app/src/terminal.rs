@@ -1166,7 +1166,7 @@ fn launch_editor(path: &std::path::Path, line: u32, col: Option<u32>) {
     let Some((program, args)) = argv.split_first() else {
         return;
     };
-    let mut command = std::process::Command::new(program);
+    let mut command = crate::child_process::command(program);
     command.args(args);
     if let Err(e) = crate::child_process::spawn_and_reap(&mut command) {
         eprintln!("taarof: failed to launch editor {program:?}: {e}");
@@ -3863,7 +3863,6 @@ mod tests {
     use crate::{AppState, BroadcastScope};
     use std::ffi::{c_void, CString};
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn detached_poll_snapshot(
@@ -7175,7 +7174,7 @@ mod tests {
     }
 
     fn run_git_quiet(cwd: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = crate::child_process::command("git")
             .args(args)
             .current_dir(cwd)
             .output()

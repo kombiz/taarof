@@ -3444,7 +3444,7 @@ mod tests {
         fs::create_dir_all(&sessions).unwrap();
         let executable = root.join("codex");
         std::os::unix::fs::symlink("/bin/sleep", &executable).unwrap();
-        let mut child = std::process::Command::new(&executable)
+        let mut child = crate::child_process::command(&executable)
             .arg("30")
             .current_dir(&project)
             .env("CODEX_HOME", &custom_home)

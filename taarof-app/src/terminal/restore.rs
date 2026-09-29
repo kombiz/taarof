@@ -484,7 +484,7 @@ pub(super) fn build_restored_tab_legend(
 #[cfg(test)]
 pub(crate) fn tmux_session_exists(target: &crate::tmux::TmuxTarget, name: &str) -> bool {
     let argv = crate::tmux::has_session_command_batch(target, name);
-    std::process::Command::new(&argv[0])
+    crate::child_process::command(&argv[0])
         .args(&argv[1..])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -500,7 +500,7 @@ pub(super) fn run_tmux_command(argv: &[String]) -> Option<String> {
     if argv.is_empty() {
         return None;
     }
-    let output = std::process::Command::new(&argv[0])
+    let output = crate::child_process::command(&argv[0])
         .args(&argv[1..])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -771,7 +771,7 @@ fn cleanup_tmux_backing_with_behavior_in_workspace(
     match close_behavior {
         crate::config::TmuxCloseBehavior::Close => {
             let argv = crate::tmux::kill_backing_command(backing);
-            let output = std::process::Command::new(&argv[0])
+            let output = crate::child_process::command(&argv[0])
                 .args(&argv[1..])
                 .output();
             let result = match output {
@@ -1138,7 +1138,7 @@ pub(super) fn run_tmux_command_sync_result_with_behavior(
     }
     // Reaped by the try_wait() loop below, including the kill-on-timeout path.
     #[allow(clippy::disallowed_methods)]
-    let mut child = std::process::Command::new(&argv[0])
+    let mut child = crate::child_process::command(&argv[0])
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

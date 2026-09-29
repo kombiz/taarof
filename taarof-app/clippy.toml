@@ -8,6 +8,14 @@
 # `Child` (to pipe output, poll `try_wait`, or hand ownership to a supervisor)
 # opts out with `#[allow(clippy::disallowed_methods)]` and a comment saying who
 # reaps it.
+#
+# Every child is also built by `crate::child_process::command`, which applies
+# the child-environment sanitizer (`crate::child_env::prepare_child_command`)
+# so no helper forwards an ambient Infisical token. A bare `Command::new` is
+# rejected everywhere except that constructor; a genuine exception (e.g. the
+# build script, which runs under cargo rather than taarof) allows it with a
+# comment saying why the sanitizer does not apply.
 disallowed-methods = [
+    { path = "std::process::Command::new", reason = "use crate::child_process::command (or crate::git::command) so the child-environment sanitizer applies" },
     { path = "std::process::Command::spawn", reason = "use crate::child_process::spawn_and_reap, or allow with a comment naming who reaps the child" },
 ]

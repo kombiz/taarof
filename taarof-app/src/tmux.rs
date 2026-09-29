@@ -851,7 +851,7 @@ fn run_tmux_command_sync_result(argv: &[String]) -> Result<String, String> {
 
     // Reaped by the try_wait() loop below, which also drains the pipes.
     #[allow(clippy::disallowed_methods)]
-    let mut child = std::process::Command::new(&argv[0])
+    let mut child = crate::child_process::command(&argv[0])
         .args(&argv[1..])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1100,13 +1100,12 @@ fn run_process_tmux_command(argv: &[String], timeout: std::time::Duration) -> Tm
         };
     }
 
-    let mut command = std::process::Command::new(&argv[0]);
+    let mut command = crate::child_process::command(&argv[0]);
     command
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    crate::child_env::prepare_child_command(&mut command, &[]);
     // The bounded wait below owns and reaps the child on every path.
     #[allow(clippy::disallowed_methods)]
     let mut child = match command.spawn() {

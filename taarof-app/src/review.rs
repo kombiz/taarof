@@ -1284,15 +1284,11 @@ fn run_git_bounded(
 }
 
 fn review_git_command(worktree: &Path) -> Command {
-    let mut command = Command::new("git");
-    command
-        .current_dir(worktree)
-        .arg("--no-optional-locks")
-        .args(["-c", "core.fsmonitor=false"]);
+    let mut command = crate::git::command(worktree);
+    command.args(["-c", "core.fsmonitor=false"]);
     // `--` ends option parsing, but Git still interprets magic pathspecs. Paths
     // here come from Git's changed-file list and must select their literal file.
     command.env("GIT_LITERAL_PATHSPECS", "1");
-    crate::child_env::prepare_child_command(&mut command, &[]);
     command
 }
 
@@ -1456,7 +1452,7 @@ mod tests {
     }
 
     fn run(root: &Path, args: &[&str]) {
-        assert!(Command::new("git")
+        assert!(crate::child_process::command("git")
             .current_dir(root)
             .args(args)
             .status()

@@ -3003,22 +3003,27 @@ where
     }
 }
 
+pub(crate) fn exact_pull_request_command(repository: &str, number: u64) -> std::process::Command {
+    let mut command = crate::child_process::command("timeout");
+    command.args([
+        EXACT_PR_COMMAND_TIMEOUT,
+        "gh",
+        "pr",
+        "view",
+        &number.to_string(),
+        "--repo",
+        repository,
+        "--json",
+        "number,title,url,state,isDraft,reviewDecision,statusCheckRollup,headRefName,headRepositoryOwner,body",
+    ]);
+    command
+}
+
 fn fetch_exact_pull_request(
     repository: &str,
     number: u64,
 ) -> Result<crate::tracking::BranchPullRequestEntry, String> {
-    let output = std::process::Command::new("timeout")
-        .args([
-            EXACT_PR_COMMAND_TIMEOUT,
-            "gh",
-            "pr",
-            "view",
-            &number.to_string(),
-            "--repo",
-            repository,
-            "--json",
-            "number,title,url,state,isDraft,reviewDecision,statusCheckRollup,headRefName,headRepositoryOwner,body",
-        ])
+    let output = exact_pull_request_command(repository, number)
         .output()
         .map_err(|error| format!("GitHub refresh unavailable: {error}"))?;
     if !output.status.success() {

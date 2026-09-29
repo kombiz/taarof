@@ -223,6 +223,10 @@ fn git(root: Option<&Path>, args: &[&str]) -> Option<String> {
     git_output(root, args).filter(|value| !value.is_empty())
 }
 
+// Documented sanitizer exception: this build script runs under cargo, not
+// taarof, so there is no taarof environment to sanitize and the app's
+// `child_process` seam is not linked here.
+#[allow(clippy::disallowed_methods)]
 fn git_output(root: Option<&Path>, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
@@ -252,6 +256,7 @@ mod tests {
         fs::create_dir_all(&p).unwrap();
         p
     }
+    #[allow(clippy::disallowed_methods)] // Test fixture under cargo; see git_output.
     fn run(dir: &Path, args: &[&str]) {
         assert!(Command::new("git")
             .arg("-C")

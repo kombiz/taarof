@@ -203,7 +203,10 @@ pub(super) fn discover_tool_versions_with_binary(
     let mut last_failure = None;
 
     for args in commands {
-        let output = Command::new(mise_bin).args(args).current_dir(cwd).output();
+        let output = crate::child_process::command(mise_bin)
+            .args(args)
+            .current_dir(cwd)
+            .output();
         match output {
             Ok(out) if out.status.success() => return parse_tool_versions_json(&out.stdout),
             Ok(out) => {
@@ -380,7 +383,9 @@ pub(super) fn discover_remote_tool_versions(
         return Vec::new();
     };
 
-    let output = Command::new(&argv[0]).args(&argv[1..]).output();
+    let output = crate::child_process::command(&argv[0])
+        .args(&argv[1..])
+        .output();
     match output {
         Ok(out) if out.status.success() => parse_tool_versions_json(&out.stdout),
         Ok(out) => {
