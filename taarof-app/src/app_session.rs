@@ -383,20 +383,44 @@ pub(crate) fn install_signal_cleanup(
     let socket_path = socket_path.map(Path::to_path_buf);
     let auto_save_source = auto_save_source.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        if shutdown_requested.swap(false, Ordering::SeqCst) {
-            // Cancel the periodic auto-save so it cannot race with the final
-            // shutdown save below.
-            if let Some(source_id) = auto_save_source.borrow_mut().take() {
-                source_id.remove();
-            }
-            save_session_once(&session_saved, &writer, &state, &tab_list, &window);
-            crate::flush_history(&state);
-            crate::cleanup_socket_once(&socket_cleaned, socket_path.as_deref());
+        let flow = signal_cleanup_tick(
+            &shutdown_requested,
+            &state,
+            &crate::ShutdownHooks {
+                // Cancel the periodic auto-save so it cannot race with the
+                // final shutdown save.
+                stop_background: &|| {
+                    if let Some(source_id) = auto_save_source.borrow_mut().take() {
+                        source_id.remove();
+                    }
+                },
+                save_session: &|| {
+                    save_session_once(&session_saved, &writer, &state, &tab_list, &window);
+                },
+                release_endpoints: &|| {
+                    crate::cleanup_socket_once(&socket_cleaned, socket_path.as_deref());
+                },
+            },
+        );
+        if flow == glib::ControlFlow::Break {
             app.quit();
-            return glib::ControlFlow::Break;
         }
-        glib::ControlFlow::Continue
+        flow
     });
+}
+
+/// One poll of the signal flag: runs the shared shutdown cleanup once a
+/// SIGINT or SIGTERM has been observed and stops polling afterwards.
+pub(crate) fn signal_cleanup_tick(
+    shutdown_requested: &AtomicBool,
+    state: &Rc<RefCell<AppState>>,
+    hooks: &crate::ShutdownHooks<'_>,
+) -> glib::ControlFlow {
+    if !shutdown_requested.swap(false, Ordering::SeqCst) {
+        return glib::ControlFlow::Continue;
+    }
+    crate::run_shutdown_cleanup(state, hooks);
+    glib::ControlFlow::Break
 }
 
 #[cfg(test)]
