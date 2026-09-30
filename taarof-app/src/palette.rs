@@ -1772,6 +1772,11 @@ fn build_mise_task_entries(
             shortcut: None,
             action: PaletteAction::Noop,
         }),
+        crate::mise::CachedTaskDiscovery::Failed(reason) => entries.push(PaletteEntry {
+            label: format!("mise: {} (retry shortly)", reason.label()),
+            shortcut: None,
+            action: PaletteAction::Noop,
+        }),
         crate::mise::CachedTaskDiscovery::Missing => {}
     }
 }
