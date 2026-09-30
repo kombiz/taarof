@@ -147,8 +147,15 @@ export function writeStoredStringArray(
   storage: Pick<StringArrayStorage, "setItem">,
   storageKey: string,
   values: string[],
-) {
-  storage.setItem(storageKey, JSON.stringify(values));
+): boolean {
+  // Monitor order and watch lists are optional preferences: a refused write
+  // (quota, privacy mode) keeps the in-memory state for this page only.
+  try {
+    storage.setItem(storageKey, JSON.stringify(values));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function readStoredMonitorOrder(storage: Pick<StringArrayStorage, "getItem">): string[] {
@@ -159,7 +166,7 @@ export function writeStoredMonitorOrder(
   storage: Pick<StringArrayStorage, "setItem">,
   keys: string[],
 ) {
-  writeStoredStringArray(storage, MONITOR_ORDER_STORAGE_KEY, keys);
+  return writeStoredStringArray(storage, MONITOR_ORDER_STORAGE_KEY, keys);
 }
 
 export function readStoredWatchedKeys(storage: Pick<StringArrayStorage, "getItem">): string[] {
@@ -170,7 +177,7 @@ export function writeStoredWatchedKeys(
   storage: Pick<StringArrayStorage, "setItem">,
   keys: string[],
 ) {
-  writeStoredStringArray(storage, MONITOR_WATCH_STORAGE_KEY, keys);
+  return writeStoredStringArray(storage, MONITOR_WATCH_STORAGE_KEY, keys);
 }
 
 export function panePriority(
