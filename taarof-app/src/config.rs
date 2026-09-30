@@ -296,15 +296,46 @@ pub fn app_config_path() -> PathBuf {
 }
 
 fn default_app_config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("taarof/config.toml")
+    user_config_dir().join("taarof/config.toml")
 }
 
 fn default_ghostty_config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("ghostty/config")
+    user_config_dir().join("ghostty/config")
+}
+
+pub(crate) fn user_config_dir() -> PathBuf {
+    resolve_user_config_dir(dirs::config_dir(), dirs::home_dir())
+}
+
+fn resolve_user_config_dir(config: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    config
+        .or_else(|| home.map(|home| home.join(".config")))
+        // Preserve the path-returning API without writing to a guessed directory
+        // when no user directory is available. Children of /dev/null cannot exist.
+        .unwrap_or_else(|| PathBuf::from("/dev/null"))
+}
+
+#[test]
+fn user_config_dir_fallbacks_are_concrete_and_safe() {
+    assert_eq!(
+        resolve_user_config_dir(
+            Some(PathBuf::from("/xdg/config")),
+            Some(PathBuf::from("/home/laddy"))
+        ),
+        PathBuf::from("/xdg/config")
+    );
+    assert_eq!(
+        resolve_user_config_dir(None, Some(PathBuf::from("/home/laddy"))),
+        PathBuf::from("/home/laddy/.config")
+    );
+    assert_eq!(
+        resolve_user_config_dir(Some(PathBuf::from("/xdg/config")), None),
+        PathBuf::from("/xdg/config")
+    );
+    let unavailable = resolve_user_config_dir(None, None);
+    assert_eq!(unavailable, PathBuf::from("/dev/null"));
+    assert!(std::fs::create_dir_all(unavailable.join("taarof")).is_err());
+    assert!(std::fs::read_to_string(unavailable.join("taarof/config.toml")).is_err());
 }
 
 /// Optional full-app colour-role overrides. The shipped Majlis values live in

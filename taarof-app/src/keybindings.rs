@@ -1015,9 +1015,7 @@ pub fn installed_hint_lines() -> Vec<String> {
 }
 
 fn config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("taarof/keybindings.toml")
+    crate::config::user_config_dir().join("taarof/keybindings.toml")
 }
 
 /// Resolved path to `keybindings.toml` (`~/.config/taarof/keybindings.toml`).
