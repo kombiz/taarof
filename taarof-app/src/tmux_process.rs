@@ -291,6 +291,31 @@ mod tests {
 
     #[test]
     fn command_children_have_no_ambient_token_or_reload_marker() {
+        // Give an isolated test process synthetic ambient credentials; never
+        // mutate the environment shared by concurrent unit tests.
+        let status = crate::child_process::command(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tmux_process::tests::sanitizer_helper",
+                "--test-threads=1",
+            ])
+            .env("TAAROF_D08_SANITIZER_HELPER", "1")
+            .env("INFISICAL_TOKEN", "synthetic-test-token")
+            .env("INFISICAL_SERVICE_TOKEN", "synthetic-test-token")
+            .env("TAAROF_RELOAD_RESUME_AGENTS", "synthetic-test-marker")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn sanitizer_helper() {
+        if std::env::var_os("TAAROF_D08_SANITIZER_HELPER").is_none() {
+            return;
+        }
+        assert!(std::env::var_os("INFISICAL_TOKEN").is_some());
+        assert!(std::env::var_os("INFISICAL_SERVICE_TOKEN").is_some());
+        assert!(std::env::var_os("TAAROF_RELOAD_RESUME_AGENTS").is_some());
         let outcome = shell(
             "test -z \"${INFISICAL_TOKEN+x}\" && test -z \"${INFISICAL_SERVICE_TOKEN+x}\" && test -z \"${TAAROF_RELOAD_RESUME_AGENTS+x}\"",
             Duration::from_secs(2), 1024);
