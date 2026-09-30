@@ -4696,19 +4696,39 @@ pub(crate) fn local_gh_command(program: &str, args: &[String]) -> Command {
     command
 }
 
+// PR summaries/checks are bounded by the query's row limit. Allow ample JSON
+// headroom while bounding both captured streams and network/pipe completion.
+const LOCAL_GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const LOCAL_GH_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+
 fn run_local_gh_command(argv: &[String]) -> Result<String, String> {
     let Some(program) = argv.first().filter(|program| program.as_str() == "gh") else {
         return Err("GitHub CLI command was not safe to run locally".to_string());
     };
-    let output = local_gh_command(program, &argv[1..])
-        .output()
-        .map_err(|_| "GitHub CLI is unavailable on the controlling host".to_string())?;
-    if !output.status.success() {
-        return Err(classify_local_gh_failure(&String::from_utf8_lossy(
-            &output.stderr,
-        )));
+    run_local_gh_query(
+        local_gh_command(program, &argv[1..]),
+        LOCAL_GH_TIMEOUT,
+        LOCAL_GH_OUTPUT_LIMIT,
+    )
+}
+
+fn run_local_gh_query(
+    command: Command,
+    timeout: std::time::Duration,
+    limit: usize,
+) -> Result<String, String> {
+    let output = crate::tmux_process::run_command(command, timeout, limit);
+    if output.spawn_error.is_some() {
+        return Err("GitHub CLI is unavailable on the controlling host".to_string());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    if output.error.is_some() || output.status.is_none() {
+        // Shared-runner diagnostics may contain OS details; retain no raw text.
+        return Err("GitHub pull-request query failed on the controlling host".to_string());
+    }
+    if !output.status.is_some_and(|status| status.success()) {
+        return Err(classify_local_gh_failure(&output.stderr));
+    }
+    Ok(output.stdout)
 }
 
 fn classify_local_gh_failure(stderr: &str) -> String {
@@ -5880,6 +5900,97 @@ mod tests {
                 "Tasks discovered; no pull requests found for this branch".into()
             )
         );
+    }
+
+    #[test]
+    fn local_gh_timeout_settles_error_and_allows_queued_and_later_retry() {
+        let key = PullRequestKey::new(PathBuf::from("/repo"), "owner/repo", "owner", "work");
+        let mut inflight = HashSet::new();
+        let mut queued = HashSet::new();
+        assert!(register_pull_request_fetch(
+            &mut inflight,
+            &mut queued,
+            &key,
+            super::PullRequestFetchReason::Passive,
+        ));
+        assert!(!register_pull_request_fetch(
+            &mut inflight,
+            &mut queued,
+            &key,
+            super::PullRequestFetchReason::ExplicitDiscovery,
+        ));
+        let mut command = super::local_gh_command("/bin/sh", &[]);
+        command.args(["-c", "exec sleep 10"]);
+        let started = std::time::Instant::now();
+        let error = super::run_local_gh_query(command, std::time::Duration::from_millis(50), 1024)
+            .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(
+            error,
+            "GitHub pull-request query failed on the controlling host"
+        );
+        // Exercise the existing completion/queued-refresh sequence without GTK.
+        assert!(queued.remove(&key));
+        assert!(inflight.remove(&key));
+        assert!(register_pull_request_fetch(
+            &mut inflight,
+            &mut queued,
+            &key,
+            super::PullRequestFetchReason::ExplicitDiscovery,
+        ));
+        let mut cache = HashMap::new();
+        record_pull_request_fetch(&mut cache, key.clone(), Err(error), 10, 20);
+        assert!(cache[&key].error.is_some());
+        assert!(inflight.remove(&key));
+        assert!(register_pull_request_fetch(
+            &mut inflight,
+            &mut queued,
+            &key,
+            super::PullRequestFetchReason::ExplicitDiscovery,
+        ));
+    }
+
+    #[test]
+    fn local_gh_oversized_output_is_rejected_and_retryable() {
+        let mut command = super::local_gh_command("/bin/sh", &[]);
+        command.args([
+            "-c",
+            "i=0; while [ $i -lt 4096 ]; do printf '0123456789abcdef'; i=$((i+1)); done",
+        ]);
+        let error =
+            super::run_local_gh_query(command, std::time::Duration::from_secs(2), 128).unwrap_err();
+        assert_eq!(
+            error,
+            "GitHub pull-request query failed on the controlling host"
+        );
+        let mut command = super::local_gh_command("/bin/sh", &[]);
+        command.args(["-c", "printf '[]'"]);
+        assert_eq!(
+            super::run_local_gh_query(command, std::time::Duration::from_secs(2), 128),
+            Ok("[]".into())
+        );
+    }
+
+    #[test]
+    fn local_gh_stderr_cap_and_spawn_errors_remain_value_blind() {
+        let mut command = super::local_gh_command("/bin/sh", &[]);
+        command.args(["-c", "i=0; while [ $i -lt 4096 ]; do printf 'sensitive-detail' >&2; i=$((i+1)); done; exit 1"]);
+        assert_eq!(
+            super::run_local_gh_query(command, std::time::Duration::from_secs(2), 128),
+            Err("GitHub pull-request query failed on the controlling host".into())
+        );
+        let command = super::local_gh_command("/nonexistent/taarof-test-gh", &[]);
+        assert_eq!(
+            super::run_local_gh_query(command, std::time::Duration::from_secs(2), 128),
+            Err("GitHub CLI is unavailable on the controlling host".into())
+        );
+        let mut command = super::local_gh_command("/bin/sh", &[]);
+        command.args(["-c", "printf 'gh auth login sensitive-detail' >&2; exit 1"]);
+        assert_eq!(
+            super::run_local_gh_query(command, std::time::Duration::from_secs(2), 128),
+            Err("GitHub authentication is required on the controlling host".into())
+        );
+        assert!(super::run_local_gh_command(&["sh".into()]).is_err());
     }
 
     #[test]
