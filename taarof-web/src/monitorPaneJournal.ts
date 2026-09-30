@@ -159,7 +159,7 @@ function isObservation(value: unknown): value is PaneTextObservation {
   );
 }
 
-function compactJournal(paneKey: string, entries: PaneTextObservation[], nowUnixMs: number): PaneJournal {
+export function compactJournal(paneKey: string, entries: PaneTextObservation[], nowUnixMs: number): PaneJournal {
   const freshEntries = entries
     .filter((entry) => entry.paneKey === paneKey)
     .filter((entry) => nowUnixMs - entry.seenAtUnixMs <= PANE_JOURNAL_LIMITS.maxAgeMs)
@@ -298,7 +298,7 @@ export function savePaneJournal(storage: PaneJournalStorage, journal: PaneJourna
   try {
     storage.setItem(key, JSON.stringify(journal));
   } catch {
-    removeStorageItem(storage, key);
+    // A failed replacement must leave the last successfully stored journal intact.
   }
 }
 
@@ -306,13 +306,17 @@ export function appendPaneTextObservation(
   storage: PaneJournalStorage,
   identity: PaneIdentity,
   input: PaneObservationInput,
+  currentJournal?: PaneJournal,
 ): PaneObservationResult {
   const normalizedText = input.text.trimEnd();
   const textHash = hashText(normalizedText);
-  const current = loadPaneJournal(storage, identity.paneKey, input.seenAtUnixMs);
+  const current = currentJournal
+    ? compactJournal(identity.paneKey, currentJournal.entries, input.seenAtUnixMs)
+    : loadPaneJournal(storage, identity.paneKey, input.seenAtUnixMs);
   const latest = current.entries[current.entries.length - 1];
 
   if (latest?.textHash === textHash && latest.text.length === normalizedText.length) {
+    if (currentJournal) savePaneJournal(storage, current);
     return { changed: false, journal: current };
   }
 
