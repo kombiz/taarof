@@ -265,7 +265,8 @@ fn degraded_subtree_catalog_keeps_rows_and_refuses_local_execution() {
     let root = tempfile::TempDir::new().unwrap();
     std::fs::write(root.path().join("session.jsonl"),
         "{\"type\":\"session_meta\",\"payload\":{\"id\":\"survivor\",\"cwd\":\"/tmp\"}}\n{\"payload\":\"unfinished").unwrap();
-    let (mut status, sessions) = discover_codex_sessions(Some(root.path()), 50);
+    let (mut status, sessions) =
+        agent_session_core::legacy::discover_codex_sessions(Some(root.path()), 50);
     // Traversal injection lives in core's private tests. Exercise its projected
     // status at the consumer boundary without weakening execution authority.
     status.ok = false;
