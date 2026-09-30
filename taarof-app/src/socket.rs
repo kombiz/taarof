@@ -4731,10 +4731,15 @@ fn write_json_response_with_timeout(
     response: SocketResponse,
     timeout: Duration,
 ) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
     let started = Instant::now();
     let mut payload = serde_json::to_vec(&response)
         .unwrap_or_else(|_| br#"{"ok":false,"error":"failed to serialize response"}"#.to_vec());
     payload.push(b'\n');
+    // A blocking send can keep making progress inside one syscall while the
+    // peer trickles reads. Poll nonblocking sends against one absolute budget.
+    conn.set_nonblocking(true)?;
     let mut pending = payload.as_slice();
     while !pending.is_empty() {
         let remaining = timeout
@@ -4746,11 +4751,29 @@ fn write_json_response_with_timeout(
                     "socket response delivery deadline exceeded",
                 )
             })?;
-        conn.set_write_timeout(Some(remaining))?;
         match conn.write(pending) {
             Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
             Ok(written) => pending = &pending[written..],
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut descriptor = libc::pollfd {
+                    fd: conn.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let wait_ms = remaining
+                    .as_millis()
+                    .saturating_add(1)
+                    .min(i32::MAX as u128) as i32;
+                // SAFETY: descriptor is a valid pollfd for the owned stream;
+                // poll only borrows it for this bounded wait.
+                if unsafe { libc::poll(&mut descriptor, 1, wait_ms) } < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+            }
             Err(error) => return Err(error),
         }
     }
