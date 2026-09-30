@@ -1,4 +1,4 @@
-//! Replacement primitive for saved views and templates only.
+//! Replacement primitive for private saved state.
 //!
 //! Each writer owns a private temporary in the destination directory. A successful
 //! return means file data was synced before rename and the directory was synced
@@ -25,7 +25,10 @@ pub(crate) fn replace(path: &Path, content: &str) -> io::Result<()> {
     replace_with(path, |file| file.write_all(content.as_bytes()))
 }
 
-fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+pub(crate) fn replace_with(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
