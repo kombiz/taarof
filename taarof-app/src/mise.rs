@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+mod bounded_tests;
 mod cache;
 mod chip;
 mod local;
@@ -258,7 +260,14 @@ enum DiscoveryCacheLocation {
 
 #[derive(Debug, Clone)]
 enum TaskDiscoveryCacheEntry {
-    Pending,
+    Pending {
+        generation: u64,
+        started_at: Instant,
+    },
+    Failed {
+        reason: DiscoveryFailure,
+        completed_at: Instant,
+    },
     Ready {
         tasks: Vec<MiseTask>,
         completed_at: Instant,
@@ -267,7 +276,14 @@ enum TaskDiscoveryCacheEntry {
 
 #[derive(Debug, Clone)]
 enum ToolVersionCacheEntry {
-    Pending,
+    Pending {
+        generation: u64,
+        started_at: Instant,
+    },
+    Failed {
+        reason: DiscoveryFailure,
+        completed_at: Instant,
+    },
     Ready {
         chip: Option<String>,
         completed_at: Instant,
@@ -295,7 +311,79 @@ struct ToolVersionCache {
 pub(crate) enum CachedTaskDiscovery {
     Missing,
     Pending,
+    Failed(DiscoveryFailure),
     Ready(Vec<MiseTask>),
+}
+
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DISCOVERY_LEASE: Duration = Duration::from_secs(6);
+const DISCOVERY_RETRY: Duration = Duration::from_secs(2);
+const DISCOVERY_OUTPUT_LIMIT: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiscoveryFailure {
+    Timeout,
+    OutputLimit,
+    Process,
+    Exit,
+    InvalidJson,
+    Unavailable,
+}
+
+impl DiscoveryFailure {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Timeout => "discovery timed out",
+            Self::OutputLimit => "discovery output exceeded limit",
+            Self::Process => "discovery process failed",
+            Self::Exit => "discovery command failed",
+            Self::InvalidJson => "discovery returned invalid JSON",
+            Self::Unavailable => "discovery unavailable",
+        }
+    }
+}
+
+fn next_discovery_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn run_discovery_command(
+    command: std::process::Command,
+    timeout: Duration,
+) -> Result<String, DiscoveryFailure> {
+    discovery_output(crate::tmux_process::run_command(
+        command,
+        timeout,
+        DISCOVERY_OUTPUT_LIMIT,
+    ))
+}
+
+fn discovery_output(outcome: crate::tmux_process::Outcome) -> Result<String, DiscoveryFailure> {
+    // Only runner-owned classifications are inspected; captured child output
+    // and spawn error values never enter viewer text or failure diagnostics.
+    if outcome.spawn_error.is_some() {
+        return Err(DiscoveryFailure::Process);
+    }
+    if let Some(error) = outcome.error {
+        return Err(if error.starts_with("command timed out") {
+            DiscoveryFailure::Timeout
+        } else if error.starts_with("command output exceeded") {
+            DiscoveryFailure::OutputLimit
+        } else {
+            DiscoveryFailure::Process
+        });
+    }
+    if !outcome.status.is_some_and(|status| status.success()) {
+        return Err(DiscoveryFailure::Exit);
+    }
+    Ok(outcome.stdout)
+}
+
+fn parse_tasks_json(output: &str) -> Result<Vec<MiseTask>, DiscoveryFailure> {
+    let tasks: Vec<MiseTask> =
+        serde_json::from_str(output).map_err(|_| DiscoveryFailure::InvalidJson)?;
+    Ok(tasks.into_iter().filter(|task| !task.hide).collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -744,63 +832,18 @@ fn local_discovery_dir(state: &crate::AppState, initial: Option<&str>) -> String
         .unwrap_or_else(|| ".".into())
 }
 
-fn discover_remote_tasks(host: &str, cwd: &str, ssh_argv: &[String]) -> Vec<MiseTask> {
+fn discover_remote_tasks(
+    _host: &str,
+    cwd: &str,
+    ssh_argv: &[String],
+) -> Result<Vec<MiseTask>, DiscoveryFailure> {
     let remote_command = remote_mise_shell_command(cwd, &["tasks", "ls", "--json"]);
-    let Some(argv) =
+    let argv =
         ssh_command_with_remote_exec(ssh_argv, remote_command, false, &["-o", "BatchMode=yes"])
-    else {
-        crate::diagnostics::record_command_failure(
-            "mise",
-            "remote-discover",
-            format!("remote mise unsupported for {host}:{cwd}"),
-            Some(serde_json::json!({
-                "host": host,
-                "cwd": cwd,
-            })),
-        );
-        return Vec::new();
-    };
-
-    let output = crate::child_process::command(&argv[0])
-        .args(&argv[1..])
-        .output();
-    match output {
-        Ok(out) => {
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                crate::diagnostics::record_command_failure(
-                    "mise",
-                    "remote-discover",
-                    format!("remote mise failed in {host}:{cwd}"),
-                    Some(serde_json::json!({
-                        "host": host,
-                        "cwd": cwd,
-                        "status": out.status.to_string(),
-                        "stderr": stderr.trim(),
-                        "argv": argv,
-                    })),
-                );
-                return Vec::new();
-            }
-            let tasks: Vec<MiseTask> = serde_json::from_slice(&out.stdout).unwrap_or_default();
-            eprintln!("taarof: mise found {} tasks in {host}:{cwd}", tasks.len());
-            tasks.into_iter().filter(|t| !t.hide).collect()
-        }
-        Err(e) => {
-            crate::diagnostics::record_command_failure(
-                "mise",
-                "remote-discover",
-                format!("remote mise failed to run for {host}:{cwd}"),
-                Some(serde_json::json!({
-                    "host": host,
-                    "cwd": cwd,
-                    "argv": argv,
-                    "error": e.to_string(),
-                })),
-            );
-            Vec::new()
-        }
-    }
+            .ok_or(DiscoveryFailure::Unavailable)?;
+    let mut command = crate::child_process::command(&argv[0]);
+    command.args(&argv[1..]);
+    parse_tasks_json(&run_discovery_command(command, DISCOVERY_TIMEOUT)?)
 }
 
 /// Discover mise tasks for a given directory.
@@ -823,9 +866,15 @@ pub fn discover_tasks(cwd: &str) -> Vec<MiseTask> {
 }
 
 pub fn discover_tasks_for_target(target: &DiscoveryTarget) -> Vec<MiseTask> {
+    try_discover_tasks_for_target(target).unwrap_or_default()
+}
+
+fn try_discover_tasks_for_target(
+    target: &DiscoveryTarget,
+) -> Result<Vec<MiseTask>, DiscoveryFailure> {
     #[cfg(test)]
     if let Some(tasks) = run_discover_tasks_test_probe(target) {
-        return tasks;
+        return Ok(tasks);
     }
 
     let tasks = match target {
@@ -837,7 +886,7 @@ pub fn discover_tasks_for_target(target: &DiscoveryTarget) -> Vec<MiseTask> {
                     "cwd": cwd,
                 }),
             ) else {
-                return Vec::new();
+                return Err(DiscoveryFailure::Unavailable);
             };
 
             discover_tasks_with_binary(cwd, &binary_path)
@@ -849,7 +898,7 @@ pub fn discover_tasks_for_target(target: &DiscoveryTarget) -> Vec<MiseTask> {
         } => discover_remote_tasks(host, cwd, ssh_argv),
     };
 
-    filter_tasks_for_target(tasks, target)
+    Ok(filter_tasks_for_target(tasks?, target))
 }
 
 pub(crate) fn standard_actions_from_tasks(

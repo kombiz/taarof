@@ -194,64 +194,37 @@ pub(super) fn require_local_mise_binary(
 /// runs (many fixtures being written and executed at once) but can also occur in
 /// production right after a mise self-install. A short bounded retry lets the
 /// offending descriptor close without changing observable behavior.
-fn run_mise_tasks_ls(mise_bin: &Path, cwd: &str) -> std::io::Result<std::process::Output> {
-    const MAX_ATTEMPTS: u32 = 20;
-    let mut attempt = 0;
-    loop {
-        match crate::child_process::command(mise_bin)
-            .args(["tasks", "ls", "--json"])
-            .current_dir(cwd)
-            .output()
+fn run_mise_tasks_ls(mise_bin: &Path, cwd: &str) -> Result<String, DiscoveryFailure> {
+    let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+    for attempt in 0..=20 {
+        let mut command = crate::child_process::command(mise_bin);
+        command.args(["tasks", "ls", "--json"]).current_dir(cwd);
+        let outcome = crate::tmux_process::run_command(
+            command,
+            deadline.saturating_duration_since(Instant::now()),
+            DISCOVERY_OUTPUT_LIMIT,
+        );
+        if outcome.spawn_error.as_ref().is_some_and(|error| {
+            error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                || error.raw_os_error() == Some(libc::ETXTBSY)
+        }) && attempt < 20
+            && Instant::now() < deadline
         {
-            Err(e)
-                if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < MAX_ATTEMPTS =>
-            {
-                attempt += 1;
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            other => return other,
+            std::thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
+            continue;
         }
+        return discovery_output(outcome);
     }
+    unreachable!("bounded retry returns on its final attempt")
 }
 
-pub(super) fn discover_tasks_with_binary(cwd: &str, mise_bin: &Path) -> Vec<MiseTask> {
-    let output = run_mise_tasks_ls(mise_bin, cwd);
-
-    match output {
-        Ok(out) => {
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                crate::diagnostics::record_command_failure(
-                    "mise",
-                    "discover",
-                    format!("mise failed in {cwd}"),
-                    Some(serde_json::json!({
-                        "cwd": cwd,
-                        "mise_bin": mise_bin,
-                        "status": out.status.to_string(),
-                        "stderr": stderr.trim(),
-                    })),
-                );
-                return Vec::new();
-            }
-            let tasks: Vec<MiseTask> = serde_json::from_slice(&out.stdout).unwrap_or_default();
-            eprintln!("taarof: mise found {} tasks in {cwd}", tasks.len());
-            tasks.into_iter().filter(|t| !t.hide).collect()
-        }
-        Err(e) => {
-            crate::diagnostics::record_command_failure(
-                "mise",
-                "discover",
-                format!("mise failed to run in {cwd}"),
-                Some(serde_json::json!({
-                    "cwd": cwd,
-                    "mise_bin": mise_bin,
-                    "error": e.to_string(),
-                })),
-            );
-            Vec::new()
-        }
-    }
+pub(super) fn discover_tasks_with_binary(
+    cwd: &str,
+    mise_bin: &Path,
+) -> Result<Vec<MiseTask>, DiscoveryFailure> {
+    parse_tasks_json(&run_mise_tasks_ls(mise_bin, cwd)?)
 }
 
 pub(super) const MISE_CONFIG_FILES: &[&str] = &[
