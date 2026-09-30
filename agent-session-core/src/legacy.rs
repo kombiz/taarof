@@ -221,6 +221,7 @@ pub fn discover_pi_sessions(
 
     let mut sessions = Vec::new();
     let mut failure = None;
+    let mut incomplete_append = false;
     for path in paths.into_iter().take(limit) {
         let modified_at_unix_ms = file_modified_unix_ms(&path).unwrap_or_else(unix_time_ms);
         let lines = match read_jsonl_sample_lines(&path) {
@@ -230,7 +231,8 @@ pub fn discover_pi_sessions(
                 continue;
             }
         };
-        if let Some(mut session) = parse_pi_session(&path, modified_at_unix_ms, &lines) {
+        incomplete_append |= lines.incomplete_append;
+        if let Some(mut session) = parse_pi_session(&path, modified_at_unix_ms, &lines.values) {
             session.last_user_message_at_unix_ms =
                 crate::message_time::last_user_message(&path, "pi");
             sessions.push(session);
@@ -245,7 +247,7 @@ pub fn discover_pi_sessions(
             name: "pi".to_string(),
             ok: failure.is_none(),
             history_available: true,
-            warning: None,
+            warning: incomplete_append.then(|| INCOMPLETE_APPEND_WARNING.into()),
             error: failure,
             session_count: sessions.len(),
         },
@@ -273,7 +275,7 @@ pub fn discover_kimi_sessions(
     };
 
     let entries = match read_bounded_jsonl(index_path, 10_000, true) {
-        Ok(entries) => entries,
+        Ok(entries) => entries.values,
         Err(error) => return provider_failure("kimi", error),
     };
     let entry_count = entries.len();
@@ -491,6 +493,7 @@ fn discover_jsonl_provider(
     let mut sessions = Vec::new();
     let mut failure = None;
     let mut missing_metadata = false;
+    let mut incomplete_append = false;
     for candidate in candidates.into_iter().take(limit) {
         let lines = match read_jsonl_sample_lines(&candidate.path) {
             Ok(lines) => lines,
@@ -499,7 +502,12 @@ fn discover_jsonl_provider(
                 continue;
             }
         };
-        if let Some(mut session) = parser(&candidate.path, candidate.modified_at_unix_ms, &lines) {
+        incomplete_append |= lines.incomplete_append;
+        if let Some(mut session) = parser(
+            &candidate.path,
+            candidate.modified_at_unix_ms,
+            &lines.values,
+        ) {
             session.last_user_message_at_unix_ms =
                 crate::message_time::last_user_message(&candidate.path, provider);
             sessions.push(session);
@@ -519,7 +527,7 @@ fn discover_jsonl_provider(
             name: provider.to_string(),
             ok: failure.is_none(),
             history_available: true,
-            warning: None,
+            warning: incomplete_append.then(|| INCOMPLETE_APPEND_WARNING.into()),
             error: failure,
             session_count: sessions.len(),
         },
@@ -703,7 +711,16 @@ fn provider_failure(
     )
 }
 
-fn read_jsonl_sample_lines(path: &Path) -> Result<Vec<Value>, String> {
+const INCOMPLETE_APPEND_WARNING: &str =
+    "Session history sample is partial: an incomplete trailing JSONL append was ignored.";
+
+#[derive(Debug, Default)]
+struct JsonlSample {
+    values: Vec<Value>,
+    incomplete_append: bool,
+}
+
+fn read_jsonl_sample_lines(path: &Path) -> Result<JsonlSample, String> {
     read_bounded_jsonl(path, MAX_SAMPLE_LINES, false)
 }
 
@@ -711,12 +728,12 @@ fn read_bounded_jsonl(
     path: &Path,
     max_lines: usize,
     require_eof: bool,
-) -> Result<Vec<Value>, String> {
+) -> Result<JsonlSample, String> {
     const MAX_LINE_BYTES: u64 = 1_048_576;
     const MAX_TOTAL_BYTES: usize = 16 * 1_048_576;
     let file = File::open(path).map_err(|_| "Session history is unreadable.")?;
     let mut reader = BufReader::new(file);
-    let mut values = Vec::new();
+    let mut sample = JsonlSample::default();
     let mut total = 0;
     for _ in 0..max_lines {
         let mut line = Vec::new();
@@ -726,25 +743,37 @@ fn read_bounded_jsonl(
             .read_until(b'\n', &mut line)
             .map_err(|_| "Session history read failed.")?;
         if count == 0 {
-            return Ok(values);
+            return Ok(sample);
         }
         total += count;
         if count as u64 > MAX_LINE_BYTES || total > MAX_TOTAL_BYTES {
             // A sample is a header read: once records are in hand, an oversized
             // later record (e.g. a large tool output) ends the sample rather than
             // failing the store. Exhaustive reads and a bad first record still fail.
-            if !require_eof && !values.is_empty() {
-                return Ok(values);
+            if !require_eof && !sample.values.is_empty() {
+                return Ok(sample);
             }
             return Err("Session history byte limit exceeded.".into());
         }
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        values.push(
-            serde_json::from_slice(&line)
-                .map_err(|_| "Session history contains malformed JSON.")?,
-        );
+        match serde_json::from_slice(&line) {
+            Ok(value) => sample.values.push(value),
+            Err(error)
+                if !require_eof
+                    && !sample.values.is_empty()
+                    && line.last() != Some(&b'\n')
+                    && error.is_eof() =>
+            {
+                // The bounded read reached EOF without a newline (byte-limit
+                // exits are handled above). Only parser-confirmed truncation
+                // after valid records is an in-progress append, not corruption.
+                sample.incomplete_append = true;
+                return Ok(sample);
+            }
+            Err(_) => return Err("Session history contains malformed JSON.".into()),
+        }
     }
     if require_eof
         && !reader
@@ -754,7 +783,7 @@ fn read_bounded_jsonl(
     {
         return Err("Session history record limit exceeded.".into());
     }
-    Ok(values)
+    Ok(sample)
 }
 
 fn first_string(lines: &[Value], keys: &[&str]) -> Option<String> {
@@ -946,6 +975,116 @@ struct FileCandidate {
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    #[test]
+    fn jsonl_sample_only_tolerates_incomplete_unterminated_later_record() {
+        let root = std::env::temp_dir().join(format!("agent-jsonl-append-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("sample.jsonl");
+        let incomplete = r#"{"payload":"unfinished"#;
+        assert!(serde_json::from_str::<Value>(incomplete)
+            .unwrap_err()
+            .is_eof());
+        let malformed = r#"{"payload":!}"#;
+        assert!(!serde_json::from_str::<Value>(malformed)
+            .unwrap_err()
+            .is_eof());
+
+        fs::write(&path, format!("{{\"id\":\"valid\"}}\n{incomplete}")).unwrap();
+        let sample = read_jsonl_sample_lines(&path).unwrap();
+        assert_eq!(sample.values, vec![serde_json::json!({"id": "valid"})]);
+        assert!(sample.incomplete_append);
+        assert!(read_bounded_jsonl(&path, 10_000, true).is_err());
+        for text in [
+            format!("{{}}\n{malformed}"),
+            format!("{{}}\n{incomplete}\n"),
+            incomplete.to_string(),
+            malformed.to_string(),
+        ] {
+            fs::write(&path, text).unwrap();
+            assert!(read_jsonl_sample_lines(&path).is_err());
+        }
+        // A valid final record needs no newline and is a clean sample.
+        fs::write(&path, "{}\n{\"id\":\"complete\"}").unwrap();
+        let sample = read_jsonl_sample_lines(&path).unwrap();
+        assert_eq!(sample.values.len(), 2);
+        assert!(!sample.incomplete_append);
+        let capped = read_bounded_jsonl(&path, 1, false).unwrap();
+        assert_eq!(capped.values.len(), 1);
+        assert!(!capped.incomplete_append);
+        assert_eq!(
+            read_bounded_jsonl(&path, 1, true).unwrap_err(),
+            "Session history record limit exceeded."
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn jsonl_providers_project_partial_clean_and_failed_history() {
+        for (provider, header) in [
+            (
+                "codex",
+                r#"{"type":"session_meta","payload":{"id":"s-1","cwd":"/tmp"}}"#,
+            ),
+            (
+                "claude",
+                r#"{"type":"user","sessionId":"s-1","cwd":"/tmp","message":{"role":"user","content":"hello"}}"#,
+            ),
+            ("pi", r#"{"type":"session","id":"s-1","cwd":"/tmp"}"#),
+        ] {
+            let root = std::env::temp_dir()
+                .join(format!("agent-{provider}-append-{}", std::process::id()));
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("session.jsonl");
+            for (tail, partial, failed) in [
+                (r#"{"payload":"unfinished"#, true, false),
+                ("{}", false, false),
+                ("{\"payload\":!}", false, true),
+                ("{\"payload\":\"unfinished\n", false, true),
+            ] {
+                fs::write(&path, format!("{header}\n{tail}")).unwrap();
+                let (status, sessions) = match provider {
+                    "codex" => discover_codex_sessions(Some(&root), 50),
+                    "claude" => discover_claude_sessions(Some(&root), 50),
+                    "pi" => discover_pi_sessions(Some(&root), None, 50),
+                    _ => unreachable!(),
+                };
+                assert_eq!(status.ok, !failed, "{provider}: {status:?}");
+                assert!(status.history_available);
+                assert_eq!(status.error.is_some(), failed);
+                assert_eq!(
+                    status.warning.as_deref(),
+                    partial.then_some(INCOMPLETE_APPEND_WARNING)
+                );
+                assert_eq!(status.session_count, usize::from(!failed));
+                assert_eq!(sessions.len(), usize::from(!failed));
+                if let Some(session) = sessions.first() {
+                    assert_eq!(session.session_id, "s-1");
+                    assert_eq!(session.cwd, "/tmp");
+                    assert_eq!(session.last_user_message_at_unix_ms, None);
+                }
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn kimi_incomplete_trailing_index_remains_a_failure() {
+        let root = std::env::temp_dir().join(format!("agent-kimi-append-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("index.jsonl");
+        fs::write(
+            &path,
+            "{\"sessionId\":\"s-1\",\"sessionDir\":\"s-1\",\"workDir\":\"/tmp\"}\n{\"sessionId\":",
+        )
+        .unwrap();
+        let (status, sessions) = discover_kimi_sessions(Some(&path), Some(&root), 50);
+        assert!(!status.ok);
+        assert!(status.error.is_some());
+        assert!(status.warning.is_none());
+        assert!(sessions.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn malformed_and_oversized_history_degrade_only_the_provider() {
