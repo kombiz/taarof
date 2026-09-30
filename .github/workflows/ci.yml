@@ -68,8 +68,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: taarof-web/package-lock.json
 
       - name: Audit frontend dependencies
         run: npm audit --package-lock-only
