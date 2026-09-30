@@ -47,6 +47,7 @@ mod task_panel;
 mod templates;
 mod terminal;
 mod tmux;
+mod tmux_process;
 mod tracking;
 mod update_watch;
 mod views;
