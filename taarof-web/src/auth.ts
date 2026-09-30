@@ -49,10 +49,15 @@ export function storeToken(token: string, storage = browserTokenStorage()): bool
 }
 
 function browserCacheStorage(): CacheStorage | null {
-  if (typeof window === "undefined" || !("caches" in window)) {
+  try {
+    if (typeof window === "undefined" || !("caches" in window)) {
+      return null;
+    }
+    return window.caches;
+  } catch {
+    // Access itself may be denied; exception details can contain a token URL.
     return null;
   }
-  return window.caches;
 }
 
 /** Resolves once cleanup settles; failures are reported without their details. */

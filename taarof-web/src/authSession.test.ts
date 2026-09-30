@@ -1,4 +1,4 @@
-import type { TokenStorage } from "./auth.js";
+import { bootstrapTokenFromUrl, type TokenStorage } from "./auth.js";
 import { resolveInitialAuth, signOut, submitToken, type AuthStateTarget } from "./authSession.js";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -174,4 +174,51 @@ test("initial auth prefers the URL token, then storage, and survives throwing st
   assert(fromStorage?.token === TOKEN && fromStorage.persisted === true, "the stored token is used");
 
   assert(resolveInitialAuth(() => null, new ThrowingTokenStorage()) === null, "throwing storage reads as signed out");
+});
+
+test("denied CacheStorage getter cannot interrupt bootstrap, submission, reset, or unauthorized cleanup", () => {
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  let cacheAccesses = 0;
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      get caches() {
+        cacheAccesses += 1;
+        throw new Error(`cache access denied for ?token=${TOKEN}`);
+      },
+    },
+  });
+  try {
+    const output = captureConsole(() => {
+      const storage = new ThrowingTokenStorage();
+      let cleanedUrl = "";
+      const initial = resolveInitialAuth(() => bootstrapTokenFromUrl({
+        href: `https://example.test/?token=${TOKEN}&view=monitor`,
+        storage,
+        replaceUrl: (url) => { cleanedUrl = url; },
+      }), storage);
+      assert(initial?.token === TOKEN && !initial.persisted, "bootstrap keeps the URL token in memory");
+      assert(cleanedUrl === "/?view=monitor", "bootstrap removes the token from the URL");
+
+      const { state, target } = fakeApp();
+      submitToken(target, TOKEN, storage);
+      assert(state.token === TOKEN && !state.persisted, "submission completes in memory");
+      signOut(target, null, storage);
+      assert(state.token === null && state.snapshot === null && state.agentSessions === null, "reset clears authenticated state");
+      assert(state.tokenError === null, "reset does not display an exception");
+
+      state.snapshot = "snapshot";
+      state.agentSessions = "agent-sessions";
+      submitToken(target, TOKEN, storage);
+      signOut(target, "The taarof token was rejected.", storage);
+      assert(state.token === null && state.snapshot === null && state.agentSessions === null, "unauthorized clears authenticated state");
+      assert(state.tokenError === "The taarof token was rejected.", "unauthorized displays only the fixed message");
+      assert(state.stopCount === 4, "every submission and sign-out stops connections");
+    });
+    assert(cacheAccesses === 5, "every transition attempted the throwing cache getter");
+    assert(output === "", "raw cache errors and token values are never logged");
+  } finally {
+    if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
+    else Reflect.deleteProperty(globalThis, "window");
+  }
 });
