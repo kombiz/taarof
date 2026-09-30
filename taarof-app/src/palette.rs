@@ -2848,19 +2848,6 @@ struct SendTargetPane {
     label: String,
 }
 
-/// Human-readable activity label for a pane, matching the socket/HTTP vocabulary
-/// (see `api::agent_activity_state_label`).
-fn send_activity_label(state: crate::workspace::AgentActivityState) -> &'static str {
-    use crate::workspace::AgentActivityState;
-    match state {
-        AgentActivityState::Idle => "idle",
-        AgentActivityState::Running => "running",
-        AgentActivityState::WaitingInput => "waiting-input",
-        AgentActivityState::Errored => "errored",
-        AgentActivityState::Done => "done",
-    }
-}
-
 /// Enumerate every pane in the active workspace as a send target, labelling each
 /// from the CACHED `runtime_probe` snapshot (never a fresh probe) exactly as the
 /// sidebar does, so labels match what the user already sees.
@@ -2899,7 +2886,7 @@ fn send_target_panes(st: &AppState) -> Vec<SendTargetPane> {
                 .unwrap_or_else(|| "shell".to_string());
             let activity = tab
                 .pane_agent_activity(leaf.pane_id)
-                .map(|activity| send_activity_label(activity.state))
+                .map(|activity| activity.state.as_wire())
                 .unwrap_or(if leaf.shell_pid.is_some() { "idle" } else { "" });
             let label = if activity.is_empty() {
                 format!("{agent_label} · pane {}", leaf.pane_id)

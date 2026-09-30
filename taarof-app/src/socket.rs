@@ -1326,7 +1326,7 @@ fn pane_agent_state_label(state: &AppState, tab_id: u32, pane_id: u32) -> Option
     state
         .find_tab(tab_id)
         .and_then(|(_, tab)| tab.pane_agent_activity.get(&pane_id))
-        .map(|activity| agents::turn_state_label(activity.state).to_string())
+        .map(|activity| activity.state.as_wire().to_string())
 }
 
 fn cleanup_agent_turns(now: Instant) {
@@ -3063,16 +3063,6 @@ fn retarget_tab_attention_to_remaining_activity(tab: &mut crate::Tab) -> bool {
     true
 }
 
-fn socket_activity_state_label(state: SocketActivityState) -> &'static str {
-    match state {
-        SocketActivityState::Idle => "idle",
-        SocketActivityState::Running => "running",
-        SocketActivityState::WaitingInput => "waiting-input",
-        SocketActivityState::Errored => "errored",
-        SocketActivityState::Done => "done",
-    }
-}
-
 fn handle_work_context_message(
     state: &Rc<RefCell<AppState>>,
     tab_target: Option<&String>,
@@ -3318,7 +3308,7 @@ fn handle_agent_status_message(
             "tab_id": tab.id,
             "tab_name": tab.name,
             "pane_id": pane_id,
-            "state": socket_activity_state_label(activity_state),
+            "state": activity_state.as_wire(),
             "source": source,
         });
     }
@@ -7430,6 +7420,43 @@ mod tests {
                 assert_eq!(source.as_deref(), Some("claude"));
             }
             _ => panic!("expected agent-status"),
+        }
+    }
+
+    #[test]
+    fn socket_agent_status_preserves_every_activity_input_form() {
+        for (wire, expected) in [
+            ("idle", AgentActivityState::Idle),
+            ("running", AgentActivityState::Running),
+            ("waiting-input", AgentActivityState::WaitingInput),
+            ("waiting", AgentActivityState::WaitingInput),
+            ("needs-input", AgentActivityState::WaitingInput),
+            ("errored", AgentActivityState::Errored),
+            ("error", AgentActivityState::Errored),
+            ("done", AgentActivityState::Done),
+        ] {
+            let message: SocketMessage = serde_json::from_value(serde_json::json!({
+                "action": "agent-status", "state": wire,
+            }))
+            .unwrap();
+            let SocketMessage::AgentStatus { state, .. } = message else {
+                panic!("expected agent-status");
+            };
+            assert_eq!(state, expected);
+            assert_eq!(state.as_wire(), expected.as_wire());
+        }
+        for wire in [
+            "working",
+            "waiting_input",
+            "Running",
+            " running ",
+            "thinking",
+            "",
+        ] {
+            assert!(serde_json::from_value::<SocketMessage>(serde_json::json!({
+                "action": "agent-status", "state": wire,
+            }))
+            .is_err());
         }
     }
 

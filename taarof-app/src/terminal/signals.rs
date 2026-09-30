@@ -35,7 +35,7 @@ fn emit_agent_activity_transition(state: &Rc<RefCell<AppState>>, tab_id: u32, pa
             serde_json::json!({
                 "tab_id": tab_id,
                 "pane_id": pane_id,
-                "state": crate::agents::turn_lifecycle_label(lifecycle),
+                "state": lifecycle.activity().as_wire(),
                 "source": source,
             }),
         );
@@ -226,28 +226,7 @@ fn read_termprop_string(terminal: &vte::Terminal, prop_name: &str) -> Option<Str
 pub(super) fn parse_termprop_activity_state(
     value: Option<&str>,
 ) -> Option<crate::workspace::AgentActivityState> {
-    match value?.trim() {
-        value if value.eq_ignore_ascii_case("idle") => {
-            Some(crate::workspace::AgentActivityState::Idle)
-        }
-        value if value.eq_ignore_ascii_case("running") => {
-            Some(crate::workspace::AgentActivityState::Running)
-        }
-        value
-            if value.eq_ignore_ascii_case("waiting-input")
-                || value.eq_ignore_ascii_case("waiting")
-                || value.eq_ignore_ascii_case("needs-input") =>
-        {
-            Some(crate::workspace::AgentActivityState::WaitingInput)
-        }
-        value if value.eq_ignore_ascii_case("errored") || value.eq_ignore_ascii_case("error") => {
-            Some(crate::workspace::AgentActivityState::Errored)
-        }
-        value if value.eq_ignore_ascii_case("done") => {
-            Some(crate::workspace::AgentActivityState::Done)
-        }
-        _ => None,
-    }
+    crate::workspace::AgentActivityState::from_termprop(value?)
 }
 
 fn schedule_termprop_done_clear(
