@@ -30,92 +30,131 @@ pub(super) fn cached_tool_version_chip(target: &DiscoveryTarget) -> Option<Optio
     let mut cache = tool_version_cache()
         .lock()
         .expect("tool version cache lock should not be poisoned");
-
     match cache.entries.get(&key) {
         Some(ToolVersionCacheEntry::Ready { chip, completed_at })
             if now.duration_since(*completed_at) <= TOOL_VERSION_TTL =>
         {
             Some(chip.clone())
         }
-        Some(ToolVersionCacheEntry::Ready { .. }) => {
+        Some(ToolVersionCacheEntry::Pending { started_at, .. })
+            if now.duration_since(*started_at) > DISCOVERY_LEASE =>
+        {
+            cache.entries.insert(
+                key,
+                ToolVersionCacheEntry::Failed {
+                    reason: DiscoveryFailure::Timeout,
+                    completed_at: now,
+                },
+            );
+            Some(Some(DiscoveryFailure::Timeout.label().into()))
+        }
+        Some(ToolVersionCacheEntry::Failed {
+            reason,
+            completed_at,
+        }) if now.duration_since(*completed_at) <= DISCOVERY_RETRY => {
+            Some(Some(reason.label().into()))
+        }
+        Some(ToolVersionCacheEntry::Ready { .. } | ToolVersionCacheEntry::Failed { .. }) => {
             cache.entries.remove(&key);
             None
         }
-        Some(ToolVersionCacheEntry::Pending) | None => None,
+        Some(ToolVersionCacheEntry::Pending { .. }) | None => None,
     }
 }
 
 pub(super) fn prepare_tool_version_discovery(
     target: &DiscoveryTarget,
-) -> ToolVersionDiscoveryRequest {
+) -> (ToolVersionDiscoveryRequest, u64) {
     let key = tool_version_cache_key(target);
     let now = Instant::now();
     let mut cache = tool_version_cache()
         .lock()
         .expect("tool version cache lock should not be poisoned");
-
     match cache.entries.get(&key) {
-        Some(ToolVersionCacheEntry::Pending) => ToolVersionDiscoveryRequest::Pending,
+        Some(ToolVersionCacheEntry::Pending { started_at, .. })
+            if now.duration_since(*started_at) <= DISCOVERY_LEASE =>
+        {
+            (ToolVersionDiscoveryRequest::Pending, 0)
+        }
         Some(ToolVersionCacheEntry::Ready { completed_at, .. })
             if now.duration_since(*completed_at) <= TOOL_VERSION_TTL =>
         {
-            ToolVersionDiscoveryRequest::UseCached
+            (ToolVersionDiscoveryRequest::UseCached, 0)
+        }
+        Some(ToolVersionCacheEntry::Failed { completed_at, .. })
+            if now.duration_since(*completed_at) <= DISCOVERY_RETRY =>
+        {
+            (ToolVersionDiscoveryRequest::UseCached, 0)
         }
         _ => {
-            cache.entries.insert(key, ToolVersionCacheEntry::Pending);
-            ToolVersionDiscoveryRequest::Start
+            let generation = next_discovery_generation();
+            cache.entries.insert(
+                key,
+                ToolVersionCacheEntry::Pending {
+                    generation,
+                    started_at: now,
+                },
+            );
+            (ToolVersionDiscoveryRequest::Start, generation)
         }
     }
 }
 
-pub(super) fn complete_tool_version_chip(target: &DiscoveryTarget, chip: Option<String>) {
-    tool_version_cache()
+pub(super) fn complete_tool_version_chip(
+    target: &DiscoveryTarget,
+    generation: u64,
+    result: Result<Option<String>, DiscoveryFailure>,
+) {
+    let key = tool_version_cache_key(target);
+    let mut cache = tool_version_cache()
         .lock()
-        .expect("tool version cache lock should not be poisoned")
-        .entries
-        .insert(
-            tool_version_cache_key(target),
-            ToolVersionCacheEntry::Ready {
-                chip,
-                completed_at: Instant::now(),
-            },
-        );
+        .expect("tool version cache lock should not be poisoned");
+    if !matches!(cache.entries.get(&key), Some(ToolVersionCacheEntry::Pending { generation: current, .. }) if *current == generation)
+    {
+        return;
+    }
+    let completed_at = Instant::now();
+    let entry = match result {
+        Ok(chip) => ToolVersionCacheEntry::Ready { chip, completed_at },
+        Err(reason) => ToolVersionCacheEntry::Failed {
+            reason,
+            completed_at,
+        },
+    };
+    cache.entries.insert(key, entry);
 }
 
-pub(super) fn spawn_tool_version_worker(target: DiscoveryTarget) {
+pub(super) fn spawn_tool_version_worker(target: DiscoveryTarget, generation: u64) {
     std::thread::spawn(move || {
-        let chip = discover_tool_version_chip(&target);
-        complete_tool_version_chip(&target, chip);
+        let result = discover_tool_version_chip(&target);
+        complete_tool_version_chip(&target, generation, result);
     });
 }
 
-/// Non-blocking sidebar/API entry point: returns the cached chip if fresh,
-/// otherwise kicks a background worker and returns `None`. The chip surfaces
-/// on the next sidebar refresh after the worker completes (typically <1s).
-/// Keeping this off the GTK main thread is the whole point.
+/// Non-blocking sidebar/API entry point. A failed probe displays a safe reason
+/// during the retry cooldown; the next request can start a new generation.
 pub(crate) fn tool_version_chip_text_for_target(target: &DiscoveryTarget) -> Option<String> {
     if let Some(chip) = cached_tool_version_chip(target) {
         return chip;
     }
-
-    if matches!(
-        prepare_tool_version_discovery(target),
-        ToolVersionDiscoveryRequest::Start
-    ) {
-        spawn_tool_version_worker(target.clone());
+    if let (ToolVersionDiscoveryRequest::Start, generation) = prepare_tool_version_discovery(target)
+    {
+        spawn_tool_version_worker(target.clone(), generation);
     }
     None
 }
 
-pub(super) fn discover_tool_version_chip(target: &DiscoveryTarget) -> Option<String> {
+pub(super) fn discover_tool_version_chip(
+    target: &DiscoveryTarget,
+) -> Result<Option<String>, DiscoveryFailure> {
     if let DiscoveryTarget::Local { cwd, .. } = target {
         if !has_mise_config(Path::new(cwd)) {
-            return None;
+            return Ok(None);
         }
     }
-
-    let tool_versions = discover_tool_versions_for_target(target);
-    format_tool_version_chip(&tool_versions)
+    Ok(format_tool_version_chip(
+        &discover_tool_versions_for_target(target)?,
+    ))
 }
 
 pub(super) fn format_tool_version_chip(tool_versions: &[ToolVersionEntry]) -> Option<String> {
@@ -162,10 +201,12 @@ pub(super) fn tool_version_priority(tool: &str) -> usize {
     }
 }
 
-pub(super) fn discover_tool_versions_for_target(target: &DiscoveryTarget) -> Vec<ToolVersionEntry> {
+pub(super) fn discover_tool_versions_for_target(
+    target: &DiscoveryTarget,
+) -> Result<Vec<ToolVersionEntry>, DiscoveryFailure> {
     #[cfg(test)]
     if let Some(tool_versions) = run_tool_version_test_probe() {
-        return filter_tool_versions_for_target(tool_versions, target);
+        return Ok(filter_tool_versions_for_target(tool_versions, target));
     }
 
     let tool_versions = match target {
@@ -177,7 +218,7 @@ pub(super) fn discover_tool_versions_for_target(target: &DiscoveryTarget) -> Vec
                     "cwd": cwd,
                 }),
             ) else {
-                return Vec::new();
+                return Ok(Vec::new());
             };
 
             discover_tool_versions_with_binary(cwd, &binary_path)
@@ -189,71 +230,44 @@ pub(super) fn discover_tool_versions_for_target(target: &DiscoveryTarget) -> Vec
         } => discover_remote_tool_versions(host, cwd, ssh_argv),
     };
 
-    filter_tool_versions_for_target(tool_versions, target)
+    Ok(filter_tool_versions_for_target(tool_versions?, target))
 }
 
 pub(super) fn discover_tool_versions_with_binary(
     cwd: &str,
     mise_bin: &Path,
-) -> Vec<ToolVersionEntry> {
-    let commands = [
+) -> Result<Vec<ToolVersionEntry>, DiscoveryFailure> {
+    // Both compatibility attempts share one wall budget.
+    let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+    let mut last_failure = DiscoveryFailure::Exit;
+    for args in [
         ["current", "--json"].as_slice(),
         ["ls", "--current", "--json"].as_slice(),
-    ];
-    let mut last_failure = None;
-
-    for args in commands {
-        let output = crate::child_process::command(mise_bin)
-            .args(args)
-            .current_dir(cwd)
-            .output();
-        match output {
-            Ok(out) if out.status.success() => return parse_tool_versions_json(&out.stdout),
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                last_failure = Some(serde_json::json!({
-                    "cwd": cwd,
-                    "mise_bin": mise_bin,
-                    "status": out.status.to_string(),
-                    "stderr": stderr.trim(),
-                    "args": args,
-                }));
-            }
-            Err(err) => {
-                last_failure = Some(serde_json::json!({
-                    "cwd": cwd,
-                    "mise_bin": mise_bin,
-                    "error": err.to_string(),
-                    "args": args,
-                }));
-            }
+    ] {
+        let mut command = crate::child_process::command(mise_bin);
+        command.args(args).current_dir(cwd);
+        match run_discovery_command(command, deadline.saturating_duration_since(Instant::now())) {
+            Ok(output) => return parse_tool_versions_result(&output),
+            Err(DiscoveryFailure::Exit) => last_failure = DiscoveryFailure::Exit,
+            Err(reason) => return Err(reason),
         }
     }
-
-    crate::diagnostics::record_command_failure(
-        "mise",
-        "current",
-        format!("mise failed to resolve current tool versions in {cwd}"),
-        last_failure,
-    );
-    Vec::new()
+    Err(last_failure)
 }
 
-pub(super) fn parse_tool_versions_json(bytes: &[u8]) -> Vec<ToolVersionEntry> {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return Vec::new();
-    };
-
+fn parse_tool_versions_result(output: &str) -> Result<Vec<ToolVersionEntry>, DiscoveryFailure> {
+    let value: serde_json::Value =
+        serde_json::from_str(output).map_err(|_| DiscoveryFailure::InvalidJson)?;
     match value {
-        serde_json::Value::Object(map) => map
+        serde_json::Value::Object(map) => Ok(map
             .iter()
             .flat_map(|(tool, entries)| parse_tool_version_entries(Some(tool), entries))
-            .collect(),
-        serde_json::Value::Array(entries) => entries
+            .collect()),
+        serde_json::Value::Array(entries) => Ok(entries
             .iter()
             .flat_map(|entry| parse_tool_version_entries(None, entry))
-            .collect(),
-        _ => Vec::new(),
+            .collect()),
+        _ => Err(DiscoveryFailure::InvalidJson),
     }
 }
 
@@ -363,62 +377,17 @@ cd {} && (\"$MISE_BIN\" current --json 2>/dev/null || \"$MISE_BIN\" ls --current
 }
 
 pub(super) fn discover_remote_tool_versions(
-    host: &str,
+    _host: &str,
     cwd: &str,
     ssh_argv: &[String],
-) -> Vec<ToolVersionEntry> {
+) -> Result<Vec<ToolVersionEntry>, DiscoveryFailure> {
     let remote_command = remote_mise_current_command(cwd);
-    let Some(argv) =
+    let argv =
         ssh_command_with_remote_exec(ssh_argv, remote_command, false, &["-o", "BatchMode=yes"])
-    else {
-        crate::diagnostics::record_command_failure(
-            "mise",
-            "remote-current",
-            format!("remote mise unsupported for {host}:{cwd}"),
-            Some(serde_json::json!({
-                "host": host,
-                "cwd": cwd,
-            })),
-        );
-        return Vec::new();
-    };
-
-    let output = crate::child_process::command(&argv[0])
-        .args(&argv[1..])
-        .output();
-    match output {
-        Ok(out) if out.status.success() => parse_tool_versions_json(&out.stdout),
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            crate::diagnostics::record_command_failure(
-                "mise",
-                "remote-current",
-                format!("remote mise failed in {host}:{cwd}"),
-                Some(serde_json::json!({
-                    "host": host,
-                    "cwd": cwd,
-                    "status": out.status.to_string(),
-                    "stderr": stderr.trim(),
-                    "argv": argv,
-                })),
-            );
-            Vec::new()
-        }
-        Err(err) => {
-            crate::diagnostics::record_command_failure(
-                "mise",
-                "remote-current",
-                format!("remote mise failed to run for {host}:{cwd}"),
-                Some(serde_json::json!({
-                    "host": host,
-                    "cwd": cwd,
-                    "argv": argv,
-                    "error": err.to_string(),
-                })),
-            );
-            Vec::new()
-        }
-    }
+            .ok_or(DiscoveryFailure::Unavailable)?;
+    let mut command = crate::child_process::command(&argv[0]);
+    command.args(&argv[1..]);
+    parse_tool_versions_result(&run_discovery_command(command, DISCOVERY_TIMEOUT)?)
 }
 
 #[cfg(test)]
