@@ -1125,141 +1125,19 @@ pub(super) fn run_tmux_command_sync_result_with_behavior(
     argv: &[String],
     failure_behavior: TmuxCommandFailureBehavior,
 ) -> Result<String, String> {
-    if argv.is_empty() {
-        if failure_behavior != TmuxCommandFailureBehavior::Silent {
-            crate::diagnostics::record_command_failure(
-                "terminal",
-                "tmux-command",
-                "refused to run an empty tmux command argv",
-                None,
-            );
-        }
-        return Err("command argv was empty".to_string());
+    let outcome = crate::tmux_process::run(argv, Duration::from_secs(10));
+    if failure_behavior == TmuxCommandFailureBehavior::DashboardListSessions
+        && outcome.error.is_none()
+        && outcome.status.is_some_and(|status| !status.success())
+        && tmux_reports_no_server(outcome.stderr.trim())
+    {
+        return Ok(String::new());
     }
-    let mut command = crate::child_process::command(&argv[0]);
-    command
-        .args(&argv[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    // Reaped by the try_wait() loop below, including the kill-on-timeout path.
-    #[allow(clippy::disallowed_methods)]
-    let spawned = command.spawn();
-    let mut child = spawned.map_err(|err| {
-        if failure_behavior != TmuxCommandFailureBehavior::Silent {
-            crate::diagnostics::record_command_failure(
-                "terminal",
-                "tmux-command",
-                format!("failed to spawn tmux-related command {}", argv[0]),
-                Some(serde_json::json!({
-                    "argv": argv,
-                    "error": err.to_string(),
-                })),
-            );
-        }
-        format!("failed to spawn command: {err}")
-    })?;
-
-    // Drain stdout/stderr on dedicated threads so a command that writes more than
-    // the OS pipe buffer (~64KB) — e.g. a large remote `.plan/tasks.json` fetched
-    // over SSH — cannot block on a full pipe and deadlock against the wait loop.
-    let stdout_reader = child.stdout.take().map(spawn_pipe_reader);
-    let stderr_reader = child.stderr.take().map(spawn_pipe_reader);
-    let join_reader = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| {
-        reader
-            .and_then(|handle| handle.join().ok())
-            .unwrap_or_default()
-    };
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        match child.try_wait().map_err(|err| {
-            if failure_behavior != TmuxCommandFailureBehavior::Silent {
-                crate::diagnostics::record_command_failure(
-                    "terminal",
-                    "tmux-command",
-                    format!("failed while waiting for tmux-related command {}", argv[0]),
-                    Some(serde_json::json!({
-                        "argv": argv,
-                        "error": err.to_string(),
-                    })),
-                );
-            }
-            format!("failed to wait for command: {err}")
-        })? {
-            Some(status) => break status,
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                // Killing the child closes the pipes, so the readers finish.
-                let _ = join_reader(stdout_reader);
-                let _ = join_reader(stderr_reader);
-                if failure_behavior != TmuxCommandFailureBehavior::Silent {
-                    crate::diagnostics::record_command_failure(
-                        "terminal",
-                        "tmux-command",
-                        format!("tmux-related command {} timed out", argv[0]),
-                        Some(serde_json::json!({
-                            "argv": argv,
-                            "timeout_secs": 10,
-                        })),
-                    );
-                }
-                return Err("command timed out after 10s".to_string());
-            }
-            None => std::thread::sleep(Duration::from_millis(25)),
-        }
-    };
-
-    let stdout_bytes = join_reader(stdout_reader);
-    let stderr_bytes = join_reader(stderr_reader);
-    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
-    let trimmed_stderr = stderr.trim();
-    if !status.success() {
-        if matches!(
-            failure_behavior,
-            TmuxCommandFailureBehavior::DashboardListSessions
-        ) && tmux_reports_no_server(trimmed_stderr)
-        {
-            return Ok(String::new());
-        }
-
-        let error = if trimmed_stderr.is_empty() {
-            format!("command exited with status {status}")
-        } else {
-            format!("command exited with status {status}: {trimmed_stderr}")
-        };
-        if failure_behavior != TmuxCommandFailureBehavior::Silent {
-            crate::diagnostics::record_command_failure(
-                "terminal",
-                "tmux-command",
-                format!("tmux-related command {} exited unsuccessfully", argv[0]),
-                Some(serde_json::json!({
-                    "argv": argv,
-                    "status": status.to_string(),
-                    "stderr": if trimmed_stderr.is_empty() {
-                        None::<String>
-                    } else {
-                        Some(trimmed_stderr.to_string())
-                    },
-                })),
-            );
-        }
-        return Err(error);
-    }
-    Ok(stdout)
-}
-
-/// Spawn a thread that drains a child pipe to a byte buffer until EOF.
-fn spawn_pipe_reader(
-    mut pipe: impl std::io::Read + Send + 'static,
-) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
-        buf
-    })
+    crate::tmux_process::result(
+        outcome,
+        argv,
+        (failure_behavior != TmuxCommandFailureBehavior::Silent).then_some("terminal"),
+    )
 }
 
 pub(crate) struct DashboardPollOutcome<'a> {
@@ -1842,6 +1720,26 @@ pub(super) fn build_restored_pane_tree(
 
 #[cfg(test)]
 mod sync_command_tests {
+    #[test]
+    fn no_server_is_empty_only_for_dashboard_lists() {
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf 'no server running on /tmp/tmux-test' >&2; exit 1".into(),
+        ];
+        assert_eq!(
+            super::run_tmux_list_sessions_command_sync_result(&argv).unwrap(),
+            ""
+        );
+        assert!(
+            super::run_tmux_command_sync_result_without_diagnostics(&argv)
+                .unwrap_err()
+                .contains("no server")
+        );
+        assert!(super::run_tmux_command_sync_result(&argv)
+            .unwrap_err()
+            .contains("no server"));
+    }
     use super::{
         remote_tmux_location, run_tmux_command_sync_result, tmux_matches_expected_generation,
     };

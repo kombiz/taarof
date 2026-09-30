@@ -196,9 +196,7 @@ fn template_schema_version() -> u32 {
 }
 
 fn templates_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("taarof/templates.json")
+    crate::config::user_config_dir().join("taarof/templates.json")
 }
 
 fn cached_store(path: &Path) -> io::Result<TemplateStore> {

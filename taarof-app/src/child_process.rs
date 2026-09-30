@@ -79,12 +79,24 @@ impl Reaped {
 pub(crate) fn spawn_and_reap(command: &mut Command) -> io::Result<Reaped> {
     // The one blessed spawn: the reaper thread below owns the wait().
     #[allow(clippy::disallowed_methods)]
-    let mut child = command.spawn()?;
+    let child = command.spawn()?;
+    Ok(reap(child))
+}
+
+/// Transfer an already spawned child to the same nonblocking reaping seam.
+pub(crate) fn reap(mut child: std::process::Child) -> Reaped {
     let pid = child.id();
     let reaper = std::thread::spawn(move || {
-        let _ = child.wait();
+        if let Err(error) = child.wait() {
+            crate::diagnostics::record_command_failure(
+                "process",
+                "reap",
+                format!("failed to reap child {pid}: {error}"),
+                None,
+            );
+        }
     });
-    Ok(Reaped { pid, reaper })
+    Reaped { pid, reaper }
 }
 
 #[cfg(test)]
