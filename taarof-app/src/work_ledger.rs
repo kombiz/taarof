@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::DirBuilderExt;
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -2310,24 +2312,19 @@ fn storage_path_for(root: &Path, session: Option<&str>) -> PathBuf {
 }
 
 fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
+    write_atomically_with(path, |file| file.write_all(content.as_bytes()))
+}
+
+fn write_atomically_with(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true).mode(0o700);
         builder.create(parent)?;
     }
-    let tmp = path.with_extension("json.tmp");
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    // `mode` only affects creation. A crash-left temp file may already exist
-    // with broader permissions, so tighten it before any sensitive JSON write.
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    file.write_all(content.as_bytes())?;
-    file.sync_all()?;
-    fs::rename(tmp, path)
+    crate::private_atomic_file::replace_with(path, write)
 }
 
 #[derive(Clone)]
@@ -4964,6 +4961,75 @@ mod tests {
     }
 
     #[test]
+    fn competing_ledger_writers_use_distinct_private_temporaries() {
+        let root = temp_path("competing-writers").with_extension("dir");
+        let path = root.join("ledger.json");
+        write_atomically(&path, r#"{"writer":0}"#).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let mut writers = Vec::new();
+        for writer in 1..=2 {
+            let path = path.clone();
+            let ready = ready_tx.clone();
+            let (release_tx, release_rx) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                write_atomically_with(&path, |file| {
+                    file.write_all(format!(r#"{{"writer":{writer},"payload":""#).as_bytes())?;
+                    ready.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    file.write_all(b"complete\"}")
+                })
+            });
+            writers.push((release_tx, handle));
+        }
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // Both writers have incomplete content open simultaneously. Neither
+        // may alter the visible destination or share the other's temporary.
+        let before = fs::read_to_string(&path).unwrap();
+        let temporaries: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &path)
+            .collect();
+        let modes: Vec<_> = temporaries
+            .iter()
+            .map(|entry| fs::metadata(entry).unwrap().permissions().mode() & 0o777)
+            .collect();
+        let partials: Vec<_> = temporaries
+            .iter()
+            .map(|entry| fs::read_to_string(entry).unwrap())
+            .collect();
+        let mut published = Vec::new();
+        for (release, handle) in writers {
+            release.send(()).unwrap();
+            handle.join().unwrap().unwrap();
+            published.push(fs::read_to_string(&path).unwrap());
+        }
+        assert_eq!(before, r#"{"writer":0}"#);
+        assert_eq!(temporaries.len(), 2);
+        assert_ne!(temporaries[0], temporaries[1]);
+        assert_eq!(modes, vec![0o600, 0o600]);
+        for writer in 1..=2 {
+            assert!(partials.contains(&format!(r#"{{"writer":{writer},"payload":""#)));
+            let value: serde_json::Value = serde_json::from_str(&published[writer - 1]).unwrap();
+            assert_eq!(value["writer"], writer);
+            assert_eq!(value["payload"], "complete");
+        }
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn writer_preserves_fifo_order_and_private_permissions_even_with_stale_temp() {
         let root = temp_path("permissions-root").with_extension("dir");
         let path = root.join("ledger.json");
@@ -4981,6 +5047,8 @@ mod tests {
         }
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        assert_eq!(fs::read_to_string(&tmp).unwrap(), "stale");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
         let saved: PersistedLedger =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(

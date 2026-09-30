@@ -4,14 +4,12 @@ on:
   pull_request:
   push:
     branches:
-      - main
       - kmux
 
-# Pull requests cancel a superseded head; pushes to main and kmux queue and are
-# never cancelled.
+# CI results for an older commit are obsolete once a newer commit arrives.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 # Fork pull requests only need to read this repository. Keep the default token
 # deliberately narrow for every CI job.
@@ -70,8 +68,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: taarof-web/package-lock.json
 
       - name: Audit frontend dependencies
         run: npm audit --package-lock-only

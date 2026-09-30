@@ -56,6 +56,42 @@ pub(crate) use self::registry::refresh_registry_identity;
 use self::runtime_dir::{runtime_dir_resolution, socket_path_in, validate_socket_path_length};
 
 const SOCKET_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const SOCKET_MAX_CONNECTIONS: usize = 32;
+const SOCKET_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+// The permit owns a connection slot until its worker has finished every phase,
+// including response delivery. Unwinding and thread-spawn failures release it.
+struct SocketConnectionPermit(Arc<Mutex<usize>>);
+
+impl SocketConnectionPermit {
+    fn acquire(active: &Arc<Mutex<usize>>, limit: usize) -> Option<Self> {
+        let mut count = active.lock().unwrap_or_else(|error| error.into_inner());
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(Self(active.clone()))
+    }
+}
+
+impl Drop for SocketConnectionPermit {
+    fn drop(&mut self) {
+        let mut count = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        *count -= 1;
+    }
+}
+
+fn spawn_socket_connection_worker(
+    permit: SocketConnectionPermit,
+    handler: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("socket-connection".into())
+        .spawn(move || {
+            let _permit = permit;
+            handler();
+        })
+}
 const SPLIT_IDEMPOTENCY_MAX_KEY_BYTES: usize = 128;
 const SPLIT_IDEMPOTENCY_MAX_RECORDS: usize = 256;
 const SPLIT_IDEMPOTENCY_TTL: Duration = Duration::from_secs(10 * 60);
@@ -1972,12 +2008,21 @@ fn spawn_socket_listener_thread(
     const SOCKET_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
     std::thread::spawn(move || {
+        let active_connections = Arc::new(Mutex::new(0));
         for stream in listener.incoming() {
             match stream {
                 Ok(conn) => {
+                    let Some(permit) = SocketConnectionPermit::acquire(
+                        &active_connections,
+                        SOCKET_MAX_CONNECTIONS,
+                    ) else {
+                        // No request was admitted; close without starting a worker.
+                        drop(conn);
+                        continue;
+                    };
                     let tx = tx.clone();
                     let history_reader = history_reader.clone();
-                    std::thread::spawn(move || {
+                    if let Err(error) = spawn_socket_connection_worker(permit, move || {
                         handle_socket_connection(
                             conn,
                             tx,
@@ -1985,7 +2030,9 @@ fn spawn_socket_listener_thread(
                             SOCKET_READ_TIMEOUT,
                             SOCKET_RESPONSE_TIMEOUT,
                         );
-                    });
+                    }) {
+                        eprintln!("taarof: socket worker spawn error: {error}");
+                    }
                 }
                 Err(error) => {
                     eprintln!("taarof: socket accept error: {error}");
@@ -4676,10 +4723,63 @@ fn write_json_response(
     conn: &mut std::os::unix::net::UnixStream,
     response: SocketResponse,
 ) -> std::io::Result<()> {
-    let payload = serde_json::to_vec(&response)
+    write_json_response_with_timeout(conn, response, SOCKET_DELIVERY_TIMEOUT)
+}
+
+fn write_json_response_with_timeout(
+    conn: &mut std::os::unix::net::UnixStream,
+    response: SocketResponse,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let started = Instant::now();
+    let mut payload = serde_json::to_vec(&response)
         .unwrap_or_else(|_| br#"{"ok":false,"error":"failed to serialize response"}"#.to_vec());
-    conn.write_all(&payload)?;
-    conn.write_all(b"\n")
+    payload.push(b'\n');
+    // A blocking send can keep making progress inside one syscall while the
+    // peer trickles reads. Poll nonblocking sends against one absolute budget.
+    conn.set_nonblocking(true)?;
+    let mut pending = payload.as_slice();
+    while !pending.is_empty() {
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "socket response delivery deadline exceeded",
+                )
+            })?;
+        match conn.write(pending) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(written) => pending = &pending[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut descriptor = libc::pollfd {
+                    fd: conn.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let wait_ms = remaining
+                    .as_millis()
+                    .saturating_add(1)
+                    .min(i32::MAX as u128) as i32;
+                // SAFETY: descriptor is a valid pollfd for the owned stream;
+                // poll only borrows it for this bounded wait.
+                if unsafe { libc::poll(&mut descriptor, 1, wait_ms) } < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    // Delivery failure only ends transport ownership. It never cancels a
+    // queued/applied mutation or establishes that retrying it is safe.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5127,6 +5227,146 @@ mod tests {
 
         cleanup_socket(&socket_path);
         let _ = std::fs::remove_dir_all(runtime_dir);
+    }
+
+    fn small_socket_send_buffer(stream: &UnixStream) {
+        use std::os::fd::AsRawFd;
+        let bytes: libc::c_int = 4096;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    std::ptr::from_ref(&bytes).cast(),
+                    std::mem::size_of_val(&bytes) as libc::socklen_t,
+                )
+            },
+            0
+        );
+    }
+
+    #[test]
+    fn socket_response_delivery_total_deadline_survives_trickle_reads() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        small_socket_send_buffer(&server);
+        client.set_nonblocking(true).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = super::write_json_response_with_timeout(
+                &mut server,
+                SocketResponse::ok_with_data(serde_json::json!({"text": "x".repeat(1024 * 1024)})),
+                Duration::from_millis(150),
+            );
+            done_tx.send(result).unwrap();
+        });
+        let started = Instant::now();
+        let mut read = 0;
+        let result = loop {
+            match done_rx.try_recv() {
+                Ok(result) => break result,
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(error) => panic!("worker disappeared: {error}"),
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+            let mut bytes = [0; 1024];
+            match client.read(&mut bytes) {
+                Ok(count) => read += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("trickle read failed: {error}"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(read > 0, "client must make partial progress");
+        assert!(matches!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn socket_connection_stalled_mutation_delivery_terminates_without_cancellation() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        small_socket_send_buffer(&server);
+        let active = Arc::new(Mutex::new(0));
+        let permit = super::SocketConnectionPermit::acquire(&active, 1).unwrap();
+        let (tx, mut rx) = tokio_mpsc::channel(1);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = super::spawn_socket_connection_worker(permit, move || {
+            handle_socket_connection(
+                server,
+                tx,
+                crate::history::HistoryReader::disabled(),
+                Duration::from_secs(1),
+                Duration::from_millis(20),
+            );
+            done_tx.send(()).unwrap();
+        })
+        .unwrap();
+        client
+            .write_all(br#"{"action":"agent-workspace","branch":"feature/test"}"#)
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let (message, response_tx) = rx.blocking_recv().unwrap();
+        assert!(matches!(message, SocketMessage::AgentWorkspace { .. }));
+        // Completion is deliberately later than the read-only response budget.
+        std::thread::sleep(Duration::from_millis(75));
+        response_tx
+            .send(SocketResponse::ok_with_data(
+                serde_json::json!({"text": "x".repeat(1024 * 1024)}),
+            ))
+            .unwrap();
+        assert_eq!(*active.lock().unwrap(), 1);
+        assert!(super::SocketConnectionPermit::acquire(&active, 1).is_none());
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stalled delivery must terminate");
+        worker.join().unwrap();
+        assert_eq!(*active.lock().unwrap(), 0);
+        assert!(super::SocketConnectionPermit::acquire(&active, 1).is_some());
+    }
+
+    #[test]
+    fn socket_connection_permits_bound_workers_and_recover_on_exit_and_panic() {
+        let active = Arc::new(Mutex::new(0));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let mut workers = Vec::new();
+        let mut releases = Vec::new();
+        for _ in 0..3 {
+            let permit = super::SocketConnectionPermit::acquire(&active, 3).unwrap();
+            let ready_tx = ready_tx.clone();
+            let (release_tx, release_rx) = mpsc::channel();
+            workers.push(
+                super::spawn_socket_connection_worker(permit, move || {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap(),
+            );
+            releases.push(release_tx);
+        }
+        for _ in 0..3 {
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        assert_eq!(*active.lock().unwrap(), 3);
+        assert!(super::SocketConnectionPermit::acquire(&active, 3).is_none());
+        releases.remove(0).send(()).unwrap();
+        workers.remove(0).join().unwrap();
+        assert_eq!(*active.lock().unwrap(), 2);
+        let permit = super::SocketConnectionPermit::acquire(&active, 3).unwrap();
+        let panicking =
+            super::spawn_socket_connection_worker(permit, || panic!("test connection failure"))
+                .unwrap();
+        assert!(panicking.join().is_err());
+        assert_eq!(*active.lock().unwrap(), 2);
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(*active.lock().unwrap(), 0);
     }
 
     #[test]
