@@ -7,6 +7,7 @@ import {
   useEffect,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
 import {
@@ -19,6 +20,8 @@ import {
 } from "./api";
 import { resolveInitialAuth, signOut, submitToken, type AuthStateTarget } from "./authSession";
 import { loadMonitorSnapshot, runtimeIdentityNamespace, type MonitorSnapshot } from "./monitorIdentity";
+import { MonitorPersistence, monitorViewIdentity } from "./monitorPersistence";
+import { optionalLocalStorage } from "./browserStorage";
 import { AgentsView } from "./components/AgentsView";
 import { selectPane, selectStage, selectTab, viewModeFromHash } from "./components/PaneStage.helpers";
 import { Sidebar } from "./components/Sidebar";
@@ -157,7 +160,9 @@ export function App() {
   const [isTokenPersisted, setIsTokenPersisted] = useState(initialAuth?.persisted ?? true);
   const [tokenError, setTokenError] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<TaarofStateSnapshot | null>(null);
-  const [monitorSnapshot, setMonitorSnapshot] = useState<MonitorSnapshot | null>(null);
+  const [monitorPersistence] = useState(() => new MonitorPersistence(optionalLocalStorage()));
+  const monitorState = useSyncExternalStore(monitorPersistence.subscribe, monitorPersistence.getSnapshot);
+  useEffect(() => () => monitorPersistence.reset(), [monitorPersistence]);
   const [agentSessions, setAgentSessions] = useState<AgentSessionsSnapshot | null>(null);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<number | null>(null);
   const [selectedTabId, setSelectedTabId] = useState<number | null>(null);
@@ -181,21 +186,18 @@ export function App() {
   const stateRefreshRef = useRef<DatasetRefreshScheduler | null>(null);
   const agentSessionsRefreshRef = useRef<DatasetRefreshScheduler | null>(null);
   const eventRecoveryRef = useRef<EventRecoveryController | null>(null);
-  const monitorSnapshotRef = useRef<MonitorSnapshot | null>(null);
   const monitorRequestGenerationRef = useRef(0);
 
   function publishMonitorSnapshot(next: MonitorSnapshot | null) {
-    monitorSnapshotRef.current = next;
-    setMonitorSnapshot(next);
+    if (next) monitorPersistence.verify(next);
+    else monitorPersistence.suspend();
   }
 
   function checkMonitorIdentity(namespace: string | null) {
-    if (namespace === null || monitorSnapshotRef.current?.namespace !== namespace) {
-      publishMonitorSnapshot(null);
-    }
+    monitorPersistence.observeIdentity(namespace);
   }
 
-  const verifiedMonitorSnapshot = monitorSnapshot?.snapshot === snapshot ? monitorSnapshot : null;
+  const monitorIdentity = monitorViewIdentity(monitorState, snapshot);
 
   const selectedStage = selectStage(snapshot, {
     workspaceId: selectedWorkspaceId,
@@ -218,15 +220,17 @@ export function App() {
 
   const authTarget: AuthStateTarget = {
     stopConnections() {
-      eventRecoveryRef.current?.stop();
-      eventRecoveryRef.current = null;
-      advanceRefreshGeneration();
+      monitorPersistence.stopConnections(() => {
+        eventRecoveryRef.current?.stop();
+        eventRecoveryRef.current = null;
+        advanceRefreshGeneration();
+      });
     },
     setToken,
     setTokenPersisted: setIsTokenPersisted,
     setTokenError,
     clearAuthenticatedState() {
-      publishMonitorSnapshot(null);
+      monitorPersistence.reset();
       setSnapshot(null);
       setAgentSessions(null);
       setIsLoading(false);
@@ -468,7 +472,7 @@ export function App() {
       },
       onStatus: (status) => {
         if (!disposed) {
-          if (status.connection === "disconnected") publishMonitorSnapshot(null);
+          monitorPersistence.observeConnection(status.connection);
           setEventStatus(status);
         }
       },
@@ -819,9 +823,11 @@ export function App() {
           >
             <Suspense fallback={<MonitorViewLoadingFallback />}>
               <LazyMonitorView
-                key={verifiedMonitorSnapshot?.namespace ?? `unverified-${paneRefreshGeneration}`}
-                runtimeId={verifiedMonitorSnapshot?.runtimeId ?? null}
-                namespace={verifiedMonitorSnapshot?.namespace ?? null}
+                key={monitorIdentity.key}
+                runtimeId={monitorIdentity.runtimeId}
+                namespace={monitorIdentity.namespace}
+                persistence={monitorPersistence}
+                persistenceState={monitorState}
                 isLoading={isLoading}
                 onSelectLiveTarget={handleSelectLiveTarget}
                 snapshot={snapshot}

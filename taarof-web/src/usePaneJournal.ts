@@ -13,6 +13,7 @@ import {
 
 export interface PaneJournalFrame extends PaneObservationInput {
   sequence: number;
+  attributionGeneration?: number;
 }
 
 export interface PaneJournalScheduler {
@@ -33,6 +34,8 @@ export interface PaneJournalFlushOptions {
 }
 
 export interface PaneJournalController {
+  setEnabled(enabled: boolean): void;
+  currentJournal(): PaneJournal | null;
   updateIdentity(identity: PaneIdentity): void;
   observe(frame: PaneObservationInput): void;
   flush(options?: PaneJournalFlushOptions): PaneJournal | null;
@@ -42,7 +45,28 @@ export interface PaneJournalController {
 
 export interface UsePaneJournalOptions {
   throttleMs?: number;
+  controllerOwner?: PaneJournalOwner;
+  generation?: number;
 }
+
+export interface PaneJournalLease {
+  updateIdentity(identity: PaneIdentity): void;
+  observe(frame: PaneObservationInput): void;
+  currentJournal(): PaneJournal | null;
+  release(): void;
+}
+
+export interface PaneJournalOwner {
+  acquire(identity: PaneIdentity, onJournal: (journal: PaneJournal) => void): PaneJournalLease | null;
+}
+
+// Quarantined observations were already attributed while verified. Compact
+// them in memory without touching browser storage while proof is unavailable.
+const suspendedStorage: PaneJournalStorage = {
+  getItem: () => null,
+  setItem: () => { throw new Error("journal persistence is suspended"); },
+  removeItem: () => {},
+};
 
 const DEFAULT_PANE_JOURNAL_THROTTLE_MS = 250;
 
@@ -74,6 +98,8 @@ export function createPaneJournalController({
 }: PaneJournalControllerOptions): PaneJournalController {
   if (identity === null) {
     return {
+      setEnabled: () => {},
+      currentJournal: () => null,
       updateIdentity: () => {},
       observe: () => {},
       flush: () => null,
@@ -85,8 +111,9 @@ export function createPaneJournalController({
   let paneIdentity = identity;
   const pending: PaneObservationInput[] = [];
   let timer: unknown = null;
-  let journal: PaneJournal | null = null;
+  let journal: PaneJournal | null = loadPaneJournal(storage, paneIdentity.paneKey);
   let cancelled = false;
+  let enabled = true;
 
   function clearTimer() {
     if (timer !== null) {
@@ -106,7 +133,7 @@ export function createPaneJournalController({
   }
 
   function observe(frame: PaneObservationInput) {
-    if (cancelled) return;
+    if (cancelled || !enabled) return;
     const previous = pending[pending.length - 1];
     if (!previous || !isConsecutiveDuplicate(previous, frame)) {
       pending.push(frame);
@@ -117,11 +144,12 @@ export function createPaneJournalController({
   function flush(options: PaneJournalFlushOptions = {}): PaneJournal | null {
     if (cancelled) return journal;
     const { notify = true } = options;
+    const persistence = enabled ? storage : suspendedStorage;
     clearTimer();
     if (pending.length === 0) {
       if (journal) {
         journal = compactJournal(paneIdentity.paneKey, journal.entries, Date.now());
-        savePaneJournal(storage, journal);
+        savePaneJournal(persistence, journal);
         if (notify) onJournal?.(journal);
       }
       return journal;
@@ -129,7 +157,7 @@ export function createPaneJournalController({
 
     const frames = pending.splice(0, pending.length);
     for (const frame of frames) {
-      journal = appendPaneTextObservation(storage, paneIdentity, frame, journal ?? undefined).journal;
+      journal = appendPaneTextObservation(persistence, paneIdentity, frame, journal ?? undefined).journal;
     }
 
     if (journal && notify) {
@@ -145,6 +173,12 @@ export function createPaneJournalController({
   }
 
   return {
+    setEnabled: (nextEnabled) => {
+      if (cancelled || nextEnabled === enabled) return;
+      enabled = nextEnabled;
+      flush({ notify: nextEnabled });
+    },
+    currentJournal: () => journal,
     updateIdentity: (nextIdentity) => {
       if (nextIdentity.paneKey !== paneIdentity.paneKey) {
         throw new Error("A pane journal controller cannot change pane keys");
@@ -165,12 +199,24 @@ export function usePaneJournal(
   options: UsePaneJournalOptions = {},
 ): PaneJournal {
   const [journal, setJournal] = useState<PaneJournal>(() =>
-    identity ? loadPaneJournal(storage, identity.paneKey) : compactJournal("", [], Date.now()),
+    identity && !options.controllerOwner
+      ? loadPaneJournal(storage, identity.paneKey) : compactJournal("", [], Date.now()),
   );
   const controllerRef = useRef<PaneJournalController | null>(null);
+  const leaseRef = useRef<PaneJournalLease | null>(null);
   const throttleMs = options.throttleMs ?? DEFAULT_PANE_JOURNAL_THROTTLE_MS;
+  const owner = options.controllerOwner;
 
   useEffect(() => {
+    if (owner) {
+      const lease = identity ? owner.acquire(identity, setJournal) : null;
+      leaseRef.current = lease;
+      setJournal(lease?.currentJournal() ?? compactJournal("", [], Date.now()));
+      return () => {
+        lease?.release();
+        if (leaseRef.current === lease) leaseRef.current = null;
+      };
+    }
     const controller = createPaneJournalController({
       storage,
       identity,
@@ -187,15 +233,21 @@ export function usePaneJournal(
         controllerRef.current = null;
       }
     };
-  }, [identity?.paneKey, storage, throttleMs]);
+  }, [identity?.paneKey, storage, throttleMs, owner, options.generation]);
 
   useEffect(() => {
-    if (identity) controllerRef.current?.updateIdentity(identity);
+    if (identity) {
+      controllerRef.current?.updateIdentity(identity);
+      leaseRef.current?.updateIdentity(identity);
+    }
   }, [identity]);
 
   useEffect(() => {
     if (latestFrame) {
       controllerRef.current?.observe(latestFrame);
+      if (latestFrame.attributionGeneration === options.generation) {
+        leaseRef.current?.observe(latestFrame);
+      }
     }
   }, [latestFrame]);
 
