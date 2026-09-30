@@ -168,6 +168,7 @@ fn prepare_discovery_snapshot(
             match crate::mise::cached_task_discovery(target) {
                 crate::mise::CachedTaskDiscovery::Ready(tasks) => tasks,
                 crate::mise::CachedTaskDiscovery::Pending
+                | crate::mise::CachedTaskDiscovery::Failed(_)
                 | crate::mise::CachedTaskDiscovery::Missing => Vec::new(),
             }
         }
@@ -342,7 +343,8 @@ fn ensure_task_discovery_poll(
                 glib::ControlFlow::Break
             }
             crate::mise::CachedTaskDiscovery::Pending => glib::ControlFlow::Continue,
-            crate::mise::CachedTaskDiscovery::Missing => {
+            crate::mise::CachedTaskDiscovery::Missing
+            | crate::mise::CachedTaskDiscovery::Failed(_) => {
                 clear_task_discovery_poll(&tab_list, tab_id);
                 glib::ControlFlow::Break
             }
