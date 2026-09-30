@@ -865,6 +865,7 @@ pub fn discover_tasks(cwd: &str) -> Vec<MiseTask> {
     discover_tasks_for_target(&local_discovery_target(cwd))
 }
 
+#[cfg(test)]
 pub fn discover_tasks_for_target(target: &DiscoveryTarget) -> Vec<MiseTask> {
     try_discover_tasks_for_target(target).unwrap_or_default()
 }
