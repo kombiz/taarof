@@ -214,3 +214,34 @@ test("cancel drops pending frames and a new identity has its own retained journa
   next.observe({ source: "raw", text: "separate", seenAtUnixMs: Date.now() });
   assert(next.flush()?.entries.map((entry) => entry.text).join(",") === "separate", "a replacement controller must not inherit another identity's journal");
 });
+
+test("same-key metadata updates preserve unsaved frames and capture new names on recovery", () => {
+  const storage = new FailingReplacementStorage();
+  const identity = createTestPaneIdentity();
+  const now = Date.now();
+  appendPaneTextObservation(storage, identity, { source: "snapshot", text: "seed", seenAtUnixMs: now });
+  const original = storage.storedJson();
+  const controller = createPaneJournalController({ storage, identity, scheduler: new ManualScheduler() });
+  storage.failWrites = true;
+  controller.observe({ source: "raw", text: "unsaved", seenAtUnixMs: now + 1 });
+  controller.flush();
+  const renamed = buildPaneIdentity({ sessionName: "taarof web", workspaceId: 1, workspaceName: "Renamed workspace", tabId: 2, tabName: "Renamed tab", paneId: 0 });
+  assert(renamed.paneKey === identity.paneKey, "a metadata rename must keep pane identity");
+  controller.updateIdentity(renamed);
+  assert(storage.storedJson() === original, "updating metadata must preserve persisted history");
+  storage.failWrites = false;
+  controller.observe({ source: "raw", text: "later", seenAtUnixMs: now + 2 });
+  controller.flush();
+  const recovered = loadPaneJournal(storage, identity.paneKey, now + 3);
+  assert(recovered.entries.map((entry) => entry.text).join(",") === "seed,unsaved,later", "same-pane rename must retain unsaved frames through recovery");
+  assert(recovered.entries[1].tabNameAtCapture === "Codex", "old observations must retain original metadata");
+  assert(recovered.entries[2].tabNameAtCapture === "Renamed tab" && recovered.entries[2].workspaceNameAtCapture === "Renamed workspace", "new observations must capture updated metadata");
+  let rejected = false;
+  try {
+    controller.updateIdentity({ ...renamed, paneKey: "different-pane" });
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, "a distinct pane key must require a separate controller");
+  assert(controller.flush()?.paneKey === identity.paneKey, "a rejected identity change must leave the retained journal isolated");
+});

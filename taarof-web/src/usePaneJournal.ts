@@ -33,6 +33,7 @@ export interface PaneJournalFlushOptions {
 }
 
 export interface PaneJournalController {
+  updateIdentity(identity: PaneIdentity): void;
   observe(frame: PaneObservationInput): void;
   flush(options?: PaneJournalFlushOptions): PaneJournal | null;
   cancel(): void;
@@ -129,6 +130,12 @@ export function createPaneJournalController({
   }
 
   return {
+    updateIdentity: (nextIdentity) => {
+      if (nextIdentity.paneKey !== identity.paneKey) {
+        throw new Error("A pane journal controller cannot change pane keys");
+      }
+      identity = nextIdentity;
+    },
     observe,
     flush,
     cancel,
@@ -165,7 +172,11 @@ export function usePaneJournal(
         controllerRef.current = null;
       }
     };
-  }, [identity, storage, throttleMs]);
+  }, [identity.paneKey, storage, throttleMs]);
+
+  useEffect(() => {
+    controllerRef.current?.updateIdentity(identity);
+  }, [identity]);
 
   useEffect(() => {
     if (latestFrame) {
