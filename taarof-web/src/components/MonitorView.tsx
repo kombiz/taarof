@@ -3,6 +3,7 @@ import {
   normalizePanePreviewText,
   type PaneAttachPhase,
 } from "../paneAttachFrames";
+import { optionalLocalStorage } from "../browserStorage";
 import {
   buildPaneIdentity,
   formatPaneJournalText,
@@ -111,7 +112,7 @@ function MonitorPaneCard({
       target.workspace.name,
     ],
   );
-  const journal = usePaneJournal(window.localStorage, identity, latestJournalFrame);
+  const journal = usePaneJournal(optionalLocalStorage(), identity, latestJournalFrame);
 
   const queueJournalFrame = useCallback(
     (frame: Omit<PaneJournalFrame, "seenAtUnixMs" | "sequence">) => {
@@ -335,10 +336,10 @@ export function MonitorView({
   const [filter, setFilter] = useState<MonitorFilter>("all");
   const [showWorkHistory, setShowWorkHistory] = useState(false);
   const [orderedKeys, setOrderedKeys] = useState<string[]>(() =>
-    readStoredMonitorOrder(window.localStorage),
+    readStoredMonitorOrder(optionalLocalStorage()),
   );
   const [watchedKeys, setWatchedKeys] = useState<string[]>(() =>
-    readStoredWatchedKeys(window.localStorage),
+    readStoredWatchedKeys(optionalLocalStorage()),
   );
   const work = snapshot?.work;
   const workTruth = work?.truth ?? [];
@@ -354,7 +355,7 @@ export function MonitorView({
   const hasWork = Boolean(work && (workEntries.length > 0 || work.legend.length > 0));
 
   useEffect(() => {
-    pruneExpiredPaneJournals(window.localStorage);
+    pruneExpiredPaneJournals(optionalLocalStorage());
   }, []);
 
   const baseTargets = useMemo(() => buildPaneTargets(snapshot), [snapshot]);
@@ -415,12 +416,12 @@ export function MonitorView({
 
   function commitOrder(nextKeys: string[]) {
     setOrderedKeys(nextKeys);
-    writeStoredMonitorOrder(window.localStorage, nextKeys);
+    writeStoredMonitorOrder(optionalLocalStorage(), nextKeys);
   }
 
   function commitWatchedKeys(nextKeys: string[]) {
     setWatchedKeys(nextKeys);
-    writeStoredWatchedKeys(window.localStorage, nextKeys);
+    writeStoredWatchedKeys(optionalLocalStorage(), nextKeys);
   }
 
   function toggleWatchedTarget(targetKey: string) {
