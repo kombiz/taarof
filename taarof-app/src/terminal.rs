@@ -2120,7 +2120,27 @@ pub(crate) fn is_remote_host(host: Option<&str>) -> bool {
 /// Shorten a path for display: replace $HOME with ~, take last 2 components if long.
 fn shorten_path(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
-    let display = if !home.is_empty() && path.starts_with(&home) {
+    shorten_path_with_home(path, &home)
+}
+
+fn shorten_path_with_home(path: &str, home: &str) -> String {
+    let home = if home == "/" {
+        home
+    } else {
+        home.trim_end_matches('/')
+    };
+    let display = if home == "/" && path.starts_with('/') {
+        if path == "/" {
+            "~".to_string()
+        } else {
+            format!("~{path}")
+        }
+    } else if !home.is_empty()
+        && (path == home
+            || path
+                .strip_prefix(home)
+                .is_some_and(|rest| rest.starts_with('/')))
+    {
         format!("~{}", &path[home.len()..])
     } else {
         path.to_string()
@@ -2136,6 +2156,37 @@ fn shorten_path(path: &str) -> String {
     } else {
         display
     }
+}
+
+#[test]
+fn shorten_path_respects_home_separator_boundary() {
+    assert_eq!(shorten_path_with_home("/home/laddy", "/home/laddy"), "~");
+    assert_eq!(
+        shorten_path_with_home("/home/laddy/code", "/home/laddy"),
+        "~/code"
+    );
+    assert_eq!(
+        shorten_path_with_home("/home/laddyfoo", "/home/laddy"),
+        "/home/laddyfoo"
+    );
+    assert_eq!(
+        shorten_path_with_home("/home/laddy/code", "/home/laddy/"),
+        "~/code"
+    );
+    assert_eq!(shorten_path_with_home("/home/laddy", ""), "/home/laddy");
+    assert_eq!(
+        shorten_path_with_home("/var/log", "/home/laddy"),
+        "/var/log"
+    );
+    assert_eq!(shorten_path_with_home("/", "/"), "~");
+    assert_eq!(shorten_path_with_home("/tmp", "/"), "~/tmp");
+    assert_eq!(
+        shorten_path_with_home(
+            "/home/laddy/a-very-long-directory-name/code/src",
+            "/home/laddy"
+        ),
+        "…/code/src"
+    );
 }
 
 /// Format hostname + path for sidebar display.
