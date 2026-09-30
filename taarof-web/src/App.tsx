@@ -18,6 +18,7 @@ import {
   fetchState,
 } from "./api";
 import { resolveInitialAuth, signOut, submitToken, type AuthStateTarget } from "./authSession";
+import { loadMonitorSnapshot, runtimeIdentityNamespace, type MonitorSnapshot } from "./monitorIdentity";
 import { AgentsView } from "./components/AgentsView";
 import { selectPane, selectStage, selectTab, viewModeFromHash } from "./components/PaneStage.helpers";
 import { Sidebar } from "./components/Sidebar";
@@ -156,6 +157,7 @@ export function App() {
   const [isTokenPersisted, setIsTokenPersisted] = useState(initialAuth?.persisted ?? true);
   const [tokenError, setTokenError] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<TaarofStateSnapshot | null>(null);
+  const [monitorSnapshot, setMonitorSnapshot] = useState<MonitorSnapshot | null>(null);
   const [agentSessions, setAgentSessions] = useState<AgentSessionsSnapshot | null>(null);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<number | null>(null);
   const [selectedTabId, setSelectedTabId] = useState<number | null>(null);
@@ -179,6 +181,21 @@ export function App() {
   const stateRefreshRef = useRef<DatasetRefreshScheduler | null>(null);
   const agentSessionsRefreshRef = useRef<DatasetRefreshScheduler | null>(null);
   const eventRecoveryRef = useRef<EventRecoveryController | null>(null);
+  const monitorSnapshotRef = useRef<MonitorSnapshot | null>(null);
+  const monitorRequestGenerationRef = useRef(0);
+
+  function publishMonitorSnapshot(next: MonitorSnapshot | null) {
+    monitorSnapshotRef.current = next;
+    setMonitorSnapshot(next);
+  }
+
+  function checkMonitorIdentity(namespace: string | null) {
+    if (namespace === null || monitorSnapshotRef.current?.namespace !== namespace) {
+      publishMonitorSnapshot(null);
+    }
+  }
+
+  const verifiedMonitorSnapshot = monitorSnapshot?.snapshot === snapshot ? monitorSnapshot : null;
 
   const selectedStage = selectStage(snapshot, {
     workspaceId: selectedWorkspaceId,
@@ -190,6 +207,7 @@ export function App() {
   const agentJobs = snapshot?.agent_jobs ?? [];
 
   function advanceRefreshGeneration() {
+    monitorRequestGenerationRef.current += 1;
     refreshGenerationRef.current += 1;
     stateRefreshRef.current?.dispose();
     agentSessionsRefreshRef.current?.dispose();
@@ -208,6 +226,7 @@ export function App() {
     setTokenPersisted: setIsTokenPersisted,
     setTokenError,
     clearAuthenticatedState() {
+      publishMonitorSnapshot(null);
       setSnapshot(null);
       setAgentSessions(null);
       setIsLoading(false);
@@ -260,19 +279,31 @@ export function App() {
       const installedGeneration = generation;
       const isCurrent = () =>
         !disposed && refreshGenerationRef.current === installedGeneration;
-      const stateRefresh = new DatasetRefreshScheduler((signal) =>
-        runGuardedRefresh({
+      const stateRefresh = new DatasetRefreshScheduler((signal) => {
+        const requestGeneration = ++monitorRequestGenerationRef.current;
+        const isCurrentRequest = () => isCurrent() &&
+          monitorRequestGenerationRef.current === requestGeneration;
+        return runGuardedRefresh({
           signal,
-          isCurrent,
-          load: () => fetchState(token, signal),
+          isCurrent: isCurrentRequest,
+          load: () => loadMonitorSnapshot({
+            signal,
+            isCurrent: isCurrentRequest,
+            fetchIdentity: () => fetchRuntimeIdentity(token, signal),
+            fetchSnapshot: () => fetchState(token, signal),
+            isUnauthorized: (error) => error instanceof ApiUnauthorizedError,
+            onIdentity: checkMonitorIdentity,
+          }),
           enqueueWrite: (write) => startTransition(write),
           onLoading: setIsLoading,
           onSuccess: (nextSnapshot) => {
-            setSnapshot(nextSnapshot);
+            setSnapshot(nextSnapshot.snapshot);
+            publishMonitorSnapshot(nextSnapshot);
             setPaneRefreshGeneration((current) => current + 1);
             eventRecoveryRef.current?.markSnapshotVerified();
           },
           onError: (error) => {
+            if (error !== null) publishMonitorSnapshot(null);
             setLoadError(
               error === null
                 ? null
@@ -287,8 +318,8 @@ export function App() {
           onUnauthorized: () => {
             handleUnauthorized("The taarof token was rejected. Paste a current token.");
           },
-        }),
-      );
+        });
+      });
       const agentSessionsRefresh = new DatasetRefreshScheduler((signal) =>
         runGuardedRefresh({
           signal,
@@ -324,11 +355,14 @@ export function App() {
     schedulers.agentSessionsRefresh.invalidate({ immediate: true });
 
     const recoverSnapshot = async (signal: AbortSignal) => {
+      const requestGeneration = ++monitorRequestGenerationRef.current;
       const recoveryGeneration = generation;
       const ownsGeneration = () =>
         !disposed && refreshGenerationRef.current === recoveryGeneration;
+      const ownsRequest = () => ownsGeneration() &&
+        monitorRequestGenerationRef.current === requestGeneration;
       const isCurrent = () =>
-        ownsGeneration() && !signal.aborted;
+        ownsRequest() && !signal.aborted;
       if (!isCurrent()) throw signal.reason ?? new DOMException("Recovery replaced.", "AbortError");
       setIsLoading(true);
       setAreAgentSessionsLoading(true);
@@ -336,7 +370,14 @@ export function App() {
       setAgentSessionsError(null);
       try {
         const [stateResult, sessionsResult] = await Promise.allSettled([
-          fetchState(token, signal),
+          loadMonitorSnapshot({
+            signal,
+            isCurrent,
+            fetchIdentity: () => fetchRuntimeIdentity(token, signal),
+            fetchSnapshot: () => fetchState(token, signal),
+            isUnauthorized: (error) => error instanceof ApiUnauthorizedError,
+            onIdentity: checkMonitorIdentity,
+          }),
           fetchAgentSessions(token, signal),
         ]);
         if (!isCurrent()) {
@@ -365,12 +406,16 @@ export function App() {
         }
         startTransition(() => {
           if (!isCurrent()) return;
-          setSnapshot(stateResult.value);
+          setSnapshot(stateResult.value.snapshot);
+          publishMonitorSnapshot(stateResult.value);
           setAgentSessions(sessionsResult.value);
           setPaneRefreshGeneration((current) => current + 1);
         });
+      } catch (error) {
+        if (ownsRequest()) publishMonitorSnapshot(null);
+        throw error;
       } finally {
-        if (ownsGeneration()) {
+        if (ownsRequest()) {
           setIsLoading(false);
           setAreAgentSessionsLoading(false);
         }
@@ -388,8 +433,17 @@ export function App() {
           close: () => socket.close(),
         };
       },
-      fetchRuntimeIdentity: async (signal) =>
-        (await fetchRuntimeIdentity(token, signal)).runtime_id,
+      fetchRuntimeIdentity: async (signal) => {
+        try {
+          const identity = await fetchRuntimeIdentity(token, signal);
+          signal.throwIfAborted();
+          if (!disposed) checkMonitorIdentity(runtimeIdentityNamespace(identity));
+          return identity.runtime_id;
+        } catch (error) {
+          if (!disposed && !signal.aborted) publishMonitorSnapshot(null);
+          throw error;
+        }
+      },
       fetchEvents: (cursor, signal) => fetchEvents(token, cursor, signal),
       recoverSnapshot,
       onEvent: (data, source) => {
@@ -413,7 +467,10 @@ export function App() {
         handleUnauthorized("The taarof token was rejected. Paste a current token.");
       },
       onStatus: (status) => {
-        if (!disposed) setEventStatus(status);
+        if (!disposed) {
+          if (status.connection === "disconnected") publishMonitorSnapshot(null);
+          setEventStatus(status);
+        }
       },
       isUnauthorized: (error) => error instanceof ApiUnauthorizedError,
     });
@@ -762,6 +819,9 @@ export function App() {
           >
             <Suspense fallback={<MonitorViewLoadingFallback />}>
               <LazyMonitorView
+                key={verifiedMonitorSnapshot?.namespace ?? `unverified-${paneRefreshGeneration}`}
+                runtimeId={verifiedMonitorSnapshot?.runtimeId ?? null}
+                namespace={verifiedMonitorSnapshot?.namespace ?? null}
                 isLoading={isLoading}
                 onSelectLiveTarget={handleSelectLiveTarget}
                 snapshot={snapshot}

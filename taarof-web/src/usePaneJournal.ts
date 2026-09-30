@@ -22,7 +22,7 @@ export interface PaneJournalScheduler {
 
 export interface PaneJournalControllerOptions {
   storage: PaneJournalStorage;
-  identity: PaneIdentity;
+  identity: PaneIdentity | null;
   onJournal?: (journal: PaneJournal) => void;
   scheduler?: PaneJournalScheduler;
   throttleMs?: number;
@@ -72,9 +72,21 @@ export function createPaneJournalController({
   scheduler = defaultScheduler(),
   throttleMs = DEFAULT_PANE_JOURNAL_THROTTLE_MS,
 }: PaneJournalControllerOptions): PaneJournalController {
+  if (identity === null) {
+    return {
+      updateIdentity: () => {},
+      observe: () => {},
+      flush: () => null,
+      cancel: () => {},
+      pendingCount: () => 0,
+    };
+  }
+  // Keep the narrowed identity separate from the nullable input captured by closures.
+  let paneIdentity = identity;
   const pending: PaneObservationInput[] = [];
   let timer: unknown = null;
   let journal: PaneJournal | null = null;
+  let cancelled = false;
 
   function clearTimer() {
     if (timer !== null) {
@@ -94,6 +106,7 @@ export function createPaneJournalController({
   }
 
   function observe(frame: PaneObservationInput) {
+    if (cancelled) return;
     const previous = pending[pending.length - 1];
     if (!previous || !isConsecutiveDuplicate(previous, frame)) {
       pending.push(frame);
@@ -102,11 +115,12 @@ export function createPaneJournalController({
   }
 
   function flush(options: PaneJournalFlushOptions = {}): PaneJournal | null {
+    if (cancelled) return journal;
     const { notify = true } = options;
     clearTimer();
     if (pending.length === 0) {
       if (journal) {
-        journal = compactJournal(identity.paneKey, journal.entries, Date.now());
+        journal = compactJournal(paneIdentity.paneKey, journal.entries, Date.now());
         savePaneJournal(storage, journal);
         if (notify) onJournal?.(journal);
       }
@@ -115,7 +129,7 @@ export function createPaneJournalController({
 
     const frames = pending.splice(0, pending.length);
     for (const frame of frames) {
-      journal = appendPaneTextObservation(storage, identity, frame, journal ?? undefined).journal;
+      journal = appendPaneTextObservation(storage, paneIdentity, frame, journal ?? undefined).journal;
     }
 
     if (journal && notify) {
@@ -125,16 +139,17 @@ export function createPaneJournalController({
   }
 
   function cancel() {
+    cancelled = true;
     clearTimer();
     pending.splice(0, pending.length);
   }
 
   return {
     updateIdentity: (nextIdentity) => {
-      if (nextIdentity.paneKey !== identity.paneKey) {
+      if (nextIdentity.paneKey !== paneIdentity.paneKey) {
         throw new Error("A pane journal controller cannot change pane keys");
       }
-      identity = nextIdentity;
+      paneIdentity = nextIdentity;
     },
     observe,
     flush,
@@ -145,12 +160,12 @@ export function createPaneJournalController({
 
 export function usePaneJournal(
   storage: PaneJournalStorage,
-  identity: PaneIdentity,
+  identity: PaneIdentity | null,
   latestFrame: PaneJournalFrame | null,
   options: UsePaneJournalOptions = {},
 ): PaneJournal {
   const [journal, setJournal] = useState<PaneJournal>(() =>
-    loadPaneJournal(storage, identity.paneKey),
+    identity ? loadPaneJournal(storage, identity.paneKey) : compactJournal("", [], Date.now()),
   );
   const controllerRef = useRef<PaneJournalController | null>(null);
   const throttleMs = options.throttleMs ?? DEFAULT_PANE_JOURNAL_THROTTLE_MS;
@@ -163,7 +178,7 @@ export function usePaneJournal(
       throttleMs,
     });
     controllerRef.current = controller;
-    setJournal(loadPaneJournal(storage, identity.paneKey));
+    setJournal(identity ? loadPaneJournal(storage, identity.paneKey) : compactJournal("", [], Date.now()));
 
     return () => {
       controller.flush({ notify: false });
@@ -172,10 +187,10 @@ export function usePaneJournal(
         controllerRef.current = null;
       }
     };
-  }, [identity.paneKey, storage, throttleMs]);
+  }, [identity?.paneKey, storage, throttleMs]);
 
   useEffect(() => {
-    controllerRef.current?.updateIdentity(identity);
+    if (identity) controllerRef.current?.updateIdentity(identity);
   }, [identity]);
 
   useEffect(() => {

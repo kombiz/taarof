@@ -14,6 +14,7 @@
     "src/eventRecovery.ts",
     "src/eventRecovery.test.ts",
     "src/monitorBoard.test.ts",
+    "src/monitorIdentity.test.ts",
     "src/monitorPaneJournal.ts",
     "src/monitorPaneJournal.test.ts",
     "src/usePaneJournal.ts",

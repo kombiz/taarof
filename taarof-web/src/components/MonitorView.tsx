@@ -50,6 +50,8 @@ const MAX_WATCH_SIGNAL_PREVIEWS = 6;
 type MonitorPhase = PaneAttachPhase;
 
 interface MonitorViewProps {
+  runtimeId: string | null;
+  namespace: string | null;
   isLoading: boolean;
   token: string;
   snapshot: TaarofStateSnapshot | null;
@@ -95,7 +97,8 @@ function MonitorPaneCard({
   );
   const identity = useMemo(
     () =>
-      buildPaneIdentity({
+      target.runtimeId === null ? null : buildPaneIdentity({
+        runtimeId: target.runtimeId,
         sessionName: target.sessionName,
         workspaceId: target.workspace.id,
         workspaceName: target.workspace.name,
@@ -105,6 +108,7 @@ function MonitorPaneCard({
       }),
     [
       target.pane.pane_id,
+      target.runtimeId,
       target.sessionName,
       target.tab.name,
       target.tab.tab_id,
@@ -237,7 +241,7 @@ function MonitorPaneCard({
 
       <details className="monitor-card__text-capture">
         <summary>
-          <span>{identity.displayName}</span>
+          <span>{identity?.displayName ?? "Unverified pane — journal unavailable"}</span>
           <strong>{journal.totalTextBytes.toLocaleString()} bytes</strong>
         </summary>
         <div className="monitor-card__journal-meta">
@@ -328,6 +332,8 @@ function MonitorPaneCard({
 }
 
 export function MonitorView({
+  runtimeId,
+  namespace,
   isLoading,
   token,
   snapshot,
@@ -336,10 +342,10 @@ export function MonitorView({
   const [filter, setFilter] = useState<MonitorFilter>("all");
   const [showWorkHistory, setShowWorkHistory] = useState(false);
   const [orderedKeys, setOrderedKeys] = useState<string[]>(() =>
-    readStoredMonitorOrder(optionalLocalStorage()),
+    readStoredMonitorOrder(optionalLocalStorage(), namespace),
   );
   const [watchedKeys, setWatchedKeys] = useState<string[]>(() =>
-    readStoredWatchedKeys(optionalLocalStorage()),
+    readStoredWatchedKeys(optionalLocalStorage(), namespace),
   );
   const work = snapshot?.work;
   const workTruth = work?.truth ?? [];
@@ -358,7 +364,7 @@ export function MonitorView({
     pruneExpiredPaneJournals(optionalLocalStorage());
   }, []);
 
-  const baseTargets = useMemo(() => buildPaneTargets(snapshot), [snapshot]);
+  const baseTargets = useMemo(() => buildPaneTargets(snapshot, runtimeId), [snapshot, runtimeId]);
   const targets = useMemo(
     () => applyManualOrder(baseTargets, orderedKeys),
     [baseTargets, orderedKeys],
@@ -416,12 +422,12 @@ export function MonitorView({
 
   function commitOrder(nextKeys: string[]) {
     setOrderedKeys(nextKeys);
-    writeStoredMonitorOrder(optionalLocalStorage(), nextKeys);
+    writeStoredMonitorOrder(optionalLocalStorage(), nextKeys, namespace);
   }
 
   function commitWatchedKeys(nextKeys: string[]) {
     setWatchedKeys(nextKeys);
-    writeStoredWatchedKeys(optionalLocalStorage(), nextKeys);
+    writeStoredWatchedKeys(optionalLocalStorage(), nextKeys, namespace);
   }
 
   function toggleWatchedTarget(targetKey: string) {
