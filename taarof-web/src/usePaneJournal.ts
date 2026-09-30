@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import {
   appendPaneTextObservation,
+  compactJournal,
   hashText,
   loadPaneJournal,
+  savePaneJournal,
   type PaneIdentity,
   type PaneJournal,
   type PaneJournalStorage,
@@ -71,6 +73,7 @@ export function createPaneJournalController({
 }: PaneJournalControllerOptions): PaneJournalController {
   const pending: PaneObservationInput[] = [];
   let timer: unknown = null;
+  let journal: PaneJournal | null = null;
 
   function clearTimer() {
     if (timer !== null) {
@@ -101,13 +104,17 @@ export function createPaneJournalController({
     const { notify = true } = options;
     clearTimer();
     if (pending.length === 0) {
-      return null;
+      if (journal) {
+        journal = compactJournal(identity.paneKey, journal.entries, Date.now());
+        savePaneJournal(storage, journal);
+        if (notify) onJournal?.(journal);
+      }
+      return journal;
     }
 
     const frames = pending.splice(0, pending.length);
-    let journal: PaneJournal | null = null;
     for (const frame of frames) {
-      journal = appendPaneTextObservation(storage, identity, frame).journal;
+      journal = appendPaneTextObservation(storage, identity, frame, journal ?? undefined).journal;
     }
 
     if (journal && notify) {
