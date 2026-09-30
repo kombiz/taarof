@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import {
   appendPaneTextObservation,
+  compactJournal,
   hashText,
   loadPaneJournal,
+  savePaneJournal,
   type PaneIdentity,
   type PaneJournal,
   type PaneJournalStorage,
@@ -31,6 +33,7 @@ export interface PaneJournalFlushOptions {
 }
 
 export interface PaneJournalController {
+  updateIdentity(identity: PaneIdentity): void;
   observe(frame: PaneObservationInput): void;
   flush(options?: PaneJournalFlushOptions): PaneJournal | null;
   cancel(): void;
@@ -71,6 +74,7 @@ export function createPaneJournalController({
 }: PaneJournalControllerOptions): PaneJournalController {
   const pending: PaneObservationInput[] = [];
   let timer: unknown = null;
+  let journal: PaneJournal | null = null;
 
   function clearTimer() {
     if (timer !== null) {
@@ -101,13 +105,17 @@ export function createPaneJournalController({
     const { notify = true } = options;
     clearTimer();
     if (pending.length === 0) {
-      return null;
+      if (journal) {
+        journal = compactJournal(identity.paneKey, journal.entries, Date.now());
+        savePaneJournal(storage, journal);
+        if (notify) onJournal?.(journal);
+      }
+      return journal;
     }
 
     const frames = pending.splice(0, pending.length);
-    let journal: PaneJournal | null = null;
     for (const frame of frames) {
-      journal = appendPaneTextObservation(storage, identity, frame).journal;
+      journal = appendPaneTextObservation(storage, identity, frame, journal ?? undefined).journal;
     }
 
     if (journal && notify) {
@@ -122,6 +130,12 @@ export function createPaneJournalController({
   }
 
   return {
+    updateIdentity: (nextIdentity) => {
+      if (nextIdentity.paneKey !== identity.paneKey) {
+        throw new Error("A pane journal controller cannot change pane keys");
+      }
+      identity = nextIdentity;
+    },
     observe,
     flush,
     cancel,
@@ -158,7 +172,11 @@ export function usePaneJournal(
         controllerRef.current = null;
       }
     };
-  }, [identity, storage, throttleMs]);
+  }, [identity.paneKey, storage, throttleMs]);
+
+  useEffect(() => {
+    controllerRef.current?.updateIdentity(identity);
+  }, [identity]);
 
   useEffect(() => {
     if (latestFrame) {
