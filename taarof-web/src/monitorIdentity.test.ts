@@ -162,17 +162,22 @@ await test("delayed prior-generation identity and snapshot completion cannot pub
   for (const stage of ["identity", "snapshot"]) {
     let current = true;
     const held = deferred<RuntimeIdentityResponse | TaarofStateSnapshot>();
+    const entered = deferred<void>();
     let identityReads = 0;
     const proofs: Array<string | null> = [];
     const request = load({ isCurrent: () => current,
       fetchIdentity: async () => {
         identityReads += 1;
+        if (stage === "identity") entered.resolve();
         return stage === "identity" ? await held.promise as RuntimeIdentityResponse : identity();
       },
-      fetchSnapshot: async () => stage === "snapshot" ? await held.promise as TaarofStateSnapshot : snapshot(),
+      fetchSnapshot: async () => {
+        if (stage === "snapshot") entered.resolve();
+        return stage === "snapshot" ? await held.promise as TaarofStateSnapshot : snapshot();
+      },
       onIdentity: (namespace) => { proofs.push(namespace); },
     });
-    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    await entered.promise;
     current = false;
     const before = proofs.length;
     held.resolve(stage === "identity" ? identity("old") : snapshot());
@@ -186,9 +191,14 @@ await test("delayed prior-generation identity and snapshot completion cannot pub
 await test("abort while waiting for second identity rejects delayed verified proof", async () => {
   const controller = new AbortController();
   const held = deferred<RuntimeIdentityResponse>();
+  const entered = deferred<void>();
   let reads = 0;
-  const request = load({ signal: controller.signal, fetchIdentity: () => ++reads === 1 ? Promise.resolve(identity()) : held.promise });
-  for (let count = 0; count < 8; count += 1) await Promise.resolve();
+  const request = load({ signal: controller.signal, fetchIdentity: () => {
+    if (++reads === 1) return Promise.resolve(identity());
+    entered.resolve();
+    return held.promise;
+  } });
+  await entered.promise;
   controller.abort();
   held.resolve(identity());
   let rejected = false;
