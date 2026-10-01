@@ -580,7 +580,11 @@ pub fn project_work_stream_from_records<'a>(
         .collect::<Vec<_>>();
     visible_origins.sort_by_key(|(_, meta)| meta.display_order);
     palette.observe_origins(visible_origins.iter().map(|(origin, _)| origin.as_str()));
-    palette.observe_origins(ordered.iter().map(|record| record.identity.pane_origin.as_str()));
+    palette.observe_origins(
+        ordered
+            .iter()
+            .map(|record| record.identity.pane_origin.as_str()),
+    );
     ordered.sort_by_key(|record| record.seq);
 
     let mut latest = HashMap::<String, WorkIdentity>::new();
@@ -2411,16 +2415,20 @@ pub fn collect_probe(state: &crate::AppState) -> WorkProbe {
             let tab_id = identity.tab_id;
             let pane_id = identity.pane_id;
             let binding = state.pane_task_binding(tab_id, pane_id).or_else(|| {
-                state.pending_tab_restores.get(&tab_id)
+                state
+                    .pending_tab_restores
+                    .get(&tab_id)
                     .and_then(|pending| pending.saved.current_task_for_pane(pane_id))
             });
             Some(PaneProbe {
                 identity,
-                activity: tab.pane_agent_activity(pane_id)
+                activity: tab
+                    .pane_agent_activity(pane_id)
                     .map(|activity| format!("{:?}", activity.state).to_ascii_lowercase()),
                 local_cwd: pane_probe_local_cwd(state, tab_id, pane_id),
                 binding_checkout_root: binding
-                    .and_then(|binding| binding.checkout_root.as_deref()).map(str::to_string),
+                    .and_then(|binding| binding.checkout_root.as_deref())
+                    .map(str::to_string),
                 binding_identity: binding.map(|binding| ProbeBindingIdentity {
                     task_id: binding.task_id.clone(),
                     title: binding.title.clone(),
@@ -2431,9 +2439,13 @@ pub fn collect_probe(state: &crate::AppState) -> WorkProbe {
                 plan_tasks: Vec::new(),
                 plan_loaded: false,
             })
-        }).collect();
+        })
+        .collect();
     let exact_pull_requests = collect_exact_pull_request_probes(state, now, refresh_pull_requests);
-    WorkProbe { panes, exact_pull_requests }
+    WorkProbe {
+        panes,
+        exact_pull_requests,
+    }
 }
 
 /// Current model identities, including headless/lazy panes. This deliberately
@@ -2469,17 +2481,17 @@ pub fn work_stream_runtime_identities(state: &crate::AppState) -> Vec<WorkIdenti
                         .and_then(|pending| pending.saved.current_task_for_pane(pane_id))
                 });
                 identities.push(WorkIdentity {
-                        session: session.clone(),
-                        workspace_origin: workspace.work_origin.clone(),
-                        tab_origin: tab.work_origin.clone(),
-                        pane_origin: pane_origin(&session, &tab.work_origin, &pane_work_origin),
-                        workspace_id: workspace.id,
-                        workspace_name: workspace.name.clone(),
-                        tab_id: tab.id,
-                        tab_name: tab.name.clone(),
-                        pane_id,
-                        task_id: binding.map(|binding| binding.task_id.clone()),
-                        task_title: binding.map(|binding| binding.title.clone()),
+                    session: session.clone(),
+                    workspace_origin: workspace.work_origin.clone(),
+                    tab_origin: tab.work_origin.clone(),
+                    pane_origin: pane_origin(&session, &tab.work_origin, &pane_work_origin),
+                    workspace_id: workspace.id,
+                    workspace_name: workspace.name.clone(),
+                    tab_id: tab.id,
+                    tab_name: tab.name.clone(),
+                    pane_id,
+                    task_id: binding.map(|binding| binding.task_id.clone()),
+                    task_title: binding.map(|binding| binding.title.clone()),
                 });
             }
         }
@@ -4632,25 +4644,52 @@ mod tests {
         }
         records.pop_front();
         records.push_back(work_stream_record(5, 2, WorkKind::AgentReportedBlocked));
-        assert!(!records.as_slices().1.is_empty(), "exercise wrapped storage");
+        assert!(
+            !records.as_slices().1.is_empty(),
+            "exercise wrapped storage"
+        );
         state.work_ledger.records = records;
         let owned = state.work_ledger.records();
-        assert_eq!(state.work_ledger.iter_records().map(|r| r.seq).collect::<Vec<_>>(), [2, 3, 4, 5]);
-        for (borrowed, stored) in state.work_ledger.iter_records().zip(state.work_ledger.records.iter()) {
+        assert_eq!(
+            state
+                .work_ledger
+                .iter_records()
+                .map(|r| r.seq)
+                .collect::<Vec<_>>(),
+            [2, 3, 4, 5]
+        );
+        for (borrowed, stored) in state
+            .work_ledger
+            .iter_records()
+            .zip(state.work_ledger.records.iter())
+        {
             assert!(std::ptr::eq(borrowed, stored));
         }
         let metadata = work_stream_pane_metadata(&state, &owned);
-        assert_eq!(metadata, work_stream_pane_metadata_from_records(&state, state.work_ledger.iter_records()));
+        assert_eq!(
+            metadata,
+            work_stream_pane_metadata_from_records(&state, state.work_ledger.iter_records())
+        );
         assert_eq!(
             project_task_truth_summary(&task_truth_inputs(&state, &metadata)),
             project_task_truth_summary(&task_truth_inputs_from_records(&state, &metadata, &owned))
         );
-        for filter in [WorkStreamFilter::All, WorkStreamFilter::History, WorkStreamFilter::Attention, WorkStreamFilter::Pane("pane-1".into())] {
+        for filter in [
+            WorkStreamFilter::All,
+            WorkStreamFilter::History,
+            WorkStreamFilter::Attention,
+            WorkStreamFilter::Pane("pane-1".into()),
+        ] {
             let mut old_palette = WorkStreamPalette::default();
             let mut borrowed_palette = old_palette.clone();
             assert_eq!(
                 project_work_stream(&owned, &mut old_palette, &filter, &metadata),
-                project_work_stream_from_records(state.work_ledger.iter_records(), &mut borrowed_palette, &filter, &metadata)
+                project_work_stream_from_records(
+                    state.work_ledger.iter_records(),
+                    &mut borrowed_palette,
+                    &filter,
+                    &metadata
+                )
             );
             assert_eq!(old_palette, borrowed_palette);
         }
@@ -4661,22 +4700,50 @@ mod tests {
         let mut state = crate::AppState::new();
         let workspace = state.active_workspace;
         let (tab_id, pane_id) = crate::seed_headless_terminal_tab(
-            &mut state, workspace, "identity fields", crate::HeadlessPaneSeed::default(),
-        ).unwrap();
-        state.headless_pane_mut(tab_id, pane_id).unwrap().current_task = Some(crate::task_binding::PaneTaskBinding {
-            task_id: "TASK-A".into(), title: "Task A".into(), checkout_root: Some("/repo".into()),
+            &mut state,
+            workspace,
+            "identity fields",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .unwrap();
+        state
+            .headless_pane_mut(tab_id, pane_id)
+            .unwrap()
+            .current_task = Some(crate::task_binding::PaneTaskBinding {
+            task_id: "TASK-A".into(),
+            title: "Task A".into(),
+            checkout_root: Some("/repo".into()),
             reporting_token: "ctx-11111111111111111111111111111111".into(),
         });
         let identities = work_stream_runtime_identities(&state);
         let probe = collect_probe(&state);
-        assert_eq!(identities, probe.panes.iter().map(|pane| pane.identity.clone()).collect::<Vec<_>>());
-        let identity = identities.iter().find(|identity| identity.tab_id == tab_id && identity.pane_id == pane_id).unwrap();
+        assert_eq!(
+            identities,
+            probe
+                .panes
+                .iter()
+                .map(|pane| pane.identity.clone())
+                .collect::<Vec<_>>()
+        );
+        let identity = identities
+            .iter()
+            .find(|identity| identity.tab_id == tab_id && identity.pane_id == pane_id)
+            .unwrap();
         assert_eq!(identity.task_id.as_deref(), Some("TASK-A"));
         assert_eq!(identity.task_title.as_deref(), Some("Task A"));
         assert_eq!(identity.tab_name, "identity fields");
         assert_eq!(identity.workspace_id, workspace);
-        state.headless_pane_mut(tab_id, pane_id).unwrap().current_task.as_mut().unwrap().task_id = "TASK-B".into();
-        assert_eq!(work_stream_runtime_identities(&state)[0].task_id.as_deref(), Some("TASK-B"));
+        state
+            .headless_pane_mut(tab_id, pane_id)
+            .unwrap()
+            .current_task
+            .as_mut()
+            .unwrap()
+            .task_id = "TASK-B".into();
+        assert_eq!(
+            work_stream_runtime_identities(&state)[0].task_id.as_deref(),
+            Some("TASK-B")
+        );
         assert!(!pane_probe_is_current(&state, &probe.panes[0]));
     }
 
@@ -4685,12 +4752,20 @@ mod tests {
         let mut state = crate::AppState::new();
         let workspace = state.active_workspace;
         let (old_tab, _) = crate::seed_headless_terminal_tab(
-            &mut state, workspace, "old", crate::HeadlessPaneSeed::default(),
-        ).unwrap();
+            &mut state,
+            workspace,
+            "old",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .unwrap();
         let stale = collect_probe(&state);
         let (new_tab, _) = crate::seed_headless_terminal_tab(
-            &mut state, workspace, "new", crate::HeadlessPaneSeed::default(),
-        ).unwrap();
+            &mut state,
+            workspace,
+            "new",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .unwrap();
         let current = collect_probe(&state);
         let append = |state: &mut crate::AppState, identity: WorkIdentity, name: &str| {
             let mut record = draft(name, name);
@@ -4698,14 +4773,38 @@ mod tests {
             state.work_ledger.append(record).unwrap()
         };
         let old_record = append(&mut state, stale.panes[0].identity.clone(), "old work");
-        let new_record = append(&mut state, current.panes.iter().find(|pane| pane.identity.tab_id == new_tab).unwrap().identity.clone(), "new work");
+        let new_record = append(
+            &mut state,
+            current
+                .panes
+                .iter()
+                .find(|pane| pane.identity.tab_id == new_tab)
+                .unwrap()
+                .identity
+                .clone(),
+            "new work",
+        );
         for workspace in &mut state.workspaces {
             workspace.tabs.retain(|tab| tab.id != old_tab);
         }
         state.observe_work_probe(stale);
-        assert_eq!(state.work_ledger.reconciliation_for(old_record.seq).origin_status, "historical");
-        assert_eq!(state.work_ledger.reconciliation_for(new_record.seq).origin_status, "live");
-        assert!(work_stream_runtime_identities(&state).iter().all(|identity| identity.tab_id != old_tab));
+        assert_eq!(
+            state
+                .work_ledger
+                .reconciliation_for(old_record.seq)
+                .origin_status,
+            "historical"
+        );
+        assert_eq!(
+            state
+                .work_ledger
+                .reconciliation_for(new_record.seq)
+                .origin_status,
+            "live"
+        );
+        assert!(work_stream_runtime_identities(&state)
+            .iter()
+            .all(|identity| identity.tab_id != old_tab));
     }
 
     #[test]
@@ -4728,14 +4827,37 @@ mod tests {
             first: Box::new(leaf()),
             second: Box::new(leaf()),
         };
-        let tab_id = crate::seed_pending_restore_tab(&mut state, workspace, "lazy split", saved, Some("/repo".into())).unwrap();
+        let tab_id = crate::seed_pending_restore_tab(
+            &mut state,
+            workspace,
+            "lazy split",
+            saved,
+            Some("/repo".into()),
+        )
+        .unwrap();
         let identities = work_stream_runtime_identities(&state);
-        assert_eq!(identities.iter().map(|identity| identity.pane_id).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(
+            identities
+                .iter()
+                .map(|identity| identity.pane_id)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
         assert!(identities.iter().all(|identity| identity.tab_id == tab_id));
         assert_ne!(identities[0].pane_origin, identities[1].pane_origin);
-        assert_eq!(identities, collect_probe(&state).panes.into_iter().map(|pane| pane.identity).collect::<Vec<_>>());
-        let metadata = work_stream_pane_metadata_from_records(&state, state.work_ledger.iter_records());
-        assert!(metadata.values().all(|meta| meta.origin_state == WorkStreamOriginState::Lazy));
+        assert_eq!(
+            identities,
+            collect_probe(&state)
+                .panes
+                .into_iter()
+                .map(|pane| pane.identity)
+                .collect::<Vec<_>>()
+        );
+        let metadata =
+            work_stream_pane_metadata_from_records(&state, state.work_ledger.iter_records());
+        assert!(metadata
+            .values()
+            .all(|meta| meta.origin_state == WorkStreamOriginState::Lazy));
     }
 
     #[test]

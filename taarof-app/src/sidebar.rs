@@ -691,9 +691,8 @@ fn refresh_work_ledger(
             &st,
             records.iter().copied(),
         );
-        let latest_status_records = crate::work_ledger::latest_task_status_records_from_iter(
-            records.iter().copied(),
-        );
+        let latest_status_records =
+            crate::work_ledger::latest_task_status_records_from_iter(records.iter().copied());
         let truth_summary = crate::work_ledger::project_task_truth_summary(
             &crate::work_ledger::task_truth_inputs_from_records(
                 &st,
@@ -783,8 +782,17 @@ fn refresh_work_ledger(
         .entries
         .iter()
         .map(|entry| crate::work_ledger::format_age(entry.record.ts_unix_ms, now))
-        .chain(truth_summary.items.iter().map(|truth| task_truth_labels_at(truth, now)))
-        .chain(sorted_truths.iter().map(|(_, truth)| task_truth_labels_at(truth, now)))
+        .chain(
+            truth_summary
+                .items
+                .iter()
+                .map(|truth| task_truth_labels_at(truth, now)),
+        )
+        .chain(
+            sorted_truths
+                .iter()
+                .map(|(_, truth)| task_truth_labels_at(truth, now)),
+        )
         .collect();
     let visible = WorkStreamVisibleState {
         projection: projection.clone(),
@@ -1119,12 +1127,7 @@ fn work_stream_origin_state_label(
 fn task_truth_labels_at(truth: &crate::work_ledger::TaskTruth, now: u64) -> String {
     let checked = truth.last_checked_unix_ms.map_or_else(
         || "Never checked".to_string(),
-        |checked| {
-            format!(
-                "Checked {}",
-                crate::work_ledger::format_age(checked, now)
-            )
-        },
+        |checked| format!("Checked {}", crate::work_ledger::format_age(checked, now)),
     );
     let mismatch = truth
         .mismatch
@@ -6227,7 +6230,10 @@ mod tests {
         super::WorkStreamVisibleState {
             projection,
             metadata: metadata.into_iter().collect(),
-            reconciliations: vec![(records[0].seq, state.work_ledger.reconciliation_for(records[0].seq))],
+            reconciliations: vec![(
+                records[0].seq,
+                state.work_ledger.reconciliation_for(records[0].seq),
+            )],
             truths: vec![(records[0].seq, summary.items[0].clone())],
             summary,
             preferences,
@@ -6257,51 +6263,129 @@ mod tests {
         use crate::work_ledger::*;
         type Change = fn(&mut super::WorkStreamVisibleState);
         let changes: &[(&str, Change)] = &[
-            ("summary", |v| v.projection.entries[0].record.summary.push('!')),
-            ("record action identity", |v| v.projection.entries[0].record.identity.tab_id += 1),
-            ("record pane identity", |v| v.projection.entries[0].record.identity.pane_id += 1),
-            ("record stable origin", |v| v.projection.entries[0].record.identity.pane_origin.push('!')),
-            ("record workspace identity", |v| v.projection.entries[0].record.identity.workspace_id += 1),
-            ("record timestamp", |v| v.projection.entries[0].record.ts_unix_ms += 1),
-            ("record task", |v| v.projection.entries[0].record.identity.task_id = Some("other".into())),
-            ("record kind", |v| v.projection.entries[0].record.kind = WorkKind::AgentReportedBlocked),
+            ("summary", |v| {
+                v.projection.entries[0].record.summary.push('!')
+            }),
+            ("record action identity", |v| {
+                v.projection.entries[0].record.identity.tab_id += 1
+            }),
+            ("record pane identity", |v| {
+                v.projection.entries[0].record.identity.pane_id += 1
+            }),
+            ("record stable origin", |v| {
+                v.projection.entries[0]
+                    .record
+                    .identity
+                    .pane_origin
+                    .push('!')
+            }),
+            ("record workspace identity", |v| {
+                v.projection.entries[0].record.identity.workspace_id += 1
+            }),
+            ("record timestamp", |v| {
+                v.projection.entries[0].record.ts_unix_ms += 1
+            }),
+            ("record task", |v| {
+                v.projection.entries[0].record.identity.task_id = Some("other".into())
+            }),
+            ("record kind", |v| {
+                v.projection.entries[0].record.kind = WorkKind::AgentReportedBlocked
+            }),
             ("entry marker", |v| v.projection.entries[0].marker.push('!')),
             ("entry color", |v| v.projection.entries[0].color_slot = None),
             ("legend text", |v| v.projection.legend[0].tab_name.push('!')),
-            ("legend action identity", |v| v.projection.legend[0].pane_id += 1),
-            ("legend workspace label", |v| v.projection.legend[0].workspace_name.push('!')),
+            ("legend action identity", |v| {
+                v.projection.legend[0].pane_id += 1
+            }),
+            ("legend workspace label", |v| {
+                v.projection.legend[0].workspace_name.push('!')
+            }),
             ("legend marker", |v| v.projection.legend[0].marker.push('!')),
-            ("legend color/actions", |v| v.projection.legend[0].color_slot = None),
-            ("legend pane origin", |v| v.projection.legend[0].pane_origin.push('!')),
-            ("legend agent", |v| v.projection.legend[0].agent_name = Some("codex".into())),
-            ("legend task", |v| v.projection.legend[0].task_id = Some("TASK-A".into())),
-            ("legend task title", |v| v.projection.legend[0].task_title = Some("Task A".into())),
-            ("legend restore state", |v| v.projection.legend[0].origin_state = WorkStreamOriginState::Lazy),
-            ("runtime identity", |v| v.metadata[0].1.identity.as_mut().unwrap().pane_id += 1),
-            ("agent label", |v| v.metadata[0].1.agent_name = Some("codex".into())),
-            ("restore/lazy origin", |v| v.metadata[0].1.origin_state = WorkStreamOriginState::Lazy),
-            ("reconciliation status", |v| v.reconciliations[0].1.status = WorkReconciliationStatus::Stale),
-            ("reconciliation reason", |v| v.reconciliations[0].1.reason.push('!')),
-            ("reconciliation source", |v| v.reconciliations[0].1.source.push('!')),
-            ("reconciliation origin", |v| v.reconciliations[0].1.origin_status.push('!')),
-            ("canonical truth", |v| v.truths[0].1.canonical = CanonicalTaskState::Done),
-            ("binding truth", |v| v.truths[0].1.binding = BindingState::Bound),
-            ("process freshness", |v| v.truths[0].1.execution = ExecutionState::Running),
-            ("truth origin", |v| v.truths[0].1.origin = WorkStreamOriginState::Historical),
-            ("verification source", |v| v.truths[0].1.verification_source.push('!')),
-            ("verification state", |v| v.truths[0].1.verification = WorkReconciliationStatus::Stale),
-            ("mismatch", |v| v.truths[0].1.mismatch = Some(TruthMismatch {
-                source: "github".into(), detail: "open PR for closed task".into(), current_value: Some("open".into()),
-            })),
-            ("last checked", |v| v.truths[0].1.last_checked_unix_ms = Some(1)),
+            ("legend color/actions", |v| {
+                v.projection.legend[0].color_slot = None
+            }),
+            ("legend pane origin", |v| {
+                v.projection.legend[0].pane_origin.push('!')
+            }),
+            ("legend agent", |v| {
+                v.projection.legend[0].agent_name = Some("codex".into())
+            }),
+            ("legend task", |v| {
+                v.projection.legend[0].task_id = Some("TASK-A".into())
+            }),
+            ("legend task title", |v| {
+                v.projection.legend[0].task_title = Some("Task A".into())
+            }),
+            ("legend restore state", |v| {
+                v.projection.legend[0].origin_state = WorkStreamOriginState::Lazy
+            }),
+            ("runtime identity", |v| {
+                v.metadata[0].1.identity.as_mut().unwrap().pane_id += 1
+            }),
+            ("agent label", |v| {
+                v.metadata[0].1.agent_name = Some("codex".into())
+            }),
+            ("restore/lazy origin", |v| {
+                v.metadata[0].1.origin_state = WorkStreamOriginState::Lazy
+            }),
+            ("reconciliation status", |v| {
+                v.reconciliations[0].1.status = WorkReconciliationStatus::Stale
+            }),
+            ("reconciliation reason", |v| {
+                v.reconciliations[0].1.reason.push('!')
+            }),
+            ("reconciliation source", |v| {
+                v.reconciliations[0].1.source.push('!')
+            }),
+            ("reconciliation origin", |v| {
+                v.reconciliations[0].1.origin_status.push('!')
+            }),
+            ("canonical truth", |v| {
+                v.truths[0].1.canonical = CanonicalTaskState::Done
+            }),
+            ("binding truth", |v| {
+                v.truths[0].1.binding = BindingState::Bound
+            }),
+            ("process freshness", |v| {
+                v.truths[0].1.execution = ExecutionState::Running
+            }),
+            ("truth origin", |v| {
+                v.truths[0].1.origin = WorkStreamOriginState::Historical
+            }),
+            ("verification source", |v| {
+                v.truths[0].1.verification_source.push('!')
+            }),
+            ("verification state", |v| {
+                v.truths[0].1.verification = WorkReconciliationStatus::Stale
+            }),
+            ("mismatch", |v| {
+                v.truths[0].1.mismatch = Some(TruthMismatch {
+                    source: "github".into(),
+                    detail: "open PR for closed task".into(),
+                    current_value: Some("open".into()),
+                })
+            }),
+            ("last checked", |v| {
+                v.truths[0].1.last_checked_unix_ms = Some(1)
+            }),
             ("truth counts", |v| v.summary.live_open_count += 1),
             ("historical count", |v| v.summary.historical_count += 1),
             ("mismatch count", |v| v.summary.mismatch_count += 1),
-            ("legend truth", |v| v.summary.items[0].execution = ExecutionState::Running),
-            ("restore health", |v| v.restore_health.status = "degraded".into()),
-            ("restore detail", |v| v.restore_health.detail = Some("partial".into())),
-            ("filter", |v| v.preferences.filter = WorkStreamFilter::History),
-            ("palette", |v| v.preferences.palette.observe_origins(["new-origin"])),
+            ("legend truth", |v| {
+                v.summary.items[0].execution = ExecutionState::Running
+            }),
+            ("restore health", |v| {
+                v.restore_health.status = "degraded".into()
+            }),
+            ("restore detail", |v| {
+                v.restore_health.detail = Some("partial".into())
+            }),
+            ("filter", |v| {
+                v.preferences.filter = WorkStreamFilter::History
+            }),
+            ("palette", |v| {
+                v.preferences.palette.observe_origins(["new-origin"])
+            }),
             ("filter options", |v| v.options[0].0.push('!')),
             ("empty message", |v| v.empty_ledger = true),
             ("relative age", |v| v.ages[0] = "1m ago".into()),
@@ -6312,7 +6396,10 @@ mod tests {
             assert!(ui.needs_rebuild(baseline.clone()));
             let mut changed = baseline.clone();
             change(&mut changed);
-            assert_eq!(changed.projection.entries[0].record.seq, baseline.projection.entries[0].record.seq);
+            assert_eq!(
+                changed.projection.entries[0].record.seq,
+                baseline.projection.entries[0].record.seq
+            );
             assert!(ui.needs_rebuild(changed.clone()), "{name}");
             assert!(!ui.needs_rebuild(changed), "{name} stable after rebuild");
         }
@@ -6322,8 +6409,14 @@ mod tests {
     fn work_stream_checked_age_changes_only_when_display_changes() {
         let mut truth = work_stream_visible_fixture().summary.items.remove(0);
         truth.last_checked_unix_ms = Some(1_000);
-        assert_eq!(super::task_truth_labels_at(&truth, 61_000), super::task_truth_labels_at(&truth, 61_999));
-        assert_ne!(super::task_truth_labels_at(&truth, 60_999), super::task_truth_labels_at(&truth, 61_000));
+        assert_eq!(
+            super::task_truth_labels_at(&truth, 61_000),
+            super::task_truth_labels_at(&truth, 61_999)
+        );
+        assert_ne!(
+            super::task_truth_labels_at(&truth, 60_999),
+            super::task_truth_labels_at(&truth, 61_000)
+        );
     }
 
     #[test]
@@ -6331,15 +6424,24 @@ mod tests {
         use crate::work_ledger::WorkPullRequestRef;
         let mut baseline = work_stream_visible_fixture();
         baseline.projection.entries[0].record.pull_request = Some(WorkPullRequestRef {
-            repository: "owner/repo".into(), number: 1, title: "PR".into(),
-            url: "https://github.com/owner/repo/pull/1".into(), state: "open".into(),
-            is_draft: false, review_decision: None, checks: Default::default(),
+            repository: "owner/repo".into(),
+            number: 1,
+            title: "PR".into(),
+            url: "https://github.com/owner/repo/pull/1".into(),
+            state: "open".into(),
+            is_draft: false,
+            review_decision: None,
+            checks: Default::default(),
         });
         for change_repository in [true, false] {
             let mut ui = super::WorkStreamUiState::default();
             assert!(ui.needs_rebuild(baseline.clone()));
             let mut changed = baseline.clone();
-            let pr = changed.projection.entries[0].record.pull_request.as_mut().unwrap();
+            let pr = changed.projection.entries[0]
+                .record
+                .pull_request
+                .as_mut()
+                .unwrap();
             if change_repository {
                 pr.repository = "owner/other".into();
             } else {
