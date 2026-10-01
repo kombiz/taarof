@@ -18,6 +18,7 @@ export type MonitorFilter = MonitorContentFilter | "watch";
 
 export interface PaneTarget {
   key: string;
+  runtimeId: string | null;
   sessionName: string;
   workspace: WorkspaceSnapshot;
   tab: TabSnapshot;
@@ -158,26 +159,46 @@ export function writeStoredStringArray(
   }
 }
 
-export function readStoredMonitorOrder(storage: Pick<StringArrayStorage, "getItem">): string[] {
-  return readStoredStringArray(storage, MONITOR_ORDER_STORAGE_KEY);
+export function monitorPreferenceKey(key: string, namespace: string): string {
+  return `${key}.v2.${encodeURIComponent(namespace)}`;
+}
+
+export function readStoredMonitorOrder(
+  storage: Pick<StringArrayStorage, "getItem">,
+  namespace: string | null,
+): string[] {
+  return namespace === null ? [] : readStoredStringArray(
+    storage, monitorPreferenceKey(MONITOR_ORDER_STORAGE_KEY, namespace),
+  );
 }
 
 export function writeStoredMonitorOrder(
   storage: Pick<StringArrayStorage, "setItem">,
   keys: string[],
+  namespace: string | null,
 ) {
-  return writeStoredStringArray(storage, MONITOR_ORDER_STORAGE_KEY, keys);
+  return namespace !== null && writeStoredStringArray(
+    storage, monitorPreferenceKey(MONITOR_ORDER_STORAGE_KEY, namespace), keys,
+  );
 }
 
-export function readStoredWatchedKeys(storage: Pick<StringArrayStorage, "getItem">): string[] {
-  return readStoredStringArray(storage, MONITOR_WATCH_STORAGE_KEY);
+export function readStoredWatchedKeys(
+  storage: Pick<StringArrayStorage, "getItem">,
+  namespace: string | null,
+): string[] {
+  return namespace === null ? [] : readStoredStringArray(
+    storage, monitorPreferenceKey(MONITOR_WATCH_STORAGE_KEY, namespace),
+  );
 }
 
 export function writeStoredWatchedKeys(
   storage: Pick<StringArrayStorage, "setItem">,
   keys: string[],
+  namespace: string | null,
 ) {
-  return writeStoredStringArray(storage, MONITOR_WATCH_STORAGE_KEY, keys);
+  return namespace !== null && writeStoredStringArray(
+    storage, monitorPreferenceKey(MONITOR_WATCH_STORAGE_KEY, namespace), keys,
+  );
 }
 
 export function panePriority(
@@ -228,7 +249,10 @@ export function panePriority(
   return score;
 }
 
-export function buildPaneTargets(snapshot: TaarofStateSnapshot | null): PaneTarget[] {
+export function buildPaneTargets(
+  snapshot: TaarofStateSnapshot | null,
+  runtimeId: string | null = null,
+): PaneTarget[] {
   if (!snapshot) {
     return [];
   }
@@ -240,7 +264,10 @@ export function buildPaneTargets(snapshot: TaarofStateSnapshot | null): PaneTarg
     workspace.tabs.forEach((tab) => {
       tab.panes.forEach((pane) => {
         targets.push({
-          key: `${workspace.id}:${tab.tab_id}:${pane.pane_id}`,
+          key: runtimeId === null
+            ? `${workspace.id}:${tab.tab_id}:${pane.pane_id}`
+            : JSON.stringify([runtimeId, snapshot.session_name, workspace.id, tab.tab_id, pane.pane_id]),
+          runtimeId,
           sessionName: snapshot.session_name,
           workspace,
           tab,
