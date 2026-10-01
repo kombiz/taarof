@@ -194,6 +194,36 @@ fn register_pull_request_fetch<K: Clone + Eq + Hash>(
     false
 }
 
+fn pull_request_fetch_is_due(
+    reason: PullRequestFetchReason,
+    now: u64,
+    fetched_at: u64,
+    ttl: u64,
+) -> bool {
+    reason == PullRequestFetchReason::ExplicitDiscovery || now.saturating_sub(fetched_at) >= ttl
+}
+
+/// Release ownership for every outcome, including worker failure. A queued
+/// explicit refresh consumes the old result and requests exactly one new fetch.
+/// Cache, feedback, and failure-backoff policies remain with each PR driver.
+fn finish_pull_request_fetch<K: Eq + Hash, T>(
+    inflight: &mut HashSet<K>,
+    refresh_after_inflight: &mut HashSet<K>,
+    key: &K,
+    result: T,
+) -> Option<T> {
+    inflight.remove(key);
+    if refresh_after_inflight.remove(key) {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+fn pull_request_fetch_context_matches<K: Eq>(key: &K, active_key: Option<&K>) -> bool {
+    active_key == Some(key)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PullRequestDiscoveryFeedback {
     Success(String),
@@ -2267,9 +2297,12 @@ impl TaskPanel {
         let now = now_ms();
         if reason == PullRequestFetchReason::Passive {
             if let Some(entry) = self.remote_pull_request_cache.borrow().get(&key) {
-                if now.saturating_sub(entry.fetched_at_ms)
-                    < remote_pull_request_identity_ttl_ms(entry.failure_streak)
-                {
+                if !pull_request_fetch_is_due(
+                    reason,
+                    now,
+                    entry.fetched_at_ms,
+                    remote_pull_request_identity_ttl_ms(entry.failure_streak),
+                ) {
                     return;
                 }
             }
@@ -2302,12 +2335,15 @@ impl TaskPanel {
                 RemoteGitIdentityError::Transport,
             ));
 
-            if panel
-                .remote_pull_request_refresh_after_inflight
-                .borrow_mut()
-                .remove(&key)
-            {
-                panel.remote_pull_request_inflight.borrow_mut().remove(&key);
+            let outcome = finish_pull_request_fetch(
+                &mut panel.remote_pull_request_inflight.borrow_mut(),
+                &mut panel
+                    .remote_pull_request_refresh_after_inflight
+                    .borrow_mut(),
+                &key,
+                outcome,
+            );
+            let Some(outcome) = outcome else {
                 panel.ensure_remote_pull_request_identity(
                     &state,
                     &tab_list,
@@ -2318,7 +2354,7 @@ impl TaskPanel {
                 );
                 panel.refresh(&state, &tab_list, &term_stack, &window);
                 return;
-            }
+            };
 
             let (previous_streak, previous_error) = panel
                 .remote_pull_request_cache
@@ -2354,10 +2390,8 @@ impl TaskPanel {
                     failure_streak,
                 },
             );
-            panel.remote_pull_request_inflight.borrow_mut().remove(&key);
-            let still_active = remote_task_target(&state)
-                .as_ref()
-                .is_some_and(|target| remote_cache_key(target) == key);
+            let active_key = remote_task_target(&state).as_ref().map(remote_cache_key);
+            let still_active = pull_request_fetch_context_matches(&key, active_key.as_ref());
             if !still_active {
                 panel
                     .remote_pull_request_feedback_pending
@@ -2381,7 +2415,12 @@ impl TaskPanel {
         let now = now_ms();
         if reason == PullRequestFetchReason::Passive {
             if let Some(entry) = self.pull_request_cache.borrow().get(&key) {
-                if now.saturating_sub(entry.fetched_at_ms) < PULL_REQUESTS_TTL_MS {
+                if !pull_request_fetch_is_due(
+                    reason,
+                    now,
+                    entry.fetched_at_ms,
+                    PULL_REQUESTS_TTL_MS,
+                ) {
                     return;
                 }
             }
@@ -2431,12 +2470,13 @@ impl TaskPanel {
                 )
             });
 
-            if panel
-                .pull_request_refresh_after_inflight
-                .borrow_mut()
-                .remove(&key)
-            {
-                panel.pull_request_inflight.borrow_mut().remove(&key);
+            let completion = finish_pull_request_fetch(
+                &mut panel.pull_request_inflight.borrow_mut(),
+                &mut panel.pull_request_refresh_after_inflight.borrow_mut(),
+                &key,
+                (result, verified_bound_task),
+            );
+            let Some((result, verified_bound_task)) = completion else {
                 panel.ensure_pull_request_fetch(
                     &state,
                     &tab_list,
@@ -2446,7 +2486,7 @@ impl TaskPanel {
                     PullRequestFetchReason::ExplicitDiscovery,
                 );
                 return;
-            }
+            };
             let verified_for_ledger = result.as_ref().ok().cloned();
 
             let active_key = panel
@@ -2459,7 +2499,7 @@ impl TaskPanel {
                 .pull_request_feedback_pending
                 .borrow_mut()
                 .remove(&key)
-                && active_key.as_ref() == Some(&key)
+                && pull_request_fetch_context_matches(&key, active_key.as_ref())
             {
                 match pull_request_discovery_feedback(&result) {
                     PullRequestDiscoveryFeedback::Success(message) => crate::show_toast(&message),
@@ -2505,7 +2545,6 @@ impl TaskPanel {
                     data,
                 );
             }
-            panel.pull_request_inflight.borrow_mut().remove(&key);
             panel.refresh(&state, &tab_list, &term_stack, &window);
         });
     }
@@ -5929,9 +5968,17 @@ mod tests {
             error,
             "GitHub pull-request query failed on the controlling host"
         );
-        // Exercise the existing completion/queued-refresh sequence without GTK.
-        assert!(queued.remove(&key));
-        assert!(inflight.remove(&key));
+        // Use the same completion transition as both production futures. The
+        // timed-out pre-click result must be discarded before the queued fetch.
+        let completion = super::finish_pull_request_fetch(
+            &mut inflight,
+            &mut queued,
+            &key,
+            Err::<BranchPullRequestsData, _>(error.clone()),
+        );
+        assert!(completion.is_none());
+        assert!(!inflight.contains(&key));
+        assert!(!queued.contains(&key));
         assert!(register_pull_request_fetch(
             &mut inflight,
             &mut queued,
@@ -5939,15 +5986,230 @@ mod tests {
             super::PullRequestFetchReason::ExplicitDiscovery,
         ));
         let mut cache = HashMap::new();
-        record_pull_request_fetch(&mut cache, key.clone(), Err(error), 10, 20);
+        let result = super::finish_pull_request_fetch(&mut inflight, &mut queued, &key, Err(error))
+            .expect("the follow-up failure settles instead of rerunning forever");
+        record_pull_request_fetch(&mut cache, key.clone(), result, 10, 20);
         assert!(cache[&key].error.is_some());
-        assert!(inflight.remove(&key));
+        assert!(!inflight.contains(&key));
         assert!(register_pull_request_fetch(
             &mut inflight,
             &mut queued,
             &key,
             super::PullRequestFetchReason::ExplicitDiscovery,
         ));
+    }
+
+    #[test]
+    fn shared_pr_completion_success_and_worker_failure_release_both_key_families() {
+        fn exercise<K: Clone + Eq + std::hash::Hash>(key: K) {
+            let mut inflight = HashSet::new();
+            let mut queued = HashSet::new();
+            for result in [Ok("success"), Err("worker did not complete")] {
+                assert!(register_pull_request_fetch(
+                    &mut inflight,
+                    &mut queued,
+                    &key,
+                    super::PullRequestFetchReason::Passive,
+                ));
+                assert_eq!(
+                    super::finish_pull_request_fetch(&mut inflight, &mut queued, &key, result),
+                    Some(result),
+                );
+                assert!(inflight.is_empty());
+                assert!(queued.is_empty());
+            }
+        }
+        exercise(PullRequestKey::new(
+            PathBuf::from("/repo"),
+            "owner/repo",
+            "owner",
+            "work",
+        ));
+        exercise((
+            vec!["ssh".to_string(), "dev-a.ts".to_string()],
+            "/repo".to_string(),
+        ));
+    }
+
+    #[test]
+    fn shared_pr_completion_coalesces_explicit_refresh_and_discards_old_result() {
+        fn exercise<K: Clone + Eq + std::hash::Hash>(key: K) {
+            let mut inflight = HashSet::new();
+            let mut queued = HashSet::new();
+            for old_result in [Ok("old success"), Err("old failure")] {
+                assert!(register_pull_request_fetch(
+                    &mut inflight,
+                    &mut queued,
+                    &key,
+                    super::PullRequestFetchReason::Passive,
+                ));
+                // Multiple operator requests during the same asynchronous flight
+                // collapse to one follow-up, including after a failed old request.
+                for _ in 0..3 {
+                    assert!(!register_pull_request_fetch(
+                        &mut inflight,
+                        &mut queued,
+                        &key,
+                        super::PullRequestFetchReason::ExplicitDiscovery,
+                    ));
+                }
+                assert_eq!(queued.len(), 1);
+                assert_eq!(
+                    super::finish_pull_request_fetch(&mut inflight, &mut queued, &key, old_result,),
+                    None
+                );
+                assert!(inflight.is_empty());
+                assert!(queued.is_empty());
+                assert!(register_pull_request_fetch(
+                    &mut inflight,
+                    &mut queued,
+                    &key,
+                    super::PullRequestFetchReason::ExplicitDiscovery,
+                ));
+                assert_eq!(
+                    super::finish_pull_request_fetch(
+                        &mut inflight,
+                        &mut queued,
+                        &key,
+                        Ok::<_, &str>("post-click success"),
+                    ),
+                    Some(Ok("post-click success"))
+                );
+                assert!(inflight.is_empty());
+                assert!(queued.is_empty());
+            }
+        }
+        exercise(PullRequestKey::new(
+            PathBuf::from("/repo"),
+            "owner/repo",
+            "owner",
+            "work",
+        ));
+        exercise((
+            vec!["ssh".to_string(), "dev-a.ts".to_string()],
+            "/repo".to_string(),
+        ));
+    }
+
+    #[test]
+    fn shared_pr_completion_stale_context_releases_only_original_ownership() {
+        fn exercise<K: Clone + Eq + std::hash::Hash>(old: K, active: K) {
+            let mut inflight = HashSet::new();
+            let mut queued = HashSet::new();
+            for key in [&old, &active] {
+                assert!(register_pull_request_fetch(
+                    &mut inflight,
+                    &mut queued,
+                    key,
+                    super::PullRequestFetchReason::Passive,
+                ));
+            }
+            assert_eq!(
+                super::finish_pull_request_fetch(
+                    &mut inflight,
+                    &mut queued,
+                    &old,
+                    Ok::<_, &str>("old success"),
+                ),
+                Some(Ok("old success"))
+            );
+            assert!(!super::pull_request_fetch_context_matches(
+                &old,
+                Some(&active)
+            ));
+            assert!(!super::pull_request_fetch_context_matches(&old, None));
+            assert!(!inflight.contains(&old));
+            assert!(inflight.contains(&active));
+            assert_eq!(
+                super::finish_pull_request_fetch(
+                    &mut inflight,
+                    &mut queued,
+                    &active,
+                    Ok::<_, &str>("current success"),
+                ),
+                Some(Ok("current success"))
+            );
+            assert!(super::pull_request_fetch_context_matches(
+                &active,
+                Some(&active)
+            ));
+            assert!(inflight.is_empty());
+        }
+        exercise(
+            PullRequestKey::new(PathBuf::from("/old"), "owner/repo", "owner", "old"),
+            PullRequestKey::new(PathBuf::from("/active"), "owner/repo", "owner", "active"),
+        );
+        exercise(
+            (
+                vec!["ssh".to_string(), "dev-a.ts".to_string()],
+                "/repo".to_string(),
+            ),
+            (
+                vec!["ssh".to_string(), "dev-b.ts".to_string()],
+                "/repo".to_string(),
+            ),
+        );
+    }
+
+    #[test]
+    fn remote_pr_failure_completion_preserves_backoff_and_later_retry() {
+        let key = (
+            vec!["ssh".to_string(), "dev-a.ts".to_string()],
+            "/repo".to_string(),
+        );
+        let mut inflight = HashSet::new();
+        let mut queued = HashSet::new();
+        let passive = super::PullRequestFetchReason::Passive;
+        let explicit = super::PullRequestFetchReason::ExplicitDiscovery;
+        assert!(register_pull_request_fetch(
+            &mut inflight,
+            &mut queued,
+            &key,
+            passive
+        ));
+        let outcome = super::finish_pull_request_fetch(
+            &mut inflight,
+            &mut queued,
+            &key,
+            RemoteGitIdentityOutcome::Error(RemoteGitIdentityError::Transport),
+        )
+        .expect("worker failure must settle");
+        let streak = next_remote_git_failure_streak(1, &outcome);
+        assert_eq!(streak, 2);
+        assert!(inflight.is_empty());
+        let fetched_at = 100;
+        let ttl = remote_pull_request_identity_ttl_ms(streak);
+        assert!(!super::pull_request_fetch_is_due(
+            passive,
+            fetched_at + ttl - 1,
+            fetched_at,
+            ttl
+        ));
+        assert!(super::pull_request_fetch_is_due(
+            explicit, fetched_at, fetched_at, ttl
+        ));
+        assert!(super::pull_request_fetch_is_due(
+            passive,
+            fetched_at + ttl,
+            fetched_at,
+            ttl
+        ));
+        assert!(register_pull_request_fetch(
+            &mut inflight,
+            &mut queued,
+            &key,
+            passive
+        ));
+        let outcome = super::finish_pull_request_fetch(
+            &mut inflight,
+            &mut queued,
+            &key,
+            RemoteGitIdentityOutcome::NoRepository,
+        )
+        .expect("later successful command must settle");
+        assert_eq!(next_remote_git_failure_streak(streak, &outcome), 0);
+        assert!(inflight.is_empty());
+        assert!(queued.is_empty());
     }
 
     #[test]
