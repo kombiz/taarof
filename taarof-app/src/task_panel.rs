@@ -1580,9 +1580,7 @@ impl TaskPanel {
             self.current_task_card.set_visible(false);
         }
 
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
-        }
+        crate::gtk_util::remove_all_children(&self.list);
         if let Some(header) = next.parallelization_header.as_deref() {
             self.list.append(&build_parallelization_header_row(header));
         }
@@ -1598,9 +1596,7 @@ impl TaskPanel {
         }
         self.empty.set_visible(next.tasks.is_empty());
 
-        while let Some(child) = self.actions.first_child() {
-            self.actions.remove(&child);
-        }
+        crate::gtk_util::remove_all_children(&self.actions);
         populate_action_buttons(
             self,
             state,
@@ -1633,9 +1629,7 @@ impl TaskPanel {
             format!("{count} agent panes · live observational state")
         };
         self.agents_summary.set_text(&summary);
-        while let Some(child) = self.agents_list.first_child() {
-            self.agents_list.remove(&child);
-        }
+        crate::gtk_util::remove_all_children(&self.agents_list);
         for card in &cards {
             self.agents_list
                 .append(&build_agent_activity_row(card, state, tab_list, term_stack));

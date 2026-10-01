@@ -647,9 +647,7 @@ fn repopulate_palette_list(palette: &CommandPalette, state: &Rc<RefCell<AppState
 fn render_palette_list(palette: &CommandPalette, state: &Rc<RefCell<AppState>>, query: &str) {
     let entries = palette_entries(palette, state);
     let filtered = filtered_entries(&entries, query);
-    while let Some(child) = palette.list.first_child() {
-        palette.list.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(&palette.list);
     for entry in filtered {
         palette.list.append(&make_row(entry));
     }
@@ -2362,7 +2360,7 @@ fn execute_action(
     match action {
         // ── Navigation / UI ──────────────────────────────────────────────────
         PaletteAction::Activate(action_name) => {
-            dispatch_activate(*action_name, window);
+            crate::keybindings::activate(window, *action_name);
             false
         }
         PaletteAction::Noop => true,
@@ -2726,22 +2724,6 @@ fn dispatch_send_to_pane(
 }
 
 // ── execute_action dispatch helpers ──────────────────────────────────────────
-
-/// Activate a GAction by its "win.<name>" string.
-fn dispatch_activate(action: crate::keybindings::Action, window: &adw::ApplicationWindow) {
-    let gaction_name = action.gaction_name();
-    if let Some(name) = gaction_name.strip_prefix("win.") {
-        if let Some(gaction) = window.lookup_action(name) {
-            if let Some(simple) = gaction.downcast_ref::<gio::SimpleAction>() {
-                simple.activate(None);
-                return;
-            }
-        }
-    }
-    // The typed enum guarantees the *name* exists; it cannot guarantee the
-    // window registered a handler for it. Say so rather than no-oping silently.
-    eprintln!("taarof: no window action registered for {gaction_name}; palette entry did nothing");
-}
 
 /// Switch to the tab identified by `tab_id` and focus its terminal.
 fn dispatch_switch_tab(

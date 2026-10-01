@@ -489,9 +489,7 @@ pub(super) fn refresh_tab_detail_section(
     };
 
     let actions_box = handle.actions_box.clone();
-    while let Some(child) = actions_box.first_child() {
-        actions_box.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(&actions_box);
     if task_buttons.is_empty() {
         actions_box.set_visible(false);
     } else {
@@ -540,9 +538,7 @@ pub(super) fn refresh_tab_detail_section(
     }
 
     let tracking_box = handle.tracking_box.clone();
-    while let Some(child) = tracking_box.first_child() {
-        tracking_box.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(&tracking_box);
     if let Some(data) = plan_tasks {
         let progress = gtk::ProgressBar::new();
         let fraction = if data.total == 0 {

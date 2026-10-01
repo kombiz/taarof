@@ -316,7 +316,7 @@ pub fn build_sidebar() -> Sidebar {
     new_btn.add_css_class("new-tab-button");
     new_btn.add_css_class("compact-hidden");
     new_btn.connect_clicked(move |button| {
-        activate_window_action(button, crate::keybindings::Action::NewTab);
+        crate::keybindings::activate(button, crate::keybindings::Action::NewTab);
     });
     sidebar.append(&new_btn);
 
@@ -328,7 +328,7 @@ pub fn build_sidebar() -> Sidebar {
     tmux_btn.set_tooltip_text(Some(&tmux_ui.tooltip));
     tmux_btn.set_sensitive(tmux_ui.available);
     tmux_btn.connect_clicked(move |button| {
-        activate_window_action(button, crate::keybindings::Action::NewTmuxTab);
+        crate::keybindings::activate(button, crate::keybindings::Action::NewTmuxTab);
     });
     sidebar.append(&tmux_btn);
 
@@ -872,12 +872,8 @@ fn refresh_work_ledger(
         .iter()
         .find_map(|(key, widget)| widget.has_focus().then(|| key.clone()));
     widgets.controls.borrow_mut().clear();
-    while let Some(child) = widgets.legend.first_child() {
-        widgets.legend.remove(&child);
-    }
-    while let Some(child) = widgets.list.first_child() {
-        widgets.list.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(&widgets.legend);
+    crate::gtk_util::remove_all_children(&widgets.list);
     if restore_health.status == "degraded" {
         let warning = gtk::Label::new(Some(
             restore_health
@@ -1714,10 +1710,6 @@ fn widget_window(widget: &impl IsA<gtk::Widget>) -> Option<adw::ApplicationWindo
         .and_then(|root| root.downcast::<adw::ApplicationWindow>().ok())
 }
 
-fn activate_window_action(widget: &impl IsA<gtk::Widget>, action: crate::keybindings::Action) {
-    crate::keybindings::activate(widget, action);
-}
-
 fn copy_text_to_clipboard(text: &str) {
     if text.trim().is_empty() {
         return;
@@ -2547,7 +2539,7 @@ fn show_tab_row_menu(
         register_tab_row_forwarded_actions(
             &group,
             move || activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row_for_focus),
-            move |action| activate_window_action(&row_for_action, action),
+            move |action| crate::keybindings::activate(&row_for_action, action),
         );
     }
 
@@ -3736,9 +3728,7 @@ fn distinct_agent_badges(names: &[String]) -> Vec<crate::agents::AgentBadge> {
 /// token as a CSS class (`agent-badge-<color_token>`), so the sidebar and web
 /// Monitor render the same identity model. The container is hidden when empty.
 fn refresh_agent_badges(container: &gtk::Box, badges: &[crate::agents::AgentBadge]) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(container);
     if badges.is_empty() {
         container.set_visible(false);
         container.set_tooltip_text(None);
@@ -3914,9 +3904,7 @@ fn refresh_agent_child_rows(
     }
     *handle.last_agent_children.borrow_mut() = Some(snapshot);
 
-    while let Some(child) = handle.agent_children.first_child() {
-        handle.agent_children.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(&handle.agent_children);
 
     handle
         .agent_expand_button
