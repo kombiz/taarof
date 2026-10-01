@@ -42,6 +42,11 @@ pub struct AppState {
     /// terminal tab used by pane- and command-targeting APIs.
     presented_tab: Option<u32>,
     last_active_workspace: Option<u32>,
+    /// Ephemeral discovery-viewer identity. Navigation and per-tab pane focus
+    /// must remain distinguishable after an away-and-back transition.
+    task_viewer_epoch: u64,
+    task_epoch_issuer: u64,
+    task_pane_epochs: HashMap<u32, u64>,
     pub next_id: u32,
     pub headless_panes: HashMap<(u32, u32), HeadlessPaneState>,
     /// Tabs restored lazily: their live `panes` is `PaneNode::Empty` and the
@@ -142,6 +147,9 @@ impl AppState {
             active_workspace: 0,
             presented_tab: None,
             last_active_workspace: None,
+            task_viewer_epoch: 0,
+            task_epoch_issuer: 0,
+            task_pane_epochs: HashMap::new(),
             next_id: 1,
             headless_panes: HashMap::new(),
             pending_tab_restores: HashMap::new(),
@@ -182,6 +190,58 @@ impl AppState {
         self.workspaces
             .iter()
             .find(|w| w.id == self.active_workspace)
+    }
+
+    pub(crate) fn invalidate_task_viewer_epoch(&mut self) {
+        self.task_viewer_epoch = self.next_task_epoch();
+    }
+
+    fn next_task_epoch(&mut self) -> u64 {
+        self.task_epoch_issuer = self
+            .task_epoch_issuer
+            .checked_add(1)
+            .expect("task viewer epoch exhausted");
+        self.task_epoch_issuer
+    }
+
+    pub(crate) fn register_task_tab_epoch(&mut self, tab_id: u32) {
+        let epoch = self.next_task_epoch();
+        self.task_pane_epochs.insert(tab_id, epoch);
+    }
+
+    pub(crate) fn task_viewer_epoch(&self) -> u64 {
+        self.task_viewer_epoch
+    }
+
+    pub(crate) fn task_pane_epoch(&self, tab_id: u32) -> u64 {
+        self.task_pane_epochs.get(&tab_id).copied().unwrap_or(0)
+    }
+
+    /// Callers keep their existing pane validation. A missing tab or an
+    /// unchanged focus does not advance discovery-viewer identity.
+    pub(crate) fn set_focused_pane(&mut self, tab_id: u32, pane_id: u32) -> bool {
+        let Some(tab) = self.find_tab_mut(tab_id) else {
+            return false;
+        };
+        if tab.focused_pane_id != pane_id {
+            tab.focused_pane_id = pane_id;
+            self.register_task_tab_epoch(tab_id);
+        }
+        true
+    }
+
+    fn task_selection(&self) -> (u32, Option<u32>, Option<u32>) {
+        (
+            self.active_workspace,
+            self.active_tab().map(|tab| tab.id),
+            self.presented_tab_id(),
+        )
+    }
+
+    fn finish_task_selection(&mut self, previous: (u32, Option<u32>, Option<u32>)) {
+        if self.task_selection() != previous {
+            self.invalidate_task_viewer_epoch();
+        }
     }
 
     pub fn active_ws_mut(&mut self) -> Option<&mut Workspace> {
@@ -331,6 +391,7 @@ impl AppState {
     }
 
     pub fn create_workspace(&mut self, name: &str, repo_root: Option<String>) -> u32 {
+        let previous = self.task_selection();
         if self
             .workspaces
             .iter()
@@ -362,6 +423,7 @@ impl AppState {
         });
         self.active_workspace = id;
         self.presented_tab = None;
+        self.finish_task_selection(previous);
         self.event_store.emit(
             "workspace_created",
             serde_json::json!({
@@ -457,6 +519,7 @@ impl AppState {
     }
 
     fn sanitize_navigation_state(&mut self) {
+        let previous = self.task_selection();
         for workspace in &mut self.workspaces {
             Self::sanitize_workspace_navigation(workspace);
         }
@@ -479,6 +542,7 @@ impl AppState {
         }) {
             self.presented_tab = None;
         }
+        self.finish_task_selection(previous);
     }
 
     pub fn reset_navigation_history(&mut self) {
@@ -493,6 +557,7 @@ impl AppState {
         if !self.has_workspace(ws_id) {
             return None;
         }
+        let previous = self.task_selection();
 
         if self.active_workspace != ws_id && self.has_workspace(self.active_workspace) {
             self.last_active_workspace = Some(self.active_workspace);
@@ -502,6 +567,7 @@ impl AppState {
         self.presented_tab = self
             .active_ws()
             .and_then(|ws| (ws.active_tab != 0).then_some(ws.active_tab));
+        self.finish_task_selection(previous);
         Some(ws_id)
     }
 
@@ -582,6 +648,7 @@ impl AppState {
         if self.workspaces[workspace_idx].tabs[tab_idx].kind != TabKind::Terminal {
             return None;
         }
+        let previous = self.task_selection();
 
         if self.active_workspace != workspace_id && self.has_workspace(self.active_workspace) {
             self.last_active_workspace = Some(self.active_workspace);
@@ -599,6 +666,7 @@ impl AppState {
         self.presented_tab = Some(tab_id);
 
         self.sanitize_navigation_state();
+        self.finish_task_selection(previous);
         Some(workspace_id)
     }
 
@@ -607,6 +675,7 @@ impl AppState {
     /// leave the active terminal unchanged so implicit socket and keyboard
     /// actions remain well-defined.
     pub fn present_tab(&mut self, tab_id: u32) -> Option<u32> {
+        let previous = self.task_selection();
         let (workspace_id, kind) = self
             .find_tab(tab_id)
             .map(|(workspace, tab)| (workspace.id, tab.kind))?;
@@ -618,6 +687,7 @@ impl AppState {
         }
         self.consume_tab_attention(tab_id);
         self.presented_tab = Some(tab_id);
+        self.finish_task_selection(previous);
         Some(workspace_id)
     }
 
@@ -642,9 +712,11 @@ impl AppState {
     }
 
     pub fn remove_workspace(&mut self, ws_id: u32) {
+        let previous = self.task_selection();
         self.workspaces.retain(|ws| ws.id != ws_id);
         self.prune_tab_owned_facts();
         self.sanitize_navigation_state();
+        self.finish_task_selection(previous);
     }
 
     pub(crate) fn activate_chord(&mut self, mode: ChordMode) -> u64 {
@@ -704,6 +776,7 @@ impl AppState {
     }
 
     pub fn remove_tab(&mut self, tab_id: u32) {
+        let previous = self.task_selection();
         for ws in &mut self.workspaces {
             ws.tabs.retain(|t| t.id != tab_id);
             if ws.last_active_tab == Some(tab_id) {
@@ -715,12 +788,14 @@ impl AppState {
         }
         self.prune_tab_owned_facts();
         self.sanitize_navigation_state();
+        self.finish_task_selection(previous);
     }
 
     /// Tab membership is the authority for every tab-owned cache. Keep one
     /// removal transition for direct tab close, workspace close and restore.
     fn prune_tab_owned_facts(&mut self) {
         let live: HashSet<u32> = self.all_tabs().map(|tab| tab.id).collect();
+        self.task_pane_epochs.retain(|tab, _| live.contains(tab));
         self.headless_panes.retain(|(tab, _), _| live.contains(tab));
         self.pending_tab_restores
             .retain(|tab, _| live.contains(tab));
@@ -916,7 +991,7 @@ impl AppState {
         {
             return Err(crate::task_binding::PaneTaskBindingError::NoLocalCwd);
         }
-        leaf.location_state.cwd = Some(cwd);
+        leaf.update_location_cache(Some(cwd), leaf.location_state.cwd_host.clone());
         leaf.current_task = Some(binding.clone());
         self.record_pane_binding_change(tab_id, pane_id, previous.as_ref(), Some(&binding));
         Ok(binding)
@@ -1007,6 +1082,7 @@ impl AppState {
         if self.workspaces[source_idx].id == target_ws_id {
             return Err(MoveTabError::AlreadyInWorkspace);
         }
+        let previous = self.task_selection();
 
         let moved_tab_idx = self.workspaces[source_idx]
             .tabs
@@ -1031,6 +1107,7 @@ impl AppState {
         }
         self.active_workspace = target_ws_id;
         self.sanitize_navigation_state();
+        self.finish_task_selection(previous);
         Ok(())
     }
 }
@@ -1058,6 +1135,7 @@ impl RuntimeHandle {
 
     pub fn clear_for_session_restore(&self) {
         let mut state = self.state.borrow_mut();
+        state.invalidate_task_viewer_epoch();
         state.workspaces.clear();
         state.active_workspace = 0;
         state.prune_tab_owned_facts();
@@ -1082,6 +1160,7 @@ impl RuntimeHandle {
         if !is_terminal {
             return false;
         }
+        let previous = state.task_selection();
         let Some(workspace) = state.workspaces.iter_mut().find(|ws| ws.id == workspace_id) else {
             return false;
         };
@@ -1089,6 +1168,7 @@ impl RuntimeHandle {
         if state.active_workspace == workspace_id {
             state.presented_tab = Some(tab_id);
         }
+        state.finish_task_selection(previous);
         true
     }
 
@@ -1111,6 +1191,7 @@ impl RuntimeHandle {
             .expect("active workspace must exist before registering a tab")
             .tabs
             .push(tab);
+        state.register_task_tab_epoch(tab_id);
         tab_id
     }
 
@@ -1142,7 +1223,7 @@ impl RuntimeHandle {
         ) {
             return None;
         }
-        tab.focused_pane_id = new_pane_id;
+        state.set_focused_pane(tab_id, new_pane_id);
         Some(new_pane_id)
     }
 
@@ -1168,7 +1249,8 @@ impl RuntimeHandle {
         let (focus_terminal, deferred_stack_widget) =
             remove_pane_from_tree(&mut tab.panes, pane_id, term_stack, stack_name);
         tab.reset_pane_agent_activity_evidence(pane_id);
-        tab.focused_pane_id = first_pane_id(&tab.panes).unwrap_or(0);
+        let focused_pane_id = first_pane_id(&tab.panes).unwrap_or(0);
+        state.set_focused_pane(tab_id, focused_pane_id);
 
         Some(ClosedPaneState {
             focus_terminal,
@@ -1413,6 +1495,65 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("test dir should be created");
         root
+    }
+
+    #[test]
+    fn task_viewer_incarnation_tokens_are_bounded_and_not_reused() {
+        let runtime = RuntimeHandle::new();
+        let state = runtime.shared_state();
+        let workspace = state.borrow().active_workspace;
+        let (tab, pane) = crate::seed_headless_terminal_tab(
+            &mut state.borrow_mut(),
+            workspace,
+            "first",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .unwrap();
+        let (other, _) = crate::seed_headless_terminal_tab(
+            &mut state.borrow_mut(),
+            workspace,
+            "other",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .unwrap();
+        let mut previous = state.borrow().task_pane_epoch(tab);
+        let issuer = state.borrow().task_epoch_issuer;
+        state.borrow_mut().set_focused_pane(tab, pane);
+        assert_eq!(
+            state.borrow().task_epoch_issuer,
+            issuer,
+            "same-pane focus is a no-op"
+        );
+        for _ in 0..32 {
+            state.borrow_mut().remove_tab(tab);
+            assert_eq!(state.borrow().task_pane_epochs.len(), 1);
+            assert!(state.borrow().task_pane_epochs.contains_key(&other));
+            state.borrow_mut().next_id = tab;
+            crate::seed_headless_terminal_tab(
+                &mut state.borrow_mut(),
+                workspace,
+                "replacement",
+                crate::HeadlessPaneSeed::default(),
+            )
+            .unwrap();
+            let current = state.borrow().task_pane_epoch(tab);
+            assert!(current > previous);
+            previous = current;
+            assert_eq!(state.borrow().task_pane_epochs.len(), 2);
+        }
+        runtime.clear_for_session_restore();
+        assert!(state.borrow().task_pane_epochs.is_empty());
+        let workspace = state.borrow_mut().create_workspace("restored", None);
+        state.borrow_mut().next_id = tab;
+        crate::seed_headless_terminal_tab(
+            &mut state.borrow_mut(),
+            workspace,
+            "restored",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .unwrap();
+        assert!(state.borrow().task_pane_epoch(tab) > previous);
+        assert_eq!(state.borrow().task_pane_epochs.len(), 1);
     }
 
     fn stub_tab_registration(

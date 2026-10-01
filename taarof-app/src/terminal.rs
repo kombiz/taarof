@@ -1490,6 +1490,7 @@ fn build_pane_leaf(
         restored_tmux: None,
         restore_unavailable_reason: None,
         location_state: PaneLocationState::default(),
+        location_generation: 0,
         process_state: PaneProcessState::default(),
         current_task: None,
         restored_agent_session: None,
@@ -2291,11 +2292,7 @@ fn cache_pane_location(
     let mut st = state.borrow_mut();
     if let Some(tab) = st.find_tab_mut(tab_id) {
         if let Some(leaf) = tab.panes.leaf_mut(pane_id) {
-            leaf.location_state = PaneLocationState {
-                cwd,
-                cwd_host,
-                updated_at_unix_ms: Some(unix_time_ms()),
-            };
+            leaf.update_location_cache(cwd, cwd_host);
         }
     }
 }
@@ -2779,9 +2776,7 @@ fn focus_menu_target_pane(
     {
         let mut st = state.borrow_mut();
         let _ = st.activate_tab(tab_id);
-        if let Some(tab) = st.find_tab_mut(tab_id) {
-            tab.focused_pane_id = pane_id;
-        }
+        st.set_focused_pane(tab_id, pane_id);
     }
     terminal.grab_focus();
 }
@@ -3289,7 +3284,7 @@ pub fn focus_pane_in_direction(
             return false;
         };
         let terminal = leaf.terminal.clone();
-        tab.focused_pane_id = target_id;
+        st.set_focused_pane(tab_id, target_id);
         terminal
     };
 
@@ -3501,8 +3496,8 @@ pub fn materialize_pending_tab(
             return false;
         };
         *tab.panes = panes;
-        tab.focused_pane_id = focused_pane_id;
         tab.next_pane_id = next_pane_id;
+        st.set_focused_pane(tab_id, focused_pane_id);
     }
 
     let stack_name = tab_root_widget_name(tab_id);
@@ -3915,6 +3910,148 @@ mod tests {
     use std::ffi::{c_void, CString};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    #[ignore = "requires an owned GTK display (xvfb-run)"]
+    fn task_discovery_terminal_viewer_gtk_lifecycle() {
+        let _glib_guard = crate::glib_main_context_test_guard();
+        let _cache_guard = crate::mise::task_discovery_test_guard();
+        gtk::init().expect("owned GTK display");
+        crate::mise::clear_task_discovery_cache_for_test();
+        let first_terminal = vte::Terminal::new();
+        let second_terminal = vte::Terminal::new();
+        let first = super::build_pane_leaf(
+            7,
+            &first_terminal,
+            &gtk::Box::new(gtk::Orientation::Vertical, 0),
+            None,
+        );
+        let second = super::build_pane_leaf(
+            8,
+            &second_terminal,
+            &gtk::Box::new(gtk::Orientation::Vertical, 0),
+            None,
+        );
+        let runtime = crate::RuntimeHandle::new();
+        let state = runtime.shared_state();
+        let tab_id = runtime.register_terminal_tab(crate::runtime::TerminalTabRegistration {
+            name: "identity".into(),
+            panes: Box::new(PaneNode::Split {
+                direction: crate::pane::SplitDirection::Horizontal,
+                first: Box::new(PaneNode::Leaf(first)),
+                second: Box::new(PaneNode::Leaf(second)),
+                widget: gtk::Paned::new(gtk::Orientation::Horizontal),
+            }),
+            focused_pane_id: 7,
+            next_pane_id: 9,
+            close_on_exit: false,
+            respawn_on_exit: None,
+        });
+        state.borrow_mut().activate_tab(tab_id).unwrap();
+        let target = crate::mise::DiscoveryTarget::Local {
+            cwd: "/d13b-viewer".into(),
+            binary_path: None,
+        };
+        let context = glib::MainContext::default();
+        let drain = || {
+            while context.pending() {
+                context.iteration(false);
+            }
+        };
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let subscribe = || {
+            crate::mise::set_pending_task_discovery_for_test(&target);
+            let identity =
+                crate::mise::TaskViewerIdentity::for_tab(&state.borrow(), tab_id).unwrap();
+            let calls = calls.clone();
+            crate::mise::subscribe_task_discovery_for_viewer(&state, identity, &target, move |_| {
+                calls.set(calls.get() + 1)
+            })
+        };
+
+        super::cache_pane_location(&state, tab_id, 7, Some("/A".into()), Some("host-a".into()));
+        let subscription = subscribe();
+        super::cache_pane_location(&state, tab_id, 7, Some("/B".into()), Some("host-a".into()));
+        super::cache_pane_location(&state, tab_id, 7, Some("/A".into()), Some("host-a".into()));
+        crate::mise::complete_current_task_discovery_for_test(&target, Ok(Vec::new()));
+        drain();
+        assert_eq!(calls.get(), 0, "cwd away/back rejects old completion");
+        drop(subscription);
+
+        let subscription = subscribe();
+        super::cache_pane_location(&state, tab_id, 7, Some("/A".into()), Some("host-b".into()));
+        super::cache_pane_location(&state, tab_id, 7, Some("/A".into()), Some("host-a".into()));
+        crate::mise::complete_current_task_discovery_for_test(&target, Ok(Vec::new()));
+        drain();
+        assert_eq!(calls.get(), 0, "host away/back rejects old completion");
+        drop(subscription);
+
+        let subscription = subscribe();
+        super::focus_menu_target_pane(&state, tab_id, 8, &second_terminal);
+        super::focus_menu_target_pane(&state, tab_id, 7, &first_terminal);
+        crate::mise::complete_current_task_discovery_for_test(&target, Ok(Vec::new()));
+        drain();
+        assert_eq!(
+            calls.get(),
+            0,
+            "context-menu direct runtime bypass advances identity"
+        );
+        drop(subscription);
+
+        let subscription = subscribe();
+        assert!(crate::views::jump_to_attention_target(
+            &mut state.borrow_mut(),
+            tab_id,
+            8
+        ));
+        assert!(crate::views::jump_to_attention_target(
+            &mut state.borrow_mut(),
+            tab_id,
+            7
+        ));
+        crate::mise::complete_current_task_discovery_for_test(&target, Ok(Vec::new()));
+        drain();
+        assert_eq!(
+            calls.get(),
+            0,
+            "attention direct runtime bypass advances identity"
+        );
+        drop(subscription);
+
+        let subscription = subscribe();
+        let generation = state
+            .borrow()
+            .find_tab(tab_id)
+            .unwrap()
+            .1
+            .panes
+            .leaf(7)
+            .unwrap()
+            .location_generation;
+        super::cache_pane_location(&state, tab_id, 7, Some("/A".into()), Some("host-a".into()));
+        super::focus_menu_target_pane(&state, tab_id, 7, &first_terminal);
+        assert_eq!(
+            state
+                .borrow()
+                .find_tab(tab_id)
+                .unwrap()
+                .1
+                .panes
+                .leaf(7)
+                .unwrap()
+                .location_generation,
+            generation
+        );
+        crate::mise::complete_current_task_discovery_for_test(&target, Ok(Vec::new()));
+        drain();
+        assert_eq!(
+            calls.get(),
+            1,
+            "timestamp-only refresh and same-pane focus preserve viewer"
+        );
+        drop(subscription);
+        assert_eq!(crate::mise::task_subscriber_count_for_test(), 0);
+    }
 
     fn detached_poll_snapshot(
         state: &AppState,

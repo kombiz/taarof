@@ -64,9 +64,7 @@ pub(super) fn connect_pane_focus_tracking(
     let focus_ctrl = gtk::EventControllerFocus::new();
     focus_ctrl.connect_enter(move |_| {
         let mut st = state_for_focus.borrow_mut();
-        if let Some(tab) = st.find_tab_mut(tab_id) {
-            tab.focused_pane_id = pane_id;
-        }
+        st.set_focused_pane(tab_id, pane_id);
         drop(st);
         super::update_tab_labels_from_terminal(
             &terminal_for_focus,

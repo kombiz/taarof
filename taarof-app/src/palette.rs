@@ -10,14 +10,6 @@ use crate::task_launch::{TaskLaunchError, TaskLaunchExecutor, TaskLaunchPlan, Ta
 use crate::templates::{SavedWorkspaceTemplate, TemplateKind, TemplateRecord};
 use crate::{AppState, RuntimeHandle};
 
-// Poll interval for the in-memory task discovery cache used while the palette
-// is open. The background worker runs mise/SSH on a separate thread; this timer
-// only reads from the in-memory cache and repaints the list when results land.
-// 500 ms is a reasonable tradeoff: the palette shows a "discovering…" entry
-// immediately, and the list refreshes at most 2× per second without spinning
-// the GTK main loop unnecessarily.
-const TASK_DISCOVERY_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
 /// A single entry in the command palette.
 struct PaletteEntry {
     label: String,
@@ -454,7 +446,7 @@ pub struct CommandPalette {
     /// Payload snapshot for the "send to pane" picker, captured when the picker
     /// opens so the delivery is independent of later selection/clipboard changes.
     send_source: Rc<RefCell<Option<SendPayloadSource>>>,
-    discovery_poll_source: Rc<RefCell<Option<glib::SourceId>>>,
+    discovery_subscription: Rc<RefCell<Option<crate::mise::TaskDiscoverySubscription>>>,
     worktree_listing: Rc<RefCell<Option<WorktreeListing>>>,
     worktree_listing_error: Rc<RefCell<Option<(PathBuf, String)>>>,
     worktree_listing_in_flight: Rc<Cell<bool>>,
@@ -476,7 +468,7 @@ impl Clone for CommandPalette {
             list: self.list.clone(),
             mode: self.mode.clone(),
             send_source: self.send_source.clone(),
-            discovery_poll_source: self.discovery_poll_source.clone(),
+            discovery_subscription: self.discovery_subscription.clone(),
             worktree_listing: self.worktree_listing.clone(),
             worktree_listing_error: self.worktree_listing_error.clone(),
             worktree_listing_in_flight: self.worktree_listing_in_flight.clone(),
@@ -485,6 +477,40 @@ impl Clone for CommandPalette {
             activate_handler: RefCell::new(None),
             row_activated_handler: RefCell::new(None),
             key_controller: RefCell::new(None),
+        }
+    }
+}
+
+impl CommandPalette {
+    /// A pending callback may not retain widgets: their signal handlers can
+    /// retain the original palette's subscription slot and create a cycle.
+    fn weak_discovery_view(&self) -> impl Fn() -> Option<Self> {
+        let container = self.container.downgrade();
+        let entry = self.entry.downgrade();
+        let list = self.list.downgrade();
+        let mode = Rc::downgrade(&self.mode);
+        let send_source = Rc::downgrade(&self.send_source);
+        let worktree_listing = Rc::downgrade(&self.worktree_listing);
+        let worktree_listing_error = Rc::downgrade(&self.worktree_listing_error);
+        let worktree_listing_in_flight = Rc::downgrade(&self.worktree_listing_in_flight);
+        let worktree_listing_generation = Rc::downgrade(&self.worktree_listing_generation);
+        move || {
+            Some(Self {
+                container: container.upgrade()?,
+                entry: entry.upgrade()?,
+                list: list.upgrade()?,
+                mode: mode.upgrade()?,
+                send_source: send_source.upgrade()?,
+                discovery_subscription: Rc::new(RefCell::new(None)),
+                worktree_listing: worktree_listing.upgrade()?,
+                worktree_listing_error: worktree_listing_error.upgrade()?,
+                worktree_listing_in_flight: worktree_listing_in_flight.upgrade()?,
+                worktree_listing_generation: worktree_listing_generation.upgrade()?,
+                search_changed_handler: RefCell::new(None),
+                activate_handler: RefCell::new(None),
+                row_activated_handler: RefCell::new(None),
+                key_controller: RefCell::new(None),
+            })
         }
     }
 }
@@ -518,13 +544,23 @@ pub fn build_command_palette() -> CommandPalette {
         .build();
     container.append(&scroll);
 
+    let discovery_subscription =
+        Rc::new(RefCell::new(None::<crate::mise::TaskDiscoverySubscription>));
+    let weak_subscription = Rc::downgrade(&discovery_subscription);
+    container.connect_visible_notify(move |container| {
+        if !container.is_visible() {
+            if let Some(slot) = weak_subscription.upgrade() {
+                slot.borrow_mut().take();
+            }
+        }
+    });
     CommandPalette {
         container,
         entry,
         list,
         mode: Rc::new(RefCell::new(PaletteMode::Default)),
         send_source: Rc::new(RefCell::new(None)),
-        discovery_poll_source: Rc::new(RefCell::new(None)),
+        discovery_subscription,
         worktree_listing: Rc::new(RefCell::new(None)),
         worktree_listing_error: Rc::new(RefCell::new(None)),
         worktree_listing_in_flight: Rc::new(Cell::new(false)),
@@ -606,6 +642,10 @@ fn repopulate_palette_list(palette: &CommandPalette, state: &Rc<RefCell<AppState
     sync_task_discovery(palette, state);
     ensure_worktree_listing(palette, state);
     ensure_palette_stores(palette, state);
+    render_palette_list(palette, state, query);
+}
+
+fn render_palette_list(palette: &CommandPalette, state: &Rc<RefCell<AppState>>, query: &str) {
     let entries = palette_entries(palette, state);
     let filtered = filtered_entries(&entries, query);
     while let Some(child) = palette.list.first_child() {
@@ -906,60 +946,63 @@ fn invalidate_worktree_listing(palette: &CommandPalette) {
     );
 }
 
-fn clear_task_discovery_poll(palette: &CommandPalette) {
-    if let Some(source_id) = palette.discovery_poll_source.borrow_mut().take() {
-        source_id.remove();
-    }
+fn clear_task_discovery_subscription(palette: &CommandPalette) {
+    palette.discovery_subscription.borrow_mut().take();
 }
 
-fn ensure_task_discovery_poll(palette: &CommandPalette, state: &Rc<RefCell<AppState>>) {
-    if palette.discovery_poll_source.borrow().is_some() {
+fn ensure_task_discovery_subscription(palette: &CommandPalette, state: &Rc<RefCell<AppState>>) {
+    clear_task_discovery_subscription(palette);
+    let Some(target) = active_task_target(&state.borrow()) else {
         return;
-    }
+    };
+    let active_tab_id = state.borrow().active_tab().map(|tab| tab.id);
+    let Some(identity) = crate::mise::TaskViewerIdentity::for_active(&state.borrow()) else {
+        return;
+    };
+    // The callback must not own the slot which owns its receiver task.
+    let slot = Rc::downgrade(&palette.discovery_subscription);
+    let palette_for_completion = palette.weak_discovery_view();
+    let state_for_completion = Rc::downgrade(state);
+    let source_id = crate::mise::subscribe_task_discovery_for_viewer(
+        state,
+        identity,
+        &target.clone(),
+        move |_| {
+            let Some(palette_for_completion) = palette_for_completion() else {
+                return;
+            };
+            let Some(state_for_completion) = state_for_completion.upgrade() else {
+                return;
+            };
+            let Some(slot) = slot.upgrade() else {
+                return;
+            };
+            slot.borrow_mut().take();
+            if !palette_for_completion.container.is_visible()
+                || !matches!(*palette_for_completion.mode.borrow(), PaletteMode::Default)
+                || active_task_target(&state_for_completion.borrow()).as_ref() != Some(&target)
+                || state_for_completion.borrow().active_tab().map(|tab| tab.id) != active_tab_id
+            {
+                return;
+            }
 
-    let palette_for_poll = palette.clone();
-    let state_for_poll = state.clone();
-    let source_id = glib::timeout_add_local(TASK_DISCOVERY_POLL_INTERVAL, move || {
-        if !palette_for_poll.container.is_visible()
-            || !matches!(*palette_for_poll.mode.borrow(), PaletteMode::Default)
-        {
-            palette_for_poll.discovery_poll_source.borrow_mut().take();
-            return glib::ControlFlow::Break;
-        }
-
-        repopulate_palette_list(
-            &palette_for_poll,
-            &state_for_poll,
-            &palette_for_poll.entry.text(),
-        );
-
-        let pending = {
-            let st = state_for_poll.borrow();
-            active_task_target(&st).is_some_and(|target| {
-                matches!(
-                    crate::mise::cached_task_discovery(&target),
-                    crate::mise::CachedTaskDiscovery::Pending
-                )
-            })
-        };
-
-        if pending {
-            glib::ControlFlow::Continue
-        } else {
-            palette_for_poll.discovery_poll_source.borrow_mut().take();
-            glib::ControlFlow::Break
-        }
-    });
+            render_palette_list(
+                &palette_for_completion,
+                &state_for_completion,
+                &palette_for_completion.entry.text(),
+            );
+        },
+    );
 
     palette
-        .discovery_poll_source
+        .discovery_subscription
         .borrow_mut()
         .replace(source_id);
 }
 
 fn sync_task_discovery(palette: &CommandPalette, state: &Rc<RefCell<AppState>>) {
     if !matches!(*palette.mode.borrow(), PaletteMode::Default) {
-        clear_task_discovery_poll(palette);
+        clear_task_discovery_subscription(palette);
         return;
     }
 
@@ -969,7 +1012,7 @@ fn sync_task_discovery(palette: &CommandPalette, state: &Rc<RefCell<AppState>>) 
     };
 
     let Some(target) = target else {
-        clear_task_discovery_poll(palette);
+        clear_task_discovery_subscription(palette);
         return;
     };
 
@@ -979,9 +1022,9 @@ fn sync_task_discovery(palette: &CommandPalette, state: &Rc<RefCell<AppState>>) 
     }
 
     match crate::mise::spawn_task_discovery(target) {
-        crate::mise::TaskDiscoveryRequest::UseCached => clear_task_discovery_poll(palette),
+        crate::mise::TaskDiscoveryRequest::UseCached => clear_task_discovery_subscription(palette),
         crate::mise::TaskDiscoveryRequest::Pending | crate::mise::TaskDiscoveryRequest::Start => {
-            ensure_task_discovery_poll(palette, state);
+            ensure_task_discovery_subscription(palette, state);
         }
     }
 }
@@ -1009,7 +1052,7 @@ pub fn show_palette(
     invalidate_palette_projects();
     invalidate_palette_views();
     invalidate_palette_templates();
-    clear_task_discovery_poll(palette);
+    clear_task_discovery_subscription(palette);
     repopulate_palette_list(palette, state, "");
     install_palette_handlers_and_show(palette, state, tab_list, term_stack, window);
 }
@@ -1023,7 +1066,7 @@ pub fn show_keybinding_help(
 ) {
     *palette.mode.borrow_mut() = PaletteMode::KeybindingHelp;
     *palette.send_source.borrow_mut() = None;
-    clear_task_discovery_poll(palette);
+    clear_task_discovery_subscription(palette);
     palette.entry.set_text("");
     repopulate_palette_list(palette, state, "");
     install_palette_handlers_and_show(palette, state, tab_list, term_stack, window);
@@ -1042,7 +1085,7 @@ pub fn open_send_to_pane_picker(
 ) {
     *palette.send_source.borrow_mut() = capture_send_source(state, last_output);
     *palette.mode.borrow_mut() = PaletteMode::SendToPane;
-    clear_task_discovery_poll(palette);
+    clear_task_discovery_subscription(palette);
     repopulate_palette_list(palette, state, "");
     install_palette_handlers_and_show(palette, state, tab_list, term_stack, window);
 }
@@ -1076,7 +1119,7 @@ pub fn open_relay_last_message_picker(
 ) {
     *palette.send_source.borrow_mut() = Some(relay_last_message_source(state));
     *palette.mode.borrow_mut() = PaletteMode::SendToPane;
-    clear_task_discovery_poll(palette);
+    clear_task_discovery_subscription(palette);
     repopulate_palette_list(palette, state, "");
     install_palette_handlers_and_show(palette, state, tab_list, term_stack, window);
 }
@@ -1094,7 +1137,7 @@ pub fn open_clipboard_history_picker(
 ) {
     *palette.send_source.borrow_mut() = None;
     *palette.mode.borrow_mut() = PaletteMode::ClipboardHistory;
-    clear_task_discovery_poll(palette);
+    clear_task_discovery_subscription(palette);
     repopulate_palette_list(palette, state, "");
     install_palette_handlers_and_show(palette, state, tab_list, term_stack, window);
 }
@@ -1111,7 +1154,7 @@ pub fn open_recent_files_picker(
 ) {
     *palette.send_source.borrow_mut() = None;
     *palette.mode.borrow_mut() = PaletteMode::RecentFiles;
-    clear_task_discovery_poll(palette);
+    clear_task_discovery_subscription(palette);
     repopulate_palette_list(palette, state, "");
     install_palette_handlers_and_show(palette, state, tab_list, term_stack, window);
 }
@@ -2131,8 +2174,10 @@ fn open_registered_project(
                             .find_tab_mut(tab_id)
                             .and_then(|tab| tab.panes.leaf_mut(tab.focused_pane_id))
                         {
-                            pane.location_state.cwd = Some(working_dir.clone());
-                            pane.location_state.cwd_host = Some(host_name.clone());
+                            pane.update_location_cache(
+                                Some(working_dir.clone()),
+                                Some(host_name.clone()),
+                            );
                         }
                         wire_project_tab(
                             state,
@@ -5141,6 +5186,106 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| entry.label == "mise: discovering tasks..."));
+    }
+
+    #[test]
+    #[ignore = "requires an owned GTK display (xvfb-run)"]
+    fn task_discovery_palette_subscription_gtk_lifecycle() {
+        let _glib_guard = crate::glib_main_context_test_guard();
+        let _guard = crate::mise::task_discovery_test_guard();
+        gtk::init().expect("owned GTK display");
+        crate::mise::clear_task_discovery_cache_for_test();
+        let (state, project) = state_with_attention(false);
+        let target = active_task_target(&state.borrow()).unwrap();
+        let palette = build_command_palette();
+        palette.container.set_visible(true);
+        let context = glib::MainContext::default();
+        let drain = || {
+            while context.pending() {
+                context.iteration(false);
+            }
+        };
+
+        crate::mise::set_pending_task_discovery_for_test(&target);
+        ensure_task_discovery_subscription(&palette, &state);
+        assert_eq!(crate::mise::task_subscriber_count_for_test(), 1);
+        let marker = gtk::ListBoxRow::new();
+        palette.list.append(&marker);
+        crate::mise::complete_current_task_discovery_for_test(&target, Ok(Vec::new()));
+        drain();
+        assert!(
+            marker.parent().is_none(),
+            "valid completion renders the list once"
+        );
+        assert!(palette.discovery_subscription.borrow().is_none());
+        let marker = gtk::ListBoxRow::new();
+        palette.list.append(&marker);
+        drain();
+        assert!(marker.parent().is_some(), "no recurring completion repaint");
+
+        crate::mise::set_pending_task_discovery_for_test(&target);
+        ensure_task_discovery_subscription(&palette, &state);
+        crate::mise::complete_current_task_discovery_for_test(&target, Ok(Vec::new()));
+        palette.container.set_visible(false);
+        assert!(palette.discovery_subscription.borrow().is_none());
+        palette.container.set_visible(true);
+        drain();
+        assert!(
+            marker.parent().is_some(),
+            "hide/show rejects queued old viewer"
+        );
+
+        crate::mise::set_pending_task_discovery_for_test(&target);
+        ensure_task_discovery_subscription(&palette, &state);
+        crate::mise::complete_current_task_discovery_for_test(&target, Ok(Vec::new()));
+        *palette.mode.borrow_mut() = PaletteMode::KeybindingHelp;
+        sync_task_discovery(&palette, &state);
+        *palette.mode.borrow_mut() = PaletteMode::Default;
+        drain();
+        assert!(
+            marker.parent().is_some(),
+            "mode away/back rejects queued old viewer"
+        );
+
+        crate::mise::set_pending_task_discovery_for_test(&target);
+        ensure_task_discovery_subscription(&palette, &state);
+        let active = state.borrow().active_tab().unwrap().id;
+        let workspace = state.borrow().active_workspace;
+        state.borrow_mut().create_workspace("away", None);
+        state.borrow_mut().activate_workspace(workspace).unwrap();
+        state.borrow_mut().activate_tab(active).unwrap();
+        crate::mise::complete_current_task_discovery_for_test(&target, Ok(Vec::new()));
+        drain();
+        assert!(
+            marker.parent().is_some(),
+            "selection away/back rejects queued old viewer"
+        );
+        clear_task_discovery_subscription(&palette);
+
+        crate::mise::set_pending_task_discovery_for_test(&target);
+        ensure_task_discovery_subscription(&palette, &state);
+        crate::mise::complete_current_task_discovery_for_test(
+            &target,
+            Err(crate::mise::DiscoveryFailure::InvalidJson),
+        );
+        drain();
+        assert!(
+            marker.parent().is_none(),
+            "typed failure settles the active palette"
+        );
+        assert!(palette.discovery_subscription.borrow().is_none());
+
+        crate::mise::set_pending_task_discovery_for_test(&target);
+        ensure_task_discovery_subscription(&palette, &state);
+        let weak_container = palette.container.downgrade();
+        drop(palette);
+        drain();
+        assert_eq!(crate::mise::task_subscriber_count_for_test(), 0);
+        assert!(
+            weak_container.upgrade().is_none(),
+            "pending callback cannot retain widgets"
+        );
+        std::fs::remove_dir_all(project).unwrap();
     }
 
     #[test]
