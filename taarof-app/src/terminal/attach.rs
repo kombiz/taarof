@@ -525,13 +525,93 @@ pub fn attach_session_async(
     });
 }
 
+type DashboardObservation = (
+    Vec<(
+        crate::dashboard::DetachedSessionCommandKey,
+        Result<String, String>,
+    )>,
+    Vec<(crate::tmux::TmuxTarget, Vec<(String, u64, bool, u32)>)>,
+    Vec<(Option<crate::tmux::TmuxTarget>, String)>,
+);
+
+pub(super) fn observe_dashboard(
+    detached: &[(String, crate::tmux::TmuxTarget, std::time::Instant)],
+    dashboard: &[crate::tmux::TmuxTarget],
+    run_pane: impl Fn(&[String]) -> Result<String, String> + Sync,
+    run_sessions: impl Fn(&[String]) -> Result<String, String> + Sync,
+) -> DashboardObservation {
+    let mut targets = dashboard.to_vec();
+    for (_, target, _) in detached {
+        if !targets.contains(target) {
+            targets.push(target.clone());
+        }
+    }
+    let rounds = super::observation::bounded_map(&targets, |target| {
+        let commands = detached
+            .iter()
+            .filter(|(_, current, _)| current == target)
+            .map(|(name, _, _)| {
+                let key = crate::dashboard::detached_session_command_key(target, name);
+                let result = run_pane(&crate::tmux::pane_current_command(target, name))
+                    .map(|output| output.trim().to_string())
+                    .map_err(|err| {
+                        format!(
+                            "detached session probe for {} on {} failed: {}",
+                            name,
+                            tmux_target_label(target),
+                            err
+                        )
+                    });
+                (key, result)
+            })
+            .collect::<Vec<_>>();
+        let mut sessions = Vec::new();
+        let mut errors = Vec::new();
+        if dashboard.contains(target) {
+            match run_sessions(&crate::tmux::list_sessions_dashboard_command(target)) {
+                Ok(output) => match crate::tmux::parse_list_sessions_tuples(&output) {
+                    Ok(live) => sessions.push((target.clone(), live)),
+                    Err(err) => errors.push((
+                        Some(target.clone()),
+                        format!(
+                            "dashboard tmux probe for {} returned invalid output: {}",
+                            tmux_target_label(target),
+                            err
+                        ),
+                    )),
+                },
+                Err(err) => errors.push((
+                    Some(target.clone()),
+                    format!(
+                        "dashboard tmux probe for {} failed: {}",
+                        tmux_target_label(target),
+                        err
+                    ),
+                )),
+            }
+        }
+        (commands, sessions, errors)
+    });
+    let mut result: DashboardObservation = (Vec::new(), Vec::new(), Vec::new());
+    for (commands, sessions, errors) in rounds {
+        result.0.extend(commands);
+        result.1.extend(sessions);
+        result.2.extend(errors);
+    }
+    result
+}
+
 /// Poll detached session status, update finished state, and rebuild dashboard_state.
-pub fn poll_dashboard_state(
+pub(crate) fn poll_dashboard_state(
     state: &Rc<RefCell<AppState>>,
     term_stack: &gtk::Stack,
     tab_list: &gtk::Box,
     window: &adw::ApplicationWindow,
+    in_flight: &crate::runtime_probe::ProbeInFlight,
 ) {
+    let Some(guard) = in_flight.try_begin() else {
+        return;
+    };
     let app_config = crate::config::app_config();
     let (detached_targets, dashboard_targets, poll_context) = {
         let mut st = state.borrow_mut();
@@ -562,72 +642,14 @@ pub fn poll_dashboard_state(
     let tab_list = tab_list.clone();
     let window = window.clone();
     glib::spawn_future_local(async move {
-        type BlockResult = (
-            Vec<(
-                crate::dashboard::DetachedSessionCommandKey,
-                Result<String, String>,
-            )>,
-            Vec<(crate::tmux::TmuxTarget, Vec<(String, u64, bool, u32)>)>,
-            Vec<(Option<crate::tmux::TmuxTarget>, String)>,
-        );
-        let (results, live_sessions, errors): BlockResult = gio::spawn_blocking(move || {
-            let mut errors = Vec::new();
-
-            let cmds = detached_targets
-                .into_iter()
-                .map(|(name, target, _)| {
-                    let key = crate::dashboard::detached_session_command_key(&target, &name);
-                    let argv = crate::tmux::pane_current_command(&target, &name);
-                    match run_tmux_command_sync_result(&argv) {
-                        Ok(output) => (key, Ok(output.trim().to_string())),
-                        Err(err) => (
-                            key,
-                            Err(format!(
-                                "detached session probe for {} on {} failed: {}",
-                                name,
-                                tmux_target_label(&target),
-                                err
-                            )),
-                        ),
-                    }
-                })
-                .collect();
-
-            let sessions = dashboard_targets
-                .into_iter()
-                .filter_map(|target| {
-                    let argv = crate::tmux::list_sessions_dashboard_command(&target);
-                    match run_tmux_list_sessions_command_sync_result(&argv) {
-                        Ok(output) => match crate::tmux::parse_list_sessions_tuples(&output) {
-                            Ok(sessions) => Some((target, sessions)),
-                            Err(err) => {
-                                errors.push((
-                                    Some(target.clone()),
-                                    format!(
-                                        "dashboard tmux probe for {} returned invalid output: {}",
-                                        tmux_target_label(&target),
-                                        err
-                                    ),
-                                ));
-                                None
-                            }
-                        },
-                        Err(err) => {
-                            errors.push((
-                                Some(target.clone()),
-                                format!(
-                                    "dashboard tmux probe for {} failed: {}",
-                                    tmux_target_label(&target),
-                                    err
-                                ),
-                            ));
-                            None
-                        }
-                    }
-                })
-                .collect();
-
-            (cmds, sessions, errors)
+        let _guard = guard;
+        let (results, live_sessions, errors) = gio::spawn_blocking(move || {
+            observe_dashboard(
+                &detached_targets,
+                &dashboard_targets,
+                run_tmux_command_sync_result,
+                run_tmux_list_sessions_command_sync_result,
+            )
         })
         .await
         .unwrap_or_else(|err| {

@@ -63,7 +63,7 @@ const CONTINUITY_OPTION: &str = "@taarof-continuity-id";
 pub const EXACT_ATTACH_UNAVAILABLE_REASON: &str =
     "Reattach unavailable: the exact saved tmux target no longer exists.";
 
-const PANE_INFO_SEPARATOR: &str = "__TAAROF_PANE_INFO_V1__";
+pub(crate) const PANE_INFO_SEPARATOR: &str = "__TAAROF_PANE_INFO_V1__";
 const LEGACY_PANE_INFO_SEPARATOR: &str = "\u{1f}";
 
 /// Generate a tmux session name from prefix, workspace, tab_id, and pane_id.
@@ -493,6 +493,54 @@ pub fn pane_info_command(target: &TmuxTarget, session_name: &str) -> Vec<String>
         format,
     ];
     wrap_for_target_noninteractive(target, args)
+}
+
+/// List all panes once; the active pane of the active window matches a
+/// session-targeted display-message. Keep routing fields outside the eight-field payload.
+pub(crate) fn list_panes_info_command(target: &TmuxTarget) -> Vec<String> {
+    let format = format!(
+        "#{{session_name}}{sep}#{{window_active}}{sep}#{{pane_active}}{sep}#{{pane_current_command}}{sep}#{{pane_current_path}}{sep}#{{pane_pid}}{sep}#{{pane_width}}{sep}#{{pane_height}}{sep}#{{session_id}}{sep}#{{session_created}}{sep}#{{@taarof-continuity-id}}",
+        sep = PANE_INFO_SEPARATOR,
+    );
+    wrap_for_target_noninteractive(
+        target,
+        vec![
+            "tmux".into(),
+            "list-panes".into(),
+            "-a".into(),
+            "-F".into(),
+            format,
+        ],
+    )
+}
+
+pub(crate) fn parse_selected_pane_info(
+    output: &str,
+    session: &str,
+) -> Result<TmuxPaneInfo, String> {
+    let mut selected = None;
+    for line in output.lines() {
+        let mut fields = line.splitn(4, PANE_INFO_SEPARATOR);
+        if fields.next() != Some(session) {
+            continue;
+        }
+        let window = fields.next();
+        let pane = fields.next();
+        if !matches!(window, Some("0" | "1")) || !matches!(pane, Some("0" | "1")) {
+            return Err("tmux pane probe returned invalid selection metadata".into());
+        }
+        if window != Some("1") || pane != Some("1") {
+            continue;
+        }
+        let info = fields
+            .next()
+            .and_then(parse_pane_info)
+            .ok_or_else(|| "tmux pane probe returned invalid metadata".to_string())?;
+        if selected.replace(info).is_some() {
+            return Err("tmux pane probe returned ambiguous selected pane".into());
+        }
+    }
+    selected.ok_or_else(|| "tmux selected pane is missing".into())
 }
 
 /// Information about a tmux session.
