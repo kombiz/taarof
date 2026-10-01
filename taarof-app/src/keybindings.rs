@@ -1576,6 +1576,56 @@ mod tests {
         assert!(activated.get());
     }
 
+    #[test]
+    #[ignore = "requires an owned disposable GTK display and D-Bus session"]
+    fn typed_activation_gtk_window_child_and_missing_handler() {
+        use adw::prelude::*;
+        // Keep this probe at the same documented typed GTK boundary as production.
+        fn resolved(widget: &impl IsA<gtk::Widget>, action: Action) -> bool {
+            gtk::prelude::WidgetExt::activate_action(widget, action.gaction_name(), None).is_ok()
+        }
+        let _guard = crate::glib_main_context_test_guard();
+        adw::init().expect("owned GTK display");
+        let application = adw::Application::builder()
+            .application_id("io.github.kombiz.taarof.test.TypedActivation")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(None::<&gio::Cancellable>)
+            .expect("owned disposable D-Bus session");
+        let window = adw::ApplicationWindow::builder()
+            .application(&application)
+            .build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let button = gtk::Button::with_label("test");
+        content.append(&button);
+        window.set_content(Some(&content));
+        assert_eq!(button.root(), Some(window.clone().upcast::<gtk::Root>()));
+
+        let activated = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = activated.clone();
+        let mut ledger = WindowActionLedger::default();
+        crate::register_bindable_window_action(&window, &mut ledger, Action::NewTab, |handler| {
+            handler.connect_activate(move |_, _| observed.set(observed.get() + 1));
+        });
+        activate(&window, Action::NewTab);
+        assert_eq!(activated.get(), 1);
+        activate(&button, Action::NewTab);
+        assert_eq!(activated.get(), 2);
+
+        assert!(resolved(&window, Action::NewTab));
+        assert!(resolved(&button, Action::NewTab));
+        assert_eq!(activated.get(), 4);
+        window.remove_action("new-tab");
+        assert!(!resolved(&window, Action::NewTab));
+        assert!(!resolved(&button, Action::NewTab));
+        activate(&window, Action::NewTab);
+        activate(&button, Action::NewTab);
+        assert_eq!(activated.get(), 4);
+        // The isolated outer harness asserts exactly two production stderr diagnostics.
+        window.destroy();
+    }
+
     fn complete_window_action_registrations() -> Vec<Action> {
         Action::ALL
             .iter()
