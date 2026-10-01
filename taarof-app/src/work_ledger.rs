@@ -1579,6 +1579,36 @@ impl WorkLedger {
         self.records.iter()
     }
 
+    // Source-input fixtures for the GTK-free sidebar producer. These expose no
+    // mutation surface in production builds and do not synthesize a projection.
+    #[cfg(test)]
+    pub(crate) fn test_record_mut(&mut self, seq: u64) -> &mut WorkRecord {
+        self.records
+            .iter_mut()
+            .find(|record| record.seq == seq)
+            .unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reconciliation_mut(&mut self, seq: u64) -> &mut WorkReconciliation {
+        self.reconciliation
+            .entry(seq)
+            .or_insert_with(|| WorkReconciliation::pending("runtime", "Waiting for reconciliation"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_restore_health_mut(&mut self) -> &mut WorkLedgerRestoreHealth {
+        &mut self.restore_health
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_plan_status(&mut self, root: &str, task: &str, status: &str) {
+        self.plan_snapshots
+            .entry(root.into())
+            .or_default()
+            .insert(task.into(), (format!("Task {task}"), status.into(), true));
+    }
+
     pub fn view_preferences(&self) -> WorkStreamPreferences {
         self.view.clone()
     }

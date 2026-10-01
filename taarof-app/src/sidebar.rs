@@ -677,25 +677,38 @@ pub(crate) fn build_session_work_panel(
     panel
 }
 
-fn refresh_work_ledger(
-    widgets: &WorkStreamWidgets,
-    ui_state: &Rc<RefCell<WorkStreamUiState>>,
-    state: &Rc<RefCell<AppState>>,
-    tab_list: &gtk::Box,
-    term_stack: &gtk::Stack,
-) {
-    let st = state.borrow();
+type WorkStreamFilterOptions = Vec<(String, crate::work_ledger::WorkStreamFilter)>;
+
+struct WorkStreamPreparedModel {
+    visible: WorkStreamVisibleState,
+    projection: crate::work_ledger::WorkStreamProjection,
+    metadata: HashMap<String, crate::work_ledger::WorkStreamPaneMeta>,
+    reconciliations: HashMap<u64, crate::work_ledger::WorkReconciliation>,
+    record_truths: HashMap<u64, crate::work_ledger::TaskTruth>,
+    restore_health: crate::work_ledger::WorkLedgerRestoreHealth,
+    truth_summary: crate::work_ledger::TaskTruthSummary,
+    effective_view: crate::work_ledger::WorkStreamPreferences,
+    filter_update: Option<(WorkStreamFilterOptions, usize)>,
+    empty_ledger: bool,
+}
+
+/// GTK-free producer used by the refresh gate and renderer. The supplied clock
+/// controls displayed ages; process/activity freshness retains its existing
+/// wall/monotonic clock policy in the truth projector.
+fn prepare_work_stream_model(
+    st: &AppState,
+    ui: &mut WorkStreamUiState,
+    now: u64,
+) -> WorkStreamPreparedModel {
     let records = st.work_ledger.iter_records().collect::<Vec<_>>();
     let (metadata, reconciliations, record_truths, restore_health, truth_summary) = {
-        let metadata = crate::work_ledger::work_stream_pane_metadata_from_records(
-            &st,
-            records.iter().copied(),
-        );
+        let metadata =
+            crate::work_ledger::work_stream_pane_metadata_from_records(st, records.iter().copied());
         let latest_status_records =
             crate::work_ledger::latest_task_status_records_from_iter(records.iter().copied());
         let truth_summary = crate::work_ledger::project_task_truth_summary(
             &crate::work_ledger::task_truth_inputs_from_records(
-                &st,
+                st,
                 &metadata,
                 records.iter().copied(),
             ),
@@ -710,7 +723,7 @@ fn refresh_work_ledger(
                 (
                     record.seq,
                     crate::work_ledger::task_truth_for_record_with(
-                        &st,
+                        st,
                         &metadata,
                         &latest_status_records,
                         record,
@@ -727,7 +740,6 @@ fn refresh_work_ledger(
         )
     };
 
-    let mut ui = ui_state.borrow_mut();
     let selected_filter = ui.filter.clone();
     let mut projection = crate::work_ledger::project_work_stream_from_records(
         records.iter().copied(),
@@ -754,15 +766,10 @@ fn refresh_work_ledger(
     } else {
         None
     };
-    widgets.clear_pane.set_sensitive(matches!(
-        ui.filter,
-        crate::work_ledger::WorkStreamFilter::Pane(_)
-    ));
     let effective_view = crate::work_ledger::WorkStreamPreferences {
         palette: ui.palette.clone(),
         filter: ui.filter.clone(),
     };
-    let now = crate::events::unix_time_ms();
     let mut sorted_metadata = metadata
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
@@ -806,10 +813,48 @@ fn refresh_work_ledger(
         empty_ledger: records.is_empty(),
         ages,
     };
+    WorkStreamPreparedModel {
+        visible,
+        projection,
+        metadata,
+        reconciliations,
+        record_truths,
+        restore_health,
+        truth_summary,
+        effective_view,
+        filter_update,
+        empty_ledger: records.is_empty(),
+    }
+}
+
+fn refresh_work_ledger(
+    widgets: &WorkStreamWidgets,
+    ui_state: &Rc<RefCell<WorkStreamUiState>>,
+    state: &Rc<RefCell<AppState>>,
+    tab_list: &gtk::Box,
+    term_stack: &gtk::Stack,
+) {
+    let st = state.borrow();
+    let mut ui = ui_state.borrow_mut();
+    let now = crate::events::unix_time_ms();
+    let WorkStreamPreparedModel {
+        visible,
+        projection,
+        metadata,
+        reconciliations,
+        record_truths,
+        restore_health,
+        truth_summary,
+        effective_view,
+        filter_update,
+        empty_ledger,
+    } = prepare_work_stream_model(&st, &mut ui, now);
+    widgets.clear_pane.set_sensitive(matches!(
+        ui.filter,
+        crate::work_ledger::WorkStreamFilter::Pane(_)
+    ));
     let unchanged = !ui.needs_rebuild(visible);
     drop(ui);
-    let empty_ledger = records.is_empty();
-    drop(records);
     drop(st);
     state
         .borrow_mut()
@@ -6195,6 +6240,841 @@ pub fn refresh_background_section(
 
 #[cfg(test)]
 mod tests {
+    fn work_stream_source_fixture() -> crate::AppState {
+        use crate::work_ledger::*;
+        let mut state = crate::AppState::new();
+        let workspace = state.active_workspace;
+        for (name, task, root) in [
+            ("Alpha", "TASK-A", "/repo-a"),
+            ("Beta", "TASK-B", "/repo-b"),
+        ] {
+            let (tab_id, pane_id) = crate::seed_headless_terminal_tab(
+                &mut state,
+                workspace,
+                name,
+                crate::HeadlessPaneSeed::default(),
+            )
+            .unwrap();
+            state
+                .headless_pane_mut(tab_id, pane_id)
+                .unwrap()
+                .current_task = Some(crate::task_binding::PaneTaskBinding {
+                task_id: task.into(),
+                title: format!("Task {task}"),
+                checkout_root: Some(root.into()),
+                reporting_token: "ctx-11111111111111111111111111111111".into(),
+            });
+            state.work_ledger.test_plan_status(root, task, "todo");
+            let identity = work_stream_runtime_identities(&state)
+                .into_iter()
+                .find(|identity| identity.tab_id == tab_id)
+                .unwrap();
+            let record = state
+                .work_ledger
+                .append(WorkDraft {
+                    kind: WorkKind::AgentStateChanged,
+                    summary: name.into(),
+                    identity,
+                    evidence_source: EvidenceSource::AgentActivity,
+                    authority: WorkAuthority::AgentObservation,
+                    verification: VerificationState::Observed,
+                    dedupe_scope: name.into(),
+                    fingerprint: name.into(),
+                })
+                .unwrap();
+            let retained = state.work_ledger.test_record_mut(record.seq);
+            retained.ts_unix_ms = 1_000;
+            retained.task_status = Some("todo".into());
+            let reconciliation = state.work_ledger.test_reconciliation_mut(record.seq);
+            reconciliation.status = WorkReconciliationStatus::Pending;
+            reconciliation.source = "plan".into();
+            reconciliation.reason = "Waiting".into();
+            reconciliation.checked_at_unix_ms = Some(1_000);
+        }
+        state.work_ledger.test_restore_health_mut().status = "degraded".into();
+        state.work_ledger.test_restore_health_mut().detail = Some("Initial warning".into());
+        state
+    }
+
+    fn first_source_pane(state: &crate::AppState) -> (u32, u32) {
+        let identity = crate::work_ledger::work_stream_runtime_identities(state).remove(0);
+        (identity.tab_id, identity.pane_id)
+    }
+
+    fn assert_work_stream_source_change(
+        mutate: impl FnOnce(&mut crate::AppState, &mut super::WorkStreamUiState),
+        expected: impl FnOnce(&super::WorkStreamPreparedModel, &super::WorkStreamPreparedModel),
+    ) {
+        let mut state = work_stream_source_fixture();
+        let mut ui = super::WorkStreamUiState::default();
+        let before = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert!(ui.needs_rebuild(before.visible.clone()));
+        let stable = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert!(!ui.needs_rebuild(stable.visible));
+        let sequences = state
+            .work_ledger
+            .iter_records()
+            .map(|record| record.seq)
+            .collect::<Vec<_>>();
+        mutate(&mut state, &mut ui);
+        assert_eq!(
+            state
+                .work_ledger
+                .iter_records()
+                .map(|record| record.seq)
+                .collect::<Vec<_>>(),
+            sequences,
+            "non-ledger input changes do not append work"
+        );
+        let changed = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        expected(&before, &changed);
+        assert!(ui.needs_rebuild(changed.visible));
+        let repeated = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert!(!ui.needs_rebuild(repeated.visible));
+    }
+
+    #[test]
+    fn work_stream_producer_content_reconciliation_canonical_and_restore_inputs_reach_gate() {
+        use crate::work_ledger::*;
+        type Change = fn(&mut crate::AppState, &mut super::WorkStreamUiState);
+        type Expected = fn(&super::WorkStreamPreparedModel, &super::WorkStreamPreparedModel);
+        let cases: &[(&str, Change, Expected)] = &[
+            (
+                "record summary",
+                |state, _| state.work_ledger.test_record_mut(1).summary = "Changed".into(),
+                |_, after| {
+                    assert_eq!(
+                        after.visible.projection.entries[0].record.summary,
+                        "Changed"
+                    )
+                },
+            ),
+            (
+                "record task identity",
+                |state, _| {
+                    state.work_ledger.test_record_mut(1).identity.task_id = Some("OTHER".into())
+                },
+                |_, after| {
+                    assert_eq!(
+                        after.visible.projection.entries[0]
+                            .record
+                            .identity
+                            .task_id
+                            .as_deref(),
+                        Some("OTHER")
+                    );
+                    assert!(after
+                        .visible
+                        .options
+                        .iter()
+                        .any(|(_, value)| value == &WorkStreamFilter::Task("OTHER".into())));
+                },
+            ),
+            (
+                "record timestamp",
+                |state, _| state.work_ledger.test_record_mut(1).ts_unix_ms = 30_000,
+                |_, after| assert_eq!(after.visible.ages[0], "just now"),
+            ),
+            (
+                "record attention kind",
+                |state, _| {
+                    state.work_ledger.test_record_mut(1).kind = WorkKind::AgentReportedBlocked
+                },
+                |_, after| {
+                    assert_eq!(
+                        after.visible.projection.entries[0].record.kind,
+                        WorkKind::AgentReportedBlocked
+                    )
+                },
+            ),
+            (
+                "reconciliation status",
+                |state, _| {
+                    state.work_ledger.test_reconciliation_mut(1).status =
+                        WorkReconciliationStatus::Stale
+                },
+                |_, after| {
+                    assert_eq!(
+                        after.visible.reconciliations[0].1.status,
+                        WorkReconciliationStatus::Stale
+                    )
+                },
+            ),
+            (
+                "reconciliation source",
+                |state, _| state.work_ledger.test_reconciliation_mut(1).source = "github".into(),
+                |_, after| assert_eq!(after.visible.truths[0].1.verification_source, "github"),
+            ),
+            (
+                "reconciliation reason",
+                |state, _| {
+                    state.work_ledger.test_reconciliation_mut(1).reason = "Changed reason".into()
+                },
+                |_, after| assert_eq!(after.visible.reconciliations[0].1.reason, "Changed reason"),
+            ),
+            (
+                "reconciliation origin",
+                |state, _| {
+                    state.work_ledger.test_reconciliation_mut(1).origin_status = "historical".into()
+                },
+                |_, after| {
+                    assert_eq!(
+                        after.visible.reconciliations[0].1.origin_status,
+                        "historical"
+                    )
+                },
+            ),
+            (
+                "checked timestamp",
+                |state, _| {
+                    state
+                        .work_ledger
+                        .test_reconciliation_mut(1)
+                        .checked_at_unix_ms = Some(30_000)
+                },
+                |_, after| {
+                    assert!(after
+                        .visible
+                        .ages
+                        .iter()
+                        .any(|age| age.contains("Checked just now")))
+                },
+            ),
+            (
+                "canonical plan",
+                |state, _| {
+                    state
+                        .work_ledger
+                        .test_plan_status("/repo-a", "TASK-A", "done")
+                },
+                |_, after| {
+                    assert_eq!(
+                        after.visible.truths[0].1.canonical,
+                        CanonicalTaskState::Done
+                    );
+                    assert_eq!(after.visible.summary.live_open_count, 1);
+                    assert_eq!(after.visible.summary.historical_count, 1);
+                },
+            ),
+            (
+                "restore status",
+                |state, _| state.work_ledger.test_restore_health_mut().status = "healthy".into(),
+                |_, after| assert_eq!(after.visible.restore_health.status, "healthy"),
+            ),
+            (
+                "restore warning",
+                |state, _| {
+                    state.work_ledger.test_restore_health_mut().detail =
+                        Some("Changed warning".into())
+                },
+                |_, after| {
+                    assert_eq!(
+                        after.visible.restore_health.detail.as_deref(),
+                        Some("Changed warning")
+                    )
+                },
+            ),
+        ];
+        for (_name, mutate, expected) in cases {
+            assert_work_stream_source_change(*mutate, *expected);
+        }
+    }
+
+    #[test]
+    fn work_stream_producer_current_identity_order_rebinding_and_options_reach_gate() {
+        use crate::work_ledger::*;
+        assert_work_stream_source_change(
+            |state, _| {
+                let (tab, _) = first_source_pane(state);
+                state.find_tab_mut(tab).unwrap().name = "Renamed".into();
+            },
+            |_, after| {
+                assert_eq!(after.visible.projection.legend[0].tab_name, "Renamed");
+                assert!(after.visible.options[3].0.contains("Renamed"));
+            },
+        );
+        assert_work_stream_source_change(
+            |state, _| {
+                let workspace = state.active_workspace;
+                state
+                    .rename_workspace(workspace, "Renamed workspace")
+                    .unwrap();
+            },
+            |_, after| {
+                assert_eq!(
+                    after.visible.projection.legend[0].workspace_name,
+                    "Renamed workspace"
+                )
+            },
+        );
+        assert_work_stream_source_change(
+            |state, _| {
+                let (tab, pane) = first_source_pane(state);
+                state.headless_pane_mut(tab, pane).unwrap().current_task = None;
+            },
+            |_, after| {
+                assert_eq!(after.visible.projection.legend[0].task_id, None);
+                assert_eq!(
+                    after.visible.summary.items[0].binding,
+                    BindingState::Unbound
+                );
+                assert_eq!(after.visible.summary.items[0].task_id, None);
+            },
+        );
+        assert_work_stream_source_change(
+            |state, _| {
+                let (tab, pane) = first_source_pane(state);
+                state
+                    .headless_pane_mut(tab, pane)
+                    .unwrap()
+                    .current_task
+                    .as_mut()
+                    .unwrap()
+                    .title = "New title".into();
+            },
+            |_, after| {
+                assert_eq!(
+                    after.visible.projection.legend[0].task_title.as_deref(),
+                    Some("New title")
+                )
+            },
+        );
+        assert_work_stream_source_change(
+            |state, _| {
+                let (tab, pane) = first_source_pane(state);
+                state.headless_pane_mut(tab, pane).unwrap().work_origin =
+                    "changed-pane-origin".into();
+            },
+            |before, after| {
+                let historical = after
+                    .visible
+                    .metadata
+                    .iter()
+                    .find(|(origin, _)| origin == &before.projection.legend[0].pane_origin)
+                    .unwrap();
+                assert_eq!(historical.1.origin_state, WorkStreamOriginState::Historical);
+                assert_eq!(
+                    after.visible.options.len(),
+                    before.visible.options.len() + 1
+                );
+                assert!(matches!(
+                    after.visible.options[5].1,
+                    WorkStreamFilter::Pane(_)
+                ));
+                assert_ne!(after.visible.options[5].1, before.visible.options[5].1);
+            },
+        );
+        assert_work_stream_source_change(
+            |state, _| {
+                state
+                    .workspaces
+                    .iter_mut()
+                    .find(|workspace| workspace.id == state.active_workspace)
+                    .unwrap()
+                    .tabs
+                    .reverse()
+            },
+            |before, after| {
+                let origin = &before.projection.legend[0].pane_origin;
+                assert_eq!(
+                    before
+                        .visible
+                        .metadata
+                        .iter()
+                        .find(|(key, _)| key == origin)
+                        .unwrap()
+                        .1
+                        .display_order,
+                    0
+                );
+                assert_eq!(
+                    after
+                        .visible
+                        .metadata
+                        .iter()
+                        .find(|(key, _)| key == origin)
+                        .unwrap()
+                        .1
+                        .display_order,
+                    1
+                );
+                assert_ne!(
+                    after.visible.summary.items[0].pane_origin,
+                    before.visible.summary.items[0].pane_origin
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn work_stream_producer_effective_filter_palette_and_promotion_reach_gate() {
+        use crate::work_ledger::*;
+        assert_work_stream_source_change(
+            |state, ui| {
+                ui.filter = WorkStreamFilter::Pane(
+                    work_stream_runtime_identities(state)[1].pane_origin.clone(),
+                )
+            },
+            |_, after| {
+                assert_eq!(after.visible.projection.entries.len(), 1);
+                assert_eq!(after.visible.projection.entries[0].record.summary, "Beta");
+                assert!(matches!(
+                    after.visible.preferences.filter,
+                    WorkStreamFilter::Pane(_)
+                ));
+            },
+        );
+        assert_work_stream_source_change(
+            |state, _| {
+                let (tab, _) = first_source_pane(state);
+                state.find_tab_mut(tab).unwrap().agent_name = Some("codex".into());
+            },
+            |_, after| {
+                assert_eq!(
+                    after.visible.projection.legend[0].agent_name.as_deref(),
+                    Some("codex")
+                )
+            },
+        );
+        assert_work_stream_source_change(
+            |state, ui| {
+                let origin = work_stream_runtime_identities(state)[0].pane_origin.clone();
+                let mut persisted = serde_json::to_value(&ui.palette).unwrap();
+                persisted["color_slots"][&origin] = serde_json::json!(4);
+                ui.palette = serde_json::from_value(persisted).unwrap();
+            },
+            |_, after| assert_eq!(after.visible.projection.entries[0].color_slot, Some(4)),
+        );
+        let mut state = work_stream_source_fixture();
+        let workspace = state.active_workspace;
+        for name in ["Third", "Fourth", "Fifth", "Overflow"] {
+            crate::seed_headless_terminal_tab(
+                &mut state,
+                workspace,
+                name,
+                crate::HeadlessPaneSeed::default(),
+            )
+            .unwrap();
+        }
+        let mut ui = super::WorkStreamUiState::default();
+        let before = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert_eq!(before.projection.legend[5].color_slot, None);
+        assert!(ui.needs_rebuild(before.visible));
+        assert!(ui.palette.promote(&before.projection.legend[5].pane_origin));
+        let promoted = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert_eq!(promoted.visible.projection.legend[5].color_slot, Some(4));
+        assert_eq!(promoted.visible.projection.legend[4].color_slot, None);
+        assert!(ui.needs_rebuild(promoted.visible));
+        let repeat = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert!(!ui.needs_rebuild(repeat.visible));
+    }
+
+    #[test]
+    fn work_stream_producer_ledger_count_and_sequence_order_reach_gate() {
+        let mut state = work_stream_source_fixture();
+        let mut ui = super::WorkStreamUiState::default();
+        let before = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert_eq!(
+            before
+                .visible
+                .projection
+                .entries
+                .iter()
+                .map(|entry| entry.record.seq)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(ui.needs_rebuild(before.visible));
+        // Change the retained chronology itself without appending an event.
+        state.work_ledger.test_record_mut(1).seq = 3;
+        let reordered = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert_eq!(
+            reordered
+                .visible
+                .projection
+                .entries
+                .iter()
+                .map(|entry| entry.record.seq)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert_eq!(
+            reordered.visible.projection.entries[0].record.summary,
+            "Beta"
+        );
+        assert!(ui.needs_rebuild(reordered.visible));
+        let repeat = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert!(!ui.needs_rebuild(repeat.visible));
+        state.work_ledger.clear_all();
+        let cleared = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert!(cleared.visible.empty_ledger);
+        assert!(cleared.visible.projection.entries.is_empty());
+        assert!(ui.needs_rebuild(cleared.visible));
+        let repeat = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert!(!ui.needs_rebuild(repeat.visible));
+    }
+
+    #[test]
+    fn work_stream_producer_row_and_checked_age_boundaries_each_reach_gate() {
+        for (boundary, expected_age) in [
+            (10_000, "10s ago"),
+            (60_000, "1m ago"),
+            (3_600_000, "1h ago"),
+            (86_400_000, "1d ago"),
+        ] {
+            for checked_age in [false, true] {
+                let mut state = work_stream_source_fixture();
+                // Keep every other displayed clock fixed even while advancing
+                // now. This proves row and checked ages enter the gate separately.
+                for seq in [1, 2] {
+                    state.work_ledger.test_record_mut(seq).ts_unix_ms = 1_000_000_000_000;
+                    state
+                        .work_ledger
+                        .test_reconciliation_mut(seq)
+                        .checked_at_unix_ms = Some(1_000_000_000_000);
+                }
+                if checked_age {
+                    state
+                        .work_ledger
+                        .test_reconciliation_mut(1)
+                        .checked_at_unix_ms = Some(1_000);
+                } else {
+                    state.work_ledger.test_record_mut(1).ts_unix_ms = 1_000;
+                }
+                let mut ui = super::WorkStreamUiState::default();
+                let before =
+                    super::prepare_work_stream_model(&state, &mut ui, 1_000 + boundary - 1);
+                assert!(ui.needs_rebuild(before.visible.clone()));
+                let changed = super::prepare_work_stream_model(&state, &mut ui, 1_000 + boundary);
+                if checked_age {
+                    assert_eq!(changed.visible.ages[0], before.visible.ages[0]);
+                    assert_eq!(changed.visible.ages[1], before.visible.ages[1]);
+                    assert!(changed.visible.ages[2].contains(&format!("Checked {expected_age}")));
+                    assert!(changed.visible.ages[4].contains(&format!("Checked {expected_age}")));
+                } else {
+                    assert_eq!(changed.visible.ages[0], expected_age);
+                    assert_eq!(changed.visible.ages[1..], before.visible.ages[1..]);
+                }
+                assert!(ui.needs_rebuild(changed.visible));
+                let repeat = super::prepare_work_stream_model(&state, &mut ui, 1_000 + boundary);
+                assert!(!ui.needs_rebuild(repeat.visible));
+            }
+        }
+    }
+
+    #[test]
+    fn work_stream_producer_actual_activity_expiry_reaches_gate() {
+        use crate::work_ledger::ExecutionState;
+        use crate::workspace::{AgentActivity, AgentActivityState};
+        for explicit in [true, false] {
+            let mut state = work_stream_source_fixture();
+            let (tab, pane) = first_source_pane(&state);
+            let activity = if explicit {
+                AgentActivity::socket(AgentActivityState::Running, "working", Some("codex".into()))
+            } else {
+                AgentActivity::output_scan(
+                    AgentActivityState::Running,
+                    "working",
+                    Some("codex".into()),
+                )
+            }
+            .unwrap();
+            state
+                .find_tab_mut(tab)
+                .unwrap()
+                .set_pane_agent_activity(pane, Some(activity));
+            let mut ui = super::WorkStreamUiState::default();
+            let before = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+            assert_eq!(
+                before.visible.summary.items[0].execution,
+                ExecutionState::Running
+            );
+            assert_eq!(
+                before.visible.truths[0].1.execution,
+                ExecutionState::Running
+            );
+            assert!(ui.needs_rebuild(before.visible));
+            // Existing windows are 8s explicit/8s output. Sixty seconds is
+            // safely expired without sleeps or a replacement policy clock.
+            let activity = state
+                .find_tab_mut(tab)
+                .unwrap()
+                .pane_agent_activity
+                .get_mut(&pane)
+                .unwrap();
+            activity.updated_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+            let changed = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+            assert_eq!(
+                changed.visible.summary.items[0].execution,
+                ExecutionState::Unknown
+            );
+            assert_eq!(
+                changed.visible.truths[0].1.execution,
+                ExecutionState::Unknown
+            );
+            assert!(ui.needs_rebuild(changed.visible));
+            let repeat = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+            assert!(!ui.needs_rebuild(repeat.visible));
+            assert_eq!(
+                state
+                    .work_ledger
+                    .iter_records()
+                    .map(|record| record.seq)
+                    .collect::<Vec<_>>(),
+                [1, 2]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires owned Xvfb GTK display; run exact --ignored --test-threads=1"]
+    fn work_stream_producer_actual_process_expiry_reaches_gate_gtk() {
+        use crate::runtime_probe::{
+            ProbeState, RuntimeProbeSnapshot, RuntimeProbeWorkerFailure, PROBE_TTL_MS,
+        };
+        use crate::work_ledger::ExecutionState;
+        let _guard = crate::glib_main_context_test_guard();
+        gtk::init().expect("owned display must initialize GTK");
+        let mut state = work_stream_source_fixture();
+        let (tab, pane) = first_source_pane(&state);
+        let headless = state.headless_panes.remove(&(tab, pane)).unwrap();
+        let pid = i32::try_from(std::process::id()).unwrap();
+        // A real PaneLeaf supplies the production PID descriptors. No terminal
+        // child is spawned and no operator process is probed or changed.
+        state.find_tab_mut(tab).unwrap().panes =
+            Box::new(crate::pane::PaneNode::Leaf(crate::pane::PaneLeaf {
+                pane_id: pane,
+                work_origin: headless.work_origin,
+                container: gtk::Box::new(gtk::Orientation::Vertical, 0),
+                terminal: vte::Terminal::new(),
+                shell_pid: Some(pid),
+                was_busy: false,
+                launch_command: None,
+                output_tracker: Rc::new(std::cell::Cell::new(None)),
+                tmux_backing: None,
+                restored_tmux: None,
+                restore_unavailable_reason: None,
+                location_state: headless.location_state,
+                process_state: headless.process_state,
+                current_task: headless.current_task,
+                restored_agent_session: None,
+                restored_spawn_kind: None,
+                agent_resume: None,
+                command_marks: Vec::new(),
+                broker: None,
+            }));
+        let now = crate::events::unix_time_ms();
+        let tab_pids = state
+            .all_tabs()
+            .map(|tab| (tab.id, tab.panes.collect_pids()))
+            .collect::<Vec<_>>();
+        let mut snapshot = RuntimeProbeSnapshot::worker_failure(
+            now,
+            &tab_pids,
+            &[(tab, pane, pid)],
+            RuntimeProbeWorkerFailure::Cancelled,
+        );
+        snapshot.process_probe = ProbeState::Ok;
+        snapshot.process_error = None;
+        snapshot.process_observed_at_unix_ms = Some(now);
+        snapshot.pane_agents.insert(
+            (tab, pane),
+            crate::agents::AgentStatus {
+                agent_name: Some("codex".into()),
+                session_id: None,
+                running: true,
+            },
+        );
+        state.runtime_probe = Some(snapshot);
+        assert!(crate::runtime_probe::runtime_process_truth_is_fresh(&state));
+        let mut ui = super::WorkStreamUiState::default();
+        let before = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert_eq!(
+            before.visible.summary.items[0].execution,
+            ExecutionState::Running
+        );
+        assert_eq!(
+            before.visible.truths[0].1.execution,
+            ExecutionState::Running
+        );
+        assert!(ui.needs_rebuild(before.visible));
+        state
+            .runtime_probe
+            .as_mut()
+            .unwrap()
+            .process_observed_at_unix_ms = Some(now - PROBE_TTL_MS - 60_000);
+        assert!(!crate::runtime_probe::runtime_process_truth_is_fresh(
+            &state
+        ));
+        let expired = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert_eq!(
+            expired.visible.summary.items[0].execution,
+            ExecutionState::Unknown
+        );
+        assert_eq!(
+            expired.visible.truths[0].1.execution,
+            ExecutionState::Unknown
+        );
+        assert!(ui.needs_rebuild(expired.visible));
+        let repeat = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert!(!ui.needs_rebuild(repeat.visible));
+        assert_eq!(
+            state
+                .work_ledger
+                .iter_records()
+                .map(|record| record.seq)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn work_stream_producer_pr_actions_and_source_attributed_mismatch_reach_gate() {
+        use crate::work_ledger::*;
+        let reference = || WorkPullRequestRef {
+            repository: "owner/repo".into(),
+            number: 1,
+            title: "PR".into(),
+            url: "https://github.com/owner/repo/pull/1".into(),
+            state: "open".into(),
+            is_draft: false,
+            review_decision: None,
+            checks: Default::default(),
+        };
+        for input in ["repository", "number", "presence"] {
+            let mut state = work_stream_source_fixture();
+            state.work_ledger.test_record_mut(1).pull_request = Some(reference());
+            let mut ui = super::WorkStreamUiState::default();
+            let before = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+            assert!(ui.needs_rebuild(before.visible));
+            let record = state.work_ledger.test_record_mut(1);
+            match input {
+                "repository" => {
+                    record.pull_request.as_mut().unwrap().repository = "owner/other".into()
+                }
+                "number" => record.pull_request.as_mut().unwrap().number = 2,
+                "presence" => record.pull_request = None,
+                _ => unreachable!(),
+            }
+            let changed = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+            let pr = changed.visible.projection.entries[0]
+                .record
+                .pull_request
+                .as_ref();
+            match input {
+                "repository" => assert_eq!(pr.unwrap().repository, "owner/other"),
+                "number" => assert_eq!(pr.unwrap().number, 2),
+                "presence" => assert!(pr.is_none()),
+                _ => unreachable!(),
+            }
+            assert!(ui.needs_rebuild(changed.visible));
+            let repeat = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+            assert!(!ui.needs_rebuild(repeat.visible));
+            assert_eq!(
+                state
+                    .work_ledger
+                    .iter_records()
+                    .map(|record| record.seq)
+                    .collect::<Vec<_>>(),
+                [1, 2]
+            );
+        }
+        let mut state = work_stream_source_fixture();
+        state.work_ledger.test_record_mut(1).pull_request = Some(reference());
+        let reconciliation = state.work_ledger.test_reconciliation_mut(1);
+        reconciliation.source = "github".into();
+        reconciliation.status = WorkReconciliationStatus::Verified;
+        let mut ui = super::WorkStreamUiState::default();
+        let before = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert_eq!(before.visible.summary.mismatch_count, 1);
+        assert_eq!(
+            before.visible.truths[0].1.mismatch.as_ref().unwrap().source,
+            "github"
+        );
+        assert!(ui.needs_rebuild(before.visible));
+        state
+            .work_ledger
+            .test_plan_status("/repo-a", "TASK-A", "in_progress");
+        let matching = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert_eq!(matching.visible.summary.mismatch_count, 0);
+        assert!(matching.visible.truths[0].1.mismatch.is_none());
+        assert_eq!(
+            matching.visible.truths[0].1.canonical,
+            CanonicalTaskState::InProgress
+        );
+        assert!(ui.needs_rebuild(matching.visible));
+        let repeat = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert!(!ui.needs_rebuild(repeat.visible));
+    }
+
+    #[test]
+    fn work_stream_producer_lazy_restore_and_removed_filter_resolution_reach_gate() {
+        use crate::work_ledger::*;
+        let mut state = work_stream_source_fixture();
+        let mut ui = super::WorkStreamUiState::default();
+        let before = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert!(ui.needs_rebuild(before.visible));
+        let workspace = state.active_workspace;
+        let tab = crate::seed_pending_restore_tab(
+            &mut state,
+            workspace,
+            "Pending",
+            crate::session::SavedPaneNode::Leaf {
+                work_origin: None,
+                cwd: Some("/repo".into()),
+                ssh_command: None,
+                tmux_session: None,
+                tmux_host: None,
+                tmux_identity: None,
+                current_task: None,
+                agent_session: None,
+            },
+            Some("/repo".into()),
+        )
+        .unwrap();
+        let changed = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        let item = changed
+            .visible
+            .projection
+            .legend
+            .iter()
+            .find(|item| item.tab_id == tab)
+            .unwrap();
+        assert_eq!(item.origin_state, WorkStreamOriginState::Lazy);
+        assert_eq!(
+            changed
+                .visible
+                .summary
+                .items
+                .iter()
+                .find(|truth| truth.pane_origin == item.pane_origin)
+                .unwrap()
+                .origin,
+            WorkStreamOriginState::Lazy
+        );
+        assert!(ui.needs_rebuild(changed.visible));
+        let repeat = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert!(!ui.needs_rebuild(repeat.visible));
+        ui.filter = WorkStreamFilter::Task("TASK-A".into());
+        let selected = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert_eq!(selected.visible.projection.entries.len(), 1);
+        assert!(ui.needs_rebuild(selected.visible));
+        // Removing the selected source option causes the existing fallback,
+        // rather than leaving the comparison keyed to an invalid selection.
+        state.work_ledger.test_record_mut(1).identity.task_id = None;
+        let removed = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert_eq!(removed.visible.preferences.filter, WorkStreamFilter::All);
+        assert!(!removed
+            .visible
+            .options
+            .iter()
+            .any(|(_, option)| option == &WorkStreamFilter::Task("TASK-A".into())));
+        assert!(removed.filter_update.is_some());
+        assert!(ui.needs_rebuild(removed.visible));
+        let repeat = super::prepare_work_stream_model(&state, &mut ui, 31_000);
+        assert!(!ui.needs_rebuild(repeat.visible));
+    }
+
     fn work_stream_visible_fixture() -> super::WorkStreamVisibleState {
         use crate::work_ledger::*;
         let mut state = crate::AppState::new();
