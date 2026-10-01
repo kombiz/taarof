@@ -2781,6 +2781,7 @@ fn install_periodic_pollers(
     window: &adw::ApplicationWindow,
     broadcast_indicator: &gtk::Box,
     broadcast_label: &gtk::Label,
+    dashboard_in_flight: &crate::runtime_probe::ProbeInFlight,
 ) -> Rc<RefCell<Option<glib::SourceId>>> {
     // ── Agent status polling every 3s ──
     {
@@ -2859,22 +2860,31 @@ fn install_periodic_pollers(
 
     // ── tmux metadata polling every 5s ──
     {
+        let metadata_in_flight = crate::runtime_probe::ProbeInFlight::default();
+        let dashboard_in_flight = dashboard_in_flight.clone();
         let state = state.clone();
         let tab_list = tab_list.clone();
         let term_stack = term_stack.clone();
         let window = window.clone();
         glib::timeout_add_seconds_local(crate::tmux::TMUX_METADATA_POLL_SECONDS, move || {
-            crate::terminal::poll_tmux_metadata(&state, &tab_list);
-            crate::terminal::poll_dashboard_state(&state, &term_stack, &tab_list, &window);
+            crate::terminal::poll_tmux_metadata(&state, &tab_list, &metadata_in_flight);
+            crate::terminal::poll_dashboard_state(
+                &state,
+                &term_stack,
+                &tab_list,
+                &window,
+                &dashboard_in_flight,
+            );
             glib::ControlFlow::Continue
         });
     }
 
     // ── Host status polling every 15s ──
     {
+        let in_flight = crate::runtime_probe::ProbeInFlight::default();
         let state = state.clone();
         glib::timeout_add_seconds_local(15, move || {
-            crate::terminal::poll_host_status(&state);
+            crate::terminal::poll_host_status(&state, &in_flight);
             glib::ControlFlow::Continue
         });
     }
@@ -3411,7 +3421,14 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
         }
     }
 
-    crate::terminal::poll_dashboard_state(&state, &term_stack, &tab_list, &window);
+    let dashboard_in_flight = crate::runtime_probe::ProbeInFlight::default();
+    crate::terminal::poll_dashboard_state(
+        &state,
+        &term_stack,
+        &tab_list,
+        &window,
+        &dashboard_in_flight,
+    );
 
     {
         let restore_legend = restore_legend.clone();
@@ -3507,6 +3524,7 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
         &window,
         &broadcast_indicator,
         &broadcast_label,
+        &dashboard_in_flight,
     );
     install_update_watcher(&update_pending_button);
 
