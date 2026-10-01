@@ -3796,32 +3796,47 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
     }
 
     {
-        let runtime = runtime.clone();
+        let state = state.clone();
         let cleanup = shutdown_cleanup.clone();
         app.connect_shutdown(move |_| {
-            // Application telemetry stays at its original shutdown point,
-            // independently of which path first admitted resource cleanup.
-            runtime.emit_event(
-                "session_stopping",
-                serde_json::json!({
-                    "session_name": crate::instance::session_name(),
-                }),
+            run_application_shutdown_with(
+                &state,
+                cleanup.as_ref(),
+                &crate::diagnostics::enqueue_shutdown_diagnostic,
+                &|message| eprintln!("taarof: {message}"),
             );
-            crate::diagnostics::record_lifecycle(
-                "shutdown",
-                "taarof session stopping",
-                Some(serde_json::json!({
-                    "pid": std::process::id(),
-                    "session_name": crate::instance::session_name(),
-                })),
-            );
-            cleanup();
         });
     }
 
     app_session::install_signal_cleanup(app, &shutdown_cleanup);
 
     window.present();
+}
+
+/// Production application-shutdown coordination, also used with private real
+/// writers/sinks in held-lock regressions. Admission never waits for sinks.
+fn run_application_shutdown_with(
+    state: &Rc<RefCell<AppState>>,
+    cleanup: &dyn Fn(),
+    enqueue: &dyn Fn(crate::diagnostics::DiagnosticRecord) -> bool,
+    report: &dyn Fn(&str),
+) {
+    let session_name = crate::instance::session_name();
+    state.borrow_mut().event_store.emit_with_drop_reporter(
+        "session_stopping",
+        serde_json::json!({ "session_name": session_name }),
+        &|message, details| {
+            crate::diagnostics::report_application_shutdown_drop_with(
+                message, details, enqueue, report,
+            )
+        },
+    );
+    crate::diagnostics::report_application_shutdown_lifecycle_with(
+        session_name.as_deref(),
+        enqueue,
+        report,
+    );
+    cleanup();
 }
 
 fn cleanup_socket_once(cleaned: &Cell<bool>, socket_path: Option<&std::path::Path>) {
@@ -4119,6 +4134,348 @@ mod tests {
             filter: work_ledger::WorkStreamFilter::History,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn application_shutdown_app_first_returns_with_journal_held_and_full_ring() {
+        application_shutdown_with_sink_held(false, false, 2);
+    }
+
+    #[test]
+    fn application_shutdown_app_first_returns_with_history_held_and_full_ring() {
+        application_shutdown_with_sink_held(false, true, 2);
+    }
+
+    #[test]
+    fn application_shutdown_cleanup_first_returns_with_journal_held_and_full_ring() {
+        application_shutdown_with_sink_held(true, false, 2);
+    }
+
+    #[test]
+    fn application_shutdown_cleanup_first_returns_with_history_held_and_full_ring() {
+        application_shutdown_with_sink_held(true, true, 2);
+    }
+
+    #[test]
+    fn application_shutdown_app_first_reports_full_writer_with_journal_held() {
+        application_shutdown_with_sink_held(false, false, 1);
+    }
+
+    fn application_shutdown_with_sink_held(
+        cleanup_first: bool,
+        hold_history: bool,
+        writer_capacity: usize,
+    ) {
+        use crate::diagnostics::{
+            self, probe_writer::ProbeWriter, DiagnosticJournal, DiagnosticRetention,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc, Arc, Mutex,
+        };
+        let label = format!("app-{cleanup_first}-{hold_history}-{writer_capacity}");
+        let directory = std::env::temp_dir().join(format!(
+            "taarof-shutdown-{label}-{}-{}",
+            std::process::id(),
+            events::unix_time_ms()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        #[cfg(feature = "history")]
+        let (history_handle, history_reader) = crate::history::HistoryHandle::open_at(
+            crate::history::HistoryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            directory.join("history.sqlite3"),
+        );
+        #[cfg(not(feature = "history"))]
+        let history_handle = AppState::new().history;
+        let journal = Arc::new(Mutex::new(DiagnosticJournal::new_with_paths(
+            None,
+            None,
+            DiagnosticRetention::default(),
+        )));
+        let history = Arc::new(Mutex::new(Some(history_handle.clone())));
+        let journal_guard = (!hold_history).then(|| journal.lock().unwrap());
+        let history_guard = hold_history.then(|| history.lock().unwrap());
+        let sink_journal = journal.clone();
+        let sink_history = history.clone();
+        let (entered, waiting) = mpsc::channel();
+        let (written, observed) = mpsc::channel();
+        let writer = Arc::new(ProbeWriter::start(writer_capacity, move |record| {
+            let first = record.action == "host-status";
+            let result = diagnostics::persist_probe_record(
+                record.clone(),
+                &sink_journal,
+                &sink_history,
+                &|_| {
+                    if first {
+                        entered.send(()).unwrap();
+                    }
+                },
+            );
+            written.send(record).unwrap();
+            result
+        }));
+        assert!(writer.enqueue(diagnostics::probe_transition_record(
+            "host-status",
+            false,
+            "probe host-status is error".into(),
+            serde_json::json!({})
+        )));
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        let caller_writer = writer.clone();
+        let caller_history = history_handle.clone();
+        let caller_directory = directory.clone();
+        let (finished, completion) = mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            let ledger_writes = Arc::new(AtomicUsize::new(0));
+            let counted_ledger = ledger_writes.clone();
+            let (state, ledger_path) = ledger_shutdown_state(&label, move |path, content| {
+                counted_ledger.fetch_add(1, Ordering::SeqCst);
+                std::fs::write(path, content)
+            });
+            {
+                let mut state = state.borrow_mut();
+                state.history = caller_history;
+                state.event_store = events::EventStore::with_capacity(2);
+                state.event_store.emit("before-one", serde_json::json!({}));
+                state.event_store.emit("before-two", serde_json::json!({}));
+                let history = state.history.clone();
+                state.event_store.install_history_sink(history);
+                state
+                    .work_ledger
+                    .set_view_preferences(attention_preferences());
+            }
+            let session_path = caller_directory.join("session.json");
+            let session_writes = Arc::new(AtomicUsize::new(0));
+            let counted_session = session_writes.clone();
+            let session_writer =
+                session::SessionWriter::for_test(session_path.clone(), move |path, content| {
+                    counted_session.fetch_add(1, Ordering::SeqCst);
+                    std::fs::write(path, content)
+                })
+                .unwrap();
+            let started = Cell::new(false);
+            let steps = RefCell::new(Vec::new());
+            let reports = RefCell::new(Vec::new());
+            let outcome = RefCell::new(None);
+            let barrier_calls = Cell::new(0);
+            let report = |message: &str| reports.borrow_mut().push(message.to_string());
+            let enqueue = |record: diagnostics::DiagnosticRecord| {
+                if record.action == "shutdown" {
+                    assert_eq!(
+                        state
+                            .borrow()
+                            .event_store
+                            .entries()
+                            .last()
+                            .unwrap()
+                            .event_type,
+                        "session_stopping"
+                    );
+                }
+                steps.borrow_mut().push(record.action.clone());
+                caller_writer.enqueue(record)
+            };
+            let cleanup = || {
+                app_session::shutdown_once(&started, &|| {
+                    barrier_calls.set(barrier_calls.get() + 1);
+                    *outcome.borrow_mut() = Some(run_shutdown_cleanup_with_probe_drain(
+                        &state,
+                        &ShutdownHooks {
+                            stop_background: &|| {
+                                steps
+                                    .borrow_mut()
+                                    .extend(["watcher".into(), "autosave".into()]);
+                            },
+                            save_session: &|| {
+                                steps.borrow_mut().push("save".into());
+                                session_writer
+                                    .shutdown(session::SessionCapture::new(
+                                        snapshot_session_state_for_test(&state.borrow()),
+                                    ))
+                                    .unwrap();
+                            },
+                            release_endpoints: &|| {
+                                steps.borrow_mut().extend(["socket".into(), "http".into()]);
+                            },
+                        },
+                        Duration::from_secs(2),
+                        &|message| {
+                            diagnostics::report_ledger_shutdown_with(message, &enqueue, &report)
+                        },
+                        &|| {
+                            assert!(
+                                ledger_path.exists(),
+                                "actual final ledger save precedes diagnostic drain"
+                            );
+                            steps
+                                .borrow_mut()
+                                .extend(["barrier".into(), "drain".into()]);
+                            diagnostics::drain_probe_writer_with(
+                                &caller_writer,
+                                Duration::from_millis(10),
+                                &report,
+                            );
+                        },
+                    ));
+                })
+            };
+            if cleanup_first {
+                cleanup();
+            }
+            run_application_shutdown_with(&state, &cleanup, &enqueue, &report);
+            let writes_after_cleanup = ledger_writes.load(Ordering::SeqCst);
+            // Later window close and both signal paths use the same admission.
+            cleanup();
+            app_session::signal_cleanup(&cleanup);
+            app_session::signal_cleanup(&cleanup);
+            assert_eq!(ledger_writes.load(Ordering::SeqCst), writes_after_cleanup);
+            assert_eq!(barrier_calls.get(), 1);
+            assert_eq!(
+                *outcome.borrow(),
+                Some(work_ledger::LedgerShutdown::Durable)
+            );
+            assert_eq!(session_writes.load(Ordering::SeqCst), 1);
+            let saved: session::SessionStateV2 =
+                serde_json::from_str(&std::fs::read_to_string(session_path).unwrap()).unwrap();
+            assert_eq!(saved.version, 2);
+            assert!(!saved.workspaces.is_empty());
+            assert_eq!(state.borrow().event_store.dropped(), 1);
+            let events = state.borrow().event_store.entries();
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| (event.seq, event.event_type.as_str()))
+                    .collect::<Vec<_>>(),
+                [(2, "before-two"), (3, "session_stopping")]
+            );
+            let expected = if cleanup_first {
+                vec![
+                    "watcher",
+                    "autosave",
+                    "save",
+                    "barrier",
+                    "drain",
+                    "socket",
+                    "http",
+                    "ring-overflow",
+                    "shutdown",
+                ]
+            } else {
+                vec![
+                    "ring-overflow",
+                    "shutdown",
+                    "watcher",
+                    "autosave",
+                    "save",
+                    "barrier",
+                    "drain",
+                    "socket",
+                    "http",
+                ]
+            };
+            assert_eq!(*steps.borrow(), expected);
+            assert!(reports
+                .borrow()
+                .iter()
+                .any(|message| message.contains("drained=false")
+                    && message.contains("history durability requires its own flush")));
+            let rejected: Vec<_> = reports
+                .borrow()
+                .iter()
+                .filter(|message| {
+                    message.starts_with("application shutdown diagnostic persistence incomplete")
+                })
+                .cloned()
+                .collect();
+            assert_eq!(
+                rejected.len(),
+                if cleanup_first {
+                    2
+                } else if writer_capacity == 1 {
+                    1
+                } else {
+                    0
+                }
+            );
+            if cleanup_first {
+                assert!(rejected[0].contains("ring-overflow"));
+                assert!(rejected[1].contains("shutdown"));
+            } else if writer_capacity == 1 {
+                assert!(rejected[0].contains("shutdown"));
+            }
+            assert!(rejected
+                .iter()
+                .all(|message| message.contains("history durability remains unknown")));
+            let reporting = reports.into_inner();
+            finished.send(reporting).unwrap();
+            let _ = std::fs::remove_file(ledger_path);
+        });
+        // The controller thread retains the ACTUAL sink guard until the
+        // production-used caller has returned, not until a logging hook fires.
+        let returned = completion.recv_timeout(Duration::from_secs(5));
+        let returned_before_release = returned.is_ok();
+        let still_waiting = observed.try_recv().is_err();
+        drop(journal_guard);
+        drop(history_guard);
+        caller.join().unwrap();
+        assert!(
+            returned_before_release,
+            "application shutdown waited for the held diagnostic sink"
+        );
+        assert!(
+            still_waiting,
+            "the diagnostic sink was not held through caller return"
+        );
+        let reports = returned.unwrap();
+        assert!(reports
+            .iter()
+            .any(|message| message.contains("drained=false")));
+        let expected_actions = if cleanup_first {
+            vec!["host-status"]
+        } else if writer_capacity == 1 {
+            vec!["host-status", "ring-overflow"]
+        } else {
+            vec!["host-status", "ring-overflow", "shutdown"]
+        };
+        for action in &expected_actions {
+            let record = observed.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(&record.action, action);
+            if action == &"ring-overflow" {
+                let details = record.details.unwrap();
+                assert_eq!(details["dropped_total"], 1);
+                assert_eq!(details["capacity"], 2);
+                assert_eq!(details["dropped_seq"], 1);
+                assert_eq!(details["oldest_retained_seq"], 2);
+            }
+        }
+        // A late sink recovery cannot provide a new durable shutdown verdict.
+        assert_eq!(writer.shutdown(Duration::from_secs(2)), None);
+        history_handle.flush().unwrap();
+        #[cfg(feature = "history")]
+        {
+            let history = serde_json::to_string(
+                &history_reader
+                    .query(None, Some(100), Default::default())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(history.contains("session_stopping"));
+            assert_eq!(
+                history.contains("taarof session stopping"),
+                !cleanup_first && writer_capacity == 2
+            );
+        }
+        assert!(reports
+            .iter()
+            .all(|message| !message.contains("drained=true")));
+        assert_eq!(
+            journal.lock().unwrap().snapshot().recent.len(),
+            expected_actions.len()
+        );
+        // Temporary session/history files stay isolated; do not touch operator state.
     }
 
     #[test]

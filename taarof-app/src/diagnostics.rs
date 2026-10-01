@@ -602,13 +602,66 @@ pub(crate) fn report_ledger_shutdown(message: &str) {
     });
 }
 
+/// Only application-shutdown telemetry uses this admission path. Rejection
+/// stays visible without ever falling back to the synchronous shared sinks.
+fn report_application_shutdown_record_with(
+    record: DiagnosticRecord,
+    enqueue: &dyn Fn(DiagnosticRecord) -> bool,
+    report: &dyn Fn(&str),
+) {
+    let record = sanitize_record(record);
+    let action = record.action.clone();
+    if !enqueue(record) {
+        report(&format!("application shutdown diagnostic persistence incomplete ({action}): bounded writer rejected admission or already stopped; history durability remains unknown"));
+    }
+}
+
+pub(crate) fn report_application_shutdown_drop_with(
+    message: String,
+    details: Option<Value>,
+    enqueue: &dyn Fn(DiagnosticRecord) -> bool,
+    report: &dyn Fn(&str),
+) {
+    report_application_shutdown_record_with(
+        make_record(
+            DiagnosticLevel::Warn,
+            "event_drop",
+            "events",
+            "ring-overflow",
+            message,
+            details,
+        ),
+        enqueue,
+        report,
+    );
+}
+
+pub(crate) fn report_application_shutdown_lifecycle_with(
+    session_name: Option<&str>,
+    enqueue: &dyn Fn(DiagnosticRecord) -> bool,
+    report: &dyn Fn(&str),
+) {
+    report_application_shutdown_record_with(
+        make_record(
+            DiagnosticLevel::Info,
+            "lifecycle",
+            "runtime",
+            "shutdown",
+            "taarof session stopping",
+            Some(serde_json::json!({ "pid": std::process::id(), "session_name": session_name })),
+        ),
+        enqueue,
+        report,
+    );
+}
+
 #[cfg(not(test))]
-fn enqueue_shutdown_diagnostic(record: DiagnosticRecord) -> bool {
+pub(crate) fn enqueue_shutdown_diagnostic(record: DiagnosticRecord) -> bool {
     probe_writer().enqueue(record)
 }
 
 #[cfg(test)]
-fn enqueue_shutdown_diagnostic(_record: DiagnosticRecord) -> bool {
+pub(crate) fn enqueue_shutdown_diagnostic(_record: DiagnosticRecord) -> bool {
     false
 }
 
