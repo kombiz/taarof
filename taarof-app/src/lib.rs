@@ -1326,27 +1326,29 @@ fn install_live_config_watcher(ui: LiveConfigUiHandles) -> Option<LiveConfigWatc
 // Splitting them up makes the structure of `build_ui` scannable and lets
 // each concern be tested or extended in isolation.
 
-/// Add a bindable window handler while recording the *actual* GTK action name.
-///
-/// The ledger is checked after all installers run. Keeping `add_action` behind
-/// this helper means deleting, duplicating, or renaming a handler cannot leave
-/// a successfully-started window with a silently dead keybinding.
-fn add_bindable_window_action(
-    window: &adw::ApplicationWindow,
+/// Create, configure, record and install a handler using its typed window name.
+/// Configuration runs before registration, preserving installer callback order.
+fn register_bindable_window_action(
+    window: &impl IsA<gio::ActionMap>,
     ledger: &mut keybindings::WindowActionLedger,
     action: keybindings::Action,
-    handler: &gio::SimpleAction,
+    configure: impl FnOnce(&gio::SimpleAction),
 ) {
-    let name = handler.name();
-    ledger.register(action, name.as_str());
-    window.add_action(handler);
+    let name = action
+        .gaction_name()
+        .strip_prefix("win.")
+        .expect("only window actions can be installed as bindable handlers");
+    let handler = gio::SimpleAction::new(name, None);
+    configure(&handler);
+    ledger.register(action, name);
+    window.add_action(&handler);
 }
 
 /// Check the actual GTK window action map as well as the typed registration
 /// ledger. This is the reverse half of the contract: a newly added window
 /// handler cannot bypass the keybinding vocabulary.
 fn validate_window_action_contract(
-    window: &adw::ApplicationWindow,
+    window: &impl IsA<gio::ActionGroup>,
     ledger: &keybindings::WindowActionLedger,
 ) {
     ledger
@@ -1378,6 +1380,11 @@ fn toggled_dock_visibility(current: bool) -> bool {
     !current
 }
 
+// Parameterized notification target belongs to app.*, outside bindable win.* actions.
+fn focus_pane_notification_action() -> gio::SimpleAction {
+    gio::SimpleAction::new("focus-pane", Some(glib::VariantTy::STRING))
+}
+
 #[allow(clippy::too_many_arguments)] // UI handles stay explicit at this installer boundary.
 fn install_dock_action(
     window: &adw::ApplicationWindow,
@@ -1389,45 +1396,45 @@ fn install_dock_action(
     content: &gtk::Paned,
     main_content: &gtk::Box,
 ) {
-    let action = gio::SimpleAction::new("toggle-dock", None);
-    let task_dock = task_dock.clone();
-    let state_for_dock = state.clone();
-    action.connect_activate(move |_, _| {
-        task_dock.set_visible(toggled_dock_visibility(task_dock.is_visible()));
-        if let Some(terminal) = get_active_terminal(&state_for_dock) {
-            terminal.grab_focus();
-        }
-    });
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::ToggleDock,
-        &action,
+        |action| {
+            let task_dock = task_dock.clone();
+            let state_for_dock = state.clone();
+            action.connect_activate(move |_, _| {
+                task_dock.set_visible(toggled_dock_visibility(task_dock.is_visible()));
+                if let Some(terminal) = get_active_terminal(&state_for_dock) {
+                    terminal.grab_focus();
+                }
+            });
+        },
     );
 
-    let action = gio::SimpleAction::new("toggle-sidebar-compact", None);
-    let sidebar_box = sidebar_box.clone();
-    let tab_list = tab_list.clone();
-    let content = content.clone();
-    let main_content = main_content.clone();
-    let state = state.clone();
-    action.connect_activate(move |_, _| {
-        let compact = !sidebar_box.has_css_class("compact");
-        sidebar::apply_compact_mode(&sidebar_box, compact);
-        configure_sidebar_layout(&content, &sidebar_box, &main_content);
-        if !compact {
-            sidebar::refresh_all_tab_rows(&tab_list, &state);
-            sidebar::refresh_all_workspace_header_meta(&tab_list, &state);
-        }
-        if let Some(terminal) = get_active_terminal(&state) {
-            terminal.grab_focus();
-        }
-    });
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::ToggleSidebarCompact,
-        &action,
+        |action| {
+            let sidebar_box = sidebar_box.clone();
+            let tab_list = tab_list.clone();
+            let content = content.clone();
+            let main_content = main_content.clone();
+            let state = state.clone();
+            action.connect_activate(move |_, _| {
+                let compact = !sidebar_box.has_css_class("compact");
+                sidebar::apply_compact_mode(&sidebar_box, compact);
+                configure_sidebar_layout(&content, &sidebar_box, &main_content);
+                if !compact {
+                    sidebar::refresh_all_tab_rows(&tab_list, &state);
+                    sidebar::refresh_all_workspace_header_meta(&tab_list, &state);
+                }
+                if let Some(terminal) = get_active_terminal(&state) {
+                    terminal.grab_focus();
+                }
+            });
+        },
     );
 }
 
@@ -1439,98 +1446,90 @@ fn install_new_tab_actions(
     tab_list: &gtk::Box,
 ) {
     // Ctrl+T = new tab
-    let action_new_tab = gio::SimpleAction::new("new-tab", None);
-    {
-        let state = state.clone();
-        let term_stack = term_stack.clone();
-        let tab_list = tab_list.clone();
-        let window_for_newtab = window.clone();
-        action_new_tab.connect_activate(move |_, _| {
-            let ws_id = {
-                let st = state.borrow();
-                st.active_ws().map(|ws| ws.id)
-            };
-            if let Some(ws_id) = ws_id {
-                sidebar::open_new_tab_in_workspace(
-                    &tab_list,
-                    &state,
-                    &term_stack,
-                    ws_id,
-                    &window_for_newtab,
-                );
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::NewTab,
-        &action_new_tab,
+        |action_new_tab| {
+            let state = state.clone();
+            let term_stack = term_stack.clone();
+            let tab_list = tab_list.clone();
+            let window_for_newtab = window.clone();
+            action_new_tab.connect_activate(move |_, _| {
+                let ws_id = {
+                    let st = state.borrow();
+                    st.active_ws().map(|ws| ws.id)
+                };
+                if let Some(ws_id) = ws_id {
+                    sidebar::open_new_tab_in_workspace(
+                        &tab_list,
+                        &state,
+                        &term_stack,
+                        ws_id,
+                        &window_for_newtab,
+                    );
+                }
+            });
+        },
     );
 
     // Ctrl+Shift+T = new tmux tab
-    let action_new_tmux_tab = gio::SimpleAction::new("new-tmux-tab", None);
-    {
-        let state = state.clone();
-        let term_stack = term_stack.clone();
-        let tab_list = tab_list.clone();
-        let window_for_tmux_tab = window.clone();
-        action_new_tmux_tab.connect_activate(move |_, _| {
-            if let Some(message) = terminal::explicit_tmux_tab_ui_state()
-                .unavailable_message
-                .as_deref()
-            {
-                show_error_toast(message);
-                return;
-            }
-            sidebar::show_create_tmux_tab_dialog(
-                &state,
-                &term_stack,
-                &tab_list,
-                &window_for_tmux_tab,
-            );
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::NewTmuxTab,
-        &action_new_tmux_tab,
+        |action_new_tmux_tab| {
+            let state = state.clone();
+            let term_stack = term_stack.clone();
+            let tab_list = tab_list.clone();
+            let window_for_tmux_tab = window.clone();
+            action_new_tmux_tab.connect_activate(move |_, _| {
+                if let Some(message) = terminal::explicit_tmux_tab_ui_state()
+                    .unavailable_message
+                    .as_deref()
+                {
+                    show_error_toast(message);
+                    return;
+                }
+                sidebar::show_create_tmux_tab_dialog(
+                    &state,
+                    &term_stack,
+                    &tab_list,
+                    &window_for_tmux_tab,
+                );
+            });
+        },
     );
 
     // Ctrl+PageUp = previous tab
-    let action_previous_tab = gio::SimpleAction::new("previous-tab", None);
-    {
-        let state = state.clone();
-        let term_stack = term_stack.clone();
-        let tab_list = tab_list.clone();
-        action_previous_tab.connect_activate(move |_, _| {
-            if sidebar::activate_previous_tab(&tab_list, &state, &term_stack) {
-                if let Some(terminal) = get_active_terminal(&state) {
-                    terminal.grab_focus();
-                }
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::PreviousTab,
-        &action_previous_tab,
+        |action_previous_tab| {
+            let state = state.clone();
+            let term_stack = term_stack.clone();
+            let tab_list = tab_list.clone();
+            action_previous_tab.connect_activate(move |_, _| {
+                if sidebar::activate_previous_tab(&tab_list, &state, &term_stack) {
+                    if let Some(terminal) = get_active_terminal(&state) {
+                        terminal.grab_focus();
+                    }
+                }
+            });
+        },
     );
 
-    let action_register_project = gio::SimpleAction::new("register-project", None);
-    {
-        let state = state.clone();
-        action_register_project.connect_activate(move |_, _| {
-            register_focused_project(&state);
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::RegisterProject,
-        &action_register_project,
+        |action_register_project| {
+            let state = state.clone();
+            action_register_project.connect_activate(move |_, _| {
+                register_focused_project(&state);
+            });
+        },
     );
 }
 
@@ -1645,94 +1644,86 @@ fn install_search_palette_actions(
     history_view: &history_view::ui::HistoryView,
 ) {
     // F002: Ctrl+Shift+F = toggle search overlay
-    let action_search = gio::SimpleAction::new("search-toggle", None);
-    {
-        let search_bar = search_bar.clone();
-        let search_entry = search_entry.clone();
-        let state_for_search = state.clone();
-        action_search.connect_activate(move |_, _| {
-            if search_bar.is_visible() {
-                // If already visible, search next
-                if let Some(terminal) = get_active_terminal(&state_for_search) {
-                    terminal.search_find_next();
-                }
-            } else {
-                search_bar.set_visible(true);
-                search_entry.grab_focus();
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::SearchToggle,
-        &action_search,
+        |action_search| {
+            {
+                let search_bar = search_bar.clone();
+                let search_entry = search_entry.clone();
+                let state_for_search = state.clone();
+                action_search.connect_activate(move |_, _| {
+                    if search_bar.is_visible() {
+                        // If already visible, search next
+                        if let Some(terminal) = get_active_terminal(&state_for_search) {
+                            terminal.search_find_next();
+                        }
+                    } else {
+                        search_bar.set_visible(true);
+                        search_entry.grab_focus();
+                    }
+                });
+            }
+        },
     );
 
-    let action_copy_recent_output = gio::SimpleAction::new("copy-recent-output", None);
-    {
-        let state = state.clone();
-        action_copy_recent_output.connect_activate(move |_, _| {
-            if let Err(err) = terminal::copy_recent_output_from_active_terminal(&state) {
-                show_error_toast(&err);
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::CopyRecentOutput,
-        &action_copy_recent_output,
+        |action_copy_recent_output| {
+            let state = state.clone();
+            action_copy_recent_output.connect_activate(move |_, _| {
+                if let Err(err) = terminal::copy_recent_output_from_active_terminal(&state) {
+                    show_error_toast(&err);
+                }
+            });
+        },
     );
 
     // Copy the focused pane's last agent message as pristine markdown; fall back
     // to recent-output capture (with an explanatory toast) when the pane has no
     // resolvable transcript (EXAMPLE-91).
-    let action_copy_last_message = gio::SimpleAction::new("copy-last-message", None);
-    {
-        let state = state.clone();
-        action_copy_last_message.connect_activate(move |_, _| {
-            match terminal::copy_last_message_from_active_pane(&state) {
-                Ok(()) => show_toast("Copied last agent message"),
-                Err(err) => show_error_toast(&err),
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::CopyLastMessage,
-        &action_copy_last_message,
+        |action_copy_last_message| {
+            let state = state.clone();
+            action_copy_last_message.connect_activate(move |_, _| {
+                match terminal::copy_last_message_from_active_pane(&state) {
+                    Ok(()) => show_toast("Copied last agent message"),
+                    Err(err) => show_error_toast(&err),
+                }
+            });
+        },
     );
 
     // Jump-to-prompt scroll actions. Terminal-scoped bindings forward here via
     // window.activate_action, so both must exist as window actions.
-    let action_jump_previous_prompt = gio::SimpleAction::new("jump-previous-prompt", None);
-    {
-        let state = state.clone();
-        action_jump_previous_prompt.connect_activate(move |_, _| {
-            terminal::jump_active_pane_to_prompt(&state, terminal::PromptJump::Previous);
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::JumpPreviousPrompt,
-        &action_jump_previous_prompt,
+        |action_jump_previous_prompt| {
+            let state = state.clone();
+            action_jump_previous_prompt.connect_activate(move |_, _| {
+                terminal::jump_active_pane_to_prompt(&state, terminal::PromptJump::Previous);
+            });
+        },
     );
 
-    let action_jump_next_prompt = gio::SimpleAction::new("jump-next-prompt", None);
-    {
-        let state = state.clone();
-        action_jump_next_prompt.connect_activate(move |_, _| {
-            terminal::jump_active_pane_to_prompt(&state, terminal::PromptJump::Next);
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::JumpNextPrompt,
-        &action_jump_next_prompt,
+        |action_jump_next_prompt| {
+            let state = state.clone();
+            action_jump_next_prompt.connect_activate(move |_, _| {
+                terminal::jump_active_pane_to_prompt(&state, terminal::PromptJump::Next);
+            });
+        },
     );
 
     // Search entry: update regex on text change
@@ -1793,34 +1784,38 @@ fn install_search_palette_actions(
     }
 
     // F004: Ctrl+Alt+J = jump to first attention tab
-    let action_jump_attention = gio::SimpleAction::new("jump-attention", None);
-    {
-        let state = state.clone();
-        let tab_list = tab_list.clone();
-        let term_stack = term_stack.clone();
-        action_jump_attention.connect_activate(move |_, _| {
-            let attention_target = {
-                let st = state.borrow();
-                views::first_attention_target(&st)
-            };
-            if let Some((tab_id, pane_id)) = attention_target {
-                if !views::focus_attention_target(&state, &tab_list, &term_stack, tab_id, pane_id) {
-                    show_error_toast("Attention target is no longer available");
-                }
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::JumpAttention,
-        &action_jump_attention,
+        |action_jump_attention| {
+            let state = state.clone();
+            let tab_list = tab_list.clone();
+            let term_stack = term_stack.clone();
+            action_jump_attention.connect_activate(move |_, _| {
+                let attention_target = {
+                    let st = state.borrow();
+                    views::first_attention_target(&st)
+                };
+                if let Some((tab_id, pane_id)) = attention_target {
+                    if !views::focus_attention_target(
+                        &state,
+                        &tab_list,
+                        &term_stack,
+                        tab_id,
+                        pane_id,
+                    ) {
+                        show_error_toast("Attention target is no longer available");
+                    }
+                }
+            });
+        },
     );
 
     // Notification activation target: focus a specific (tab, pane). Registered
     // on the application (not the window) because desktop notifications
     // activate `app.`-scoped actions. Parameter is a `"<tab>:<pane>"` string.
-    let action_focus_pane = gio::SimpleAction::new("focus-pane", Some(glib::VariantTy::STRING));
+    let action_focus_pane = focus_pane_notification_action();
     {
         let state = state.clone();
         let tab_list = tab_list.clone();
@@ -1865,267 +1860,249 @@ fn install_search_palette_actions(
     }
 
     // F007: Ctrl+Shift+P = command palette
-    let action_palette = gio::SimpleAction::new("command-palette", None);
-    {
-        let cmd_palette = cmd_palette.clone();
-        let state = state.clone();
-        let tab_list = tab_list.clone();
-        let term_stack = term_stack.clone();
-        let window_for_palette = window.clone();
-        action_palette.connect_activate(move |_, _| {
-            if cmd_palette.container.is_visible() {
-                cmd_palette.container.set_visible(false);
-            } else {
-                palette::show_palette(
+    register_bindable_window_action(
+        window,
+        action_ledger,
+        keybindings::Action::CommandPalette,
+        |action_palette| {
+            let cmd_palette = cmd_palette.clone();
+            let state = state.clone();
+            let tab_list = tab_list.clone();
+            let term_stack = term_stack.clone();
+            let window_for_palette = window.clone();
+            action_palette.connect_activate(move |_, _| {
+                if cmd_palette.container.is_visible() {
+                    cmd_palette.container.set_visible(false);
+                } else {
+                    palette::show_palette(
+                        &cmd_palette,
+                        &state,
+                        &tab_list,
+                        &term_stack,
+                        &window_for_palette,
+                    );
+                }
+            });
+        },
+    );
+
+    register_bindable_window_action(
+        window,
+        action_ledger,
+        keybindings::Action::ShortcutHelp,
+        |action_help| {
+            let cmd_palette = cmd_palette.clone();
+            let state = state.clone();
+            let tab_list = tab_list.clone();
+            let term_stack = term_stack.clone();
+            let window = window.clone();
+            action_help.connect_activate(move |_, _| {
+                palette::show_keybinding_help(
                     &cmd_palette,
                     &state,
                     &tab_list,
                     &term_stack,
-                    &window_for_palette,
+                    &window,
                 );
-            }
-        });
-    }
-    add_bindable_window_action(
-        window,
-        action_ledger,
-        keybindings::Action::CommandPalette,
-        &action_palette,
-    );
-
-    let action_help = gio::SimpleAction::new("shortcut-help", None);
-    {
-        let cmd_palette = cmd_palette.clone();
-        let state = state.clone();
-        let tab_list = tab_list.clone();
-        let term_stack = term_stack.clone();
-        let window = window.clone();
-        action_help.connect_activate(move |_, _| {
-            palette::show_keybinding_help(&cmd_palette, &state, &tab_list, &term_stack, &window);
-        });
-    }
-    add_bindable_window_action(
-        window,
-        action_ledger,
-        keybindings::Action::ShortcutHelp,
-        &action_help,
+            });
+        },
     );
 
     // Send to pane: open the target picker seeded from the current
     // selection/clipboard (or the active pane's recent output).
-    let action_send_to_pane = gio::SimpleAction::new("send-to-pane", None);
-    {
-        let cmd_palette = cmd_palette.clone();
-        let state = state.clone();
-        let tab_list = tab_list.clone();
-        let term_stack = term_stack.clone();
-        let window_for_send = window.clone();
-        action_send_to_pane.connect_activate(move |_, _| {
-            palette::open_send_to_pane_picker(
-                &cmd_palette,
-                &state,
-                &tab_list,
-                &term_stack,
-                &window_for_send,
-                false,
-            );
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::SendToPane,
-        &action_send_to_pane,
+        |action_send_to_pane| {
+            let cmd_palette = cmd_palette.clone();
+            let state = state.clone();
+            let tab_list = tab_list.clone();
+            let term_stack = term_stack.clone();
+            let window_for_send = window.clone();
+            action_send_to_pane.connect_activate(move |_, _| {
+                palette::open_send_to_pane_picker(
+                    &cmd_palette,
+                    &state,
+                    &tab_list,
+                    &term_stack,
+                    &window_for_send,
+                    false,
+                );
+            });
+        },
     );
 
-    let action_send_last_output_to_pane = gio::SimpleAction::new("send-last-output-to-pane", None);
-    {
-        let cmd_palette = cmd_palette.clone();
-        let state = state.clone();
-        let tab_list = tab_list.clone();
-        let term_stack = term_stack.clone();
-        let window_for_send = window.clone();
-        action_send_last_output_to_pane.connect_activate(move |_, _| {
-            palette::open_send_to_pane_picker(
-                &cmd_palette,
-                &state,
-                &tab_list,
-                &term_stack,
-                &window_for_send,
-                true,
-            );
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::SendLastOutputToPane,
-        &action_send_last_output_to_pane,
+        |action_send_last_output_to_pane| {
+            let cmd_palette = cmd_palette.clone();
+            let state = state.clone();
+            let tab_list = tab_list.clone();
+            let term_stack = term_stack.clone();
+            let window_for_send = window.clone();
+            action_send_last_output_to_pane.connect_activate(move |_, _| {
+                palette::open_send_to_pane_picker(
+                    &cmd_palette,
+                    &state,
+                    &tab_list,
+                    &term_stack,
+                    &window_for_send,
+                    true,
+                );
+            });
+        },
     );
 
     // Relay last message: open the send-to-pane picker preloaded with the active
     // pane's last agent message (falling back to recent output) for two-keystroke
     // agent-to-agent handoff (EXAMPLE-91).
-    let action_relay_last_message = gio::SimpleAction::new("relay-last-message", None);
-    {
-        let cmd_palette = cmd_palette.clone();
-        let state = state.clone();
-        let tab_list = tab_list.clone();
-        let term_stack = term_stack.clone();
-        let window_for_relay = window.clone();
-        action_relay_last_message.connect_activate(move |_, _| {
-            palette::open_relay_last_message_picker(
-                &cmd_palette,
-                &state,
-                &tab_list,
-                &term_stack,
-                &window_for_relay,
-            );
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::RelayLastMessage,
-        &action_relay_last_message,
+        |action_relay_last_message| {
+            let cmd_palette = cmd_palette.clone();
+            let state = state.clone();
+            let tab_list = tab_list.clone();
+            let term_stack = term_stack.clone();
+            let window_for_relay = window.clone();
+            action_relay_last_message.connect_activate(move |_, _| {
+                palette::open_relay_last_message_picker(
+                    &cmd_palette,
+                    &state,
+                    &tab_list,
+                    &term_stack,
+                    &window_for_relay,
+                );
+            });
+        },
     );
 
     // Clipboard history: open the keyboard-first picker over the in-memory
     // clipboard "kill-ring" of taarof-initiated copies (EXAMPLE-88).
-    let action_clipboard_history = gio::SimpleAction::new("clipboard-history", None);
-    {
-        let cmd_palette = cmd_palette.clone();
-        let state = state.clone();
-        let tab_list = tab_list.clone();
-        let term_stack = term_stack.clone();
-        let window_for_clipboard = window.clone();
-        action_clipboard_history.connect_activate(move |_, _| {
-            palette::open_clipboard_history_picker(
-                &cmd_palette,
-                &state,
-                &tab_list,
-                &term_stack,
-                &window_for_clipboard,
-            );
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::ClipboardHistory,
-        &action_clipboard_history,
+        |action_clipboard_history| {
+            let cmd_palette = cmd_palette.clone();
+            let state = state.clone();
+            let tab_list = tab_list.clone();
+            let term_stack = term_stack.clone();
+            let window_for_clipboard = window.clone();
+            action_clipboard_history.connect_activate(move |_, _| {
+                palette::open_clipboard_history_picker(
+                    &cmd_palette,
+                    &state,
+                    &tab_list,
+                    &term_stack,
+                    &window_for_clipboard,
+                );
+            });
+        },
     );
 
     // Recent files: open the keyboard-first picker over the files the focused
     // tab's agents created/edited, resolved against each pane's cwd (EXAMPLE-92).
-    let action_recent_files = gio::SimpleAction::new("recent-files", None);
-    {
-        let cmd_palette = cmd_palette.clone();
-        let state = state.clone();
-        let tab_list = tab_list.clone();
-        let term_stack = term_stack.clone();
-        let window_for_recent_files = window.clone();
-        action_recent_files.connect_activate(move |_, _| {
-            palette::open_recent_files_picker(
-                &cmd_palette,
-                &state,
-                &tab_list,
-                &term_stack,
-                &window_for_recent_files,
-            );
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::RecentFiles,
-        &action_recent_files,
+        |action_recent_files| {
+            let cmd_palette = cmd_palette.clone();
+            let state = state.clone();
+            let tab_list = tab_list.clone();
+            let term_stack = term_stack.clone();
+            let window_for_recent_files = window.clone();
+            action_recent_files.connect_activate(move |_, _| {
+                palette::open_recent_files_picker(
+                    &cmd_palette,
+                    &state,
+                    &tab_list,
+                    &term_stack,
+                    &window_for_recent_files,
+                );
+            });
+        },
     );
 
     // Peek file: open the file referenced by the current selection in the
     // in-app overlay (EXAMPLE-93).
-    let action_peek_file = gio::SimpleAction::new("peek-file", None);
-    {
-        let state = state.clone();
-        action_peek_file.connect_activate(move |_, _| {
-            crate::terminal::peek_active_selection(&state);
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::PeekFile,
-        &action_peek_file,
+        |action_peek_file| {
+            let state = state.clone();
+            action_peek_file.connect_activate(move |_, _| {
+                crate::terminal::peek_active_selection(&state);
+            });
+        },
     );
 
-    let action_workspace_inspector = gio::SimpleAction::new("workspace-inspector", None);
-    {
-        let workspace_inspector = workspace_inspector.clone();
-        let state = state.clone();
-        let tab_list = tab_list.clone();
-        let window_for_inspector = window.clone();
-        action_workspace_inspector.connect_activate(move |_, _| {
-            if workspace_inspector.container.is_visible() {
-                workspace_inspector.hide(&state);
-            } else {
-                workspace_inspector.show(&state, &tab_list, &window_for_inspector);
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::WorkspaceInspector,
-        &action_workspace_inspector,
+        |action_workspace_inspector| {
+            let workspace_inspector = workspace_inspector.clone();
+            let state = state.clone();
+            let tab_list = tab_list.clone();
+            let window_for_inspector = window.clone();
+            action_workspace_inspector.connect_activate(move |_, _| {
+                if workspace_inspector.container.is_visible() {
+                    workspace_inspector.hide(&state);
+                } else {
+                    workspace_inspector.show(&state, &tab_list, &window_for_inspector);
+                }
+            });
+        },
     );
 
-    let action_history_view = gio::SimpleAction::new("history-view", None);
-    {
-        let history_view = history_view.clone();
-        action_history_view.connect_activate(move |_, _| {
-            if history_view.container.is_visible() {
-                history_view.hide();
-            } else {
-                history_view.show();
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::HistoryView,
-        &action_history_view,
+        |action_history_view| {
+            let history_view = history_view.clone();
+            action_history_view.connect_activate(move |_, _| {
+                if history_view.container.is_visible() {
+                    history_view.hide();
+                } else {
+                    history_view.show();
+                }
+            });
+        },
     );
 
-    let action_paste_active_input = gio::SimpleAction::new("paste-active-input", None);
-    {
-        let state = state.clone();
-        action_paste_active_input.connect_activate(move |_, _| {
-            terminal::paste_clipboard_to_active_scope(&state);
-            if let Some(terminal) = get_active_terminal(&state) {
-                terminal.grab_focus();
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::Paste,
-        &action_paste_active_input,
+        |action_paste_active_input| {
+            let state = state.clone();
+            action_paste_active_input.connect_activate(move |_, _| {
+                terminal::paste_clipboard_to_active_scope(&state);
+                if let Some(terminal) = get_active_terminal(&state) {
+                    terminal.grab_focus();
+                }
+            });
+        },
     );
 
-    let action_toggle_selection_mode = gio::SimpleAction::new("toggle-selection-mode", None);
-    {
-        let state = state.clone();
-        action_toggle_selection_mode.connect_activate(move |_, _| {
-            let _ = terminal::toggle_active_terminal_input_mode(&state);
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::ToggleSelectionMode,
-        &action_toggle_selection_mode,
+        |action_toggle_selection_mode| {
+            let state = state.clone();
+            action_toggle_selection_mode.connect_activate(move |_, _| {
+                let _ = terminal::toggle_active_terminal_input_mode(&state);
+            });
+        },
     );
 }
 
@@ -2137,88 +2114,80 @@ fn install_broadcast_actions(
     broadcast_label: &gtk::Label,
 ) {
     // Ctrl+Alt+B = toggle broadcast input shortcut scope
-    let action_toggle_broadcast = gio::SimpleAction::new("toggle-broadcast-input", None);
-    {
-        let state = state.clone();
-        let indicator = broadcast_indicator.clone();
-        let label = broadcast_label.clone();
-        action_toggle_broadcast.connect_activate(move |_, _| {
-            state.borrow_mut().toggle_broadcast_shortcut_scope();
-            refresh_broadcast_indicator(&indicator, &label, &state);
-            if let Some(terminal) = get_active_terminal(&state) {
-                terminal.grab_focus();
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::ToggleBroadcastInput,
-        &action_toggle_broadcast,
+        |action_toggle_broadcast| {
+            let state = state.clone();
+            let indicator = broadcast_indicator.clone();
+            let label = broadcast_label.clone();
+            action_toggle_broadcast.connect_activate(move |_, _| {
+                state.borrow_mut().toggle_broadcast_shortcut_scope();
+                refresh_broadcast_indicator(&indicator, &label, &state);
+                if let Some(terminal) = get_active_terminal(&state) {
+                    terminal.grab_focus();
+                }
+            });
+        },
     );
 
-    let action_broadcast_tab = gio::SimpleAction::new("broadcast-tab", None);
-    {
-        let state = state.clone();
-        let indicator = broadcast_indicator.clone();
-        let label = broadcast_label.clone();
-        action_broadcast_tab.connect_activate(move |_, _| {
-            state
-                .borrow_mut()
-                .set_broadcast_scope(Some(BroadcastScope::Tab));
-            refresh_broadcast_indicator(&indicator, &label, &state);
-            if let Some(terminal) = get_active_terminal(&state) {
-                terminal.grab_focus();
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::BroadcastTab,
-        &action_broadcast_tab,
+        |action_broadcast_tab| {
+            let state = state.clone();
+            let indicator = broadcast_indicator.clone();
+            let label = broadcast_label.clone();
+            action_broadcast_tab.connect_activate(move |_, _| {
+                state
+                    .borrow_mut()
+                    .set_broadcast_scope(Some(BroadcastScope::Tab));
+                refresh_broadcast_indicator(&indicator, &label, &state);
+                if let Some(terminal) = get_active_terminal(&state) {
+                    terminal.grab_focus();
+                }
+            });
+        },
     );
 
-    let action_broadcast_workspace = gio::SimpleAction::new("broadcast-workspace", None);
-    {
-        let state = state.clone();
-        let indicator = broadcast_indicator.clone();
-        let label = broadcast_label.clone();
-        action_broadcast_workspace.connect_activate(move |_, _| {
-            state
-                .borrow_mut()
-                .set_broadcast_scope(Some(BroadcastScope::Workspace));
-            refresh_broadcast_indicator(&indicator, &label, &state);
-            if let Some(terminal) = get_active_terminal(&state) {
-                terminal.grab_focus();
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::BroadcastWorkspace,
-        &action_broadcast_workspace,
+        |action_broadcast_workspace| {
+            let state = state.clone();
+            let indicator = broadcast_indicator.clone();
+            let label = broadcast_label.clone();
+            action_broadcast_workspace.connect_activate(move |_, _| {
+                state
+                    .borrow_mut()
+                    .set_broadcast_scope(Some(BroadcastScope::Workspace));
+                refresh_broadcast_indicator(&indicator, &label, &state);
+                if let Some(terminal) = get_active_terminal(&state) {
+                    terminal.grab_focus();
+                }
+            });
+        },
     );
 
-    let action_broadcast_off = gio::SimpleAction::new("broadcast-off", None);
-    {
-        let state = state.clone();
-        let indicator = broadcast_indicator.clone();
-        let label = broadcast_label.clone();
-        action_broadcast_off.connect_activate(move |_, _| {
-            state.borrow_mut().set_broadcast_scope(None);
-            refresh_broadcast_indicator(&indicator, &label, &state);
-            if let Some(terminal) = get_active_terminal(&state) {
-                terminal.grab_focus();
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::BroadcastOff,
-        &action_broadcast_off,
+        |action_broadcast_off| {
+            let state = state.clone();
+            let indicator = broadcast_indicator.clone();
+            let label = broadcast_label.clone();
+            action_broadcast_off.connect_activate(move |_, _| {
+                state.borrow_mut().set_broadcast_scope(None);
+                refresh_broadcast_indicator(&indicator, &label, &state);
+                if let Some(terminal) = get_active_terminal(&state) {
+                    terminal.grab_focus();
+                }
+            });
+        },
     );
 }
 
@@ -2229,25 +2198,23 @@ fn install_discovery_and_task_actions(
     tab_list: &gtk::Box,
 ) {
     // Ctrl+Shift+D = per-tab discovery
-    let action_discover = gio::SimpleAction::new("discover-tab", None);
-    {
-        let state = state.clone();
-        let tab_list = tab_list.clone();
-        action_discover.connect_activate(move |_, _| {
-            let tab_id = {
-                let st = state.borrow();
-                st.active_tab().map(|t| t.id)
-            };
-            if let Some(tab_id) = tab_id {
-                task_panel::discover_tasks_explicitly(&state, &tab_list, tab_id);
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::DiscoverTab,
-        &action_discover,
+        |action_discover| {
+            let state = state.clone();
+            let tab_list = tab_list.clone();
+            action_discover.connect_activate(move |_, _| {
+                let tab_id = {
+                    let st = state.borrow();
+                    st.active_tab().map(|t| t.id)
+                };
+                if let Some(tab_id) = tab_id {
+                    task_panel::discover_tasks_explicitly(&state, &tab_list, tab_id);
+                }
+            });
+        },
     );
 }
 
@@ -2263,75 +2230,71 @@ fn install_chord_overlay_actions(
     chord_timeout: Duration,
 ) {
     // F026: generic leader-mode activation
-    let action_leader_mode = gio::SimpleAction::new("leader-mode", None);
-    {
-        let state = state.clone();
-        let chord_overlay = chord_overlay.clone();
-        let window_for_leader = window.clone();
-        let tab_list = tab_list.clone();
-        let term_stack = term_stack.clone();
-        let leader_map = keybindings.leader_map.clone();
-        action_leader_mode.connect_activate(move |_, _| {
-            if leader_map.is_empty() {
-                show_error_toast("Leader mode is not configured");
-                return;
-            }
-            let entries = leader_overlay_entries(&leader_map);
-            show_chord_overlay(
-                &chord_overlay,
-                &state,
-                ChordMode::Leader,
-                &entries,
-                "No leader bindings configured",
-                &window_for_leader,
-                &tab_list,
-                &term_stack,
-                chord_timeout,
-            );
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::LeaderMode,
-        &action_leader_mode,
+        |action_leader_mode| {
+            let state = state.clone();
+            let chord_overlay = chord_overlay.clone();
+            let window_for_leader = window.clone();
+            let tab_list = tab_list.clone();
+            let term_stack = term_stack.clone();
+            let leader_map = keybindings.leader_map.clone();
+            action_leader_mode.connect_activate(move |_, _| {
+                if leader_map.is_empty() {
+                    show_error_toast("Leader mode is not configured");
+                    return;
+                }
+                let entries = leader_overlay_entries(&leader_map);
+                show_chord_overlay(
+                    &chord_overlay,
+                    &state,
+                    ChordMode::Leader,
+                    &entries,
+                    "No leader bindings configured",
+                    &window_for_leader,
+                    &tab_list,
+                    &term_stack,
+                    chord_timeout,
+                );
+            });
+        },
     );
 
     // F012: Ctrl+F5 chord overlay for quick workspace actions
-    let action_quick_action = gio::SimpleAction::new("quick-action", None);
-    {
-        let state = state.clone();
-        let chord_overlay = chord_overlay.clone();
-        let window_for_quick = window.clone();
-        let tab_list = tab_list.clone();
-        let term_stack = term_stack.clone();
-        let quick_action_map = keybindings.quick_action_map.clone();
-        action_quick_action.connect_activate(move |_, _| {
-            let actions = {
-                let st = state.borrow();
-                st.active_tab()
-                    .map(|tab| tab.discovered_actions.clone())
-                    .unwrap_or_default()
-            };
-            let entries = quick_action_overlay_entries(&actions, &quick_action_map);
-            show_chord_overlay(
-                &chord_overlay,
-                &state,
-                ChordMode::QuickAction,
-                &entries,
-                "No actions available",
-                &window_for_quick,
-                &tab_list,
-                &term_stack,
-                chord_timeout,
-            );
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::QuickAction,
-        &action_quick_action,
+        |action_quick_action| {
+            let state = state.clone();
+            let chord_overlay = chord_overlay.clone();
+            let window_for_quick = window.clone();
+            let tab_list = tab_list.clone();
+            let term_stack = term_stack.clone();
+            let quick_action_map = keybindings.quick_action_map.clone();
+            action_quick_action.connect_activate(move |_, _| {
+                let actions = {
+                    let st = state.borrow();
+                    st.active_tab()
+                        .map(|tab| tab.discovered_actions.clone())
+                        .unwrap_or_default()
+                };
+                let entries = quick_action_overlay_entries(&actions, &quick_action_map);
+                show_chord_overlay(
+                    &chord_overlay,
+                    &state,
+                    ChordMode::QuickAction,
+                    &entries,
+                    "No actions available",
+                    &window_for_quick,
+                    &tab_list,
+                    &term_stack,
+                    chord_timeout,
+                );
+            });
+        },
     );
 
     // Chord follow-up key controller (Capture phase on the window so VTE
@@ -2401,128 +2364,121 @@ fn install_split_actions(
     tab_list: &gtk::Box,
 ) {
     // F009: Ctrl+Shift+\ = split vertical
-    let action_split_v = gio::SimpleAction::new("split-vertical", None);
-    {
-        let state = state.clone();
-        let runtime = runtime.clone();
-        let term_stack = term_stack.clone();
-        let tab_list = tab_list.clone();
-        let window_for_split = window.clone();
-        action_split_v.connect_activate(move |_, _| {
-            let target_tab_id = {
-                let st = state.borrow();
-                st.active_tab().map(|tab| tab.id)
-            };
-            let do_split = {
-                let runtime = runtime.clone();
-                let term_stack = term_stack.clone();
-                let tab_list = tab_list.clone();
-                let window_for_split = window_for_split.clone();
-                move || {
-                    terminal::split_pane(
-                        &runtime,
-                        &term_stack,
-                        pane::SplitDirection::Vertical,
-                        &tab_list,
-                        &window_for_split,
-                    );
-                }
-            };
-            if let Some(tab_id) = target_tab_id {
-                terminal::validate_split_tmux_then(&state, &window_for_split, tab_id, do_split);
-            } else {
-                do_split();
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::SplitVertical,
-        &action_split_v,
+        |action_split_v| {
+            let state = state.clone();
+            let runtime = runtime.clone();
+            let term_stack = term_stack.clone();
+            let tab_list = tab_list.clone();
+            let window_for_split = window.clone();
+            action_split_v.connect_activate(move |_, _| {
+                let target_tab_id = {
+                    let st = state.borrow();
+                    st.active_tab().map(|tab| tab.id)
+                };
+                let do_split = {
+                    let runtime = runtime.clone();
+                    let term_stack = term_stack.clone();
+                    let tab_list = tab_list.clone();
+                    let window_for_split = window_for_split.clone();
+                    move || {
+                        terminal::split_pane(
+                            &runtime,
+                            &term_stack,
+                            pane::SplitDirection::Vertical,
+                            &tab_list,
+                            &window_for_split,
+                        );
+                    }
+                };
+                if let Some(tab_id) = target_tab_id {
+                    terminal::validate_split_tmux_then(&state, &window_for_split, tab_id, do_split);
+                } else {
+                    do_split();
+                }
+            });
+        },
     );
 
     // F009: Ctrl+Shift+- = split horizontal
-    let action_split_h = gio::SimpleAction::new("split-horizontal", None);
-    {
-        let state = state.clone();
-        let runtime = runtime.clone();
-        let term_stack = term_stack.clone();
-        let tab_list = tab_list.clone();
-        let window_for_split = window.clone();
-        action_split_h.connect_activate(move |_, _| {
-            let target_tab_id = {
-                let st = state.borrow();
-                st.active_tab().map(|tab| tab.id)
-            };
-            let do_split = {
-                let runtime = runtime.clone();
-                let term_stack = term_stack.clone();
-                let tab_list = tab_list.clone();
-                let window_for_split = window_for_split.clone();
-                move || {
-                    terminal::split_pane(
-                        &runtime,
-                        &term_stack,
-                        pane::SplitDirection::Horizontal,
-                        &tab_list,
-                        &window_for_split,
-                    );
-                }
-            };
-            if let Some(tab_id) = target_tab_id {
-                terminal::validate_split_tmux_then(&state, &window_for_split, tab_id, do_split);
-            } else {
-                do_split();
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::SplitHorizontal,
-        &action_split_h,
+        |action_split_h| {
+            let state = state.clone();
+            let runtime = runtime.clone();
+            let term_stack = term_stack.clone();
+            let tab_list = tab_list.clone();
+            let window_for_split = window.clone();
+            action_split_h.connect_activate(move |_, _| {
+                let target_tab_id = {
+                    let st = state.borrow();
+                    st.active_tab().map(|tab| tab.id)
+                };
+                let do_split = {
+                    let runtime = runtime.clone();
+                    let term_stack = term_stack.clone();
+                    let tab_list = tab_list.clone();
+                    let window_for_split = window_for_split.clone();
+                    move || {
+                        terminal::split_pane(
+                            &runtime,
+                            &term_stack,
+                            pane::SplitDirection::Horizontal,
+                            &tab_list,
+                            &window_for_split,
+                        );
+                    }
+                };
+                if let Some(tab_id) = target_tab_id {
+                    terminal::validate_split_tmux_then(&state, &window_for_split, tab_id, do_split);
+                } else {
+                    do_split();
+                }
+            });
+        },
     );
 
     // F009: Ctrl+Shift+W = close focused pane
-    let action_close_pane = gio::SimpleAction::new("close-pane", None);
-    {
-        let state = state.clone();
-        let runtime = runtime.clone();
-        let term_stack = term_stack.clone();
-        let tab_list = tab_list.clone();
-        action_close_pane.connect_activate(move |_, _| {
-            let (tab_id, pane_id) = {
-                let st = state.borrow();
-                let tab = match st.active_tab() {
-                    Some(t) => t,
-                    None => return,
-                };
-                (tab.id, tab.focused_pane_id)
-            };
-            let _ = terminal::close_pane(&runtime, &term_stack, Some(&tab_list), tab_id, pane_id);
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::ClosePane,
-        &action_close_pane,
+        |action_close_pane| {
+            let state = state.clone();
+            let runtime = runtime.clone();
+            let term_stack = term_stack.clone();
+            let tab_list = tab_list.clone();
+            action_close_pane.connect_activate(move |_, _| {
+                let (tab_id, pane_id) = {
+                    let st = state.borrow();
+                    let tab = match st.active_tab() {
+                        Some(t) => t,
+                        None => return,
+                    };
+                    (tab.id, tab.focused_pane_id)
+                };
+                let _ =
+                    terminal::close_pane(&runtime, &term_stack, Some(&tab_list), tab_id, pane_id);
+            });
+        },
     );
 
     // F022: Ctrl+Shift+Z = toggle focused pane zoom
-    let action_toggle_pane_zoom = gio::SimpleAction::new("toggle-pane-zoom", None);
-    {
-        let state = state.clone();
-        action_toggle_pane_zoom.connect_activate(move |_, _| {
-            terminal::toggle_pane_zoom(&state);
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::TogglePaneZoom,
-        &action_toggle_pane_zoom,
+        |action_toggle_pane_zoom| {
+            let state = state.clone();
+            action_toggle_pane_zoom.connect_activate(move |_, _| {
+                terminal::toggle_pane_zoom(&state);
+            });
+        },
     );
 
     // F009: Ctrl+Shift+H/J/K/L = focus pane (vim-style navigation)
@@ -2544,12 +2500,7 @@ fn install_split_actions(
             pane::PaneNavigationDirection::Down,
         ),
     ] {
-        let action_name = action
-            .gaction_name()
-            .strip_prefix("win.")
-            .expect("focus actions are window actions");
-        let handler = gio::SimpleAction::new(action_name, None);
-        {
+        register_bindable_window_action(window, action_ledger, action, |handler| {
             let state = state.clone();
             let term_stack = term_stack.clone();
             let window_for_focus = window.clone();
@@ -2561,8 +2512,7 @@ fn install_split_actions(
                     &window_for_focus,
                 );
             });
-        }
-        add_bindable_window_action(window, action_ledger, action, &handler);
+        });
     }
 }
 
@@ -2575,142 +2525,143 @@ fn install_workspace_actions(
     tab_list: &gtk::Box,
 ) {
     // Ctrl+Alt+N = new workspace
-    let action_new_ws = gio::SimpleAction::new("new-workspace", None);
-    {
-        let state = state.clone();
-        let runtime = runtime.clone();
-        let term_stack = term_stack.clone();
-        let tab_list = tab_list.clone();
-        let window_for_ws = window.clone();
-        action_new_ws.connect_activate(move |_, _| {
-            // Capture only immutable in-memory context. Repository discovery
-            // follows on a worker so this GTK action creates a usable shell
-            // immediately even when the focused path sits on slow storage.
-            let cwd = {
-                let st = state.borrow();
-                crate::mise::discovery_dir(&st)
-            };
-            let ws_name = {
-                let st = state.borrow();
-                format!("Workspace {}", st.workspaces.len() + 1)
-            };
-
-            let ws_id = { runtime.create_workspace(&ws_name, None) };
-            let ws_origin = state
-                .borrow()
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.id == ws_id)
-                .map(|workspace| workspace.work_origin.clone());
-            sidebar::add_workspace_header(&tab_list, &state, &term_stack, ws_id, &ws_name);
-
-            let tab_id =
-                terminal::create_terminal(&runtime, &term_stack, "Shell", Some(&cwd), None);
-            sidebar::add_tab_row(&tab_list, &state, &term_stack, tab_id, "Shell", true);
-            terminal::wire_tab_terminals(&state, &term_stack, &tab_list, &window_for_ws, tab_id);
-
-            let state_for_apply = state.clone();
-            let tab_list_for_apply = tab_list.clone();
-            let request_key = format!("discover:new-workspace:{ws_id}");
-            let submission = git::spawn_async(
-                request_key,
-                move || git::discover(&cwd),
-                move |git_info| {
-                    let discovered_name = workspace_name_from_git_info(&git_info);
-                    let header_name = {
-                        let mut st = state_for_apply.borrow_mut();
-                        let Some(workspace) = st.workspaces.iter_mut().find(|workspace| {
-                            workspace.id == ws_id
-                                && ws_origin.as_deref() == Some(workspace.work_origin.as_str())
-                        }) else {
-                            return;
-                        };
-                        apply_git_info_to_workspace(workspace, &git_info);
-                        if let Some(name) = discovered_name.as_ref() {
-                            workspace.name = name.clone();
-                        }
-                        workspace.name.clone()
-                    };
-                    sidebar::set_workspace_header_label(
-                        &tab_list_for_apply,
-                        &state_for_apply,
-                        ws_id,
-                        &workspace_header_label(&header_name, &git_info),
-                    );
-                },
-            );
-            if matches!(submission, git::GitAsyncSubmission::Saturated) {
-                crate::show_toast(
-                    "Git metadata refresh is busy; workspace details will refresh later",
-                );
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::NewWorkspace,
-        &action_new_ws,
+        |action_new_ws| {
+            {
+                let state = state.clone();
+                let runtime = runtime.clone();
+                let term_stack = term_stack.clone();
+                let tab_list = tab_list.clone();
+                let window_for_ws = window.clone();
+                action_new_ws.connect_activate(move |_, _| {
+                    // Capture only immutable in-memory context. Repository discovery
+                    // follows on a worker so this GTK action creates a usable shell
+                    // immediately even when the focused path sits on slow storage.
+                    let cwd = {
+                        let st = state.borrow();
+                        crate::mise::discovery_dir(&st)
+                    };
+                    let ws_name = {
+                        let st = state.borrow();
+                        format!("Workspace {}", st.workspaces.len() + 1)
+                    };
+
+                    let ws_id = { runtime.create_workspace(&ws_name, None) };
+                    let ws_origin = state
+                        .borrow()
+                        .workspaces
+                        .iter()
+                        .find(|workspace| workspace.id == ws_id)
+                        .map(|workspace| workspace.work_origin.clone());
+                    sidebar::add_workspace_header(&tab_list, &state, &term_stack, ws_id, &ws_name);
+
+                    let tab_id =
+                        terminal::create_terminal(&runtime, &term_stack, "Shell", Some(&cwd), None);
+                    sidebar::add_tab_row(&tab_list, &state, &term_stack, tab_id, "Shell", true);
+                    terminal::wire_tab_terminals(
+                        &state,
+                        &term_stack,
+                        &tab_list,
+                        &window_for_ws,
+                        tab_id,
+                    );
+
+                    let state_for_apply = state.clone();
+                    let tab_list_for_apply = tab_list.clone();
+                    let request_key = format!("discover:new-workspace:{ws_id}");
+                    let submission = git::spawn_async(
+                        request_key,
+                        move || git::discover(&cwd),
+                        move |git_info| {
+                            let discovered_name = workspace_name_from_git_info(&git_info);
+                            let header_name = {
+                                let mut st = state_for_apply.borrow_mut();
+                                let Some(workspace) = st.workspaces.iter_mut().find(|workspace| {
+                                    workspace.id == ws_id
+                                        && ws_origin.as_deref()
+                                            == Some(workspace.work_origin.as_str())
+                                }) else {
+                                    return;
+                                };
+                                apply_git_info_to_workspace(workspace, &git_info);
+                                if let Some(name) = discovered_name.as_ref() {
+                                    workspace.name = name.clone();
+                                }
+                                workspace.name.clone()
+                            };
+                            sidebar::set_workspace_header_label(
+                                &tab_list_for_apply,
+                                &state_for_apply,
+                                ws_id,
+                                &workspace_header_label(&header_name, &git_info),
+                            );
+                        },
+                    );
+                    if matches!(submission, git::GitAsyncSubmission::Saturated) {
+                        crate::show_toast(
+                            "Git metadata refresh is busy; workspace details will refresh later",
+                        );
+                    }
+                });
+            }
+        },
     );
 
-    let action_previous_ws = gio::SimpleAction::new("previous-workspace", None);
-    {
-        let state = state.clone();
-        let term_stack = term_stack.clone();
-        let tab_list = tab_list.clone();
-        action_previous_ws.connect_activate(move |_, _| {
-            if sidebar::activate_previous_workspace(&tab_list, &state, &term_stack) {
-                if let Some(terminal) = get_active_terminal(&state) {
-                    terminal.grab_focus();
-                }
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::PreviousWorkspace,
-        &action_previous_ws,
+        |action_previous_ws| {
+            let state = state.clone();
+            let term_stack = term_stack.clone();
+            let tab_list = tab_list.clone();
+            action_previous_ws.connect_activate(move |_, _| {
+                if sidebar::activate_previous_workspace(&tab_list, &state, &term_stack) {
+                    if let Some(terminal) = get_active_terminal(&state) {
+                        terminal.grab_focus();
+                    }
+                }
+            });
+        },
     );
 
-    let action_next_ws = gio::SimpleAction::new("next-workspace", None);
-    {
-        let state = state.clone();
-        let term_stack = term_stack.clone();
-        let tab_list = tab_list.clone();
-        action_next_ws.connect_activate(move |_, _| {
-            if sidebar::activate_workspace_relative(&tab_list, &state, &term_stack, 1) {
-                if let Some(terminal) = get_active_terminal(&state) {
-                    terminal.grab_focus();
-                }
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::NextWorkspace,
-        &action_next_ws,
+        |action_next_ws| {
+            let state = state.clone();
+            let term_stack = term_stack.clone();
+            let tab_list = tab_list.clone();
+            action_next_ws.connect_activate(move |_, _| {
+                if sidebar::activate_workspace_relative(&tab_list, &state, &term_stack, 1) {
+                    if let Some(terminal) = get_active_terminal(&state) {
+                        terminal.grab_focus();
+                    }
+                }
+            });
+        },
     );
 
-    let action_prev_ws = gio::SimpleAction::new("prev-workspace", None);
-    {
-        let state = state.clone();
-        let term_stack = term_stack.clone();
-        let tab_list = tab_list.clone();
-        action_prev_ws.connect_activate(move |_, _| {
-            if sidebar::activate_workspace_relative(&tab_list, &state, &term_stack, -1) {
-                if let Some(terminal) = get_active_terminal(&state) {
-                    terminal.grab_focus();
-                }
-            }
-        });
-    }
-    add_bindable_window_action(
+    register_bindable_window_action(
         window,
         action_ledger,
         keybindings::Action::PrevWorkspace,
-        &action_prev_ws,
+        |action_prev_ws| {
+            let state = state.clone();
+            let term_stack = term_stack.clone();
+            let tab_list = tab_list.clone();
+            action_prev_ws.connect_activate(move |_, _| {
+                if sidebar::activate_workspace_relative(&tab_list, &state, &term_stack, -1) {
+                    if let Some(terminal) = get_active_terminal(&state) {
+                        terminal.grab_focus();
+                    }
+                }
+            });
+        },
     );
 }
 
@@ -3967,6 +3918,74 @@ pub fn get_active_terminal(state: &Rc<RefCell<AppState>>) -> Option<vte::Termina
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parameterized_focus_pane_remains_application_scoped() {
+        use super::*;
+        let application_actions = gio::SimpleActionGroup::new();
+        let handler = focus_pane_notification_action();
+        application_actions.add_action(&handler);
+        assert_eq!(
+            handler.parameter_type().as_deref(),
+            Some(glib::VariantTy::STRING)
+        );
+        assert!(keybindings::Action::ALL.iter().all(|action| {
+            action.gaction_name() != "win.focus-pane" && action.gaction_name() != "app.focus-pane"
+        }));
+        assert_eq!(handler.name(), "focus-pane");
+    }
+
+    #[test]
+    fn typed_window_registration_installs_configured_handlers_and_checks_actual_map() {
+        use super::*;
+        let group = gio::SimpleActionGroup::new();
+        let mut ledger = keybindings::WindowActionLedger::default();
+        let activated = Rc::new(Cell::new(false));
+        for &action in keybindings::Action::ALL {
+            if !action.gaction_name().starts_with("win.") {
+                continue;
+            }
+            let activated = activated.clone();
+            register_bindable_window_action(&group, &mut ledger, action, |handler| {
+                assert_eq!(
+                    handler.name(),
+                    action.gaction_name().trim_start_matches("win.")
+                );
+                assert!(handler.parameter_type().is_none());
+                handler.connect_activate(move |_, _| activated.set(true));
+            });
+        }
+        validate_window_action_contract(&group, &ledger);
+        group.activate_action("new-tab", None);
+        assert!(activated.get());
+
+        group.remove_action("new-tab");
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_window_action_contract(&group, &ledger);
+        }))
+        .is_err());
+        register_bindable_window_action(&group, &mut ledger, keybindings::Action::NewTab, |_| {});
+        assert!(ledger.validate().unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn typed_window_registration_rejects_bypass_and_missing_installer() {
+        use super::*;
+        let group = gio::SimpleActionGroup::new();
+        let mut ledger = keybindings::WindowActionLedger::default();
+        for &action in keybindings::Action::ALL {
+            if action.gaction_name().starts_with("win.") {
+                register_bindable_window_action(&group, &mut ledger, action, |_| {});
+            }
+        }
+        group.add_action(&gio::SimpleAction::new("bypass", None));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_window_action_contract(&group, &ledger);
+        }))
+        .is_err());
+        assert!(keybindings::WindowActionLedger::default()
+            .validate()
+            .is_err());
+    }
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
