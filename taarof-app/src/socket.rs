@@ -190,8 +190,7 @@ fn correlate_native_turn(
     evidence: Option<&agents::ProviderNativeTurnId>,
 ) -> Option<agents::ProviderNativeTurnId> {
     let provider = turn.provider.as_deref()?;
-    if !matches!(provider, "claude" | "codex")
-        || current.provider.as_deref() != Some(provider)
+    if current.provider.as_deref() != Some(provider)
         || current.provider_shell_pid != turn.provider_shell_pid
         || current.provider_session_id != turn.provider_session_id
         || turn
@@ -4784,7 +4783,7 @@ fn write_json_response_with_timeout(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         agent_turn_stop_outcome, alert_event_payload, apply_agent_turn_events, apply_notify_state,
         bind_socket_listener, bounded_agent_output, cancel_agent_turn, cleanup_socket,
@@ -5038,6 +5037,35 @@ mod tests {
         let mut old_id = current.clone();
         old_id.native_turn_id.as_mut().unwrap().id = "old-turn".into();
         assert!(correlate_native_turn(&turn, &old_id, old_id.native_turn_id.as_ref()).is_none());
+        let mut wrong_pid = current.clone();
+        wrong_pid.provider_shell_pid = Some(43);
+        assert!(
+            correlate_native_turn(&turn, &wrong_pid, wrong_pid.native_turn_id.as_ref()).is_none()
+        );
+        let mut wrong_session = current.clone();
+        wrong_session.provider_session_id = Some("other-provider-session".into());
+        assert!(correlate_native_turn(
+            &turn,
+            &wrong_session,
+            wrong_session.native_turn_id.as_ref()
+        )
+        .is_none());
+        let mut wrong_provider = current.clone();
+        wrong_provider.provider = Some("other-provider".into());
+        assert!(correlate_native_turn(
+            &turn,
+            &wrong_provider,
+            wrong_provider.native_turn_id.as_ref()
+        )
+        .is_none());
+        let mut wrong_evidence = current.clone();
+        wrong_evidence.native_turn_id.as_mut().unwrap().provider = "other-provider".into();
+        assert!(correlate_native_turn(
+            &turn,
+            &wrong_evidence,
+            wrong_evidence.native_turn_id.as_ref()
+        )
+        .is_none());
         let mut mismatched = current;
         mismatched.transcript_session_id = Some("other-session".into());
         assert!(
@@ -5052,11 +5080,6 @@ mod tests {
         turn.provider = Some("pi".into());
         let current = NativeTurnBoundary {
             provider: Some("pi".into()),
-            native_turn_id: Some(crate::agents::ProviderNativeTurnId {
-                provider: "pi".into(),
-                id: "turn".into(),
-                observed_at_unix_ms: 1_001,
-            }),
             ..Default::default()
         };
         assert!(correlate_native_turn(&turn, &current, current.native_turn_id.as_ref()).is_none());
@@ -5067,6 +5090,32 @@ mod tests {
             ..Default::default()
         };
         assert!(correlate_native_turn(&turn, &missing, None).is_none());
+    }
+
+    /// Runs real socket correlation against evidence folded by a test adapter.
+    pub(crate) fn assert_adapter_native_turn_correlation(
+        evidence: Option<&crate::agents::ProviderNativeTurnId>,
+        expected: Option<&str>,
+    ) {
+        let mut turn = pending_agent_turn();
+        turn.provider = Some("test-native".into());
+        turn.prompted_at_unix_ms = 1_000;
+        turn.provider_shell_pid = Some(42);
+        turn.provider_session_id = Some("provider-session".into());
+        turn.transcript_session_id = Some("transcript-session".into());
+        let current = NativeTurnBoundary {
+            provider: turn.provider.clone(),
+            provider_shell_pid: turn.provider_shell_pid,
+            provider_session_id: turn.provider_session_id.clone(),
+            transcript_session_id: turn.transcript_session_id.clone(),
+            native_turn_id: evidence.cloned(),
+        };
+        assert_eq!(
+            correlate_native_turn(&turn, &current, evidence)
+                .as_ref()
+                .map(|native| native.id.as_str()),
+            expected
+        );
     }
 
     fn send_socket_request_for_tests(
