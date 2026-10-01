@@ -1493,6 +1493,7 @@ fn unix_time_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::agent_activity_payload;
     use super::{
         agent_badge_payload, agent_entry_payload, build_active_alerts,
         build_health_snapshot_from_parts, host_status_payload, pane_attach_metadata,
