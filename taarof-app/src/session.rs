@@ -1030,7 +1030,7 @@ impl SessionWriter {
     }
 
     #[cfg(test)]
-    fn for_test(
+    pub(crate) fn for_test(
         path: PathBuf,
         write: impl Fn(&Path, &str) -> io::Result<()> + Send + Sync + 'static,
     ) -> io::Result<Self> {

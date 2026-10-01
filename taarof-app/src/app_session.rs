@@ -6,15 +6,10 @@
 
 use adw::prelude::*;
 
+use glib::translate::{from_glib_full, ToGlibPtr};
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::path::Path;
 use std::rc::Rc;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::time::Duration;
 
 use crate::{git, session, sidebar, terminal, workspace, AppState, RuntimeHandle};
 
@@ -354,83 +349,310 @@ pub(crate) fn save_session_once(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // Shutdown wiring intentionally passes the live GTK handles explicitly from one setup site.
-pub(crate) fn install_signal_cleanup(
-    app: &adw::Application,
-    writer: &Rc<session::SessionWriter>,
-    state: &Rc<RefCell<AppState>>,
-    tab_list: &gtk::Box,
-    window: &adw::ApplicationWindow,
-    session_saved: &Rc<Cell<bool>>,
-    socket_cleaned: &Rc<Cell<bool>>,
-    socket_path: Option<&Path>,
-    auto_save_source: &Rc<RefCell<Option<glib::SourceId>>>,
-) {
-    let shutdown_requested = Arc::new(AtomicBool::new(false));
-    for signum in [libc::SIGINT, libc::SIGTERM] {
-        if let Err(e) = signal_hook::flag::register(signum, shutdown_requested.clone()) {
-            eprintln!("taarof: failed to register signal handler for {signum}: {e}");
+pub(crate) fn install_signal_cleanup(app: &adw::Application, cleanup: &Rc<dyn Fn()>) {
+    let context = glib::MainContext::default();
+    let _owner = context
+        .acquire()
+        .expect("GTK main context must be locally owned");
+    let sources = Rc::new(RefCell::new(Vec::new()));
+    let weak_sources = Rc::downgrade(&sources);
+    let app_ref = app.downgrade();
+    let cleanup = cleanup.clone();
+    let callback: Rc<dyn Fn()> = Rc::new(move || {
+        if let Some(sources) = weak_sources.upgrade() {
+            cancel_signal_sources(&sources);
         }
-    }
-
-    let app = app.clone();
-    let writer = writer.clone();
-    let state = state.clone();
-    let tab_list = tab_list.clone();
-    let window = window.clone();
-    let session_saved = session_saved.clone();
-    let socket_cleaned = socket_cleaned.clone();
-    let socket_path = socket_path.map(Path::to_path_buf);
-    let auto_save_source = auto_save_source.clone();
-    glib::timeout_add_local(Duration::from_millis(100), move || {
-        let flow = signal_cleanup_tick(
-            &shutdown_requested,
-            &state,
-            &crate::ShutdownHooks {
-                // Cancel the periodic auto-save so it cannot race with the
-                // final shutdown save.
-                stop_background: &|| {
-                    if let Some(source_id) = auto_save_source.borrow_mut().take() {
-                        source_id.remove();
-                    }
-                },
-                save_session: &|| {
-                    save_session_once(&session_saved, &writer, &state, &tab_list, &window);
-                },
-                release_endpoints: &|| {
-                    crate::cleanup_socket_once(&socket_cleaned, socket_path.as_deref());
-                },
-            },
-        );
-        if flow == glib::ControlFlow::Break {
+        cleanup();
+        if let Some(app) = app_ref.upgrade() {
             app.quit();
         }
-        flow
     });
+    *sources.borrow_mut() = register_signal_sources(
+        &context,
+        callback,
+        unix_signal_source,
+        |source, context| unsafe {
+            glib::ffi::g_source_attach(source.to_glib_none().0, context.to_glib_none().0)
+        },
+        |signum, error| {
+            eprintln!("taarof: failed to register signal handler for {signum}: {error}");
+        },
+    );
+    app.connect_shutdown(move |_| cancel_signal_sources(&sources));
 }
 
-/// One poll of the signal flag: runs the shared shutdown cleanup once a
-/// SIGINT or SIGTERM has been observed and stops polling afterwards.
-pub(crate) fn signal_cleanup_tick(
-    shutdown_requested: &AtomicBool,
-    state: &Rc<RefCell<AppState>>,
-    hooks: &crate::ShutdownHooks<'_>,
-) -> glib::ControlFlow {
-    if !shutdown_requested.swap(false, Ordering::SeqCst) {
-        return glib::ControlFlow::Continue;
+/// Admit cleanup before running hooks, including any reentrant quit/close path.
+pub(crate) fn shutdown_once(started: &Cell<bool>, cleanup: &dyn Fn()) {
+    if !started.replace(true) {
+        cleanup();
     }
-    crate::run_shutdown_cleanup(state, hooks);
+}
+
+pub(crate) fn signal_cleanup(cleanup: &dyn Fn()) -> glib::ControlFlow {
+    cleanup();
     glib::ControlFlow::Break
+}
+
+fn cancel_signal_sources(sources: &RefCell<Vec<glib::Source>>) {
+    for source in sources.take() {
+        source.destroy();
+    }
+}
+
+fn unix_signal_source(signum: i32) -> Result<glib::Source, &'static str> {
+    // Only SIGINT/SIGTERM reach this constructor. Check before adopting the
+    // full GLib reference: the safe gtk-rs helper assumes a non-null source.
+    let source = unsafe { glib_unix::ffi::g_unix_signal_source_new(signum) };
+    unsafe { checked_signal_source(source) }
+}
+
+/// `source`, if non-null, must be an owned GLib source reference.
+unsafe fn checked_signal_source(
+    source: *mut glib::ffi::GSource,
+) -> Result<glib::Source, &'static str> {
+    if source.is_null() {
+        Err("GLib could not create Unix signal source")
+    } else {
+        Ok(unsafe { from_glib_full(source) })
+    }
+}
+
+type LocalSignalCallback = glib::thread_guard::ThreadGuard<Rc<dyn Fn()>>;
+
+unsafe extern "C" fn dispatch_signal_callback(data: glib::ffi::gpointer) -> glib::ffi::gboolean {
+    // GLib owns this box until destroy_signal_callback. Registration and all
+    // source teardown occur on the owning context thread; ThreadGuard also
+    // checks that invariant before accessing the non-Send GTK closure.
+    let callback = unsafe { &*data.cast::<LocalSignalCallback>() }
+        .get_ref()
+        .clone();
+    signal_cleanup(callback.as_ref());
+    glib::ffi::GFALSE
+}
+
+unsafe extern "C" fn destroy_signal_callback(data: glib::ffi::gpointer) {
+    drop(unsafe { Box::from_raw(data.cast::<LocalSignalCallback>()) });
+}
+
+fn register_signal_sources(
+    context: &glib::MainContext,
+    callback: Rc<dyn Fn()>,
+    mut create: impl FnMut(i32) -> Result<glib::Source, &'static str>,
+    mut attach: impl FnMut(&glib::Source, &glib::MainContext) -> u32,
+    mut report: impl FnMut(i32, &'static str),
+) -> Vec<glib::Source> {
+    assert!(
+        context.is_owner(),
+        "signal registration requires main context ownership"
+    );
+    let mut sources = Vec::new();
+    for signum in [libc::SIGINT, libc::SIGTERM] {
+        let source = match create(signum) {
+            Ok(source) => source,
+            Err(error) => {
+                report(signum, error);
+                continue;
+            }
+        };
+        let data = Box::new(LocalSignalCallback::new(callback.clone()));
+        unsafe {
+            glib::ffi::g_source_set_callback(
+                source.to_glib_none().0,
+                Some(dispatch_signal_callback),
+                Box::into_raw(data).cast(),
+                Some(destroy_signal_callback),
+            );
+        }
+        if attach(&source, context) == 0 {
+            // An unattached source can retain its callback until its last
+            // reference drops even after destroy. Release local captures now.
+            unsafe {
+                glib::ffi::g_source_set_callback(
+                    source.to_glib_none().0,
+                    None,
+                    std::ptr::null_mut(),
+                    None,
+                );
+            }
+            source.destroy();
+            report(signum, "GLib could not attach Unix signal source");
+        } else {
+            sources.push(source);
+        }
+    }
+    sources
 }
 
 #[cfg(test)]
 mod tests {
     use super::{build_session_state_v2, saved_agent_session};
+    use super::{
+        cancel_signal_sources, checked_signal_source, register_signal_sources, shutdown_once,
+        unix_signal_source,
+    };
     use crate::session::{
         SavedAgentSession, SavedAgentSessionSource, SavedPaneNode, SessionStateV2,
     };
     use crate::tracking::TrackingData;
     use crate::{seed_headless_terminal_tab, AppState, HeadlessPaneSeed};
+    use glib::translate::ToGlibPtr;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    fn attach_source(source: &glib::Source, context: &glib::MainContext) -> u32 {
+        unsafe { glib::ffi::g_source_attach(source.to_glib_none().0, context.to_glib_none().0) }
+    }
+
+    #[test]
+    fn signal_sources_attach_and_cancel_without_delivering_real_signals() {
+        let context = glib::MainContext::new();
+        let _owner = context.acquire().unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let callback: Rc<dyn Fn()> = {
+            let calls = calls.clone();
+            Rc::new(move || calls.set(calls.get() + 1))
+        };
+        let weak_callback = Rc::downgrade(&callback);
+        let sources = RefCell::new(register_signal_sources(
+            &context,
+            callback,
+            unix_signal_source,
+            attach_source,
+            |_, error| panic!("{error}"),
+        ));
+        assert_eq!(sources.borrow().len(), 2);
+        let observed = sources.borrow().clone();
+        for source in &observed {
+            assert_eq!(source.context().as_ref(), Some(&context));
+            assert!(!source.is_destroyed());
+        }
+        assert_eq!(calls.get(), 0);
+        cancel_signal_sources(&sources);
+        cancel_signal_sources(&sources);
+        assert!(observed.iter().all(glib::Source::is_destroyed));
+        assert!(
+            weak_callback.upgrade().is_none(),
+            "source teardown must release GTK callback captures"
+        );
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn signal_source_dispatch_runs_once_on_owner_and_tears_down_both_sources() {
+        let context = glib::MainContext::new();
+        let _owner = context.acquire().unwrap();
+        let owner_thread = std::thread::current().id();
+        let sources = Rc::new(RefCell::new(Vec::new()));
+        let weak_sources = Rc::downgrade(&sources);
+        let calls = Rc::new(Cell::new(0));
+        let started = Rc::new(Cell::new(false));
+        let callback: Rc<dyn Fn()> = {
+            let calls = calls.clone();
+            let started = started.clone();
+            Rc::new(move || {
+                assert_eq!(std::thread::current().id(), owner_thread);
+                if let Some(sources) = weak_sources.upgrade() {
+                    cancel_signal_sources(&sources);
+                }
+                shutdown_once(&started, &|| calls.set(calls.get() + 1));
+            })
+        };
+        // Use immediately ready sources through the production registration and
+        // C callback seam; never deliver SIGINT/SIGTERM to the test process.
+        *sources.borrow_mut() = register_signal_sources(
+            &context,
+            callback,
+            |_| {
+                Ok(glib::idle_source_new(None, glib::Priority::DEFAULT, || {
+                    glib::ControlFlow::Break
+                }))
+            },
+            attach_source,
+            |_, error| panic!("{error}"),
+        );
+        let observed = sources.borrow().clone();
+        assert!(context.iteration(false));
+        assert_eq!(calls.get(), 1);
+        assert!(sources.borrow().is_empty());
+        assert!(observed.iter().all(glib::Source::is_destroyed));
+        assert!(!context.iteration(false));
+    }
+
+    #[test]
+    fn signal_source_constructor_failure_reports_and_retains_successful_sibling() {
+        let context = glib::MainContext::new();
+        let _owner = context.acquire().unwrap();
+        let errors = RefCell::new(Vec::new());
+        let sources = RefCell::new(register_signal_sources(
+            &context,
+            Rc::new(|| {}),
+            |signum| {
+                if signum == libc::SIGINT {
+                    unsafe { checked_signal_source(std::ptr::null_mut()) }
+                } else {
+                    unix_signal_source(signum)
+                }
+            },
+            attach_source,
+            |signum, error| errors.borrow_mut().push((signum, error)),
+        ));
+        assert_eq!(
+            *errors.borrow(),
+            [(libc::SIGINT, "GLib could not create Unix signal source")]
+        );
+        assert_eq!(sources.borrow().len(), 1);
+        cancel_signal_sources(&sources);
+    }
+
+    #[test]
+    fn signal_source_attach_failure_destroys_source_and_releases_callback() {
+        let context = glib::MainContext::new();
+        let _owner = context.acquire().unwrap();
+        let callback: Rc<dyn Fn()> = Rc::new(|| panic!("failed source cannot dispatch"));
+        let weak_callback = Rc::downgrade(&callback);
+        let observed = RefCell::new(Vec::new());
+        let errors = RefCell::new(Vec::new());
+        let sources = register_signal_sources(
+            &context,
+            callback,
+            |signum| {
+                let source = unix_signal_source(signum)?;
+                observed.borrow_mut().push(source.clone());
+                Ok(source)
+            },
+            |_, _| 0,
+            |signum, error| errors.borrow_mut().push((signum, error)),
+        );
+        assert!(sources.is_empty());
+        assert_eq!(
+            *errors.borrow(),
+            [
+                (libc::SIGINT, "GLib could not attach Unix signal source"),
+                (libc::SIGTERM, "GLib could not attach Unix signal source")
+            ]
+        );
+        assert!(observed.borrow().iter().all(glib::Source::is_destroyed));
+        assert!(weak_callback.upgrade().is_none());
+    }
+
+    #[test]
+    fn shutdown_once_admits_before_reentrant_hooks_for_every_exit_path() {
+        for first in ["window", "application", "SIGINT", "SIGTERM"] {
+            let started = Cell::new(false);
+            let steps = RefCell::new(Vec::new());
+            let cleanup = || {
+                steps.borrow_mut().push(first);
+                shutdown_once(&started, &|| panic!("reentrant cleanup admitted"));
+            };
+            shutdown_once(&started, &cleanup);
+            for _ in ["window", "application", "SIGINT", "SIGTERM"] {
+                shutdown_once(&started, &cleanup);
+            }
+            assert_eq!(*steps.borrow(), [first]);
+        }
+    }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
