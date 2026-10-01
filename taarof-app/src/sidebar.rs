@@ -6844,8 +6844,8 @@ mod tests {
         let pid = i32::try_from(std::process::id()).unwrap();
         // A real PaneLeaf supplies the production PID descriptors. No terminal
         // child is spawned and no operator process is probed or changed.
-        state.find_tab_mut(tab).unwrap().panes =
-            Box::new(crate::pane::PaneNode::Leaf(crate::pane::PaneLeaf {
+        *state.find_tab_mut(tab).unwrap().panes =
+            crate::pane::PaneNode::Leaf(crate::pane::PaneLeaf {
                 pane_id: pane,
                 work_origin: headless.work_origin,
                 container: gtk::Box::new(gtk::Orientation::Vertical, 0),
@@ -6865,7 +6865,7 @@ mod tests {
                 agent_resume: None,
                 command_marks: Vec::new(),
                 broker: None,
-            }));
+            });
         let now = crate::events::unix_time_ms();
         let tab_pids = state
             .all_tabs()
