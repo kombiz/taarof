@@ -621,6 +621,16 @@ pub(crate) trait TranscriptAdapter: Send + Sync {
     /// Normalised agent kind this adapter handles, e.g. `claude`.
     fn agent_kind(&self) -> &'static str;
 
+    /// Native identity evidence, including the marker needed to clear a prior
+    /// turn. Unsupported formats must return `None`, never synthetic IDs.
+    fn native_turn_evidence(
+        &self,
+        _record: &Value,
+        _fold_at_unix_ms: u64,
+    ) -> Option<NativeTurnEvidence> {
+        None
+    }
+
     /// Resolve the transcript file for a session. Returns `None` when the file
     /// cannot be located, so unresolvable panes degrade silently.
     fn resolve_path(
@@ -634,6 +644,12 @@ pub(crate) trait TranscriptAdapter: Send + Sync {
     /// Fold complete JSONL lines into `state`, returning typed changes seen in
     /// this exact batch. The returned file list is intentionally not capped.
     fn ingest_lines(&self, lines: &[String], state: &mut TranscriptState) -> TranscriptDelta;
+}
+
+pub(crate) struct NativeTurnEvidence {
+    marker: TurnMarker,
+    id: Option<String>,
+    observed_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -798,33 +814,25 @@ fn bounded_native_id(value: Option<&str>) -> Option<String> {
 
 fn apply_native_turn_id(
     state: &mut TranscriptState,
+    adapter: &dyn TranscriptAdapter,
     value: &Value,
-    marker: Option<TurnMarker>,
-    provider: &str,
     fold_at_unix_ms: u64,
 ) {
-    let Some(marker) = marker else {
+    let Some(evidence) = adapter.native_turn_evidence(value, fold_at_unix_ms) else {
         return;
     };
-    if marker == TurnMarker::Started
+    if evidence.marker == TurnMarker::Started
         && !matches!(state.turn.phase, crate::agents::TurnPhase::Active)
     {
         // Never let a previous turn's native identity bleed into a new turn
         // whose provider record is missing or malformed.
         state.native_turn_id = None;
     }
-    let candidate = match provider {
-        "claude" if marker == TurnMarker::Started => {
-            bounded_native_id(value.get("uuid").and_then(Value::as_str))
-        }
-        "codex" => bounded_native_id(value.pointer("/payload/turn_id").and_then(Value::as_str)),
-        _ => None,
-    };
-    if let Some(id) = candidate {
+    if let Some(id) = bounded_native_id(evidence.id.as_deref()) {
         state.native_turn_id = Some(ProviderNativeTurnId {
-            provider: provider.to_string(),
+            provider: adapter.agent_kind().to_string(),
             id,
-            observed_at_unix_ms: record_timestamp_unix_ms(value).unwrap_or(fold_at_unix_ms),
+            observed_at_unix_ms: evidence.observed_at_unix_ms,
         });
     }
 }
@@ -1252,6 +1260,21 @@ impl TranscriptAdapter for ClaudeTranscriptAdapter {
         "claude"
     }
 
+    fn native_turn_evidence(
+        &self,
+        record: &Value,
+        fold_at_unix_ms: u64,
+    ) -> Option<NativeTurnEvidence> {
+        let marker = claude_turn_marker(record)?;
+        Some(NativeTurnEvidence {
+            marker,
+            id: (marker == TurnMarker::Started)
+                .then(|| bounded_native_id(record.get("uuid").and_then(Value::as_str)))
+                .flatten(),
+            observed_at_unix_ms: record_timestamp_unix_ms(record).unwrap_or(fold_at_unix_ms),
+        })
+    }
+
     fn resolve_path(
         &self,
         session_id: Option<&str>,
@@ -1343,7 +1366,7 @@ impl TranscriptAdapter for ClaudeTranscriptAdapter {
             };
             let marker = claude_turn_marker(&value);
             fold_claude_child_agents(&value, state, now);
-            apply_native_turn_id(state, &value, marker, "claude", now);
+            apply_native_turn_id(state, self, &value, now);
             apply_turn_marker(state, &value, marker, now);
             if value.get("type").and_then(Value::as_str) != Some("assistant") {
                 continue;
@@ -1551,6 +1574,18 @@ impl TranscriptAdapter for CodexTranscriptAdapter {
         "codex"
     }
 
+    fn native_turn_evidence(
+        &self,
+        record: &Value,
+        fold_at_unix_ms: u64,
+    ) -> Option<NativeTurnEvidence> {
+        Some(NativeTurnEvidence {
+            marker: codex_turn_marker(record)?,
+            id: bounded_native_id(record.pointer("/payload/turn_id").and_then(Value::as_str)),
+            observed_at_unix_ms: record_timestamp_unix_ms(record).unwrap_or(fold_at_unix_ms),
+        })
+    }
+
     fn resolve_path(
         &self,
         session_id: Option<&str>,
@@ -1579,7 +1614,7 @@ impl TranscriptAdapter for CodexTranscriptAdapter {
             };
             let marker = codex_turn_marker(&value);
             fold_codex_child_agents(&value, state, now);
-            apply_native_turn_id(state, &value, marker, "codex", now);
+            apply_native_turn_id(state, self, &value, now);
             apply_turn_marker(state, &value, marker, now);
             if value.get("type").and_then(Value::as_str) != Some("response_item") {
                 continue;
@@ -3621,6 +3656,109 @@ mod tests {
             "message": {"role": "user", "content": "hello"}
         });
         assert_eq!(fold(&adapter, &[prompt]).native_turn_id, None);
+    }
+
+    #[test]
+    fn supporting_adapter_native_evidence_reaches_socket_without_provider_list() {
+        struct SupportingAdapter;
+        impl TranscriptAdapter for SupportingAdapter {
+            fn agent_kind(&self) -> &'static str {
+                "test-native"
+            }
+            fn resolve_path(
+                &self,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: Option<u64>,
+                _: Option<&Path>,
+            ) -> Option<ResolvedTranscript> {
+                None
+            }
+            fn native_turn_evidence(
+                &self,
+                record: &Value,
+                fold_at_unix_ms: u64,
+            ) -> Option<NativeTurnEvidence> {
+                let marker = match record.get("marker")?.as_str()? {
+                    "start" => TurnMarker::Started,
+                    "complete" => TurnMarker::Completed,
+                    _ => return None,
+                };
+                Some(NativeTurnEvidence {
+                    marker,
+                    id: record.get("id").and_then(Value::as_str).map(str::to_owned),
+                    observed_at_unix_ms: record
+                        .get("time")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(fold_at_unix_ms),
+                })
+            }
+            fn ingest_lines(
+                &self,
+                lines: &[String],
+                state: &mut TranscriptState,
+            ) -> TranscriptDelta {
+                for line in lines {
+                    let value: Value = serde_json::from_str(line).unwrap();
+                    apply_native_turn_id(state, self, &value, 1_001);
+                    if let Some(evidence) = self.native_turn_evidence(&value, 1_001) {
+                        state.turn =
+                            PaneTurn::new(evidence.marker.phase(), evidence.observed_at_unix_ms);
+                    }
+                }
+                TranscriptDelta::default()
+            }
+        }
+        let tracker = TranscriptTracker::with_adapters(vec![Box::new(SupportingAdapter)]);
+        let adapter = tracker.adapters[0].as_ref();
+        let mut state = fold(
+            adapter,
+            &[serde_json::json!({"marker":"start", "id":"real-test-turn", "time":1001})],
+        );
+        crate::socket::tests::assert_adapter_native_turn_correlation(
+            state.native_turn_id.as_ref(),
+            Some("real-test-turn"),
+        );
+        let stale = fold(
+            adapter,
+            &[serde_json::json!({"marker":"start", "id":"stale", "time":999})],
+        );
+        crate::socket::tests::assert_adapter_native_turn_correlation(
+            stale.native_turn_id.as_ref(),
+            None,
+        );
+        let no_marker = fold(
+            adapter,
+            &[serde_json::json!({"id":"not-evidence", "time":1001})],
+        );
+        crate::socket::tests::assert_adapter_native_turn_correlation(
+            no_marker.native_turn_id.as_ref(),
+            None,
+        );
+        adapter.ingest_lines(
+            &[
+                serde_json::json!({"marker":"complete"}).to_string(),
+                serde_json::json!({"marker":"start", "id":"bad\nidentity"}).to_string(),
+            ],
+            &mut state,
+        );
+        assert_eq!(state.native_turn_id, None);
+        crate::socket::tests::assert_adapter_native_turn_correlation(
+            state.native_turn_id.as_ref(),
+            None,
+        );
+        let unsupported = PiTranscriptAdapter::with_sessions_root(PathBuf::from("/nonexistent"));
+        let mut unsupported_state = TranscriptState::default();
+        apply_native_turn_id(
+            &mut unsupported_state,
+            &unsupported,
+            &serde_json::json!({"marker":"start", "id":"pretend-native", "uuid":"pretend-native", "time":1001}),
+            1_001,
+        );
+        crate::socket::tests::assert_adapter_native_turn_correlation(
+            unsupported_state.native_turn_id.as_ref(),
+            None,
+        );
     }
 
     #[test]
