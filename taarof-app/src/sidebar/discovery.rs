@@ -8,14 +8,6 @@ use super::view_model::{tab_row_handle, PlanMonitorState};
 use super::*;
 use crate::tracking::{PlanTasksData, TrackingData};
 
-// Poll interval for the in-memory task discovery cache. This timer checks
-// whether the background worker has stored its results yet — it does NOT invoke
-// mise or SSH itself. A shorter interval feels more responsive but wastes
-// main-loop wakeups on slow discovery (remote SSH can take several seconds).
-// 500 ms balances perceived latency against idle-CPU churn; the spinner in the
-// sidebar communicates that work is in progress while the user waits.
-const TASK_DISCOVERY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-
 #[derive(Debug)]
 struct DiscoverySnapshot {
     target: crate::mise::DiscoveryTarget,
@@ -112,10 +104,10 @@ pub(crate) fn discover_for_tab(
 
     match request {
         crate::mise::TaskDiscoveryRequest::UseCached => {
-            clear_task_discovery_poll(tab_list, tab_id);
+            clear_task_discovery_subscription(tab_list, tab_id);
         }
         crate::mise::TaskDiscoveryRequest::Pending | crate::mise::TaskDiscoveryRequest::Start => {
-            ensure_task_discovery_poll(state, tab_list, tab_id, target);
+            ensure_task_discovery_subscription(state, tab_list, tab_id, target);
         }
     }
 }
@@ -193,7 +185,14 @@ fn submit_discovery_snapshot(
     let Some(handle) = tab_row_handle(tab_list, tab_id) else {
         return;
     };
-    let generation = handle.discovery_generation.get().wrapping_add(1);
+    let Some(identity) = crate::mise::TaskViewerIdentity::for_tab(&state.borrow(), tab_id) else {
+        return;
+    };
+    let generation = handle
+        .discovery_generation
+        .get()
+        .checked_add(1)
+        .expect("sidebar discovery generation exhausted");
     handle.discovery_generation.set(generation);
     let worker_target = target.clone();
     let apply_target = target.clone();
@@ -203,6 +202,9 @@ fn submit_discovery_snapshot(
         format!("sidebar-discovery:{tab_id}:{generation}:{target:?}"),
         move || Ok(build_discovery_snapshot(&worker_target, tasks)),
         move |result| {
+            if !identity.is_current(&state_for_apply.borrow()) {
+                return;
+            }
             let Ok(snapshot) = result else {
                 if reveal {
                     crate::show_error_toast(
@@ -277,7 +279,7 @@ pub(crate) fn invalidate_and_rediscover_if_target_changed(
         return;
     }
 
-    clear_task_discovery_poll(tab_list, tab_id);
+    clear_task_discovery_subscription(tab_list, tab_id);
     {
         let mut st = state.borrow_mut();
         st.task_discovery_snapshots.remove(&tab_id);
@@ -305,14 +307,14 @@ fn task_discovery_target_changed(
     }
 }
 
-fn clear_task_discovery_poll(tab_list: &gtk::Box, tab_id: u32) {
+fn clear_task_discovery_subscription(tab_list: &gtk::Box, tab_id: u32) {
     let Some(handle) = tab_row_handle(tab_list, tab_id) else {
         return;
     };
-    handle.clear_discovery_poll();
+    handle.clear_discovery_subscription();
 }
 
-fn ensure_task_discovery_poll(
+fn ensure_task_discovery_subscription(
     state: &Rc<RefCell<AppState>>,
     tab_list: &gtk::Box,
     tab_id: u32,
@@ -321,36 +323,39 @@ fn ensure_task_discovery_poll(
     let Some(handle) = tab_row_handle(tab_list, tab_id) else {
         return;
     };
-    if handle.discovery_poll_source.borrow().is_some() {
+    handle.clear_discovery_subscription();
+    let Some(identity) = crate::mise::TaskViewerIdentity::for_tab(&state.borrow(), tab_id) else {
         return;
-    }
-
-    let state = state.clone();
-    let tab_list = tab_list.clone();
-    let target_for_poll = target.clone();
-    let source_id = glib::timeout_add_local(TASK_DISCOVERY_POLL_INTERVAL, move || {
-        match crate::mise::cached_task_discovery(&target_for_poll) {
-            crate::mise::CachedTaskDiscovery::Ready(tasks) => {
-                clear_task_discovery_poll(&tab_list, tab_id);
-                submit_discovery_snapshot(
-                    &state,
-                    &tab_list,
-                    tab_id,
-                    target_for_poll.clone(),
-                    tasks,
-                    false,
-                );
-                glib::ControlFlow::Break
+    };
+    let weak_state = Rc::downgrade(state);
+    let tab_list = tab_list.downgrade();
+    let target_for_completion = target.clone();
+    let source_id =
+        crate::mise::subscribe_task_discovery_for_viewer(state, identity, &target, move |result| {
+            let (Some(state), Some(tab_list)) = (weak_state.upgrade(), tab_list.upgrade()) else {
+                return;
+            };
+            if resolve_discovery_target(&state, tab_id).as_ref() != Some(&target_for_completion) {
+                return;
             }
-            crate::mise::CachedTaskDiscovery::Pending => glib::ControlFlow::Continue,
-            crate::mise::CachedTaskDiscovery::Missing
-            | crate::mise::CachedTaskDiscovery::Failed(_) => {
-                clear_task_discovery_poll(&tab_list, tab_id);
-                glib::ControlFlow::Break
+            clear_task_discovery_subscription(&tab_list, tab_id);
+            match result {
+                crate::mise::CachedTaskDiscovery::Ready(tasks) => {
+                    submit_discovery_snapshot(
+                        &state,
+                        &tab_list,
+                        tab_id,
+                        target_for_completion.clone(),
+                        tasks,
+                        false,
+                    );
+                }
+                crate::mise::CachedTaskDiscovery::Pending => {}
+                crate::mise::CachedTaskDiscovery::Missing
+                | crate::mise::CachedTaskDiscovery::Failed(_) => {}
             }
-        }
-    });
-    handle.set_discovery_poll(source_id);
+        });
+    handle.set_discovery_subscription(source_id);
 }
 
 fn update_plan_monitor(
@@ -665,6 +670,110 @@ mod tests {
             task_buttons: Vec::new(),
             tracking_data: None,
         }
+    }
+
+    #[test]
+    #[ignore = "requires an owned GTK display (xvfb-run)"]
+    fn task_discovery_sidebar_subscription_gtk_lifecycle() {
+        let _glib_guard = crate::glib_main_context_test_guard();
+        let _cache_guard = crate::mise::task_discovery_test_guard();
+        gtk::init().expect("owned GTK display");
+        crate::mise::clear_task_discovery_cache_for_test();
+        let mut initial = crate::AppState::new();
+        for (id, cwd) in [
+            (11, "/tmp/d13b-sidebar-one"),
+            (12, "/tmp/d13b-sidebar-one"),
+            (13, "/tmp/d13b-sidebar-other"),
+        ] {
+            let mut tab = stub_tab(id);
+            tab.discovery_cwd = Some(cwd.into());
+            initial.active_ws_mut().unwrap().tabs.push(tab);
+            initial.register_task_tab_epoch(id);
+        }
+        initial.activate_tab(11).unwrap();
+        let state = Rc::new(RefCell::new(initial));
+        let tab_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let stack = gtk::Stack::new();
+        for id in [11, 12, 13] {
+            crate::sidebar::add_tab_row(&tab_list, &state, &stack, id, "test", false);
+        }
+        let first = super::resolve_discovery_target(&state, 11).unwrap();
+        let other = super::resolve_discovery_target(&state, 13).unwrap();
+        crate::mise::set_pending_task_discovery_for_test(&first);
+        crate::mise::set_pending_task_discovery_for_test(&other);
+        for (id, target) in [
+            (11, first.clone()),
+            (12, first.clone()),
+            (13, other.clone()),
+        ] {
+            super::ensure_task_discovery_subscription(&state, &tab_list, id, target);
+        }
+        assert_eq!(crate::mise::task_subscriber_count_for_test(), 3);
+        // Unrelated active-tab navigation does not invalidate either current row.
+        state.borrow_mut().activate_tab(12).unwrap();
+        crate::mise::complete_current_task_discovery_for_test(
+            &first,
+            Ok(vec![crate::mise::MiseTask {
+                name: "test".into(),
+                description: "test".into(),
+                hide: false,
+                source: None,
+                global: false,
+            }]),
+        );
+        let context = glib::MainContext::default();
+        let started = Instant::now();
+        while state.borrow().task_discovery_snapshots.len() < 2
+            && started.elapsed() < Duration::from_secs(2)
+        {
+            context.iteration(false);
+            std::thread::yield_now();
+        }
+        for id in [11, 12] {
+            assert_eq!(
+                state.borrow().find_tab(id).unwrap().1.discovered_actions,
+                vec![WorkspaceAction::Test]
+            );
+            assert!(super::tab_row_handle(&tab_list, id)
+                .unwrap()
+                .discovery_subscription
+                .borrow()
+                .is_none());
+        }
+        assert!(super::tab_row_handle(&tab_list, 13)
+            .unwrap()
+            .discovery_subscription
+            .borrow()
+            .is_some());
+        crate::mise::complete_current_task_discovery_for_test(
+            &other,
+            Err(crate::mise::DiscoveryFailure::InvalidJson),
+        );
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert!(super::tab_row_handle(&tab_list, 13)
+            .unwrap()
+            .discovery_subscription
+            .borrow()
+            .is_none());
+
+        crate::mise::set_pending_task_discovery_for_test(&first);
+        super::ensure_task_discovery_subscription(&state, &tab_list, 11, first.clone());
+        crate::mise::complete_current_task_discovery_for_test(&first, Ok(Vec::new()));
+        super::super::view_model::remove_tab_row_handle(&tab_list, 11).unwrap();
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert_eq!(
+            state.borrow().find_tab(11).unwrap().1.discovered_actions,
+            vec![WorkspaceAction::Test],
+            "removed viewer rejects queued completion"
+        );
+        for id in [12, 13] {
+            super::super::view_model::remove_tab_row_handle(&tab_list, id).unwrap();
+        }
+        assert_eq!(crate::mise::task_subscriber_count_for_test(), 0);
     }
 
     #[test]

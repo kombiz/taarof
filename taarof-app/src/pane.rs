@@ -176,6 +176,8 @@ pub struct PaneLeaf {
     /// exact identity without treating a same-named replacement as authority.
     pub restore_unavailable_reason: Option<String>,
     pub location_state: PaneLocationState,
+    /// Local-only generation; timestamp refreshes do not invalidate viewers.
+    pub(crate) location_generation: u64,
     pub process_state: PaneProcessState,
     pub current_task: Option<crate::task_binding::PaneTaskBinding>,
     /// Last persisted agent identity for this pane. Keep it across bare-shell
@@ -373,6 +375,12 @@ impl PaneLeaf {
     }
 
     pub fn update_location_cache(&mut self, cwd: Option<String>, cwd_host: Option<String>) {
+        if self.location_state.cwd != cwd || self.location_state.cwd_host != cwd_host {
+            self.location_generation = self
+                .location_generation
+                .checked_add(1)
+                .expect("pane location generation exhausted");
+        }
         self.location_state = PaneLocationState {
             cwd,
             cwd_host,

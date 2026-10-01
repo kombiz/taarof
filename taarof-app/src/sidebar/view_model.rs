@@ -24,7 +24,7 @@ pub(super) struct SidebarRegistry {
 impl SidebarRegistry {
     fn teardown(&self) {
         for handle in self.tab_rows.borrow().values() {
-            handle.clear_discovery_poll();
+            handle.clear_discovery_subscription();
             handle.clear_plan_monitor();
         }
         self.tab_rows.borrow_mut().clear();
@@ -161,20 +161,21 @@ pub(super) struct TabRowHandle {
     /// Latest discovery submission for this row. A completion may only update
     /// GTK when it still owns this generation, even when the cwd is unchanged.
     pub(super) discovery_generation: Rc<Cell<u64>>,
-    pub(super) discovery_poll_source: Rc<RefCell<Option<glib::SourceId>>>,
+    pub(super) discovery_subscription: Rc<RefCell<Option<crate::mise::TaskDiscoverySubscription>>>,
     pub(super) plan_monitor: Rc<RefCell<Option<PlanMonitorState>>>,
 }
 
 impl TabRowHandle {
-    pub(super) fn clear_discovery_poll(&self) {
-        if let Some(source_id) = self.discovery_poll_source.borrow_mut().take() {
-            source_id.remove();
-        }
+    pub(super) fn clear_discovery_subscription(&self) {
+        self.discovery_subscription.borrow_mut().take();
     }
 
-    pub(super) fn set_discovery_poll(&self, source_id: glib::SourceId) {
-        self.clear_discovery_poll();
-        self.discovery_poll_source.borrow_mut().replace(source_id);
+    pub(super) fn set_discovery_subscription(
+        &self,
+        source_id: crate::mise::TaskDiscoverySubscription,
+    ) {
+        self.clear_discovery_subscription();
+        self.discovery_subscription.borrow_mut().replace(source_id);
     }
 
     pub(super) fn clear_plan_monitor(&self) {
@@ -281,7 +282,7 @@ pub(super) fn remove_tab_row_handle(tab_list: &gtk::Box, tab_id: u32) -> Option<
     let registry = sidebar_registry(tab_list);
     let handle = registry.tab_rows.borrow_mut().remove(&tab_id);
     if let Some(handle) = &handle {
-        handle.clear_discovery_poll();
+        handle.clear_discovery_subscription();
         handle.clear_plan_monitor();
         registry.view_model.borrow_mut().remove_tab(tab_id);
     }

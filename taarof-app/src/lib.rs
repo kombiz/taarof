@@ -308,6 +308,8 @@ pub fn seed_headless_terminal_tab(
     });
     workspace.active_tab = tab_id;
     state.active_workspace = workspace_id;
+    state.register_task_tab_epoch(tab_id);
+    state.invalidate_task_viewer_epoch();
     Some((tab_id, pane_id))
 }
 
@@ -369,6 +371,8 @@ pub fn seed_pending_restore_tab(
     });
     workspace.active_tab = tab_id;
     state.active_workspace = workspace_id;
+    state.register_task_tab_epoch(tab_id);
+    state.invalidate_task_viewer_epoch();
     state.pending_tab_restores.insert(
         tab_id,
         session::PendingTabRestore {
@@ -1839,14 +1843,15 @@ fn install_search_palette_actions(
                 // consumed attention state so it can notify again later.
                 let terminal = {
                     let mut st = state.borrow_mut();
-                    st.find_tab_mut(tab_id).and_then(|tab| {
-                        if tab.panes.leaf(pane_id).is_some() {
-                            tab.focused_pane_id = pane_id;
-                        }
+                    let terminal = st.find_tab_mut(tab_id).and_then(|tab| {
                         tab.needs_attention = false;
                         tab.clear_pane_notification(pane_id);
                         tab.panes.leaf(pane_id).map(|leaf| leaf.terminal.clone())
-                    })
+                    });
+                    if terminal.is_some() {
+                        st.set_focused_pane(tab_id, pane_id);
+                    }
+                    terminal
                 };
                 if let Some(terminal) = terminal {
                     terminal.grab_focus();

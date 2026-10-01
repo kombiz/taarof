@@ -14,6 +14,7 @@ mod remote;
 pub use self::remote::shell_quote;
 
 pub(crate) use self::cache::{cached_task_discovery, spawn_task_discovery};
+pub(crate) use self::cache::{subscribe_task_discovery, TaskDiscoverySubscription};
 pub(crate) use self::chip::tool_version_chip_text_for_target;
 #[cfg(test)]
 pub(crate) use self::local::local_discovery_target;
@@ -38,8 +39,9 @@ use self::local::{classify_task_scope, find_mise, normalize_mise_binary_path};
 use self::cache::spawn_task_discovery_for_test;
 #[cfg(test)]
 pub(crate) use self::cache::{
-    clear_task_discovery_cache_for_test, set_pending_task_discovery_for_test,
-    set_ready_task_discovery_for_test, task_discovery_test_guard,
+    clear_task_discovery_cache_for_test, complete_current_task_discovery_for_test,
+    set_pending_task_discovery_for_test, set_ready_task_discovery_for_test,
+    task_discovery_test_guard, task_subscriber_count_for_test,
 };
 #[cfg(test)]
 pub(crate) use self::chip::{
@@ -300,6 +302,7 @@ enum ToolVersionDiscoveryRequest {
 #[derive(Debug, Default)]
 struct TaskDiscoveryCache {
     entries: std::collections::HashMap<DiscoveryCacheKey, TaskDiscoveryCacheEntry>,
+    subscribers: std::collections::HashMap<u64, cache::Subscriber>,
 }
 
 #[derive(Debug, Default)]
@@ -345,7 +348,12 @@ impl DiscoveryFailure {
 
 fn next_discovery_generation() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    NEXT.fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |generation| generation.checked_add(1),
+    )
+    .expect("discovery generation exhausted")
 }
 
 fn run_discovery_command(
@@ -787,6 +795,68 @@ pub(crate) fn task_target_for_tab(state: &crate::AppState, tab_id: u32) -> Optio
         }),
         remote => Some(remote),
     }
+}
+
+/// Immutable GTK-local viewer identity, independent of the cache generation.
+/// Sidebar rows bind to their own tab; the palette additionally binds to the
+/// active selection. Both reject target-equal focus/location round trips.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskViewerIdentity {
+    tab_id: u32,
+    pane_id: u32,
+    tab_epoch: u64,
+    location: Option<(String, u64)>,
+    selection_epoch: Option<u64>,
+}
+
+impl TaskViewerIdentity {
+    pub(crate) fn for_tab(state: &crate::AppState, tab_id: u32) -> Option<Self> {
+        let (_, tab) = state.find_tab(tab_id)?;
+        Some(Self {
+            tab_id,
+            pane_id: tab.focused_pane_id,
+            tab_epoch: state.task_pane_epoch(tab_id),
+            location: tab
+                .panes
+                .leaf(tab.focused_pane_id)
+                .or_else(|| tab.panes.first_leaf())
+                .map(|leaf| (leaf.work_origin.clone(), leaf.location_generation)),
+            selection_epoch: None,
+        })
+    }
+
+    pub(crate) fn for_active(state: &crate::AppState) -> Option<Self> {
+        let mut identity = Self::for_tab(state, state.active_tab()?.id)?;
+        identity.selection_epoch = Some(state.task_viewer_epoch());
+        Some(identity)
+    }
+
+    pub(crate) fn is_current(&self, state: &crate::AppState) -> bool {
+        let current = if self.selection_epoch.is_some() {
+            Self::for_active(state)
+        } else {
+            Self::for_tab(state, self.tab_id)
+        };
+        current.as_ref() == Some(self)
+    }
+}
+
+pub(crate) fn subscribe_task_discovery_for_viewer(
+    state: &std::rc::Rc<std::cell::RefCell<crate::AppState>>,
+    identity: TaskViewerIdentity,
+    target: &DiscoveryTarget,
+    callback: impl FnOnce(CachedTaskDiscovery) + 'static,
+) -> TaskDiscoverySubscription {
+    let state = std::rc::Rc::downgrade(state);
+    subscribe_task_discovery(target, move |result| {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let current = identity.is_current(&state.borrow());
+        if current {
+            callback(result);
+        }
+    })
 }
 
 fn focused_target(state: &crate::AppState) -> Option<DiscoveryTarget> {
