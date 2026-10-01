@@ -3,7 +3,6 @@ use gtk::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
 
 use crate::sidebar;
 use crate::task_launch::{TaskLaunchError, TaskLaunchExecutor, TaskLaunchPlan, TaskLaunchRequest};

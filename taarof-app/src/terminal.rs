@@ -2275,13 +2275,6 @@ pub(crate) fn terminal_location_metadata(
     location_metadata_from_terminal_state(cwd_uri.as_deref(), title.as_deref())
 }
 
-fn unix_time_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 fn cache_pane_location(
     state: &Rc<RefCell<AppState>>,
     tab_id: u32,
