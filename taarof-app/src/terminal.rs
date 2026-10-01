@@ -4115,6 +4115,8 @@ mod tests {
     #[test]
     fn probe_transition_writer_preserves_event_and_persistence_order_after_borrow_release() {
         use crate::diagnostics::probe_writer::ProbeWriter;
+        use std::cell::RefCell;
+        use std::rc::Rc;
         use std::sync::mpsc;
         use std::time::Duration;
         let state = Rc::new(RefCell::new(AppState::new()));
