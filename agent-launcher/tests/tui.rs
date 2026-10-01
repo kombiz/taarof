@@ -259,6 +259,54 @@ fn tui_empty_and_failed_provider_snapshot() {
     assert!(rendered.contains("No matching sessions"));
     assert!(rendered.contains("History unavailable"));
 }
+
+#[test]
+fn degraded_subtree_catalog_keeps_rows_and_refuses_local_execution() {
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::write(root.path().join("session.jsonl"),
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"survivor\",\"cwd\":\"/tmp\"}}\n{\"payload\":\"unfinished").unwrap();
+    let (mut status, sessions) =
+        agent_session_core::legacy::discover_codex_sessions(Some(root.path()), 50);
+    // Traversal injection lives in core's private tests. Exercise its projected
+    // status at the consumer boundary without weakening execution authority.
+    status.ok = false;
+    status.error = Some("Session store discovery is incomplete (1 traversal errors). Session store directory is unreadable.".into());
+    assert!(status.warning.is_some());
+    let incoming = SessionCatalog::from_discovery(
+        AgentSessionDiscovery {
+            providers: vec![status.clone()],
+            sessions,
+            ..Default::default()
+        },
+        "local.ts",
+    );
+    assert_eq!(incoming.providers, vec![status]);
+    assert_eq!(incoming.sessions.len(), 1);
+    let reference = incoming.sessions[0].stable_ref.clone();
+    let selector = agent_launcher::stable_ref_selector(&reference);
+    assert_eq!(
+        agent_launcher::select_resume(&incoming, &selector).unwrap_err(),
+        "provider discovery unavailable; refusing stale selection"
+    );
+    let picker = Picker::new(incoming.clone(), vec![], "local.ts".into());
+    let rows = picker.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key, RowKey::Session(reference.clone()));
+    let rendered = snapshot(&picker, 120, 30);
+    assert!(rendered.contains("survivor"));
+    assert!(rendered.contains("discovery is incomplete"));
+    assert_eq!(
+        picker
+            .revalidate(
+                &RowKey::Session(reference),
+                ActionKind::Resume,
+                incoming,
+                vec![]
+            )
+            .unwrap_err(),
+        "provider discovery failed; refusing launch"
+    );
+}
 #[test]
 fn tui_revalidation_rejects_disappearance_changed_plan_and_failed_provider() {
     let row = live_session();

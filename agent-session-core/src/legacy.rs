@@ -157,7 +157,22 @@ pub fn discover_pi_sessions(
     session_map_path: Option<&Path>,
     limit: usize,
 ) -> (AgentSessionProviderStatus, Vec<AgentSessionRecord>) {
+    discover_pi_sessions_with_collector(
+        sessions_root,
+        session_map_path,
+        limit,
+        collect_jsonl_candidates,
+    )
+}
+
+fn discover_pi_sessions_with_collector(
+    sessions_root: Option<&Path>,
+    session_map_path: Option<&Path>,
+    limit: usize,
+    collector: impl FnOnce(&Path) -> Result<CandidateScan, String>,
+) -> (AgentSessionProviderStatus, Vec<AgentSessionRecord>) {
     let mut paths = Vec::new();
+    let mut traversal_error = None;
     if let Some(session_map_path) = session_map_path {
         match read_pi_session_map(session_map_path) {
             Ok(mapped_paths) => {
@@ -194,18 +209,21 @@ pub fn discover_pi_sessions(
 
     if paths.is_empty() {
         if let Some(root) = sessions_root.filter(|root| root.exists()) {
-            paths = match collect_jsonl_candidates(root) {
-                Ok(paths) => paths,
+            let scan = match collector(root) {
+                Ok(scan) => scan,
                 Err(error) => return provider_failure("pi", error),
-            }
-            .into_iter()
-            .map(|candidate| candidate.path)
-            .take(limit)
-            .collect();
+            };
+            traversal_error = scan.error;
+            paths = scan
+                .files
+                .into_iter()
+                .map(|candidate| candidate.path)
+                .take(limit)
+                .collect();
         }
     }
 
-    if paths.is_empty() {
+    if paths.is_empty() && traversal_error.is_none() {
         return (
             AgentSessionProviderStatus {
                 name: "pi".to_string(),
@@ -242,6 +260,7 @@ pub fn discover_pi_sessions(
     }
     sessions.sort_by_key(|session| Reverse(session.updated_at_unix_ms));
     sessions.truncate(limit);
+    let failure = combine_discovery_errors(traversal_error, failure);
     (
         AgentSessionProviderStatus {
             name: "pi".to_string(),
@@ -458,6 +477,16 @@ fn discover_jsonl_provider(
     limit: usize,
     parser: fn(&Path, u64, &[Value]) -> Option<AgentSessionRecord>,
 ) -> (AgentSessionProviderStatus, Vec<AgentSessionRecord>) {
+    discover_jsonl_provider_with_collector(root, provider, limit, parser, collect_jsonl_candidates)
+}
+
+fn discover_jsonl_provider_with_collector(
+    root: Option<&Path>,
+    provider: &str,
+    limit: usize,
+    parser: fn(&Path, u64, &[Value]) -> Option<AgentSessionRecord>,
+    collector: impl FnOnce(&Path) -> Result<CandidateScan, String>,
+) -> (AgentSessionProviderStatus, Vec<AgentSessionRecord>) {
     let Some(root) = root.filter(|path| path.exists()) else {
         return (
             AgentSessionProviderStatus {
@@ -472,11 +501,11 @@ fn discover_jsonl_provider(
         );
     };
 
-    let candidates = match collect_jsonl_candidates(root) {
-        Ok(candidates) => candidates,
+    let scan = match collector(root) {
+        Ok(scan) => scan,
         Err(error) => return provider_failure(provider, error),
     };
-    if candidates.is_empty() {
+    if scan.files.is_empty() && scan.error.is_none() {
         return (
             AgentSessionProviderStatus {
                 name: provider.to_string(),
@@ -494,7 +523,7 @@ fn discover_jsonl_provider(
     let mut failure = None;
     let mut missing_metadata = false;
     let mut incomplete_append = false;
-    for candidate in candidates.into_iter().take(limit) {
+    for candidate in scan.files.into_iter().take(limit) {
         let lines = match read_jsonl_sample_lines(&candidate.path) {
             Ok(lines) => lines,
             Err(error) => {
@@ -522,6 +551,7 @@ fn discover_jsonl_provider(
     }
     sessions.sort_by_key(|session| Reverse(session.updated_at_unix_ms));
     sessions.truncate(limit);
+    let failure = combine_discovery_errors(scan.error, failure);
     (
         AgentSessionProviderStatus {
             name: provider.to_string(),
@@ -655,43 +685,105 @@ fn read_pi_session_map(path: &Path) -> Result<Vec<PathBuf>, String> {
         .collect())
 }
 
-fn collect_jsonl_candidates(root: &Path) -> Result<Vec<FileCandidate>, String> {
+struct CandidateScan {
+    files: Vec<FileCandidate>,
+    error: Option<String>,
+}
+
+enum CandidateEntry {
+    Directory(PathBuf),
+    File(FileCandidate),
+    Other,
+}
+
+fn combine_discovery_errors(traversal: Option<String>, history: Option<String>) -> Option<String> {
+    match (traversal, history) {
+        (Some(traversal), Some(history)) => Some(format!("{traversal} {history}")),
+        (traversal, history) => traversal.or(history),
+    }
+}
+
+fn collect_jsonl_candidates(root: &Path) -> Result<CandidateScan, String> {
+    collect_jsonl_candidates_with(root, |dir| {
+        fs::read_dir(dir)
+            .map_err(|_| "Session store directory is unreadable.".to_string())
+            .map(|entries| entries.map(candidate_entry))
+    })
+}
+
+fn candidate_entry(entry: std::io::Result<fs::DirEntry>) -> Result<CandidateEntry, String> {
+    let entry = entry.map_err(|_| "Session store entry is unreadable.")?;
+    let path = entry.path();
+    let file_type = entry
+        .file_type()
+        .map_err(|_| "Session store entry type is unreadable.")?;
+    if file_type.is_dir() {
+        return Ok(CandidateEntry::Directory(path));
+    }
+    if file_type.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+        let modified_at_unix_ms = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata_modified_unix_ms(&metadata))
+            .unwrap_or_default();
+        return Ok(CandidateEntry::File(FileCandidate {
+            path,
+            modified_at_unix_ms,
+        }));
+    }
+    Ok(CandidateEntry::Other)
+}
+
+// The injected reader keeps traversal-fault tests independent of process privileges.
+// Both production and tests yield entries lazily so the global entry cap is hard.
+fn collect_jsonl_candidates_with<I>(
+    root: &Path,
+    mut read_dir: impl FnMut(&Path) -> Result<I, String>,
+) -> Result<CandidateScan, String>
+where
+    I: Iterator<Item = Result<CandidateEntry, String>>,
+{
     let mut stack = vec![root.to_path_buf()];
     let mut files = Vec::new();
     let mut visited = 0;
+    let mut error_count = 0;
+    let mut first_error = None;
     while let Some(dir) = stack.pop() {
-        let entries = fs::read_dir(&dir).map_err(|_| "Session store directory is unreadable.")?;
+        let entries = match read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if dir == root => return Err(error),
+            Err(error) => {
+                error_count += 1;
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
         for entry in entries {
             visited += 1;
             if visited > 100_000 {
                 return Err("Session store traversal limit exceeded.".into());
             }
-            let entry = entry.map_err(|_| "Session store entry is unreadable.")?;
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .map_err(|_| "Session store entry type is unreadable.")?;
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if file_type.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-            {
-                let modified_at_unix_ms = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|metadata| metadata_modified_unix_ms(&metadata))
-                    .unwrap_or_default();
-                files.push(FileCandidate {
-                    path,
-                    modified_at_unix_ms,
-                });
+            match entry {
+                Ok(CandidateEntry::Directory(path)) => stack.push(path),
+                Ok(CandidateEntry::File(candidate)) => files.push(candidate),
+                Ok(CandidateEntry::Other) => {}
+                Err(error) => {
+                    error_count += 1;
+                    first_error.get_or_insert(error);
+                }
             }
         }
     }
     files.sort_by_key(|candidate| Reverse(candidate.modified_at_unix_ms));
     files.truncate(MAX_FILE_CANDIDATES);
-    Ok(files)
+    Ok(CandidateScan {
+        files,
+        error: first_error.map(|error| {
+            format!(
+                "Session store discovery is incomplete ({error_count} traversal errors). {error}"
+            )
+        }),
+    })
 }
 
 fn provider_failure(
@@ -975,6 +1067,252 @@ struct FileCandidate {
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    fn injected_subtree_scan(root: &Path) -> Result<CandidateScan, String> {
+        collect_jsonl_candidates_with(root, |dir| {
+            if dir == root.join("unreadable") {
+                return Err("Session store directory is unreadable.".into());
+            }
+            Ok(if dir == root {
+                vec![
+                    Ok(CandidateEntry::Directory(root.join("readable"))),
+                    Ok(CandidateEntry::Directory(root.join("unreadable"))),
+                    Err("Session store entry is unreadable.".into()),
+                    Err("Session store entry type is unreadable.".into()),
+                ]
+            } else {
+                fs::read_dir(dir).unwrap().map(candidate_entry).collect()
+            }
+            .into_iter())
+        })
+    }
+
+    #[test]
+    fn subtree_faults_preserve_provider_rows_warning_and_normalized_catalog() {
+        for (provider, header, parser) in [
+            (
+                "codex",
+                r#"{"type":"session_meta","payload":{"id":"survivor","cwd":"/tmp"}}"#,
+                parse_codex_session as fn(&Path, u64, &[Value]) -> Option<AgentSessionRecord>,
+            ),
+            (
+                "claude",
+                r#"{"type":"user","sessionId":"survivor","cwd":"/tmp","message":{"role":"user","content":"hello"}}"#,
+                parse_claude_session,
+            ),
+            (
+                "pi",
+                r#"{"type":"session","id":"survivor","cwd":"/tmp"}"#,
+                parse_pi_session,
+            ),
+        ] {
+            let root = std::env::temp_dir()
+                .join(format!("agent-{provider}-subtrees-{}", std::process::id()));
+            fs::create_dir_all(root.join("readable")).unwrap();
+            fs::write(
+                root.join("readable/session.jsonl"),
+                format!("{header}\n{{\"payload\":\"unfinished"),
+            )
+            .unwrap();
+            let (status, sessions) = if provider == "pi" {
+                discover_pi_sessions_with_collector(Some(&root), None, 50, injected_subtree_scan)
+            } else {
+                discover_jsonl_provider_with_collector(
+                    Some(&root),
+                    provider,
+                    50,
+                    parser,
+                    injected_subtree_scan,
+                )
+            };
+            assert!(!status.ok, "{provider}");
+            assert!(status.history_available);
+            assert_eq!(status.session_count, 1);
+            assert_eq!(status.warning.as_deref(), Some(INCOMPLETE_APPEND_WARNING));
+            assert!(status
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("3 traversal errors"));
+            assert_eq!(sessions[0].session_id, "survivor");
+            assert_eq!(sessions[0].cwd, "/tmp");
+            assert_eq!(sessions[0].last_user_message_at_unix_ms, None);
+            let catalog = crate::SessionCatalog::from_discovery(
+                AgentSessionDiscovery {
+                    providers: vec![status.clone()],
+                    sessions,
+                    ..Default::default()
+                },
+                "local.ts",
+            );
+            assert_eq!(catalog.providers, vec![status]);
+            assert_eq!(catalog.sessions.len(), 1);
+            assert_eq!(catalog.sessions[0].stable_ref.session_id, "survivor");
+            assert_eq!(catalog.sessions[0].display.cwd, "/tmp");
+            assert_eq!(catalog.sessions[0].last_user_message_at_unix_ms, None);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn subtree_fault_and_file_parse_failure_coexist() {
+        let root = std::env::temp_dir().join(format!("agent-subtree-parse-{}", std::process::id()));
+        fs::create_dir_all(root.join("readable")).unwrap();
+        fs::write(root.join("readable/bad.jsonl"), "{bad\n").unwrap();
+        let (status, sessions) = discover_jsonl_provider_with_collector(
+            Some(&root),
+            "codex",
+            50,
+            parse_codex_session,
+            injected_subtree_scan,
+        );
+        assert!(!status.ok);
+        assert!(status.history_available);
+        assert!(sessions.is_empty());
+        let error = status.error.unwrap();
+        assert!(error.contains("3 traversal errors"));
+        assert!(error.contains("Session history contains malformed JSON."));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_unreadable_subtrees_are_degraded_not_missing_stores() {
+        let root =
+            std::env::temp_dir().join(format!("agent-empty-subtrees-{}", std::process::id()));
+        fs::create_dir_all(root.join("readable")).unwrap();
+        for (status, sessions) in [
+            discover_jsonl_provider_with_collector(
+                Some(&root),
+                "codex",
+                50,
+                parse_codex_session,
+                injected_subtree_scan,
+            ),
+            discover_pi_sessions_with_collector(Some(&root), None, 50, injected_subtree_scan),
+        ] {
+            assert!(!status.ok);
+            assert!(status.history_available);
+            assert!(status.error.is_some());
+            assert!(status.warning.is_none());
+            assert!(sessions.is_empty());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn root_and_global_traversal_limit_remain_hard_failures() {
+        let root = std::env::temp_dir().join(format!("agent-root-fault-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let root_failure = |root: &Path| {
+            collect_jsonl_candidates_with(root, |_| {
+                Err::<std::vec::IntoIter<Result<CandidateEntry, String>>, _>(
+                    "Session store directory is unreadable.".into(),
+                )
+            })
+        };
+        for (status, sessions) in [
+            discover_jsonl_provider_with_collector(
+                Some(&root),
+                "codex",
+                50,
+                parse_codex_session,
+                root_failure,
+            ),
+            discover_pi_sessions_with_collector(Some(&root), None, 50, root_failure),
+        ] {
+            assert!(!status.ok);
+            assert!(!status.history_available);
+            assert_eq!(
+                status.error.as_deref(),
+                Some("Session store directory is unreadable.")
+            );
+            assert!(sessions.is_empty());
+        }
+        for entries in [100_000, 100_001] {
+            let result = collect_jsonl_candidates_with(&root, |_| {
+                Ok((0..entries).map(|index| {
+                    if index == 0 {
+                        Err("Session store entry is unreadable.".into())
+                    } else {
+                        Ok(CandidateEntry::Other)
+                    }
+                }))
+            });
+            if entries == 100_000 {
+                assert!(result.unwrap().error.is_some());
+            } else {
+                assert_eq!(
+                    result.err().unwrap(),
+                    "Session store traversal limit exceeded."
+                );
+            }
+        }
+        // A readable candidate and earlier soft faults cannot turn a global
+        // stop across separate directories into successful partial discovery.
+        let capped = |root: &Path| {
+            collect_jsonl_candidates_with(root, |dir| {
+                let entries: Box<dyn Iterator<Item = Result<CandidateEntry, String>>> =
+                    if dir == root {
+                        Box::new(
+                            vec![
+                                Ok(CandidateEntry::Directory(root.join("a"))),
+                                Ok(CandidateEntry::Directory(root.join("b"))),
+                                Ok(CandidateEntry::File(FileCandidate {
+                                    path: root.join("valid.jsonl"),
+                                    modified_at_unix_ms: 1,
+                                })),
+                                Err("Session store entry is unreadable.".into()),
+                            ]
+                            .into_iter(),
+                        )
+                    } else {
+                        Box::new((0..50_000).map(|_| Ok(CandidateEntry::Other)))
+                    };
+                Ok(entries)
+            })
+        };
+        for (status, sessions) in [
+            discover_jsonl_provider_with_collector(
+                Some(&root),
+                "codex",
+                50,
+                parse_codex_session,
+                capped,
+            ),
+            discover_pi_sessions_with_collector(Some(&root), None, 50, capped),
+        ] {
+            assert!(!status.ok);
+            assert!(!status.history_available);
+            assert_eq!(
+                status.error.as_deref(),
+                Some("Session store traversal limit exceeded.")
+            );
+            assert!(sessions.is_empty());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn candidate_cap_retains_newest_200_after_traversal_faults() {
+        let root = Path::new("/injected");
+        let scan = collect_jsonl_candidates_with(root, |_| {
+            Ok((0..251).map(|index| {
+                if index == 250 {
+                    Err("Session store entry type is unreadable.".into())
+                } else {
+                    Ok(CandidateEntry::File(FileCandidate {
+                        path: root.join(format!("{index}.jsonl")),
+                        modified_at_unix_ms: index,
+                    }))
+                }
+            }))
+        })
+        .unwrap();
+        assert!(scan.error.is_some());
+        assert_eq!(scan.files.len(), MAX_FILE_CANDIDATES);
+        assert_eq!(scan.files.first().unwrap().modified_at_unix_ms, 249);
+        assert_eq!(scan.files.last().unwrap().modified_at_unix_ms, 50);
+    }
 
     #[test]
     fn jsonl_sample_only_tolerates_incomplete_unterminated_later_record() {
