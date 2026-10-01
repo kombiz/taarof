@@ -1176,7 +1176,7 @@ mod tests {
         source.comm.insert(42, "codex".into());
         source.cmdline.insert(
             42,
-            vec!["codex".into(), "--session".into(), "session".into()],
+            vec!["codex".into(), "resume".into(), "session".into()],
         );
         source.executables.insert(42, "codex".into());
         let snapshot =
