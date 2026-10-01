@@ -628,19 +628,38 @@ mod subscription_tests {
             .with_thread_default(|| {
                 let target = target("subscription-timely-ready");
                 let (_, generation) = prepare_task_discovery(&target);
+                assert!(tokio::runtime::Handle::try_current().is_err());
+                let deadline = Instant::now() + Duration::from_millis(100);
+                {
+                    let mut cache = task_discovery_cache().lock().unwrap();
+                    let entry = cache
+                        .entries
+                        .get_mut(&DiscoveryCacheKey::from(&target))
+                        .expect("prepared target is present");
+                    let TaskDiscoveryCacheEntry::Pending { started_at, .. } = entry else {
+                        panic!("prepared target is pending");
+                    };
+                    *started_at = deadline - DISCOVERY_LEASE;
+                }
                 let result = std::rc::Rc::new(std::cell::RefCell::new(None));
                 let result_for_callback = result.clone();
                 let subscription = subscribe_task_discovery(&target, move |value| {
                     *result_for_callback.borrow_mut() = Some(value)
                 });
+                assert!(Instant::now() < deadline, "completion starts within lease");
                 complete_task_discovery(&target, generation, Ok(Vec::new()));
-                // Simulate a concluded lease with timely Ready queued, followed by
-                // GTK resuming later. Ready retains its independent45s lifetime.
-                set_ready_task_discovery_for_test(
-                    &target,
-                    Vec::new(),
-                    DISCOVERY_LEASE + Duration::from_secs(1),
+                assert_eq!(
+                    cached_task_discovery(&target),
+                    CachedTaskDiscovery::Ready(Vec::new()),
+                    "worker completed while the original lease was valid"
                 );
+                // Do not poll GTK until the deadline captured by the subscription
+                // has actually elapsed. Timely queued Ready must beat that timer.
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(20),
+                );
+                assert!(Instant::now() >= deadline);
+                assert!(result.borrow().is_none(), "first GTK poll is still delayed");
                 while context.pending() {
                     context.iteration(false);
                 }
@@ -653,6 +672,8 @@ mod subscription_tests {
                     TaskDiscoveryRequest::UseCached
                 );
                 drop(subscription);
+                assert_eq!(task_subscriber_count_for_test(), 0);
+                assert!(tokio::runtime::Handle::try_current().is_err());
             })
             .unwrap();
     }
