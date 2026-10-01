@@ -172,6 +172,32 @@ impl EventStore {
         event_type: impl Into<String>,
         payload: serde_json::Value,
     ) -> u64 {
+        self.emit_with_timestamp_and_drop_reporter(
+            ts_unix_ms,
+            event_type,
+            payload,
+            &|message, details| crate::diagnostics::record_event_drop(message, details),
+        )
+    }
+
+    /// Application shutdown supplies bounded diagnostic admission for this
+    /// one emission; ordinary events retain their existing overflow reporter.
+    pub(crate) fn emit_with_drop_reporter(
+        &mut self,
+        event_type: impl Into<String>,
+        payload: serde_json::Value,
+        report_drop: &dyn Fn(String, Option<serde_json::Value>),
+    ) -> u64 {
+        self.emit_with_timestamp_and_drop_reporter(unix_time_ms(), event_type, payload, report_drop)
+    }
+
+    fn emit_with_timestamp_and_drop_reporter(
+        &mut self,
+        ts_unix_ms: u64,
+        event_type: impl Into<String>,
+        payload: serde_json::Value,
+        report_drop: &dyn Fn(String, Option<serde_json::Value>),
+    ) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
 
@@ -207,7 +233,7 @@ impl EventStore {
             let capacity = self.capacity as u64;
             let abnormal_rate_crossed = drops_before < capacity && drops_after >= capacity;
             if episode_start || abnormal_rate_crossed {
-                crate::diagnostics::record_event_drop(
+                report_drop(
                     format!(
                         "event retention overflowed; dropped {} records total from the in-memory ring",
                         self.dropped,

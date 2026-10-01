@@ -637,7 +637,7 @@ pub(crate) fn jump_to_attention_target(
     if !tab.panes.contains_pane(pane_id) {
         return false;
     }
-    tab.focused_pane_id = pane_id;
+    state.set_focused_pane(tab_id, pane_id);
     state.activate_tab(tab_id).is_some()
 }
 

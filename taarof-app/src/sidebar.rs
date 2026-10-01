@@ -1548,16 +1548,15 @@ fn focus_work_record_origin(
     };
     let terminal = {
         let mut st = state.borrow_mut();
-        st.find_tab_mut(revalidated_tab).and_then(|tab| {
-            let terminal = tab
-                .panes
+        let terminal = st.find_tab(revalidated_tab).and_then(|(_, tab)| {
+            tab.panes
                 .leaf(revalidated_pane)
-                .map(|leaf| leaf.terminal.clone());
-            if terminal.is_some() {
-                tab.focused_pane_id = revalidated_pane;
-            }
-            terminal
-        })
+                .map(|leaf| leaf.terminal.clone())
+        });
+        if terminal.is_some() {
+            st.set_focused_pane(revalidated_tab, revalidated_pane);
+        }
+        terminal
     };
     let Some(terminal) = terminal else {
         restore_previous_work_focus(state, tab_list, term_stack, previous);
@@ -1582,12 +1581,13 @@ fn restore_previous_work_focus(
     }
     let terminal = {
         let mut st = state.borrow_mut();
-        st.find_tab_mut(tab_id).and_then(|tab| {
-            tab.panes.leaf(pane_id).map(|leaf| {
-                tab.focused_pane_id = pane_id;
-                leaf.terminal.clone()
-            })
-        })
+        let terminal = st
+            .find_tab(tab_id)
+            .and_then(|(_, tab)| tab.panes.leaf(pane_id).map(|leaf| leaf.terminal.clone()));
+        if terminal.is_some() {
+            st.set_focused_pane(tab_id, pane_id);
+        }
+        terminal
     };
     if let Some(terminal) = terminal {
         terminal.grab_focus();
@@ -3448,7 +3448,7 @@ fn select_agent_pane_target(state: &mut AppState, tab_id: u32, pane_id: u32) -> 
         _ => tab.panes.leaf(pane_id).is_some(),
     };
     if exists {
-        tab.focused_pane_id = pane_id;
+        state.set_focused_pane(tab_id, pane_id);
     }
     exists
 }
@@ -4597,7 +4597,7 @@ pub fn add_tab_row(
             tracking_box: tracking_box.clone(),
             plan_tasks: Rc::new(RefCell::new(None)),
             discovery_generation: Rc::new(Cell::new(0)),
-            discovery_poll_source: Rc::new(RefCell::new(None)),
+            discovery_subscription: Rc::new(RefCell::new(None)),
             plan_monitor: Rc::new(RefCell::new(None)),
         },
     );
