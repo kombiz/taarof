@@ -1202,40 +1202,44 @@ async fn spa_fallback(State(state): State<HttpState>, uri: Uri) -> Response {
 
 // ── Server startup ──
 
-fn build_router_with_web_asset_candidates(
-    bridge: BridgeSender,
-    auth_token: String,
-    event_broadcast: broadcast::Sender<Value>,
+/// Optional runtime dependencies shared by startup and router assembly.
+struct HttpServerOptions {
+    control_config: crate::config::HttpControlConfig,
     web_asset_candidates: Vec<PathBuf>,
-) -> Router {
-    build_router_with_web_asset_candidates_and_catalog(
-        bridge,
-        auth_token,
-        event_broadcast,
-        web_asset_candidates,
-        crate::agent_sessions::default_catalog(),
-        false,
-    )
+    agent_session_catalog: Option<Arc<crate::agent_sessions::AgentSessionCatalog>>,
+    pane_dirty: Arc<PaneDirtyRegistry>,
+    history_reader: crate::history::HistoryReader,
 }
 
-fn build_router_with_web_asset_candidates_and_catalog(
-    bridge: BridgeSender,
-    auth_token: String,
-    event_broadcast: broadcast::Sender<Value>,
-    web_asset_candidates: Vec<PathBuf>,
-    agent_session_catalog: Arc<crate::agent_sessions::AgentSessionCatalog>,
+impl Default for HttpServerOptions {
+    fn default() -> Self {
+        Self {
+            control_config: crate::config::HttpControlConfig::default(),
+            web_asset_candidates: web_asset_candidate_paths(),
+            // Resolve only during router assembly, after startup prerequisites
+            // succeed; disabled/failed startup must not initialize the catalog.
+            agent_session_catalog: None,
+            pane_dirty: Arc::new(PaneDirtyRegistry::default()),
+            history_reader: crate::history::HistoryReader::disabled(),
+        }
+    }
+}
+
+/// Gates are supplied separately from optional dependencies: startup derives
+/// these from the resolved bind, rather than trusting an options default.
+#[derive(Default)]
+struct HttpRouterGates {
     control_enabled: bool,
-) -> Router {
-    build_router_with_web_asset_candidates_catalog_and_dirty(
-        bridge,
-        auth_token,
-        event_broadcast,
-        web_asset_candidates,
-        agent_session_catalog,
-        control_enabled,
-        true,
-        Arc::new(PaneDirtyRegistry::default()),
-    )
+    bind_is_loopback: bool,
+}
+
+impl HttpRouterGates {
+    fn for_bind(control_config: &crate::config::HttpControlConfig, addr: SocketAddr) -> Self {
+        Self {
+            control_enabled: http_control_enabled_for_bind(control_config, addr),
+            bind_is_loopback: addr.ip().is_loopback(),
+        }
+    }
 }
 
 /// A per-router runtime identifier stamped onto every remote protocol frame.
@@ -1245,42 +1249,20 @@ fn generate_runtime_id() -> String {
         .unwrap_or_else(|_| "00000000-0000-4000-8000-000000000000".to_string())
 }
 
-#[allow(clippy::too_many_arguments)] // Router assembly threads explicit runtime dependencies.
-fn build_router_with_web_asset_candidates_catalog_and_dirty(
+fn build_router_with_options(
     bridge: BridgeSender,
     auth_token: String,
     event_broadcast: broadcast::Sender<Value>,
-    web_asset_candidates: Vec<PathBuf>,
-    agent_session_catalog: Arc<crate::agent_sessions::AgentSessionCatalog>,
-    control_enabled: bool,
-    bind_is_loopback: bool,
-    pane_dirty: Arc<PaneDirtyRegistry>,
+    options: HttpServerOptions,
+    gates: HttpRouterGates,
 ) -> Router {
-    build_router_with_web_asset_candidates_catalog_dirty_and_history(
-        bridge,
-        auth_token,
-        event_broadcast,
+    let HttpServerOptions {
         web_asset_candidates,
         agent_session_catalog,
-        control_enabled,
-        bind_is_loopback,
         pane_dirty,
-        crate::history::HistoryReader::disabled(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_router_with_web_asset_candidates_catalog_dirty_and_history(
-    bridge: BridgeSender,
-    auth_token: String,
-    event_broadcast: broadcast::Sender<Value>,
-    web_asset_candidates: Vec<PathBuf>,
-    agent_session_catalog: Arc<crate::agent_sessions::AgentSessionCatalog>,
-    control_enabled: bool,
-    bind_is_loopback: bool,
-    pane_dirty: Arc<PaneDirtyRegistry>,
-    history_reader: crate::history::HistoryReader,
-) -> Router {
+        history_reader,
+        ..
+    } = options;
     let pane_snapshotter = default_pane_snapshotter(bridge.clone());
     let pane_snapshot_slots = Arc::new(Semaphore::new(HTTP_PANE_ATTACH_MAX_SNAPSHOT_WORKERS));
     let pane_attach_hub = PaneAttachHub::new(
@@ -1293,10 +1275,11 @@ fn build_router_with_web_asset_candidates_catalog_dirty_and_history(
     let state = HttpState {
         bridge,
         auth_token: Arc::new(auth_token),
-        control_enabled,
-        bind_is_loopback,
+        control_enabled: gates.control_enabled,
+        bind_is_loopback: gates.bind_is_loopback,
         runtime_id: Arc::new(generate_runtime_id()),
-        agent_session_catalog,
+        agent_session_catalog: agent_session_catalog
+            .unwrap_or_else(crate::agent_sessions::default_catalog),
         event_broadcast,
         web_asset_candidates: Arc::new(web_asset_candidates),
         pane_attach_slots: Arc::new(Semaphore::new(HTTP_PANE_ATTACH_MAX_CONNECTIONS)),
@@ -1312,11 +1295,15 @@ pub fn build_router(
     auth_token: String,
     event_broadcast: broadcast::Sender<Value>,
 ) -> Router {
-    build_router_with_web_asset_candidates(
+    build_router_with_options(
         bridge,
         auth_token,
         event_broadcast,
-        web_asset_candidate_paths(),
+        HttpServerOptions::default(),
+        HttpRouterGates {
+            bind_is_loopback: true,
+            ..Default::default()
+        },
     )
 }
 
@@ -1330,15 +1317,18 @@ pub(super) fn test_router_with_gates(
 ) -> (Router, BridgeReceiver) {
     let (bridge_tx, bridge_rx) = mpsc::channel(16);
     let (event_tx, _) = broadcast::channel(16);
-    let app = build_router_with_web_asset_candidates_catalog_and_dirty(
+    let app = build_router_with_options(
         bridge_tx,
         "secret".to_string(),
         event_tx,
-        Vec::new(),
-        crate::agent_sessions::default_catalog(),
-        control_enabled,
-        bind_is_loopback,
-        Arc::new(PaneDirtyRegistry::default()),
+        HttpServerOptions {
+            web_asset_candidates: Vec::new(),
+            ..Default::default()
+        },
+        HttpRouterGates {
+            control_enabled,
+            bind_is_loopback,
+        },
     );
     (app, bridge_rx)
 }
@@ -1384,11 +1374,7 @@ pub fn start_http_server(
     runtime_dir: &Path,
     config: &crate::config::HttpConfig,
 ) -> Option<(BridgeReceiver, broadcast::Sender<Value>)> {
-    start_http_server_with_control_config(
-        runtime_dir,
-        config,
-        &crate::config::HttpControlConfig::default(),
-    )
+    start_http_server_with_options(runtime_dir, config, HttpServerOptions::default())
 }
 
 pub fn start_http_server_with_control_config(
@@ -1396,11 +1382,13 @@ pub fn start_http_server_with_control_config(
     config: &crate::config::HttpConfig,
     control_config: &crate::config::HttpControlConfig,
 ) -> Option<(BridgeReceiver, broadcast::Sender<Value>)> {
-    start_http_server_with_web_asset_candidates_and_control_config(
+    start_http_server_with_options(
         runtime_dir,
         config,
-        control_config,
-        web_asset_candidate_paths(),
+        HttpServerOptions {
+            control_config: control_config.clone(),
+            ..Default::default()
+        },
     )
 }
 
@@ -1411,12 +1399,14 @@ pub fn start_http_server_with_control_config_and_dirty(
     control_config: &crate::config::HttpControlConfig,
     pane_dirty: Arc<PaneDirtyRegistry>,
 ) -> Option<(BridgeReceiver, broadcast::Sender<Value>)> {
-    start_http_server_with_control_config_dirty_and_history(
+    start_http_server_with_options(
         runtime_dir,
         config,
-        control_config,
-        pane_dirty,
-        crate::history::HistoryReader::disabled(),
+        HttpServerOptions {
+            control_config: control_config.clone(),
+            pane_dirty,
+            ..Default::default()
+        },
     )
 }
 
@@ -1428,13 +1418,15 @@ pub fn start_http_server_with_control_config_dirty_and_history(
     pane_dirty: Arc<PaneDirtyRegistry>,
     history_reader: crate::history::HistoryReader,
 ) -> Option<(BridgeReceiver, broadcast::Sender<Value>)> {
-    start_http_server_with_web_asset_candidates_control_config_dirty_and_history(
+    start_http_server_with_options(
         runtime_dir,
         config,
-        control_config,
-        web_asset_candidate_paths(),
-        pane_dirty,
-        history_reader,
+        HttpServerOptions {
+            control_config: control_config.clone(),
+            pane_dirty,
+            history_reader,
+            ..Default::default()
+        },
     )
 }
 
@@ -1444,11 +1436,13 @@ pub fn start_http_server_with_web_asset_candidates(
     config: &crate::config::HttpConfig,
     web_asset_candidates: Vec<PathBuf>,
 ) -> Option<(BridgeReceiver, broadcast::Sender<Value>)> {
-    start_http_server_with_web_asset_candidates_and_control_config(
+    start_http_server_with_options(
         runtime_dir,
         config,
-        &crate::config::HttpControlConfig::default(),
-        web_asset_candidates,
+        HttpServerOptions {
+            web_asset_candidates,
+            ..Default::default()
+        },
     )
 }
 
@@ -1459,12 +1453,14 @@ pub fn start_http_server_with_web_asset_candidates_and_control_config(
     control_config: &crate::config::HttpControlConfig,
     web_asset_candidates: Vec<PathBuf>,
 ) -> Option<(BridgeReceiver, broadcast::Sender<Value>)> {
-    start_http_server_with_web_asset_candidates_control_config_and_dirty(
+    start_http_server_with_options(
         runtime_dir,
         config,
-        control_config,
-        web_asset_candidates,
-        Arc::new(PaneDirtyRegistry::default()),
+        HttpServerOptions {
+            control_config: control_config.clone(),
+            web_asset_candidates,
+            ..Default::default()
+        },
     )
 }
 
@@ -1476,13 +1472,15 @@ pub fn start_http_server_with_web_asset_candidates_control_config_and_dirty(
     web_asset_candidates: Vec<PathBuf>,
     pane_dirty: Arc<PaneDirtyRegistry>,
 ) -> Option<(BridgeReceiver, broadcast::Sender<Value>)> {
-    start_http_server_with_web_asset_candidates_control_config_dirty_and_history(
+    start_http_server_with_options(
         runtime_dir,
         config,
-        control_config,
-        web_asset_candidates,
-        pane_dirty,
-        crate::history::HistoryReader::disabled(),
+        HttpServerOptions {
+            control_config: control_config.clone(),
+            web_asset_candidates,
+            pane_dirty,
+            ..Default::default()
+        },
     )
 }
 
@@ -1494,6 +1492,24 @@ pub fn start_http_server_with_web_asset_candidates_control_config_dirty_and_hist
     web_asset_candidates: Vec<PathBuf>,
     pane_dirty: Arc<PaneDirtyRegistry>,
     history_reader: crate::history::HistoryReader,
+) -> Option<(BridgeReceiver, broadcast::Sender<Value>)> {
+    start_http_server_with_options(
+        runtime_dir,
+        config,
+        HttpServerOptions {
+            control_config: control_config.clone(),
+            web_asset_candidates,
+            pane_dirty,
+            history_reader,
+            ..Default::default()
+        },
+    )
+}
+
+fn start_http_server_with_options(
+    runtime_dir: &Path,
+    config: &crate::config::HttpConfig,
+    options: HttpServerOptions,
 ) -> Option<(BridgeReceiver, broadcast::Sender<Value>)> {
     if !config.enabled {
         return None;
@@ -1546,24 +1562,14 @@ pub fn start_http_server_with_web_asset_candidates_control_config_dirty_and_hist
 
     let (bridge_tx, bridge_rx) = mpsc::channel::<HttpBridgeRequest>(HTTP_BRIDGE_CAPACITY);
     let (event_tx, _) = broadcast::channel::<Value>(256);
-    let control_enabled = http_control_enabled_for_bind(control_config, addr);
-    if control_config.enabled && !control_enabled {
+    let gates = HttpRouterGates::for_bind(&options.control_config, addr);
+    if options.control_config.enabled && !gates.control_enabled {
         eprintln!(
             "taarof: HTTP control API disabled: [http_control].enabled requires a loopback bind"
         );
     }
 
-    let app = build_router_with_web_asset_candidates_catalog_dirty_and_history(
-        bridge_tx,
-        token.clone(),
-        event_tx.clone(),
-        web_asset_candidates,
-        crate::agent_sessions::default_catalog(),
-        control_enabled,
-        addr.ip().is_loopback(),
-        pane_dirty,
-        history_reader,
-    );
+    let app = build_router_with_options(bridge_tx, token.clone(), event_tx.clone(), options, gates);
 
     std::thread::spawn(move || {
         rt.block_on(async move {
@@ -1625,15 +1631,23 @@ mod tests {
     fn test_router_with_control(token: &str, control_enabled: bool) -> (Router, BridgeReceiver) {
         let (bridge_tx, bridge_rx) = mpsc::channel(8);
         let (event_tx, _) = broadcast::channel(16);
-        let app = build_router_with_web_asset_candidates_and_catalog(
+        let app = build_router_with_options(
             bridge_tx,
             token.to_string(),
             event_tx,
-            Vec::new(),
-            Arc::new(crate::agent_sessions::AgentSessionCatalog::with_scanner(
-                Arc::new(FixedAgentSessionScanner::empty()),
-            )),
-            control_enabled,
+            HttpServerOptions {
+                web_asset_candidates: Vec::new(),
+                agent_session_catalog: Some(Arc::new(
+                    crate::agent_sessions::AgentSessionCatalog::with_scanner(Arc::new(
+                        FixedAgentSessionScanner::empty(),
+                    )),
+                )),
+                ..Default::default()
+            },
+            HttpRouterGates {
+                control_enabled,
+                bind_is_loopback: true,
+            },
         );
         (app, bridge_rx)
     }
@@ -2106,7 +2120,10 @@ mod tests {
                     }
                 })
                 .await;
-                assert!(result.is_ok(), "{target:?} control={control}: client remained {rendered:?} after output stopped");
+                assert!(
+                    result.is_ok(),
+                    "{target:?} control={control}: client remained {rendered:?} after output stopped"
+                );
                 assert!(
                     tokio::time::timeout(Duration::from_millis(80), socket.next())
                         .await
@@ -3259,16 +3276,19 @@ mod tests {
 
         let (bridge, _bridge_rx) = mpsc::channel(1);
         let (event_tx, _) = broadcast::channel(1);
-        let app = build_router_with_web_asset_candidates_catalog_dirty_and_history(
+        let app = build_router_with_options(
             bridge,
             "secret".to_string(),
             event_tx,
-            Vec::new(),
-            crate::agent_sessions::default_catalog(),
-            false,
-            true,
-            Arc::new(PaneDirtyRegistry::default()),
-            reader,
+            HttpServerOptions {
+                web_asset_candidates: Vec::new(),
+                history_reader: reader,
+                ..Default::default()
+            },
+            HttpRouterGates {
+                bind_is_loopback: true,
+                ..Default::default()
+            },
         );
         let response = app
             .oneshot(
@@ -4353,6 +4373,99 @@ mod tests {
             &config,
             SocketAddr::from(([0, 0, 0, 0], 7800))
         ));
+    }
+
+    #[test]
+    fn http_assembly_defaults_do_not_enable_control_or_assume_loopback() {
+        let options = HttpServerOptions::default();
+        let gates = HttpRouterGates::default();
+        assert!(!options.control_config.enabled);
+        assert!(options.agent_session_catalog.is_none());
+        assert!(!gates.control_enabled);
+        assert!(!gates.bind_is_loopback);
+        for addr in [
+            SocketAddr::from(([127, 0, 0, 1], 7800)),
+            SocketAddr::from(([0, 0, 0, 0], 7800)),
+        ] {
+            assert!(!HttpRouterGates::for_bind(&options.control_config, addr).control_enabled);
+        }
+    }
+
+    #[test]
+    fn public_startup_convenience_keeps_disabled_http_without_token_file() {
+        let root = unique_temp_dir("disabled-http-options");
+        let runtime_dir = root.join("runtime");
+        let config = crate::config::HttpConfig::default();
+        assert!(!config.enabled);
+        assert!(start_http_server(&runtime_dir, &config).is_none());
+        assert!(!token_path(&runtime_dir).exists());
+        assert!(!runtime_dir.exists());
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_router_convenience_keeps_authenticated_control_disabled() {
+        let (bridge, mut receiver) = mpsc::channel(1);
+        let (events, _) = broadcast::channel(1);
+        let response = build_router(bridge, "secret".to_string(), events)
+            .oneshot(control_request(
+                "/api/v1/control/split-pane",
+                Some("secret"),
+                serde_json::json!({ "direction": "vertical" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn http_options_control_uses_resolved_loopback_bind() {
+        for (address, allowed) in [
+            ("127.0.0.1:7800", true),
+            ("[::1]:7800", true),
+            ("0.0.0.0:7800", false),
+            ("[::]:7800", false),
+        ] {
+            let options = HttpServerOptions {
+                control_config: crate::config::HttpControlConfig { enabled: true },
+                web_asset_candidates: Vec::new(),
+                ..Default::default()
+            };
+            let gates =
+                HttpRouterGates::for_bind(&options.control_config, address.parse().unwrap());
+            assert_eq!(gates.control_enabled, allowed);
+            assert_eq!(gates.bind_is_loopback, allowed);
+            let (bridge, mut receiver) = mpsc::channel(1);
+            let (events, _) = broadcast::channel(1);
+            let responder = tokio::spawn(async move {
+                if let Some(HttpBridgeRequest::ControlAction { reply, .. }) = receiver.recv().await
+                {
+                    let _ = reply.send(Ok(serde_json::json!({ "ok": true })));
+                    true
+                } else {
+                    false
+                }
+            });
+            let response =
+                build_router_with_options(bridge, "secret".to_string(), events, options, gates)
+                    .oneshot(control_request(
+                        "/api/v1/control/split-pane",
+                        Some("secret"),
+                        serde_json::json!({ "direction": "vertical" }),
+                    ))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                response.status(),
+                if allowed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::FORBIDDEN
+                },
+            );
+            assert_eq!(responder.await.unwrap(), allowed);
+        }
     }
 
     #[test]

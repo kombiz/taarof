@@ -602,3 +602,46 @@ fn live_plan_task_id(work: &serde_json::Value, pane_origin: &str, task_id: &str)
         .count();
     (matches == 1).then(|| task_id.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an owned disposable GTK display and D-Bus session"]
+    fn focus_pane_gtk_application_parameter_routing() {
+        let _guard = crate::glib_main_context_test_guard();
+        adw::init().expect("owned GTK display");
+        let application = adw::Application::builder()
+            .application_id("io.github.kombiz.taarof.test.FocusPaneRouting")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        application
+            .register(None::<&gio::Cancellable>)
+            .expect("owned disposable D-Bus session");
+        let window = adw::ApplicationWindow::builder()
+            .application(&application)
+            .build();
+        let handler = crate::focus_pane_notification_action();
+        assert_eq!(
+            handler.parameter_type().as_deref(),
+            Some(glib::VariantTy::STRING)
+        );
+        let received = Rc::new(RefCell::new(Vec::<String>::new()));
+        let observed = received.clone();
+        handler.connect_activate(move |_, parameter| {
+            observed.borrow_mut().push(
+                parameter
+                    .and_then(|value| value.get::<String>())
+                    .expect("focus-pane routes its string parameter"),
+            );
+        });
+        application.add_action(&handler);
+        assert!(application.lookup_action("focus-pane").is_some());
+        assert!(window.lookup_action("focus-pane").is_none());
+        activate_focus_pane(&window, 7, 41);
+        activate_focus_pane(&window, 8, 42);
+        assert_eq!(*received.borrow(), ["7:41", "8:42"]);
+        window.destroy();
+    }
+}
