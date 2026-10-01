@@ -655,7 +655,7 @@ pub fn poll_dashboard_state(
             .filter_map(|(key, result)| result.err().map(|error| (key, error)))
             .collect::<Vec<_>>();
 
-        {
+        let diagnostic = {
             let mut st = state.borrow_mut();
             apply_dashboard_poll_results(
                 &mut st,
@@ -670,7 +670,10 @@ pub fn poll_dashboard_state(
                     session_prefix: &session_prefix,
                     poll_context: &poll_context,
                 },
-            );
+            )
+        };
+        if let Some(record) = diagnostic {
+            crate::diagnostics::enqueue_probe_transition(record);
         }
 
         crate::sidebar::refresh_background_section(&tab_list, &state, &term_stack, &window);
