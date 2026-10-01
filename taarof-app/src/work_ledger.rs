@@ -580,12 +580,12 @@ pub fn project_work_stream_from_records<'a>(
         .collect::<Vec<_>>();
     visible_origins.sort_by_key(|(_, meta)| meta.display_order);
     palette.observe_origins(visible_origins.iter().map(|(origin, _)| origin.as_str()));
+    ordered.sort_by_key(|record| record.seq);
     palette.observe_origins(
         ordered
             .iter()
             .map(|record| record.identity.pane_origin.as_str()),
     );
-    ordered.sort_by_key(|record| record.seq);
 
     let mut latest = HashMap::<String, WorkIdentity>::new();
     for record in &ordered {
@@ -2408,10 +2408,9 @@ pub struct VerifiedPullRequestBinding {
 pub fn collect_probe(state: &crate::AppState) -> WorkProbe {
     let now = crate::events::unix_time_ms();
     let refresh_pull_requests = state.work_ledger.pull_request_reconciliation_due(now);
-    let panes = work_stream_runtime_identities(state)
+    let panes = work_stream_runtime_identity_contexts(state)
         .into_iter()
-        .filter_map(|identity| {
-            let tab = state.find_tab(identity.tab_id)?.1;
+        .map(|(tab, identity)| {
             let tab_id = identity.tab_id;
             let pane_id = identity.pane_id;
             let binding = state.pane_task_binding(tab_id, pane_id).or_else(|| {
@@ -2420,7 +2419,7 @@ pub fn collect_probe(state: &crate::AppState) -> WorkProbe {
                     .get(&tab_id)
                     .and_then(|pending| pending.saved.current_task_for_pane(pane_id))
             });
-            Some(PaneProbe {
+            PaneProbe {
                 identity,
                 activity: tab
                     .pane_agent_activity(pane_id)
@@ -2438,7 +2437,7 @@ pub fn collect_probe(state: &crate::AppState) -> WorkProbe {
                 plan_root: None,
                 plan_tasks: Vec::new(),
                 plan_loaded: false,
-            })
+            }
         })
         .collect();
     let exact_pull_requests = collect_exact_pull_request_probes(state, now, refresh_pull_requests);
@@ -2451,6 +2450,15 @@ pub fn collect_probe(state: &crate::AppState) -> WorkProbe {
 /// Current model identities, including headless/lazy panes. This deliberately
 /// does not construct plan, binding-token, activity or PR probe payloads.
 pub fn work_stream_runtime_identities(state: &crate::AppState) -> Vec<WorkIdentity> {
+    work_stream_runtime_identity_contexts(state)
+        .into_iter()
+        .map(|(_, identity)| identity)
+        .collect()
+}
+
+fn work_stream_runtime_identity_contexts(
+    state: &crate::AppState,
+) -> Vec<(&crate::Tab, WorkIdentity)> {
     let session = crate::instance::session_name().unwrap_or_else(|| "default".to_string());
     let mut identities = Vec::new();
     for workspace in &state.workspaces {
@@ -2480,19 +2488,22 @@ pub fn work_stream_runtime_identities(state: &crate::AppState) -> Vec<WorkIdenti
                         .get(&tab.id)
                         .and_then(|pending| pending.saved.current_task_for_pane(pane_id))
                 });
-                identities.push(WorkIdentity {
-                    session: session.clone(),
-                    workspace_origin: workspace.work_origin.clone(),
-                    tab_origin: tab.work_origin.clone(),
-                    pane_origin: pane_origin(&session, &tab.work_origin, &pane_work_origin),
-                    workspace_id: workspace.id,
-                    workspace_name: workspace.name.clone(),
-                    tab_id: tab.id,
-                    tab_name: tab.name.clone(),
-                    pane_id,
-                    task_id: binding.map(|binding| binding.task_id.clone()),
-                    task_title: binding.map(|binding| binding.title.clone()),
-                });
+                identities.push((
+                    tab,
+                    WorkIdentity {
+                        session: session.clone(),
+                        workspace_origin: workspace.work_origin.clone(),
+                        tab_origin: tab.work_origin.clone(),
+                        pane_origin: pane_origin(&session, &tab.work_origin, &pane_work_origin),
+                        workspace_id: workspace.id,
+                        workspace_name: workspace.name.clone(),
+                        tab_id: tab.id,
+                        tab_name: tab.name.clone(),
+                        pane_id,
+                        task_id: binding.map(|binding| binding.task_id.clone()),
+                        task_title: binding.map(|binding| binding.title.clone()),
+                    },
+                ));
             }
         }
     }
