@@ -1329,6 +1329,22 @@ fn pane_agent_state_label(state: &AppState, tab_id: u32, pane_id: u32) -> Option
         .map(|activity| activity.state.as_wire().to_string())
 }
 
+fn socket_agent_activity_event_payload(
+    tab_id: u32,
+    tab_name: &str,
+    pane_id: u32,
+    state: AgentActivityState,
+    source: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tab_id": tab_id,
+        "tab_name": tab_name,
+        "pane_id": pane_id,
+        "state": state.as_wire(),
+        "source": source,
+    })
+}
+
 fn cleanup_agent_turns(now: Instant) {
     AGENT_TURNS.with(|turns| {
         turns.borrow_mut().retain(|_, turn| {
@@ -3304,13 +3320,8 @@ fn handle_agent_status_message(
             }
         }
 
-        activity_event = serde_json::json!({
-            "tab_id": tab.id,
-            "tab_name": tab.name,
-            "pane_id": pane_id,
-            "state": activity_state.as_wire(),
-            "source": source,
-        });
+        activity_event =
+            socket_agent_activity_event_payload(tab.id, &tab.name, pane_id, activity_state, source);
     }
 
     RuntimeHandle::from_shared_state(state.clone())
@@ -7443,7 +7454,6 @@ mod tests {
                 panic!("expected agent-status");
             };
             assert_eq!(state, expected);
-            assert_eq!(state.as_wire(), expected.as_wire());
         }
         for wire in [
             "working",
@@ -7457,6 +7467,72 @@ mod tests {
                 "action": "agent-status", "state": wire,
             }))
             .is_err());
+        }
+    }
+
+    #[test]
+    fn socket_activity_event_producer_pins_every_state() {
+        for (state, wire) in [
+            (AgentActivityState::Idle, "idle"),
+            (AgentActivityState::Running, "running"),
+            (AgentActivityState::WaitingInput, "waiting-input"),
+            (AgentActivityState::Errored, "errored"),
+            (AgentActivityState::Done, "done"),
+        ] {
+            for source in [None, Some("codex")] {
+                assert_eq!(
+                    super::socket_agent_activity_event_payload(3, "editor", 7, state, source),
+                    serde_json::json!({
+                        "tab_id": 3, "tab_name": "editor", "pane_id": 7,
+                        "state": wire, "source": source,
+                    }),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pane_agent_state_label_producer_pins_every_state() {
+        let mut state = AppState::new();
+        let workspace_id = state.active_workspace;
+        let (tab_id, pane_id) = crate::seed_headless_terminal_tab(
+            &mut state,
+            workspace_id,
+            "editor",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .unwrap();
+        assert_eq!(super::pane_agent_state_label(&state, tab_id, pane_id), None);
+        for (activity_state, wire) in [
+            (AgentActivityState::Idle, "idle"),
+            (AgentActivityState::Running, "running"),
+            (AgentActivityState::WaitingInput, "waiting-input"),
+            (AgentActivityState::Errored, "errored"),
+            (AgentActivityState::Done, "done"),
+        ] {
+            state
+                .find_tab_mut(tab_id)
+                .unwrap()
+                .pane_agent_activity
+                .insert(
+                    pane_id,
+                    AgentActivity {
+                        state: activity_state,
+                        text: "test".into(),
+                        source: None,
+                        origin: crate::workspace::AgentActivityOrigin::Socket,
+                        updated_at: std::time::Instant::now(),
+                        observed_at_unix_ms: 1,
+                    },
+                );
+            assert_eq!(
+                super::pane_agent_state_label(&state, tab_id, pane_id).as_deref(),
+                Some(wire)
+            );
+            assert_eq!(
+                super::pane_agent_state_label(&state, tab_id, pane_id + 1),
+                None
+            );
         }
     }
 

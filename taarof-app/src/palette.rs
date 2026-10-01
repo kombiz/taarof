@@ -2848,6 +2848,23 @@ struct SendTargetPane {
     label: String,
 }
 
+fn send_target_pane_label(
+    agent_label: &str,
+    pane_id: u32,
+    state: Option<crate::workspace::AgentActivityState>,
+    has_shell: bool,
+) -> String {
+    let activity =
+        state
+            .map(|state| state.as_wire())
+            .unwrap_or(if has_shell { "idle" } else { "" });
+    if activity.is_empty() {
+        format!("{agent_label} · pane {pane_id}")
+    } else {
+        format!("{agent_label} · pane {pane_id} · {activity}")
+    }
+}
+
 /// Enumerate every pane in the active workspace as a send target, labelling each
 /// from the CACHED `runtime_probe` snapshot (never a fresh probe) exactly as the
 /// sidebar does, so labels match what the user already sees.
@@ -2884,15 +2901,13 @@ fn send_target_panes(st: &AppState) -> Vec<SendTargetPane> {
                 .find(|instance| instance.pane_id == leaf.pane_id)
                 .map(|instance| instance.instance_label.clone())
                 .unwrap_or_else(|| "shell".to_string());
-            let activity = tab
-                .pane_agent_activity(leaf.pane_id)
-                .map(|activity| activity.state.as_wire())
-                .unwrap_or(if leaf.shell_pid.is_some() { "idle" } else { "" });
-            let label = if activity.is_empty() {
-                format!("{agent_label} · pane {}", leaf.pane_id)
-            } else {
-                format!("{agent_label} · pane {} · {activity}", leaf.pane_id)
-            };
+            let label = send_target_pane_label(
+                &agent_label,
+                leaf.pane_id,
+                tab.pane_agent_activity(leaf.pane_id)
+                    .map(|activity| activity.state),
+                leaf.shell_pid.is_some(),
+            );
             panes.push(SendTargetPane {
                 tab_id: tab.id,
                 pane_id: leaf.pane_id,
@@ -4686,6 +4701,36 @@ pub(crate) fn spawn_command_in_new_tab(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn send_target_pane_label_producer_pins_every_activity_state() {
+        use crate::workspace::AgentActivityState;
+        for (state, label) in [
+            (AgentActivityState::Idle, "codex · pane 7 · idle"),
+            (AgentActivityState::Running, "codex · pane 7 · running"),
+            (
+                AgentActivityState::WaitingInput,
+                "codex · pane 7 · waiting-input",
+            ),
+            (AgentActivityState::Errored, "codex · pane 7 · errored"),
+            (AgentActivityState::Done, "codex · pane 7 · done"),
+        ] {
+            for has_shell in [false, true] {
+                assert_eq!(
+                    super::send_target_pane_label("codex", 7, Some(state), has_shell),
+                    label
+                );
+            }
+        }
+        assert_eq!(
+            super::send_target_pane_label("shell", 7, None, true),
+            "shell · pane 7 · idle"
+        );
+        assert_eq!(
+            super::send_target_pane_label("shell", 7, None, false),
+            "shell · pane 7"
+        );
+    }
+
     use super::*;
     use crate::pane::PaneNode;
     use crate::workspace::{Tab, TabKind};

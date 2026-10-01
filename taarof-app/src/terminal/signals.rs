@@ -32,14 +32,23 @@ fn emit_agent_activity_transition(state: &Rc<RefCell<AppState>>, tab_id: u32, pa
     if let Some((lifecycle, source)) = evidence {
         crate::runtime::RuntimeHandle::from_shared_state(state.clone()).emit_event(
             "agent_activity_changed",
-            serde_json::json!({
-                "tab_id": tab_id,
-                "pane_id": pane_id,
-                "state": lifecycle.activity().as_wire(),
-                "source": source,
-            }),
+            terminal_agent_activity_event_payload(tab_id, pane_id, lifecycle, source.as_deref()),
         );
     }
+}
+
+fn terminal_agent_activity_event_payload(
+    tab_id: u32,
+    pane_id: u32,
+    lifecycle: crate::agents::AgentLifecycle,
+    source: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tab_id": tab_id,
+        "pane_id": pane_id,
+        "state": lifecycle.activity().as_wire(),
+        "source": source,
+    })
 }
 
 pub(super) fn connect_pane_focus_tracking(
@@ -767,6 +776,25 @@ pub(super) fn connect_output_tracking(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_activity_event_producer_pins_every_lifecycle_state() {
+        use crate::agents::AgentLifecycle;
+        for (lifecycle, wire) in [
+            (AgentLifecycle::Idle, "idle"),
+            (AgentLifecycle::Working, "running"),
+            (AgentLifecycle::WaitingInput, "waiting-input"),
+            (AgentLifecycle::Errored, "errored"),
+            (AgentLifecycle::Done, "done"),
+        ] {
+            for source in [None, Some("claude")] {
+                assert_eq!(
+                    super::terminal_agent_activity_event_payload(3, 7, lifecycle, source),
+                    serde_json::json!({"tab_id": 3, "pane_id": 7, "state": wire, "source": source})
+                );
+            }
+        }
+    }
+
     use super::{
         apply_scanned_output_activity, apply_scanned_output_activity_for_pane,
         clear_termprop_activity_for_state, parse_termprop_activity_state,
