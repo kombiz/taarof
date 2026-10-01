@@ -53,6 +53,8 @@ impl WriterClient {
     }
 
     pub(crate) fn try_record(&self, draft: HistoryRecordDraft) {
+        // Retain the validated Rust 1.98 API despite its Rust 1.99 deprecation.
+        #[allow(deprecated)]
         let previous_depth = match self.status.queue_depth.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,

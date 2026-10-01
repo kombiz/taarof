@@ -945,13 +945,13 @@ fn strip_prepared_tmux_backings(
     let mut st = state.borrow_mut();
     if let Some(tab) = st.find_tab_mut(tab_id) {
         for leaf in tab.panes.leaves_mut() {
-            if leaf.tmux_backing.as_ref().is_some_and(&matches) {
+            if leaf.tmux_backing.as_ref().is_some_and(matches) {
                 leaf.tmux_backing = None;
             }
         }
     }
     for ((current_tab_id, _), pane) in &mut st.headless_panes {
-        if *current_tab_id == tab_id && pane.tmux_backing.as_ref().is_some_and(&matches) {
+        if *current_tab_id == tab_id && pane.tmux_backing.as_ref().is_some_and(matches) {
             pane.tmux_backing = None;
         }
     }
