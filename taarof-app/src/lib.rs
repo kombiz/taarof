@@ -3738,8 +3738,9 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
     let session_saved = Rc::new(Cell::new(false));
     let socket_cleaned = Rc::new(Cell::new(false));
 
-    // ── Save session on window close + clean up socket ──
-    {
+    // All exit paths share the same resource hooks and admission guard. The
+    // guard is set before any hook can reenter close/quit on the GTK context.
+    let shutdown_cleanup: Rc<dyn Fn()> = {
         let state = state.clone();
         let session_writer = session_writer.clone();
         let tab_list = tab_list.clone();
@@ -3747,97 +3748,78 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
         let session_saved = session_saved.clone();
         let socket_cleaned = socket_cleaned.clone();
         let socket_path = socket_path.clone();
-        let http_dir_for_close = http_runtime_dir_for_cleanup.clone();
-        let auto_save_source_close = auto_save_source.clone();
-        let live_config_watcher_close = live_config_watcher.clone();
+        let http_dir = http_runtime_dir_for_cleanup.clone();
+        let auto_save_source = auto_save_source.clone();
+        let live_config_watcher = live_config_watcher.clone();
+        let started = Cell::new(false);
+        Rc::new(move || {
+            app_session::shutdown_once(&started, &|| {
+                run_shutdown_cleanup(
+                    &state,
+                    &ShutdownHooks {
+                        stop_background: &|| {
+                            if let Some(watcher) = &live_config_watcher {
+                                watcher.cancel();
+                            }
+                            // Cancel the periodic auto-save so it cannot race with
+                            // the final shutdown save.
+                            if let Some(source_id) = auto_save_source.borrow_mut().take() {
+                                source_id.remove();
+                            }
+                        },
+                        save_session: &|| {
+                            app_session::save_session_once(
+                                &session_saved,
+                                &session_writer,
+                                &state,
+                                &tab_list,
+                                &window_ref,
+                            );
+                        },
+                        release_endpoints: &|| {
+                            cleanup_socket_once(&socket_cleaned, socket_path.as_deref());
+                            if let Some(dir) = &http_dir {
+                                http::cleanup_token_file(dir);
+                            }
+                        },
+                    },
+                );
+            })
+        })
+    };
+    {
+        let cleanup = shutdown_cleanup.clone();
         window.connect_close_request(move |_win| {
-            run_shutdown_cleanup(
-                &state,
-                &ShutdownHooks {
-                    stop_background: &|| {
-                        if let Some(watcher) = &live_config_watcher_close {
-                            watcher.cancel();
-                        }
-                        // Cancel the periodic auto-save so it cannot race with
-                        // the final shutdown save.
-                        if let Some(source_id) = auto_save_source_close.borrow_mut().take() {
-                            source_id.remove();
-                        }
-                    },
-                    save_session: &|| {
-                        app_session::save_session_once(
-                            &session_saved,
-                            &session_writer,
-                            &state,
-                            &tab_list,
-                            &window_ref,
-                        );
-                    },
-                    release_endpoints: &|| {
-                        cleanup_socket_once(&socket_cleaned, socket_path.as_deref());
-                        if let Some(dir) = &http_dir_for_close {
-                            http::cleanup_token_file(dir);
-                        }
-                    },
-                },
-            );
+            cleanup();
             glib::Propagation::Proceed
         });
     }
 
     {
         let runtime = runtime.clone();
-        let socket_cleaned = socket_cleaned.clone();
-        let socket_path = socket_path.clone();
-        let http_dir_for_shutdown = http_runtime_dir_for_cleanup.clone();
-        let live_config_watcher_shutdown = live_config_watcher.clone();
+        let cleanup = shutdown_cleanup.clone();
         app.connect_shutdown(move |_| {
-            run_shutdown_cleanup(
-                &runtime.shared_state(),
-                &ShutdownHooks {
-                    stop_background: &|| {
-                        if let Some(watcher) = &live_config_watcher_shutdown {
-                            watcher.cancel();
-                        }
-                        runtime.emit_event(
-                            "session_stopping",
-                            serde_json::json!({
-                                "session_name": crate::instance::session_name(),
-                            }),
-                        );
-                        crate::diagnostics::record_lifecycle(
-                            "shutdown",
-                            "taarof session stopping",
-                            Some(serde_json::json!({
-                                "pid": std::process::id(),
-                                "session_name": crate::instance::session_name(),
-                            })),
-                        );
-                    },
-                    // Close or signal cleanup owns the final session save.
-                    save_session: &|| {},
-                    release_endpoints: &|| {
-                        cleanup_socket_once(&socket_cleaned, socket_path.as_deref());
-                        if let Some(dir) = &http_dir_for_shutdown {
-                            http::cleanup_token_file(dir);
-                        }
-                    },
-                },
+            // Application telemetry stays at its original shutdown point,
+            // independently of which path first admitted resource cleanup.
+            runtime.emit_event(
+                "session_stopping",
+                serde_json::json!({
+                    "session_name": crate::instance::session_name(),
+                }),
             );
+            crate::diagnostics::record_lifecycle(
+                "shutdown",
+                "taarof session stopping",
+                Some(serde_json::json!({
+                    "pid": std::process::id(),
+                    "session_name": crate::instance::session_name(),
+                })),
+            );
+            cleanup();
         });
     }
 
-    app_session::install_signal_cleanup(
-        app,
-        &session_writer,
-        &state,
-        &tab_list,
-        &window,
-        &session_saved,
-        &socket_cleaned,
-        socket_path.as_deref(),
-        &auto_save_source,
-    );
+    app_session::install_signal_cleanup(app, &shutdown_cleanup);
 
     window.present();
 }
@@ -4126,15 +4108,20 @@ mod tests {
     #[test]
     fn close_first_shutdown_waits_for_final_ledger_snapshot_then_signal_skips_barrier() {
         let mut ledger = latched_ledger("close-first");
+        let started = Cell::new(false);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let close = ledger.hooks(entered_tx);
         let releaser = ledger.release_once_cleanup_waits(entered_rx, close.released.clone());
 
         // Window close runs the shared cleanup while the final write is held.
-        assert_eq!(
-            close.run(|hooks| run_shutdown_cleanup(&ledger.state, hooks)),
-            work_ledger::LedgerShutdown::Durable
-        );
+        close.run(|hooks| {
+            app_session::shutdown_once(&started, &|| {
+                assert_eq!(
+                    run_shutdown_cleanup(&ledger.state, hooks),
+                    work_ledger::LedgerShutdown::Durable
+                );
+            })
+        });
         assert_eq!(
             close.completed_at_release.get(),
             Some(2),
@@ -4148,14 +4135,20 @@ mod tests {
         assert_eq!(ledger.saved_filter(), serde_json::json!("history"));
         let writes_after_close = ledger.writes.load(std::sync::atomic::Ordering::SeqCst);
 
-        // A later signal runs the same cleanup without a second barrier.
+        // A later signal cannot rerun any resource hook or persistence barrier.
         let signal = HookLog::default();
-        let requested = std::sync::atomic::AtomicBool::new(true);
         assert_eq!(
-            signal.run(|hooks| app_session::signal_cleanup_tick(&requested, &ledger.state, hooks)),
+            signal.run(
+                |hooks| app_session::signal_cleanup(&|| app_session::shutdown_once(
+                    &started,
+                    &|| {
+                        run_shutdown_cleanup(&ledger.state, hooks);
+                    }
+                ))
+            ),
             glib::ControlFlow::Break
         );
-        assert_eq!(*signal.steps.borrow(), ["stop", "save", "release"]);
+        assert!(signal.steps.borrow().is_empty());
         assert_eq!(
             ledger.writes.load(std::sync::atomic::Ordering::SeqCst),
             writes_after_close
@@ -4174,21 +4167,19 @@ mod tests {
     #[test]
     fn signal_first_shutdown_waits_for_final_ledger_snapshot_then_close_skips_barrier() {
         let mut ledger = latched_ledger("signal-first");
+        let started = Cell::new(false);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let signal = ledger.hooks(entered_tx);
-        let requested = std::sync::atomic::AtomicBool::new(false);
-
-        // No signal yet: the poll neither cleans up nor stops.
-        assert_eq!(
-            signal.run(|hooks| app_session::signal_cleanup_tick(&requested, &ledger.state, hooks)),
-            glib::ControlFlow::Continue
-        );
-        assert!(signal.steps.borrow().is_empty());
-
-        requested.store(true, std::sync::atomic::Ordering::SeqCst);
         let releaser = ledger.release_once_cleanup_waits(entered_rx, signal.released.clone());
         assert_eq!(
-            signal.run(|hooks| app_session::signal_cleanup_tick(&requested, &ledger.state, hooks)),
+            signal.run(
+                |hooks| app_session::signal_cleanup(&|| app_session::shutdown_once(
+                    &started,
+                    &|| {
+                        run_shutdown_cleanup(&ledger.state, hooks);
+                    }
+                ))
+            ),
             glib::ControlFlow::Break
         );
         assert_eq!(
@@ -4206,11 +4197,12 @@ mod tests {
 
         // The window close that app.quit() triggers skips the barrier.
         let close = HookLog::default();
-        assert_eq!(
-            close.run(|hooks| run_shutdown_cleanup(&ledger.state, hooks)),
-            work_ledger::LedgerShutdown::AlreadyShutDown
-        );
-        assert_eq!(*close.steps.borrow(), ["stop", "save", "release"]);
+        close.run(|hooks| {
+            app_session::shutdown_once(&started, &|| {
+                run_shutdown_cleanup(&ledger.state, hooks);
+            })
+        });
+        assert!(close.steps.borrow().is_empty());
         assert_eq!(
             ledger.writes.load(std::sync::atomic::Ordering::SeqCst),
             writes_after_signal
@@ -4218,6 +4210,51 @@ mod tests {
         assert_eq!(
             ledger.reopened_filter(),
             work_ledger::WorkStreamFilter::History
+        );
+        let _ = std::fs::remove_file(&ledger.path);
+    }
+
+    #[test]
+    fn application_first_shutdown_saves_and_waits_then_all_other_paths_skip_cleanup() {
+        let mut ledger = latched_ledger("application-first");
+        let started = Cell::new(false);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let application = ledger.hooks(entered_tx);
+        let releaser = ledger.release_once_cleanup_waits(entered_rx, application.released.clone());
+        application.run(|hooks| {
+            app_session::shutdown_once(&started, &|| {
+                assert_eq!(
+                    run_shutdown_cleanup(&ledger.state, hooks),
+                    work_ledger::LedgerShutdown::Durable
+                );
+            });
+        });
+        assert_eq!(application.completed_at_release.get(), Some(2));
+        assert!(releaser.join().unwrap());
+        assert_eq!(*application.steps.borrow(), ["stop", "save", "release"]);
+        assert_eq!(ledger.saved_filter(), serde_json::json!("history"));
+        let writes = ledger.writes.load(std::sync::atomic::Ordering::SeqCst);
+        let later = HookLog::default();
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            assert_eq!(
+                later.run(|hooks| app_session::signal_cleanup(&|| {
+                    app_session::shutdown_once(&started, &|| {
+                        run_shutdown_cleanup(&ledger.state, hooks);
+                    });
+                })),
+                glib::ControlFlow::Break,
+                "signal {signal}"
+            );
+        }
+        later.run(|hooks| {
+            app_session::shutdown_once(&started, &|| {
+                run_shutdown_cleanup(&ledger.state, hooks);
+            })
+        });
+        assert!(later.steps.borrow().is_empty());
+        assert_eq!(
+            ledger.writes.load(std::sync::atomic::Ordering::SeqCst),
+            writes
         );
         let _ = std::fs::remove_file(&ledger.path);
     }
