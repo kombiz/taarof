@@ -8613,6 +8613,7 @@ pub(crate) mod tests {
                 assert!(st
                     .find_tab(tab_id)
                     .unwrap()
+                    .1
                     .panes
                     .first_leaf()
                     .unwrap()
@@ -8633,6 +8634,7 @@ pub(crate) mod tests {
             for actual in [
                 &st.find_tab(tab_id)
                     .unwrap()
+                    .1
                     .panes
                     .first_leaf()
                     .unwrap()
