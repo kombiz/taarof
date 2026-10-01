@@ -54,11 +54,11 @@ test("Monitor preference reads and writes tolerate a throwing localStorage gette
     const storage = optionalLocalStorage();
     assert(optionalLocalStorage() === storage, "the fallback is stable across renders");
 
-    assert(readStoredMonitorOrder(storage).length === 0, "order reads as empty");
-    assert(readStoredWatchedKeys(storage).length === 0, "watch list reads as empty");
-    assert(writeStoredMonitorOrder(storage, ["1:1:1"]) === false, "order write is refused without throwing");
-    assert(writeStoredWatchedKeys(storage, ["1:1:1"]) === false, "watch write is refused without throwing");
-    assert(readStoredWatchedKeys(storage).length === 0, "refused writes are not persisted");
+    assert(readStoredMonitorOrder(storage, "runtime-a").length === 0, "order reads as empty");
+    assert(readStoredWatchedKeys(storage, "runtime-a").length === 0, "watch list reads as empty");
+    assert(writeStoredMonitorOrder(storage, ["1:1:1"], "runtime-a") === false, "order write is refused without throwing");
+    assert(writeStoredWatchedKeys(storage, ["1:1:1"], "runtime-a") === false, "watch write is refused without throwing");
+    assert(readStoredWatchedKeys(storage, "runtime-a").length === 0, "refused writes are not persisted");
   });
 });
 

@@ -1,6 +1,7 @@
 import {
   MONITOR_ORDER_STORAGE_KEY,
   MONITOR_WATCH_STORAGE_KEY,
+  monitorPreferenceKey,
   applyManualOrder,
   buildFilterOptions,
   buildPaneTargets,
@@ -354,20 +355,29 @@ test("applyManualOrder honors stored order then falls back to priority", () => {
   );
 });
 
+test("verified pane targets key reused coordinates by runtime and session", () => {
+  const state = snapshot({ workspaces: [workspace(1, [tab(2, [pane(0)])])] });
+  const [a] = buildPaneTargets(state, "runtime-a");
+  const [b] = buildPaneTargets(state, "runtime-b");
+  const [otherSession] = buildPaneTargets({ ...state, session_name: "other" }, "runtime-a");
+  assertEqual(a.key, JSON.stringify(["runtime-a", "legacy-app", 1, 2, 0]));
+  assert(a.key !== b.key && a.key !== otherSession.key, "runtime and session must isolate coordinates");
+});
+
 test("localStorage string-array adapters ignore bad values and write JSON arrays", () => {
   const storage = new MemoryStringArrayStorage([
-    [MONITOR_ORDER_STORAGE_KEY, JSON.stringify(["one", 2, "two", null])],
+    [monitorPreferenceKey(MONITOR_ORDER_STORAGE_KEY, "runtime-a"), JSON.stringify(["one", 2, "two", null])],
     ["invalid", "{"],
   ]);
 
-  assertDeepEqual(readStoredMonitorOrder(storage), ["one", "two"]);
+  assertDeepEqual(readStoredMonitorOrder(storage, "runtime-a"), ["one", "two"]);
   assertDeepEqual(readStoredStringArray(storage, "missing"), []);
   assertDeepEqual(readStoredStringArray(storage, "invalid"), []);
 
-  writeStoredWatchedKeys(storage, ["1:1:1", "1:1:2"]);
+  writeStoredWatchedKeys(storage, ["1:1:1", "1:1:2"], "runtime-a");
 
-  assertEqual(storage.getItem(MONITOR_WATCH_STORAGE_KEY), "[\"1:1:1\",\"1:1:2\"]");
-  assertDeepEqual(readStoredWatchedKeys(storage), ["1:1:1", "1:1:2"]);
+  assertEqual(storage.getItem(monitorPreferenceKey(MONITOR_WATCH_STORAGE_KEY, "runtime-a")), "[\"1:1:1\",\"1:1:2\"]");
+  assertDeepEqual(readStoredWatchedKeys(storage, "runtime-a"), ["1:1:1", "1:1:2"]);
 });
 
 test("monitor preference writers tolerate storage that refuses writes", () => {
@@ -377,9 +387,9 @@ test("monitor preference writers tolerate storage that refuses writes", () => {
     },
   };
 
-  assertEqual(writeStoredWatchedKeys(refusing, ["1:1:1"]), false);
-  assertEqual(writeStoredMonitorOrder(refusing, ["1:1:1"]), false);
-  assertEqual(writeStoredWatchedKeys(new MemoryStringArrayStorage(), ["1:1:1"]), true);
+  assertEqual(writeStoredWatchedKeys(refusing, ["1:1:1"], "runtime-a"), false);
+  assertEqual(writeStoredMonitorOrder(refusing, ["1:1:1"], "runtime-a"), false);
+  assertEqual(writeStoredWatchedKeys(new MemoryStringArrayStorage(), ["1:1:1"], "runtime-a"), true);
 });
 
 
