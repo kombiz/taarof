@@ -3885,12 +3885,28 @@ fn run_shutdown_cleanup_within(
     ledger_budget: Duration,
     report_incomplete: &dyn Fn(&str),
 ) -> work_ledger::LedgerShutdown {
+    run_shutdown_cleanup_with_probe_drain(
+        state,
+        hooks,
+        ledger_budget,
+        report_incomplete,
+        &crate::diagnostics::shutdown_probe_transitions,
+    )
+}
+
+fn run_shutdown_cleanup_with_probe_drain(
+    state: &Rc<RefCell<AppState>>,
+    hooks: &ShutdownHooks<'_>,
+    ledger_budget: Duration,
+    report_incomplete: &dyn Fn(&str),
+    drain_probes: &dyn Fn(),
+) -> work_ledger::LedgerShutdown {
     (hooks.stop_background)();
     (hooks.save_session)();
     // The ledger barrier runs before the history flush because ledger appends
     // feed history.
     let ledger = flush_work_ledger_for_shutdown(state, ledger_budget, report_incomplete);
-    crate::diagnostics::shutdown_probe_transitions();
+    drain_probes();
     if let Err(error) = state.borrow().history.flush() {
         eprintln!("taarof: could not flush history during shutdown: {error}");
     }
@@ -4122,6 +4138,72 @@ mod tests {
             filter: work_ledger::WorkStreamFilter::History,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn shared_shutdown_drains_probe_writer_once_before_releasing_endpoints() {
+        use crate::diagnostics::probe_writer::ProbeWriter;
+        use std::sync::mpsc;
+        let state = Rc::new(RefCell::new(AppState::new()));
+        let (written, observed) = mpsc::channel();
+        let writer = ProbeWriter::start(2, move |record| {
+            written.send(record).unwrap();
+            Ok(())
+        });
+        assert!(writer.enqueue(crate::diagnostics::probe_transition_record(
+            "host-status",
+            true,
+            "probe host-status recovered".into(),
+            serde_json::json!({})
+        )));
+        let drain_count = Cell::new(0);
+        let released = Cell::new(0);
+        let hooks = ShutdownHooks {
+            stop_background: &|| {},
+            save_session: &|| {},
+            release_endpoints: &|| {
+                assert_eq!(drain_count.get(), 1);
+                if released.get() == 0 {
+                    assert_eq!(observed.try_recv().unwrap().action, "probe-recovered");
+                }
+                released.set(released.get() + 1);
+            },
+        };
+        let drain = || {
+            assert!(
+                state.try_borrow_mut().is_ok(),
+                "no AppState borrow during diagnostic drain"
+            );
+            if let Some(outcome) = writer.shutdown(Duration::from_secs(2)) {
+                assert!(outcome.completed);
+                assert_eq!((outcome.dropped, outcome.failed), (0, 0));
+                drain_count.set(drain_count.get() + 1);
+            }
+        };
+        let _ = run_shutdown_cleanup_with_probe_drain(
+            &state,
+            &hooks,
+            Duration::from_secs(2),
+            &|_| {},
+            &drain,
+        );
+        assert!(!writer.enqueue(crate::diagnostics::probe_transition_record(
+            "host-status",
+            true,
+            "late".into(),
+            serde_json::json!({})
+        )));
+        assert_eq!(
+            run_shutdown_cleanup_with_probe_drain(
+                &state,
+                &hooks,
+                Duration::from_secs(2),
+                &|_| {},
+                &drain
+            ),
+            work_ledger::LedgerShutdown::AlreadyShutDown
+        );
+        assert_eq!(released.get(), 2);
     }
 
     #[test]
