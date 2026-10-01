@@ -884,7 +884,7 @@ fn remote_tmux_location(
     (!cwd.is_empty()).then(|| (cwd.to_string(), ssh_target.clone()))
 }
 
-fn tmux_matches_expected_generation(
+pub(super) fn tmux_matches_expected_generation(
     expected: &crate::session::SavedTmuxIdentity,
     info: &crate::tmux::TmuxPaneInfo,
 ) -> bool {
@@ -894,9 +894,16 @@ fn tmux_matches_expected_generation(
 }
 
 /// Poll all tmux-backed panes and update their pane_info metadata.
-pub fn poll_tmux_metadata(state: &Rc<RefCell<AppState>>, tab_list: &gtk::Box) {
-    // Collect (tab_id, pane_id, argv) for all tmux-backed panes — lightweight, on main thread
-    let targets: Vec<(u32, u32, Vec<String>)> = {
+pub(crate) fn poll_tmux_metadata(
+    state: &Rc<RefCell<AppState>>,
+    tab_list: &gtk::Box,
+    in_flight: &crate::runtime_probe::ProbeInFlight,
+) {
+    let Some(guard) = in_flight.try_begin() else {
+        return;
+    };
+    // Capture routing and execution identity for all tmux-backed panes on the main thread.
+    let targets: Vec<super::observation::PaneRequest> = {
         let st = state.borrow();
         st.workspaces
             .iter()
@@ -904,9 +911,13 @@ pub fn poll_tmux_metadata(state: &Rc<RefCell<AppState>>, tab_list: &gtk::Box) {
             .flat_map(|tab| {
                 tab.panes.leaves().into_iter().filter_map(|leaf| {
                     let backing = leaf.tmux_backing.as_ref()?;
-                    let argv =
-                        crate::tmux::pane_info_command(&backing.target, &backing.session_name);
-                    Some((tab.id, leaf.pane_id, argv))
+                    Some((
+                        tab.id,
+                        leaf.pane_id,
+                        backing.target.clone(),
+                        backing.session_name.clone(),
+                        backing.clone(),
+                    ))
                 })
             })
             .collect()
@@ -920,25 +931,15 @@ pub fn poll_tmux_metadata(state: &Rc<RefCell<AppState>>, tab_list: &gtk::Box) {
     let state = state.clone();
     let tab_list = tab_list.clone();
     glib::spawn_future_local(async move {
-        let results: Vec<(u32, u32, Result<crate::tmux::TmuxPaneInfo, String>)> =
-            gio::spawn_blocking(move || {
-                targets
-                    .into_iter()
-                    .map(|(tab_id, pane_id, argv)| {
-                        let info = run_tmux_command_sync_result(&argv).and_then(|output| {
-                            crate::tmux::parse_pane_info(&output).ok_or_else(|| {
-                                "tmux pane probe returned invalid metadata".to_string()
-                            })
-                        });
-                        (tab_id, pane_id, info)
-                    })
-                    .collect()
-            })
-            .await
-            .unwrap_or_default();
+        let _guard = guard;
+        let results: Vec<super::observation::PaneResult> = gio::spawn_blocking(move || {
+            super::observation::observe_panes(targets, run_tmux_command_sync_result)
+        })
+        .await
+        .unwrap_or_default();
 
         let mut any_changed = false;
-        for (tab_id, pane_id, mut result) in results {
+        for ((tab_id, pane_id, _, _, captured), mut result) in results {
             let mut st = state.borrow_mut();
             let mut event = None;
             if let Some(tab) = st.find_tab_mut(tab_id) {
@@ -953,19 +954,12 @@ pub fn poll_tmux_metadata(state: &Rc<RefCell<AppState>>, tab_list: &gtk::Box) {
                             probe_error,
                         ) = {
                             let backing = leaf.tmux_backing.as_mut().expect("checked above");
-                            let replacement_generation = backing
-                                .expected_generation
-                                .as_ref()
-                                .is_some_and(|expected| {
-                                    result.as_ref().is_ok_and(|info| {
-                                        !tmux_matches_expected_generation(expected, info)
-                                    })
-                                });
-                            if replacement_generation {
-                                result = Err(
-                                    "exact saved tmux target no longer exists; same-name replacement refused"
-                                        .to_string(),
-                                );
+                            if !super::observation::accept_pane_result(
+                                backing,
+                                &captured,
+                                &mut result,
+                            ) {
+                                continue;
                             }
                             let location_update = result
                                 .as_ref()
@@ -1036,7 +1030,13 @@ pub fn poll_tmux_metadata(state: &Rc<RefCell<AppState>>, tab_list: &gtk::Box) {
 }
 
 /// Poll host status for all workspaces that have a host_config_name set.
-pub fn poll_host_status(state: &Rc<RefCell<AppState>>) {
+pub(crate) fn poll_host_status(
+    state: &Rc<RefCell<AppState>>,
+    in_flight: &crate::runtime_probe::ProbeInFlight,
+) {
+    let Some(guard) = in_flight.try_begin() else {
+        return;
+    };
     let app_config = crate::config::app_config();
 
     // Collect (ws_id, ssh_target) pairs — lightweight, on main thread
@@ -1059,28 +1059,25 @@ pub fn poll_host_status(state: &Rc<RefCell<AppState>>) {
 
     let state = state.clone();
     glib::spawn_future_local(async move {
-        let results: Vec<(u32, Result<crate::host::HostStatus, String>)> =
-            gio::spawn_blocking(move || {
-                targets
-                    .into_iter()
-                    .map(|(ws_id, ssh_target)| {
-                        let argv = crate::host::probe_status_command(&ssh_target);
-                        let status = run_tmux_command_sync_result(&argv).and_then(|output| {
-                            crate::host::parse_probe_output(&output).ok_or_else(|| {
-                                "host probe returned invalid status output".to_string()
-                            })
-                        });
-                        (ws_id, status)
-                    })
-                    .collect()
-            })
-            .await
-            .unwrap_or_default();
+        let _guard = guard;
+        let results: Vec<super::observation::HostResult> = gio::spawn_blocking(move || {
+            super::observation::observe_hosts(targets, run_tmux_command_sync_result)
+        })
+        .await
+        .unwrap_or_default();
 
-        for (ws_id, result) in results {
+        for (ws_id, host, result) in results {
             let mut st = state.borrow_mut();
             let mut event = None;
             if let Some(ws) = st.workspaces.iter_mut().find(|w| w.id == ws_id) {
+                let current_host = ws
+                    .host_config_name
+                    .as_ref()
+                    .and_then(|name| app_config.hosts.iter().find(|h| &h.name == name))
+                    .and_then(|config| config.ssh_target.as_ref());
+                if current_host != Some(&host) {
+                    continue;
+                }
                 let transition = match result {
                     Ok(status) => ws.host_status.record_success(status),
                     Err(error) => ws.host_status.record_failure(error),

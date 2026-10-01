@@ -6,6 +6,7 @@
 mod attach;
 mod broadcast;
 mod broker_pty;
+mod observation;
 mod process;
 mod restore;
 mod signals;
@@ -14,10 +15,10 @@ mod splits;
 pub(crate) use self::broker_pty::BrokerHandle;
 
 // Non-test parent code uses these items from submodules.
+pub(crate) use self::attach::poll_dashboard_state;
 pub(crate) use self::attach::resolve_attached_session_pane;
 pub use self::attach::{
     attach_session_async, detach_session_by_name, kill_session_by_name_with_hint_async,
-    poll_dashboard_state,
 };
 use self::broadcast::connect_broadcast_input;
 pub(crate) use self::broadcast::{
@@ -41,9 +42,10 @@ use self::restore::{
     build_restored_pane_tree, build_restored_tab_legend, remote_split_respawn, saved_cwd_to_path,
 };
 pub use self::restore::{
-    plan_restored_spawns, poll_host_status, poll_tmux_metadata, AgentResumeOffer, AutoResumeAgents,
-    PlannedRestoreSpawn, SessionRestoreResumePolicy,
+    plan_restored_spawns, AgentResumeOffer, AutoResumeAgents, PlannedRestoreSpawn,
+    SessionRestoreResumePolicy,
 };
+pub(crate) use self::restore::{poll_host_status, poll_tmux_metadata};
 use self::splits::resolved_target_pane_id;
 pub use self::splits::{
     close_pane, detach_pane, open_split_pane, save_pane_tree_for_tab, split_pane,
