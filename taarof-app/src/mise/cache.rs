@@ -134,11 +134,12 @@ pub(crate) fn subscribe_task_discovery(
         let result = if generation == 0 {
             receiver.await.ok()
         } else {
-            use futures_util::future::{select, Either};
+            let mut receiver = receiver;
             let timeout = glib::timeout_future(deadline.saturating_duration_since(Instant::now()));
-            match select(receiver, timeout).await {
-                Either::Left((result, _)) => result.ok(),
-                Either::Right((_, receiver)) => {
+            tokio::select! {
+                biased;
+                result = &mut receiver => result.ok(),
+                _ = timeout => {
                     expire_subscription(&key, generation);
                     receiver.await.ok()
                 }
