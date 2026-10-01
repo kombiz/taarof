@@ -77,6 +77,7 @@ function test(name: string, fn: () => void) {
 
 test("pane identity includes tab name and stable unique ids", () => {
   const first = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 7,
     workspaceName: "Sample",
@@ -85,6 +86,7 @@ test("pane identity includes tab name and stable unique ids", () => {
     paneId: 0,
   });
   const second = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 7,
     workspaceName: "Sample",
@@ -93,7 +95,7 @@ test("pane identity includes tab name and stable unique ids", () => {
     paneId: 0,
   });
 
-  assert(first.paneKey === "taarof web:7:42:0", "paneKey should include session, workspace, tab, pane");
+  assert(first.paneKey === JSON.stringify(["runtime-a", "taarof web", 7, 42, 0]), "paneKey should include session, workspace, tab, pane");
   assert(first.displayName.startsWith("KMUX_pane-0_"), "displayName should preserve safe tab name");
   assert(first.displayName !== second.displayName, "duplicate tab names must remain distinguishable");
 });
@@ -101,6 +103,7 @@ test("pane identity includes tab name and stable unique ids", () => {
 test("append dedupes repeated terminal text", () => {
   const storage = new MemoryStorage();
   const identity = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 1,
     workspaceName: "Main",
@@ -148,6 +151,7 @@ test("append dedupes repeated terminal text", () => {
 test("stored journals with legacy isLatest fields still load", () => {
   const storage = new MemoryStorage();
   const identity = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 1,
     workspaceName: "Main",
@@ -159,7 +163,7 @@ test("stored journals with legacy isLatest fields still load", () => {
 
   storage.setItem(
     key,
-    `{"paneKey":"${identity.paneKey}","entries":[{"paneKey":"${identity.paneKey}","displayName":"Codex_pane-0_test","tabNameAtCapture":"Codex","workspaceNameAtCapture":"Main","workspaceId":1,"tabId":2,"paneId":0,"seenAtUnixMs":1000,"source":"snapshot","text":"one","textHash":"00000000","isLatest":true}],"totalTextBytes":3}`,
+    `{"paneKey":${JSON.stringify(identity.paneKey)},"entries":[{"paneKey":${JSON.stringify(identity.paneKey)},"displayName":"Codex_pane-0_test","tabNameAtCapture":"Codex","workspaceNameAtCapture":"Main","workspaceId":1,"tabId":2,"paneId":0,"seenAtUnixMs":1000,"source":"snapshot","text":"one","textHash":"00000000","isLatest":true}],"totalTextBytes":3}`,
   );
 
   const journal = loadPaneJournal(storage, identity.paneKey, 1000);
@@ -175,6 +179,7 @@ test("stored journals with legacy isLatest fields still load", () => {
 test("loadPaneJournal does not write storage for a valid journal", () => {
   const storage = new CountingStorage();
   const identity = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 1,
     workspaceName: "Main",
@@ -200,6 +205,7 @@ test("loadPaneJournal does not write storage for a valid journal", () => {
 test("append on an unchanged frame performs no storage write", () => {
   const storage = new CountingStorage();
   const identity = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 1,
     workspaceName: "Main",
@@ -229,6 +235,7 @@ test("append on an unchanged frame performs no storage write", () => {
 test("append on a changed frame writes exactly once", () => {
   const storage = new CountingStorage();
   const identity = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 1,
     workspaceName: "Main",
@@ -258,6 +265,7 @@ test("append on a changed frame writes exactly once", () => {
 test("append tolerates storage write failures", () => {
   const storage = new FailingWriteStorage();
   const identity = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 1,
     workspaceName: "Main",
@@ -279,6 +287,7 @@ test("append tolerates storage write failures", () => {
 test("retention enforces age, entry, and text caps", () => {
   const storage = new MemoryStorage();
   const identity = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 1,
     workspaceName: "Main",
@@ -310,6 +319,7 @@ test("retention enforces age, entry, and text caps", () => {
 test("invalid storage is cleared defensively", () => {
   const storage = new MemoryStorage();
   const identity = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 1,
     workspaceName: "Main",
@@ -327,6 +337,7 @@ test("invalid storage is cleared defensively", () => {
 test("invalid non-finite dimensions are cleared defensively", () => {
   const storage = new MemoryStorage();
   const identity = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 1,
     workspaceName: "Main",
@@ -338,7 +349,7 @@ test("invalid non-finite dimensions are cleared defensively", () => {
 
   storage.setItem(
     key,
-    `{"paneKey":"${identity.paneKey}","entries":[{"paneKey":"${identity.paneKey}","displayName":"Codex_pane-0_test","tabNameAtCapture":"Codex","workspaceNameAtCapture":"Main","workspaceId":1,"tabId":2,"paneId":0,"seenAtUnixMs":1000,"source":"snapshot","cols":1e999,"text":"one","textHash":"00000000","isLatest":true}],"totalTextBytes":3}`,
+    `{"paneKey":${JSON.stringify(identity.paneKey)},"entries":[{"paneKey":${JSON.stringify(identity.paneKey)},"displayName":"Codex_pane-0_test","tabNameAtCapture":"Codex","workspaceNameAtCapture":"Main","workspaceId":1,"tabId":2,"paneId":0,"seenAtUnixMs":1000,"source":"snapshot","cols":1e999,"text":"one","textHash":"00000000","isLatest":true}],"totalTextBytes":3}`,
   );
 
   const journal = loadPaneJournal(storage, identity.paneKey, 1000);
@@ -349,6 +360,7 @@ test("invalid non-finite dimensions are cleared defensively", () => {
 test("prune removes stale orphan journals without loading a card directly", () => {
   const storage = new MemoryStorage();
   const identity = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 1,
     workspaceName: "Closed",
@@ -372,6 +384,7 @@ test("prune removes stale orphan journals without loading a card directly", () =
 test("prune keeps fresh journals", () => {
   const storage = new MemoryStorage();
   const identity = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 1,
     workspaceName: "Main",
@@ -396,6 +409,7 @@ test("prune keeps fresh journals", () => {
 test("prune removes invalid encoded keys and malformed journals defensively", () => {
   const storage = new MemoryStorage();
   const identity = buildPaneIdentity({
+    runtimeId: "runtime-a",
     sessionName: "taarof web",
     workspaceId: 1,
     workspaceName: "Main",

@@ -11,8 +11,7 @@ mod signatures;
 mod transcript;
 
 #[cfg(test)]
-use crate::workspace::AgentActivity;
-use crate::workspace::AgentActivityState;
+use crate::workspace::{AgentActivity, AgentActivityState};
 
 /// Classify whether an agent-state transition carries provider attribution.
 /// Generic prompt waits still accept unattributed post-boundary evidence, but
@@ -22,26 +21,6 @@ pub(crate) fn turn_evidence_quality(source: Option<&str>) -> &'static str {
         "provider-attributed"
     } else {
         "degraded-generic"
-    }
-}
-
-pub(crate) fn turn_state_label(state: AgentActivityState) -> &'static str {
-    match state {
-        AgentActivityState::Idle => "idle",
-        AgentActivityState::Running => "running",
-        AgentActivityState::WaitingInput => "waiting-input",
-        AgentActivityState::Errored => "errored",
-        AgentActivityState::Done => "done",
-    }
-}
-
-pub(crate) fn turn_lifecycle_label(state: AgentLifecycle) -> &'static str {
-    match state {
-        AgentLifecycle::Idle => "idle",
-        AgentLifecycle::Working => "running",
-        AgentLifecycle::WaitingInput => "waiting-input",
-        AgentLifecycle::Errored => "errored",
-        AgentLifecycle::Done => "done",
     }
 }
 

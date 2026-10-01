@@ -12,6 +12,7 @@ export interface PaneJournalEnumerableStorage extends PaneJournalStorage {
 }
 
 export interface PaneIdentityInput {
+  runtimeId: string;
   sessionName: string;
   workspaceId: number;
   workspaceName: string;
@@ -104,7 +105,7 @@ export function hashText(value: string): string {
 }
 
 export function buildPaneIdentity(input: PaneIdentityInput): PaneIdentity {
-  const paneKey = `${input.sessionName}:${input.workspaceId}:${input.tabId}:${input.paneId}`;
+  const paneKey = JSON.stringify([input.runtimeId, input.sessionName, input.workspaceId, input.tabId, input.paneId]);
   const shortHash = hashText(paneKey).slice(0, 6);
   return {
     paneKey,

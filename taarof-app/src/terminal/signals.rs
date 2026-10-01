@@ -32,14 +32,23 @@ fn emit_agent_activity_transition(state: &Rc<RefCell<AppState>>, tab_id: u32, pa
     if let Some((lifecycle, source)) = evidence {
         crate::runtime::RuntimeHandle::from_shared_state(state.clone()).emit_event(
             "agent_activity_changed",
-            serde_json::json!({
-                "tab_id": tab_id,
-                "pane_id": pane_id,
-                "state": crate::agents::turn_lifecycle_label(lifecycle),
-                "source": source,
-            }),
+            terminal_agent_activity_event_payload(tab_id, pane_id, lifecycle, source.as_deref()),
         );
     }
+}
+
+fn terminal_agent_activity_event_payload(
+    tab_id: u32,
+    pane_id: u32,
+    lifecycle: crate::agents::AgentLifecycle,
+    source: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tab_id": tab_id,
+        "pane_id": pane_id,
+        "state": lifecycle.activity().as_wire(),
+        "source": source,
+    })
 }
 
 pub(super) fn connect_pane_focus_tracking(
@@ -226,28 +235,7 @@ fn read_termprop_string(terminal: &vte::Terminal, prop_name: &str) -> Option<Str
 pub(super) fn parse_termprop_activity_state(
     value: Option<&str>,
 ) -> Option<crate::workspace::AgentActivityState> {
-    match value?.trim() {
-        value if value.eq_ignore_ascii_case("idle") => {
-            Some(crate::workspace::AgentActivityState::Idle)
-        }
-        value if value.eq_ignore_ascii_case("running") => {
-            Some(crate::workspace::AgentActivityState::Running)
-        }
-        value
-            if value.eq_ignore_ascii_case("waiting-input")
-                || value.eq_ignore_ascii_case("waiting")
-                || value.eq_ignore_ascii_case("needs-input") =>
-        {
-            Some(crate::workspace::AgentActivityState::WaitingInput)
-        }
-        value if value.eq_ignore_ascii_case("errored") || value.eq_ignore_ascii_case("error") => {
-            Some(crate::workspace::AgentActivityState::Errored)
-        }
-        value if value.eq_ignore_ascii_case("done") => {
-            Some(crate::workspace::AgentActivityState::Done)
-        }
-        _ => None,
-    }
+    crate::workspace::AgentActivityState::from_termprop(value?)
 }
 
 fn schedule_termprop_done_clear(
@@ -788,6 +776,25 @@ pub(super) fn connect_output_tracking(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_activity_event_producer_pins_every_lifecycle_state() {
+        use crate::agents::AgentLifecycle;
+        for (lifecycle, wire) in [
+            (AgentLifecycle::Idle, "idle"),
+            (AgentLifecycle::Working, "running"),
+            (AgentLifecycle::WaitingInput, "waiting-input"),
+            (AgentLifecycle::Errored, "errored"),
+            (AgentLifecycle::Done, "done"),
+        ] {
+            for source in [None, Some("claude")] {
+                assert_eq!(
+                    super::terminal_agent_activity_event_payload(3, 7, lifecycle, source),
+                    serde_json::json!({"tab_id": 3, "pane_id": 7, "state": wire, "source": source})
+                );
+            }
+        }
+    }
+
     use super::{
         apply_scanned_output_activity, apply_scanned_output_activity_for_pane,
         clear_termprop_activity_for_state, parse_termprop_activity_state,

@@ -46,7 +46,7 @@ pub(crate) fn agent_activity_transition_payload(
         serde_json::json!({
             "tab_id": tab_id,
             "pane_id": pane_id,
-            "state": crate::agents::turn_lifecycle_label(after),
+            "state": after.activity().as_wire(),
             "source": source,
         })
     })
@@ -71,12 +71,7 @@ pub fn agent_turn_transition(
         return None;
     }
     let state = event.payload.get("state")?.as_str()?;
-    if !matches!(
-        state,
-        "running" | "done" | "waiting-input" | "errored" | "idle"
-    ) {
-        return None;
-    }
+    crate::workspace::AgentActivityState::from_wire(state)?;
     let source = event
         .payload
         .get("source")
@@ -752,6 +747,28 @@ mod tests {
         let evidence = agent_turn_transition(&event, 8, 3, 5).expect("matching evidence");
         assert_eq!(evidence.state, "waiting-input");
         assert_eq!(evidence.evidence_quality, "degraded-generic");
+    }
+
+    #[test]
+    fn persisted_activity_events_reject_nonhistorical_spellings() {
+        for state in [
+            "working",
+            "waiting_input",
+            "waiting",
+            "needs-input",
+            "error",
+            "Running",
+            " running ",
+            "",
+        ] {
+            let event = EventRecord {
+                seq: 2,
+                ts_unix_ms: 1,
+                event_type: "agent_activity_changed".into(),
+                payload: json!({"tab_id": 3, "pane_id": 4, "state": state}),
+            };
+            assert!(agent_turn_transition(&event, 1, 3, 4).is_none(), "{state}");
+        }
     }
 
     #[test]
