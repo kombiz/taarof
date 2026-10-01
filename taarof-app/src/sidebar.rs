@@ -2337,6 +2337,68 @@ fn resolve_tab_move_dispatch(
         .map(|entry| (entry.tab_id, entry.target_ws_id))
 }
 
+const TAB_ROW_FORWARDED: &[(&str, &str, crate::keybindings::Action)] = &[
+    (
+        "split-vertical",
+        "Split Vertical",
+        crate::keybindings::Action::SplitVertical,
+    ),
+    (
+        "split-horizontal",
+        "Split Horizontal",
+        crate::keybindings::Action::SplitHorizontal,
+    ),
+    (
+        "send-to-pane",
+        "Send to Pane…",
+        crate::keybindings::Action::SendToPane,
+    ),
+    (
+        "send-last-output-to-pane",
+        "Send Last Output to Pane…",
+        crate::keybindings::Action::SendLastOutputToPane,
+    ),
+    (
+        "copy-last-message",
+        "Copy Last Agent Message",
+        crate::keybindings::Action::CopyLastMessage,
+    ),
+    (
+        "relay-last-message",
+        "Relay Last Message to Pane…",
+        crate::keybindings::Action::RelayLastMessage,
+    ),
+    (
+        "recent-files",
+        "Recent Files…",
+        crate::keybindings::Action::RecentFiles,
+    ),
+];
+
+fn append_tab_row_forwarded_items(menu: &gio::Menu) {
+    for &(id, label, _) in TAB_ROW_FORWARDED {
+        menu.append(Some(label), Some(&format!("{TAB_MENU_ACTION_GROUP}.{id}")));
+    }
+}
+
+fn register_tab_row_forwarded_actions(
+    group: &gio::SimpleActionGroup,
+    focus_clicked_tab: impl Fn() + Clone + 'static,
+    activate: impl Fn(crate::keybindings::Action) + Clone + 'static,
+) {
+    for &(id, _, forwarded) in TAB_ROW_FORWARDED {
+        let action = gio::SimpleAction::new(id, None);
+        let focus_clicked_tab = focus_clicked_tab.clone();
+        let activate = activate.clone();
+        action.connect_activate(move |_, _| {
+            // Pickers, clipboard operations and splits must target the clicked tab.
+            focus_clicked_tab();
+            activate(forwarded);
+        });
+        group.add_action(&action);
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Menu builders keep their GTK dependencies explicit for local event wiring.
 fn show_tab_row_menu(
     row: &gtk::Box,
@@ -2409,22 +2471,7 @@ fn show_tab_row_menu(
     }
 
     let layout = gio::Menu::new();
-    layout.append(Some("Split Vertical"), Some("tab.split-vertical"));
-    layout.append(Some("Split Horizontal"), Some("tab.split-horizontal"));
-    layout.append(Some("Send to Pane…"), Some("tab.send-to-pane"));
-    layout.append(
-        Some("Send Last Output to Pane…"),
-        Some("tab.send-last-output-to-pane"),
-    );
-    layout.append(
-        Some("Copy Last Agent Message"),
-        Some("tab.copy-last-message"),
-    );
-    layout.append(
-        Some("Relay Last Message to Pane…"),
-        Some("tab.relay-last-message"),
-    );
-    layout.append(Some("Recent Files…"), Some("tab.recent-files"));
+    append_tab_row_forwarded_items(&layout);
     layout.append(Some("Copy CWD"), Some("tab.copy-cwd"));
     layout.append(Some("Discover Tasks"), Some("tab.discover"));
     if let Some(offer) = agent_resume.as_ref() {
@@ -2491,100 +2538,18 @@ fn show_tab_row_menu(
     }
     group.add_action(&duplicate_action);
 
-    let split_vertical_action = gio::SimpleAction::new("split-vertical", None);
     {
-        let row = row.clone();
+        let row_for_focus = row.clone();
+        let row_for_action = row.clone();
         let tab_list = tab_list.clone();
         let state = state.clone();
         let term_stack = term_stack.clone();
-        split_vertical_action.connect_activate(move |_, _| {
-            activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::SplitVertical);
-        });
+        register_tab_row_forwarded_actions(
+            &group,
+            move || activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row_for_focus),
+            move |action| activate_window_action(&row_for_action, action),
+        );
     }
-    group.add_action(&split_vertical_action);
-
-    let split_horizontal_action = gio::SimpleAction::new("split-horizontal", None);
-    {
-        let row = row.clone();
-        let tab_list = tab_list.clone();
-        let state = state.clone();
-        let term_stack = term_stack.clone();
-        split_horizontal_action.connect_activate(move |_, _| {
-            activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::SplitHorizontal);
-        });
-    }
-    group.add_action(&split_horizontal_action);
-
-    // Focus the right-clicked tab's pane first, then open the send-to-pane
-    // picker seeded from that pane's selection/clipboard (or recent output).
-    let send_to_pane_action = gio::SimpleAction::new("send-to-pane", None);
-    {
-        let row = row.clone();
-        let tab_list = tab_list.clone();
-        let state = state.clone();
-        let term_stack = term_stack.clone();
-        send_to_pane_action.connect_activate(move |_, _| {
-            activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::SendToPane);
-        });
-    }
-    group.add_action(&send_to_pane_action);
-
-    let send_last_output_to_pane_action = gio::SimpleAction::new("send-last-output-to-pane", None);
-    {
-        let row = row.clone();
-        let tab_list = tab_list.clone();
-        let state = state.clone();
-        let term_stack = term_stack.clone();
-        send_last_output_to_pane_action.connect_activate(move |_, _| {
-            activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::SendLastOutputToPane);
-        });
-    }
-    group.add_action(&send_last_output_to_pane_action);
-
-    let copy_last_message_action = gio::SimpleAction::new("copy-last-message", None);
-    {
-        let row = row.clone();
-        let tab_list = tab_list.clone();
-        let state = state.clone();
-        let term_stack = term_stack.clone();
-        copy_last_message_action.connect_activate(move |_, _| {
-            activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::CopyLastMessage);
-        });
-    }
-    group.add_action(&copy_last_message_action);
-
-    let relay_last_message_action = gio::SimpleAction::new("relay-last-message", None);
-    {
-        let row = row.clone();
-        let tab_list = tab_list.clone();
-        let state = state.clone();
-        let term_stack = term_stack.clone();
-        relay_last_message_action.connect_activate(move |_, _| {
-            activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::RelayLastMessage);
-        });
-    }
-    group.add_action(&relay_last_message_action);
-
-    // Focus the right-clicked tab first, then open the recent-files picker so it
-    // targets that tab's agents (EXAMPLE-92).
-    let recent_files_action = gio::SimpleAction::new("recent-files", None);
-    {
-        let row = row.clone();
-        let tab_list = tab_list.clone();
-        let state = state.clone();
-        let term_stack = term_stack.clone();
-        recent_files_action.connect_activate(move |_, _| {
-            activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::RecentFiles);
-        });
-    }
-    group.add_action(&recent_files_action);
 
     let copy_cwd_action = gio::SimpleAction::new("copy-cwd", None);
     {
@@ -8068,6 +8033,76 @@ mod tests {
         assert_eq!(entries[0].action_name, "move-to-1");
         assert_eq!(entries[0].detailed_action_name, "tab.move-to-1");
         assert_eq!(entries[1].detailed_action_name, "tab.move-to-3");
+    }
+
+    #[test]
+    fn tab_row_forwarded_menu_preserves_order_labels_and_action_ids() {
+        let menu = gio::Menu::new();
+        super::append_tab_row_forwarded_items(&menu);
+        let expected = [
+            ("Split Vertical", "tab.split-vertical"),
+            ("Split Horizontal", "tab.split-horizontal"),
+            ("Send to Pane…", "tab.send-to-pane"),
+            ("Send Last Output to Pane…", "tab.send-last-output-to-pane"),
+            ("Copy Last Agent Message", "tab.copy-last-message"),
+            ("Relay Last Message to Pane…", "tab.relay-last-message"),
+            ("Recent Files…", "tab.recent-files"),
+        ];
+        assert_eq!(menu.n_items(), expected.len() as i32);
+        for (index, (label, action)) in expected.into_iter().enumerate() {
+            assert_eq!(
+                menu.item_attribute_value(index as i32, "label", None)
+                    .and_then(|value| value.get::<String>()),
+                Some(label.to_string())
+            );
+            assert_eq!(
+                menu.item_attribute_value(index as i32, "action", None)
+                    .and_then(|value| value.get::<String>()),
+                Some(action.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn tab_row_forwarded_registered_callbacks_focus_clicked_tab_before_activation() {
+        use crate::keybindings::Action;
+        let group = gio::SimpleActionGroup::new();
+        let active_tab = Rc::new(std::cell::Cell::new(99));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let active_for_focus = active_tab.clone();
+        let events_for_focus = events.clone();
+        let active_for_action = active_tab.clone();
+        let events_for_action = events.clone();
+        super::register_tab_row_forwarded_actions(
+            &group,
+            move || {
+                active_for_focus.set(7);
+                events_for_focus.borrow_mut().push((7, None));
+            },
+            move |action| {
+                events_for_action
+                    .borrow_mut()
+                    .push((active_for_action.get(), Some(action)));
+            },
+        );
+        let expected = [
+            ("split-vertical", Action::SplitVertical),
+            ("split-horizontal", Action::SplitHorizontal),
+            ("send-to-pane", Action::SendToPane),
+            ("send-last-output-to-pane", Action::SendLastOutputToPane),
+            ("copy-last-message", Action::CopyLastMessage),
+            ("relay-last-message", Action::RelayLastMessage),
+            ("recent-files", Action::RecentFiles),
+        ];
+        assert_eq!(group.list_actions().len(), expected.len());
+        for (id, action) in expected {
+            assert!(group.has_action(id));
+            assert!(group.is_action_enabled(id));
+            active_tab.set(99);
+            events.borrow_mut().clear();
+            group.activate_action(id, None);
+            assert_eq!(*events.borrow(), vec![(7, None), (7, Some(action))]);
+        }
     }
 
     #[test]
