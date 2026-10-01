@@ -1053,6 +1053,7 @@ version = "0.22.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc698e05c8483a899312f76b30b8d6d59e44f9e6ddf93a7487a6de34019b543d"
 dependencies = [
+ "futures-core",
  "glib",
  "glib-unix-sys",
 ]
