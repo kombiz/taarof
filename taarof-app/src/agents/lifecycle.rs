@@ -65,6 +65,27 @@ pub(crate) enum AgentLifecycle {
 }
 
 impl AgentLifecycle {
+    pub(crate) fn from_activity(state: AgentActivityState) -> Self {
+        match state {
+            AgentActivityState::Idle => Self::Idle,
+            AgentActivityState::Running => Self::Working,
+            AgentActivityState::WaitingInput => Self::WaitingInput,
+            AgentActivityState::Errored => Self::Errored,
+            AgentActivityState::Done => Self::Done,
+        }
+    }
+
+    /// Explicit conversion to the activity contract (distinct from catalog wire).
+    pub(crate) fn activity(self) -> AgentActivityState {
+        match self {
+            Self::Idle => AgentActivityState::Idle,
+            Self::Working => AgentActivityState::Running,
+            Self::WaitingInput => AgentActivityState::WaitingInput,
+            Self::Errored => AgentActivityState::Errored,
+            Self::Done => AgentActivityState::Done,
+        }
+    }
+
     /// Uppercase badge text for the native sidebar and agent cards.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -77,7 +98,7 @@ impl AgentLifecycle {
     }
 
     /// Colourful, glanceable label for native UI badges. Wire/API labels stay
-    /// plain and stable through [`Self::label`] and [`Self::wire`].
+    /// plain and stable through [`Self::wire`].
     pub(crate) fn ui_label(self) -> &'static str {
         match self {
             Self::Working => "🟢 WORKING",
@@ -193,16 +214,6 @@ impl PaneTurn {
     }
 }
 
-fn lifecycle_for_signal_state(state: AgentActivityState) -> AgentLifecycle {
-    match state {
-        AgentActivityState::Idle => AgentLifecycle::Idle,
-        AgentActivityState::Running => AgentLifecycle::Working,
-        AgentActivityState::WaitingInput => AgentLifecycle::WaitingInput,
-        AgentActivityState::Errored => AgentLifecycle::Errored,
-        AgentActivityState::Done => AgentLifecycle::Done,
-    }
-}
-
 /// Resolve one pane's lifecycle state from every piece of evidence taarof has.
 ///
 /// `signal` is the last recorded [`AgentActivity`] for the pane (socket,
@@ -218,7 +229,7 @@ pub(crate) fn resolve(
 ) -> AgentLifecycle {
     // 1. The agent reported its own state through a privileged channel.
     if let Some(signal) = signal.filter(|signal| signal.has_fresh_explicit_update()) {
-        return lifecycle_for_signal_state(signal.state);
+        return AgentLifecycle::from_activity(signal.state);
     }
 
     // 2. A live attention signal. Permission prompts and crashed turns never
@@ -230,7 +241,7 @@ pub(crate) fn resolve(
                 AgentActivityState::WaitingInput | AgentActivityState::Errored
             )
     }) {
-        return lifecycle_for_signal_state(signal.state);
+        return AgentLifecycle::from_activity(signal.state);
     }
 
     // 3. Native transcript turn evidence.

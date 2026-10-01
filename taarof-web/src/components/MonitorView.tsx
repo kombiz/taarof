@@ -4,6 +4,7 @@ import {
   type PaneAttachPhase,
 } from "../paneAttachFrames";
 import { optionalLocalStorage } from "../browserStorage";
+import type { MonitorPersistence, MonitorPersistenceState } from "../monitorPersistence";
 import {
   buildPaneIdentity,
   formatPaneJournalText,
@@ -22,14 +23,10 @@ import {
   matchesMonitorFilter,
   paneAgentBadge,
   paneAgentLabel,
-  readStoredMonitorOrder,
-  readStoredWatchedKeys,
   resolveWorkFocusTarget,
   tabAgentInstances,
   visibleWorkTruth,
   workTruthLabels,
-  writeStoredMonitorOrder,
-  writeStoredWatchedKeys,
   type MonitorFilter,
   type PaneTarget,
 } from "../monitorBoard";
@@ -50,6 +47,10 @@ const MAX_WATCH_SIGNAL_PREVIEWS = 6;
 type MonitorPhase = PaneAttachPhase;
 
 interface MonitorViewProps {
+  persistence: MonitorPersistence;
+  persistenceState: MonitorPersistenceState;
+  runtimeId: string | null;
+  namespace: string | null;
   isLoading: boolean;
   token: string;
   snapshot: TaarofStateSnapshot | null;
@@ -57,6 +58,8 @@ interface MonitorViewProps {
 }
 
 interface MonitorPaneCardProps {
+  persistence: MonitorPersistence;
+  persistenceGeneration: number;
   actionLabel?: string;
   canMoveDown: boolean;
   canMoveUp: boolean;
@@ -72,6 +75,8 @@ interface MonitorPaneCardProps {
 }
 
 function MonitorPaneCard({
+  persistence,
+  persistenceGeneration,
   actionLabel = "Watch",
   canMoveDown,
   canMoveUp,
@@ -95,7 +100,8 @@ function MonitorPaneCard({
   );
   const identity = useMemo(
     () =>
-      buildPaneIdentity({
+      target.runtimeId === null ? null : buildPaneIdentity({
+        runtimeId: target.runtimeId,
         sessionName: target.sessionName,
         workspaceId: target.workspace.id,
         workspaceName: target.workspace.name,
@@ -105,6 +111,7 @@ function MonitorPaneCard({
       }),
     [
       target.pane.pane_id,
+      target.runtimeId,
       target.sessionName,
       target.tab.name,
       target.tab.tab_id,
@@ -112,18 +119,23 @@ function MonitorPaneCard({
       target.workspace.name,
     ],
   );
-  const journal = usePaneJournal(optionalLocalStorage(), identity, latestJournalFrame);
+  const journal = usePaneJournal(optionalLocalStorage(), identity, latestJournalFrame, {
+    controllerOwner: persistence,
+    generation: persistenceGeneration,
+  });
 
   const queueJournalFrame = useCallback(
     (frame: Omit<PaneJournalFrame, "seenAtUnixMs" | "sequence">) => {
+      if (!identity || !persistence.canAttribute(identity.paneKey, persistenceGeneration)) return;
       frameSequenceRef.current += 1;
       setLatestJournalFrame({
         ...frame,
         seenAtUnixMs: Date.now(),
         sequence: frameSequenceRef.current,
+        attributionGeneration: persistenceGeneration,
       });
     },
-    [],
+    [identity, persistence, persistenceGeneration],
   );
 
   useEffect(() => {
@@ -237,7 +249,7 @@ function MonitorPaneCard({
 
       <details className="monitor-card__text-capture">
         <summary>
-          <span>{identity.displayName}</span>
+          <span>{identity?.displayName ?? "Unverified pane — journal unavailable"}</span>
           <strong>{journal.totalTextBytes.toLocaleString()} bytes</strong>
         </summary>
         <div className="monitor-card__journal-meta">
@@ -328,6 +340,10 @@ function MonitorPaneCard({
 }
 
 export function MonitorView({
+  persistence,
+  persistenceState,
+  runtimeId,
+  namespace,
   isLoading,
   token,
   snapshot,
@@ -335,12 +351,10 @@ export function MonitorView({
 }: MonitorViewProps) {
   const [filter, setFilter] = useState<MonitorFilter>("all");
   const [showWorkHistory, setShowWorkHistory] = useState(false);
-  const [orderedKeys, setOrderedKeys] = useState<string[]>(() =>
-    readStoredMonitorOrder(optionalLocalStorage()),
-  );
-  const [watchedKeys, setWatchedKeys] = useState<string[]>(() =>
-    readStoredWatchedKeys(optionalLocalStorage()),
-  );
+  const [unverifiedOrder, setUnverifiedOrder] = useState<string[]>([]);
+  const [unverifiedWatch, setUnverifiedWatch] = useState<string[]>([]);
+  const orderedKeys = namespace === null ? unverifiedOrder : persistenceState.orderedKeys;
+  const watchedKeys = namespace === null ? unverifiedWatch : persistenceState.watchedKeys;
   const work = snapshot?.work;
   const workTruth = work?.truth ?? [];
   const workEntries = work?.all_entries ?? work?.entries ?? [];
@@ -355,10 +369,17 @@ export function MonitorView({
   const hasWork = Boolean(work && (workEntries.length > 0 || work.legend.length > 0));
 
   useEffect(() => {
-    pruneExpiredPaneJournals(optionalLocalStorage());
-  }, []);
+    if (namespace === null) {
+      setUnverifiedOrder([]);
+      setUnverifiedWatch([]);
+    }
+  }, [namespace, snapshot]);
 
-  const baseTargets = useMemo(() => buildPaneTargets(snapshot), [snapshot]);
+  useEffect(() => {
+    if (namespace !== null) pruneExpiredPaneJournals(optionalLocalStorage());
+  }, [namespace]);
+
+  const baseTargets = useMemo(() => buildPaneTargets(snapshot, runtimeId), [snapshot, runtimeId]);
   const targets = useMemo(
     () => applyManualOrder(baseTargets, orderedKeys),
     [baseTargets, orderedKeys],
@@ -415,13 +436,13 @@ export function MonitorView({
   );
 
   function commitOrder(nextKeys: string[]) {
-    setOrderedKeys(nextKeys);
-    writeStoredMonitorOrder(optionalLocalStorage(), nextKeys);
+    if (namespace === null) setUnverifiedOrder(nextKeys);
+    else persistence.commitOrder(nextKeys, namespace);
   }
 
   function commitWatchedKeys(nextKeys: string[]) {
-    setWatchedKeys(nextKeys);
-    writeStoredWatchedKeys(optionalLocalStorage(), nextKeys);
+    if (namespace === null) setUnverifiedWatch(nextKeys);
+    else persistence.commitWatchedKeys(nextKeys, namespace);
   }
 
   function toggleWatchedTarget(targetKey: string) {
@@ -620,6 +641,8 @@ export function MonitorView({
           <div className="monitor-view__signal-grid">
             {visibleWatchSignalTargets.map((target) => (
               <MonitorPaneCard
+                persistence={persistence}
+                persistenceGeneration={persistenceState.generation}
                 actionLabel="Add to watch"
                 canMoveDown={false}
                 canMoveUp={false}
@@ -656,6 +679,8 @@ export function MonitorView({
         {visibleTargets.map((target, targetIndex) => {
           return (
           <MonitorPaneCard
+            persistence={persistence}
+            persistenceGeneration={persistenceState.generation}
             canMoveDown={targetIndex < visibleTargets.length - 1}
             canMoveUp={targetIndex > 0}
             isLive={livePreviewKeys.has(target.key)}

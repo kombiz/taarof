@@ -46,6 +46,23 @@ read-only messages documented below.
 
 ## Endpoints
 
+### Lifecycle and activity vocabulary
+
+These established fields have distinct wire contracts. Agent catalog lifecycle
+`state` uses `idle`, `working`, `waiting_input`, `errored`, and `done`.
+Activity payload `state` and `agent_activity_changed` events use `idle`,
+`running`, `waiting-input`, `errored`, and `done`. The lifecycle enum owns the
+catalog conversion and explicitly converts to the activity enum for events;
+the activity enum owns activity wire conversion. Native badge labels remain
+display text only.
+
+Socket `agent-status` inputs also accept `waiting` and `needs-input` for
+`waiting-input`, and `error` for `errored`. They are case-sensitive and reject
+surrounding whitespace. VTE activity termprops accept these same forms after
+trimming whitespace and ignoring ASCII case. Persisted activity events accept
+only the five established activity forms above, retaining historical input
+acceptance and rejection. This centralization introduces no wire migration.
+
 ### query-state
 
 Returns a versioned snapshot of the full taarof runtime state.

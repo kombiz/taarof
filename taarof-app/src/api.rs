@@ -13,10 +13,7 @@ use crate::{
     pane::{PaneLeaf, PaneProcessState},
     probe::{ProbeSnapshot, ProbeState},
     tracking::TrackingData,
-    workspace::{
-        AgentActivity, AgentActivityOrigin, AgentActivityState, Tab, TabKind, Workspace,
-        WorkspaceStatus,
-    },
+    workspace::{AgentActivity, AgentActivityOrigin, Tab, TabKind, Workspace, WorkspaceStatus},
     AppState,
 };
 
@@ -946,7 +943,7 @@ fn tmux_probe_size(
 
 fn agent_activity_payload(activity: &AgentActivity) -> Value {
     json!({
-        "state": agent_activity_state_label(activity.state),
+        "state": activity.state.as_wire(),
         "text": activity.text,
         "source": activity.source,
         "origin": agent_activity_origin_label(activity.origin),
@@ -1466,16 +1463,6 @@ fn tab_kind_label(kind: TabKind) -> &'static str {
     }
 }
 
-fn agent_activity_state_label(state: AgentActivityState) -> &'static str {
-    match state {
-        AgentActivityState::Idle => "idle",
-        AgentActivityState::Running => "running",
-        AgentActivityState::WaitingInput => "waiting-input",
-        AgentActivityState::Errored => "errored",
-        AgentActivityState::Done => "done",
-    }
-}
-
 fn agent_activity_origin_label(origin: AgentActivityOrigin) -> &'static str {
     match origin {
         AgentActivityOrigin::Socket => "socket",
@@ -1506,6 +1493,7 @@ fn unix_time_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::agent_activity_payload;
     use super::{
         agent_badge_payload, agent_entry_payload, build_active_alerts,
         build_health_snapshot_from_parts, host_status_payload, pane_attach_metadata,
@@ -1762,6 +1750,68 @@ mod tests {
         assert_eq!(payload["state"], serde_json::json!("working"));
         assert_eq!(payload["state_label"], serde_json::json!("WORKING"));
         assert_eq!(payload["activity"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn lifecycle_and_activity_producers_preserve_distinct_wire_contracts() {
+        use crate::agents::AgentLifecycle;
+        let instance = crate::runtime_probe::AgentInstance {
+            pane_id: 4,
+            agent_name: Some("claude".into()),
+            session_id: None,
+            instance_label: "claude".into(),
+            kind_index: 1,
+        };
+        for (lifecycle, catalog, activity_wire) in [
+            (AgentLifecycle::Idle, "idle", "idle"),
+            (AgentLifecycle::Working, "working", "running"),
+            (
+                AgentLifecycle::WaitingInput,
+                "waiting_input",
+                "waiting-input",
+            ),
+            (AgentLifecycle::Errored, "errored", "errored"),
+            (AgentLifecycle::Done, "done", "done"),
+        ] {
+            assert_eq!(
+                AgentLifecycle::from_activity(lifecycle.activity()),
+                lifecycle
+            );
+            assert_eq!(
+                agent_entry_payload(&instance, None, lifecycle)["state"],
+                catalog
+            );
+            let activity = AgentActivity {
+                state: lifecycle.activity(),
+                text: "test".into(),
+                source: None,
+                origin: crate::workspace::AgentActivityOrigin::Socket,
+                updated_at: std::time::Instant::now(),
+                observed_at_unix_ms: 1,
+            };
+            assert_eq!(agent_activity_payload(&activity)["state"], activity_wire);
+            let before = if lifecycle == AgentLifecycle::Idle {
+                AgentLifecycle::Working
+            } else {
+                AgentLifecycle::Idle
+            };
+            let payload =
+                crate::events::agent_activity_transition_payload(3, 4, before, lifecycle, None)
+                    .unwrap();
+            assert_eq!(payload["state"], activity_wire);
+            let event = crate::events::EventRecord {
+                seq: 2,
+                ts_unix_ms: 1,
+                event_type: "agent_activity_changed".into(),
+                payload,
+            };
+            assert_eq!(
+                crate::events::agent_turn_transition(&event, 1, 3, 4)
+                    .unwrap()
+                    .state,
+                activity_wire
+            );
+        }
     }
 
     #[test]

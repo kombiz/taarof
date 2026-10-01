@@ -83,7 +83,7 @@ function test(name: string, fn: () => void) {
 
 function createTestPaneIdentity() {
   return buildPaneIdentity({
-    sessionName: "taarof web",
+    runtimeId: "runtime-a", sessionName: "taarof web",
     workspaceId: 1,
     workspaceName: "Main",
     tabId: 2,
@@ -225,7 +225,7 @@ test("same-key metadata updates preserve unsaved frames and capture new names on
   storage.failWrites = true;
   controller.observe({ source: "raw", text: "unsaved", seenAtUnixMs: now + 1 });
   controller.flush();
-  const renamed = buildPaneIdentity({ sessionName: "taarof web", workspaceId: 1, workspaceName: "Renamed workspace", tabId: 2, tabName: "Renamed tab", paneId: 0 });
+  const renamed = buildPaneIdentity({ runtimeId: "runtime-a", sessionName: "taarof web", workspaceId: 1, workspaceName: "Renamed workspace", tabId: 2, tabName: "Renamed tab", paneId: 0 });
   assert(renamed.paneKey === identity.paneKey, "a metadata rename must keep pane identity");
   controller.updateIdentity(renamed);
   assert(storage.storedJson() === original, "updating metadata must preserve persisted history");

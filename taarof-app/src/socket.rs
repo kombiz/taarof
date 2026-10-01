@@ -190,8 +190,7 @@ fn correlate_native_turn(
     evidence: Option<&agents::ProviderNativeTurnId>,
 ) -> Option<agents::ProviderNativeTurnId> {
     let provider = turn.provider.as_deref()?;
-    if !matches!(provider, "claude" | "codex")
-        || current.provider.as_deref() != Some(provider)
+    if current.provider.as_deref() != Some(provider)
         || current.provider_shell_pid != turn.provider_shell_pid
         || current.provider_session_id != turn.provider_session_id
         || turn
@@ -1271,7 +1270,23 @@ fn pane_agent_state_label(state: &AppState, tab_id: u32, pane_id: u32) -> Option
     state
         .find_tab(tab_id)
         .and_then(|(_, tab)| tab.pane_agent_activity.get(&pane_id))
-        .map(|activity| agents::turn_state_label(activity.state).to_string())
+        .map(|activity| activity.state.as_wire().to_string())
+}
+
+fn socket_agent_activity_event_payload(
+    tab_id: u32,
+    tab_name: &str,
+    pane_id: u32,
+    state: AgentActivityState,
+    source: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tab_id": tab_id,
+        "tab_name": tab_name,
+        "pane_id": pane_id,
+        "state": state.as_wire(),
+        "source": source,
+    })
 }
 
 fn cleanup_agent_turns(now: Instant) {
@@ -3015,16 +3030,6 @@ fn retarget_tab_attention_to_remaining_activity(tab: &mut crate::Tab) -> bool {
     true
 }
 
-fn socket_activity_state_label(state: SocketActivityState) -> &'static str {
-    match state {
-        SocketActivityState::Idle => "idle",
-        SocketActivityState::Running => "running",
-        SocketActivityState::WaitingInput => "waiting-input",
-        SocketActivityState::Errored => "errored",
-        SocketActivityState::Done => "done",
-    }
-}
-
 fn handle_work_context_message(
     state: &Rc<RefCell<AppState>>,
     tab_target: Option<&String>,
@@ -3266,13 +3271,8 @@ fn handle_agent_status_message(
             }
         }
 
-        activity_event = serde_json::json!({
-            "tab_id": tab.id,
-            "tab_name": tab.name,
-            "pane_id": pane_id,
-            "state": socket_activity_state_label(activity_state),
-            "source": source,
-        });
+        activity_event =
+            socket_agent_activity_event_payload(tab.id, &tab.name, pane_id, activity_state, source);
     }
 
     RuntimeHandle::from_shared_state(state.clone())
@@ -4728,7 +4728,7 @@ fn write_json_response_with_timeout(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         agent_turn_stop_outcome, alert_event_payload, apply_agent_turn_events, apply_notify_state,
         bind_socket_listener, bounded_agent_output, cancel_agent_turn, cleanup_socket,
@@ -4982,6 +4982,35 @@ mod tests {
         let mut old_id = current.clone();
         old_id.native_turn_id.as_mut().unwrap().id = "old-turn".into();
         assert!(correlate_native_turn(&turn, &old_id, old_id.native_turn_id.as_ref()).is_none());
+        let mut wrong_pid = current.clone();
+        wrong_pid.provider_shell_pid = Some(43);
+        assert!(
+            correlate_native_turn(&turn, &wrong_pid, wrong_pid.native_turn_id.as_ref()).is_none()
+        );
+        let mut wrong_session = current.clone();
+        wrong_session.provider_session_id = Some("other-provider-session".into());
+        assert!(correlate_native_turn(
+            &turn,
+            &wrong_session,
+            wrong_session.native_turn_id.as_ref()
+        )
+        .is_none());
+        let mut wrong_provider = current.clone();
+        wrong_provider.provider = Some("other-provider".into());
+        assert!(correlate_native_turn(
+            &turn,
+            &wrong_provider,
+            wrong_provider.native_turn_id.as_ref()
+        )
+        .is_none());
+        let mut wrong_evidence = current.clone();
+        wrong_evidence.native_turn_id.as_mut().unwrap().provider = "other-provider".into();
+        assert!(correlate_native_turn(
+            &turn,
+            &wrong_evidence,
+            wrong_evidence.native_turn_id.as_ref()
+        )
+        .is_none());
         let mut mismatched = current;
         mismatched.transcript_session_id = Some("other-session".into());
         assert!(
@@ -4996,11 +5025,6 @@ mod tests {
         turn.provider = Some("pi".into());
         let current = NativeTurnBoundary {
             provider: Some("pi".into()),
-            native_turn_id: Some(crate::agents::ProviderNativeTurnId {
-                provider: "pi".into(),
-                id: "turn".into(),
-                observed_at_unix_ms: 1_001,
-            }),
             ..Default::default()
         };
         assert!(correlate_native_turn(&turn, &current, current.native_turn_id.as_ref()).is_none());
@@ -5011,6 +5035,32 @@ mod tests {
             ..Default::default()
         };
         assert!(correlate_native_turn(&turn, &missing, None).is_none());
+    }
+
+    /// Runs real socket correlation against evidence folded by a test adapter.
+    pub(crate) fn assert_adapter_native_turn_correlation(
+        evidence: Option<&crate::agents::ProviderNativeTurnId>,
+        expected: Option<&str>,
+    ) {
+        let mut turn = pending_agent_turn();
+        turn.provider = Some("test-native".into());
+        turn.prompted_at_unix_ms = 1_000;
+        turn.provider_shell_pid = Some(42);
+        turn.provider_session_id = Some("provider-session".into());
+        turn.transcript_session_id = Some("transcript-session".into());
+        let current = NativeTurnBoundary {
+            provider: turn.provider.clone(),
+            provider_shell_pid: turn.provider_shell_pid,
+            provider_session_id: turn.provider_session_id.clone(),
+            transcript_session_id: turn.transcript_session_id.clone(),
+            native_turn_id: evidence.cloned(),
+        };
+        assert_eq!(
+            correlate_native_turn(&turn, &current, evidence)
+                .as_ref()
+                .map(|native| native.id.as_str()),
+            expected
+        );
     }
 
     fn send_socket_request_for_tests(
@@ -7679,6 +7729,108 @@ mod tests {
                 assert_eq!(source.as_deref(), Some("claude"));
             }
             _ => panic!("expected agent-status"),
+        }
+    }
+
+    #[test]
+    fn socket_agent_status_preserves_every_activity_input_form() {
+        for (wire, expected) in [
+            ("idle", AgentActivityState::Idle),
+            ("running", AgentActivityState::Running),
+            ("waiting-input", AgentActivityState::WaitingInput),
+            ("waiting", AgentActivityState::WaitingInput),
+            ("needs-input", AgentActivityState::WaitingInput),
+            ("errored", AgentActivityState::Errored),
+            ("error", AgentActivityState::Errored),
+            ("done", AgentActivityState::Done),
+        ] {
+            let message: SocketMessage = serde_json::from_value(serde_json::json!({
+                "action": "agent-status", "state": wire,
+            }))
+            .unwrap();
+            let SocketMessage::AgentStatus { state, .. } = message else {
+                panic!("expected agent-status");
+            };
+            assert_eq!(state, expected);
+        }
+        for wire in [
+            "working",
+            "waiting_input",
+            "Running",
+            " running ",
+            "thinking",
+            "",
+        ] {
+            assert!(serde_json::from_value::<SocketMessage>(serde_json::json!({
+                "action": "agent-status", "state": wire,
+            }))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn socket_activity_event_producer_pins_every_state() {
+        for (state, wire) in [
+            (AgentActivityState::Idle, "idle"),
+            (AgentActivityState::Running, "running"),
+            (AgentActivityState::WaitingInput, "waiting-input"),
+            (AgentActivityState::Errored, "errored"),
+            (AgentActivityState::Done, "done"),
+        ] {
+            for source in [None, Some("codex")] {
+                assert_eq!(
+                    super::socket_agent_activity_event_payload(3, "editor", 7, state, source),
+                    serde_json::json!({
+                        "tab_id": 3, "tab_name": "editor", "pane_id": 7,
+                        "state": wire, "source": source,
+                    }),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pane_agent_state_label_producer_pins_every_state() {
+        let mut state = AppState::new();
+        let workspace_id = state.active_workspace;
+        let (tab_id, pane_id) = crate::seed_headless_terminal_tab(
+            &mut state,
+            workspace_id,
+            "editor",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .unwrap();
+        assert_eq!(super::pane_agent_state_label(&state, tab_id, pane_id), None);
+        for (activity_state, wire) in [
+            (AgentActivityState::Idle, "idle"),
+            (AgentActivityState::Running, "running"),
+            (AgentActivityState::WaitingInput, "waiting-input"),
+            (AgentActivityState::Errored, "errored"),
+            (AgentActivityState::Done, "done"),
+        ] {
+            state
+                .find_tab_mut(tab_id)
+                .unwrap()
+                .pane_agent_activity
+                .insert(
+                    pane_id,
+                    AgentActivity {
+                        state: activity_state,
+                        text: "test".into(),
+                        source: None,
+                        origin: crate::workspace::AgentActivityOrigin::Socket,
+                        updated_at: std::time::Instant::now(),
+                        observed_at_unix_ms: 1,
+                    },
+                );
+            assert_eq!(
+                super::pane_agent_state_label(&state, tab_id, pane_id).as_deref(),
+                Some(wire)
+            );
+            assert_eq!(
+                super::pane_agent_state_label(&state, tab_id, pane_id + 1),
+                None
+            );
         }
     }
 
