@@ -434,9 +434,7 @@ impl PeekOverlay {
 
     /// Populate and show the summary page with `message` and an eject button.
     fn show_summary(&self, message: &str) {
-        while let Some(child) = self.summary_body.first_child() {
-            self.summary_body.remove(&child);
-        }
+        crate::gtk_util::remove_all_children(&self.summary_body);
 
         let label = gtk::Label::new(Some(message));
         label.set_wrap(true);

@@ -126,9 +126,7 @@ impl WorkspaceInspector {
         *last = next.clone();
         drop(last);
 
-        while let Some(child) = self.body.first_child() {
-            self.body.remove(&child);
-        }
+        crate::gtk_util::remove_all_children(&self.body);
 
         let Some(data) = next else {
             self.title.set_text("Workspace Inspector");

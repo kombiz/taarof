@@ -872,12 +872,8 @@ fn refresh_work_ledger(
         .iter()
         .find_map(|(key, widget)| widget.has_focus().then(|| key.clone()));
     widgets.controls.borrow_mut().clear();
-    while let Some(child) = widgets.legend.first_child() {
-        widgets.legend.remove(&child);
-    }
-    while let Some(child) = widgets.list.first_child() {
-        widgets.list.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(&widgets.legend);
+    crate::gtk_util::remove_all_children(&widgets.list);
     if restore_health.status == "degraded" {
         let warning = gtk::Label::new(Some(
             restore_health
@@ -3771,9 +3767,7 @@ fn distinct_agent_badges(names: &[String]) -> Vec<crate::agents::AgentBadge> {
 /// token as a CSS class (`agent-badge-<color_token>`), so the sidebar and web
 /// Monitor render the same identity model. The container is hidden when empty.
 fn refresh_agent_badges(container: &gtk::Box, badges: &[crate::agents::AgentBadge]) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(container);
     if badges.is_empty() {
         container.set_visible(false);
         container.set_tooltip_text(None);
@@ -3949,9 +3943,7 @@ fn refresh_agent_child_rows(
     }
     *handle.last_agent_children.borrow_mut() = Some(snapshot);
 
-    while let Some(child) = handle.agent_children.first_child() {
-        handle.agent_children.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(&handle.agent_children);
 
     handle
         .agent_expand_button

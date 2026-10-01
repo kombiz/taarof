@@ -13,6 +13,7 @@ mod dashboard;
 mod diagnostics;
 mod events;
 mod git;
+mod gtk_util;
 pub mod history;
 mod history_view;
 mod host;
@@ -507,9 +508,7 @@ impl RestoreLegendUi {
     }
 
     fn populate(&self, legend: &session::RestoredTabLegend) {
-        while let Some(child) = self.items_box.first_child() {
-            self.items_box.remove(&child);
-        }
+        crate::gtk_util::remove_all_children(&self.items_box);
 
         for item in &legend.items {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -624,9 +623,7 @@ fn populate_chord_overlay(
     tab_list: &gtk::Box,
     term_stack: &gtk::Stack,
 ) {
-    while let Some(child) = overlay.first_child() {
-        overlay.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(overlay);
 
     if entries.is_empty() {
         let empty = gtk::Label::new(Some(empty_text));

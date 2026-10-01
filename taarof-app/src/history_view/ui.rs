@@ -158,9 +158,7 @@ impl HistoryView {
         // keeps repeated "Load more" clicks from destroying and recreating every
         // widget in the list.
         if model.rows.len() < *rendered {
-            while let Some(child) = self.list.first_child() {
-                self.list.remove(&child);
-            }
+            crate::gtk_util::remove_all_children(&self.list);
             *rendered = 0;
         }
         match &model.render_state {
