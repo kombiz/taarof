@@ -6283,13 +6283,17 @@ mod tests {
                 })
                 .unwrap();
             let retained = state.work_ledger.test_record_mut(record.seq);
-            retained.ts_unix_ms = 1_000;
             retained.task_status = Some("todo".into());
             let reconciliation = state.work_ledger.test_reconciliation_mut(record.seq);
             reconciliation.status = WorkReconciliationStatus::Pending;
             reconciliation.source = "plan".into();
             reconciliation.reason = "Waiting".into();
             reconciliation.checked_at_unix_ms = Some(1_000);
+        }
+        // Set display timestamps only after appending both records: append's
+        // real retention clock would otherwise prune the first old fixture.
+        for seq in [1, 2] {
+            state.work_ledger.test_record_mut(seq).ts_unix_ms = 1_000;
         }
         state.work_ledger.test_restore_health_mut().status = "degraded".into();
         state.work_ledger.test_restore_health_mut().detail = Some("Initial warning".into());
