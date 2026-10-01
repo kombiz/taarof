@@ -8587,7 +8587,11 @@ pub(crate) mod tests {
             ssh_target: "fixture.invalid".into(),
         };
         let mut replacement = prepared.clone();
-        replacement.expected_generation.as_mut().unwrap().continuity_id = "replacement".into();
+        replacement
+            .expected_generation
+            .as_mut()
+            .unwrap()
+            .continuity_id = "replacement".into();
         for (candidate, should_strip) in [
             (prepared.clone(), true),
             (different_target, false),
@@ -8598,19 +8602,41 @@ pub(crate) mod tests {
                 let leaves = st.find_tab_mut(tab_id).unwrap().panes.leaves_mut();
                 assert_eq!(leaves.len(), 1, "the actual live loop must visit a leaf");
                 leaves.into_iter().next().unwrap().tmux_backing = Some(candidate.clone());
-                st.headless_panes.get_mut(&(tab_id, pane_id)).unwrap().tmux_backing =
-                    Some(candidate.clone());
-                st.headless_panes.get_mut(&(other_tab_id, other_pane_id)).unwrap().tmux_backing =
-                    Some(prepared.clone());
-                assert!(st.find_tab(tab_id).unwrap().panes.first_leaf().unwrap().tmux_backing
-                    .as_ref().unwrap().same_execution_target(&candidate));
-                assert!(st.headless_pane(tab_id, pane_id).unwrap().tmux_backing
-                    .as_ref().unwrap().same_execution_target(&candidate));
+                st.headless_panes
+                    .get_mut(&(tab_id, pane_id))
+                    .unwrap()
+                    .tmux_backing = Some(candidate.clone());
+                st.headless_panes
+                    .get_mut(&(other_tab_id, other_pane_id))
+                    .unwrap()
+                    .tmux_backing = Some(prepared.clone());
+                assert!(st
+                    .find_tab(tab_id)
+                    .unwrap()
+                    .panes
+                    .first_leaf()
+                    .unwrap()
+                    .tmux_backing
+                    .as_ref()
+                    .unwrap()
+                    .same_execution_target(&candidate));
+                assert!(st
+                    .headless_pane(tab_id, pane_id)
+                    .unwrap()
+                    .tmux_backing
+                    .as_ref()
+                    .unwrap()
+                    .same_execution_target(&candidate));
             }
             super::strip_prepared_tmux_backings(&state, tab_id, std::slice::from_ref(&prepared));
             let st = state.borrow();
             for actual in [
-                &st.find_tab(tab_id).unwrap().panes.first_leaf().unwrap().tmux_backing,
+                &st.find_tab(tab_id)
+                    .unwrap()
+                    .panes
+                    .first_leaf()
+                    .unwrap()
+                    .tmux_backing,
                 &st.headless_pane(tab_id, pane_id).unwrap().tmux_backing,
             ] {
                 assert_eq!(actual.is_none(), should_strip);
@@ -8618,8 +8644,13 @@ pub(crate) mod tests {
                     assert!(actual.as_ref().unwrap().same_execution_target(&candidate));
                 }
             }
-            assert!(st.headless_pane(other_tab_id, other_pane_id).unwrap().tmux_backing
-                .as_ref().unwrap().same_execution_target(&prepared));
+            assert!(st
+                .headless_pane(other_tab_id, other_pane_id)
+                .unwrap()
+                .tmux_backing
+                .as_ref()
+                .unwrap()
+                .same_execution_target(&prepared));
         }
     }
 
