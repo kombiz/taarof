@@ -348,12 +348,16 @@ impl DiscoveryFailure {
 
 fn next_discovery_generation() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_update(
-        std::sync::atomic::Ordering::Relaxed,
-        std::sync::atomic::Ordering::Relaxed,
-        |generation| generation.checked_add(1),
-    )
-    .expect("discovery generation exhausted")
+    // Retain the validated Rust 1.98 API despite its Rust 1.99 deprecation.
+    #[allow(deprecated)]
+    let generation = NEXT
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |generation| generation.checked_add(1),
+        )
+        .expect("discovery generation exhausted");
+    generation
 }
 
 fn run_discovery_command(

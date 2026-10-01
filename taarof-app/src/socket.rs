@@ -945,13 +945,13 @@ fn strip_prepared_tmux_backings(
     let mut st = state.borrow_mut();
     if let Some(tab) = st.find_tab_mut(tab_id) {
         for leaf in tab.panes.leaves_mut() {
-            if leaf.tmux_backing.as_ref().is_some_and(&matches) {
+            if leaf.tmux_backing.as_ref().is_some_and(matches) {
                 leaf.tmux_backing = None;
             }
         }
     }
     for ((current_tab_id, _), pane) in &mut st.headless_panes {
-        if *current_tab_id == tab_id && pane.tmux_backing.as_ref().is_some_and(&matches) {
+        if *current_tab_id == tab_id && pane.tmux_backing.as_ref().is_some_and(matches) {
             pane.tmux_backing = None;
         }
     }
@@ -8526,6 +8526,134 @@ pub(crate) mod tests {
             .borrow()
             .dashboard_poll_tracker
             .result_is_current(&poll_context, &crate::tmux::TmuxTarget::Local));
+    }
+
+    #[test]
+    #[ignore = "requires an owned display; run exact test with xvfb-run and --ignored"]
+    fn strip_prepared_tmux_backings_preserves_exact_live_and_headless_identities() {
+        let _glib_guard = crate::glib_main_context_test_guard();
+        gtk::init().expect("backing cleanup test requires an owned display (use xvfb-run)");
+        let state = Rc::new(RefCell::new(AppState::new()));
+        let workspace_id = state.borrow().active_workspace;
+        let (tab_id, pane_id) = crate::seed_headless_terminal_tab(
+            &mut state.borrow_mut(),
+            workspace_id,
+            "cleanup-fixture",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .expect("fixture tab");
+        let (other_tab_id, other_pane_id) = crate::seed_headless_terminal_tab(
+            &mut state.borrow_mut(),
+            workspace_id,
+            "other-fixture",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .expect("other fixture tab");
+        let prepared = crate::pane::TmuxBacking {
+            session_name: "same-name".into(),
+            target: crate::tmux::TmuxTarget::Local,
+            expected_generation: Some(crate::session::SavedTmuxIdentity {
+                session_id: "$1".into(),
+                session_created: 1,
+                continuity_id: "original".into(),
+            }),
+            pane_info: crate::probe::ProbeSnapshot::default(),
+        };
+        *state.borrow_mut().find_tab_mut(tab_id).unwrap().panes =
+            PaneNode::Leaf(crate::pane::PaneLeaf {
+                pane_id,
+                work_origin: crate::pane::new_pane_work_origin(),
+                container: gtk::Box::new(gtk::Orientation::Vertical, 0),
+                terminal: vte::Terminal::new(),
+                shell_pid: None,
+                was_busy: false,
+                launch_command: None,
+                output_tracker: Rc::new(Cell::new(None)),
+                tmux_backing: None,
+                restored_tmux: None,
+                restore_unavailable_reason: None,
+                location_state: crate::pane::PaneLocationState::default(),
+                location_generation: 0,
+                process_state: crate::pane::PaneProcessState::default(),
+                current_task: None,
+                restored_agent_session: None,
+                restored_spawn_kind: None,
+                agent_resume: None,
+                command_marks: Vec::new(),
+                broker: None,
+            });
+        let mut different_target = prepared.clone();
+        different_target.target = crate::tmux::TmuxTarget::Remote {
+            ssh_target: "fixture.invalid".into(),
+        };
+        let mut replacement = prepared.clone();
+        replacement
+            .expected_generation
+            .as_mut()
+            .unwrap()
+            .continuity_id = "replacement".into();
+        for (candidate, should_strip) in [
+            (prepared.clone(), true),
+            (different_target, false),
+            (replacement, false),
+        ] {
+            {
+                let mut st = state.borrow_mut();
+                let leaves = st.find_tab_mut(tab_id).unwrap().panes.leaves_mut();
+                assert_eq!(leaves.len(), 1, "the actual live loop must visit a leaf");
+                leaves.into_iter().next().unwrap().tmux_backing = Some(candidate.clone());
+                st.headless_panes
+                    .get_mut(&(tab_id, pane_id))
+                    .unwrap()
+                    .tmux_backing = Some(candidate.clone());
+                st.headless_panes
+                    .get_mut(&(other_tab_id, other_pane_id))
+                    .unwrap()
+                    .tmux_backing = Some(prepared.clone());
+                assert!(st
+                    .find_tab(tab_id)
+                    .unwrap()
+                    .1
+                    .panes
+                    .first_leaf()
+                    .unwrap()
+                    .tmux_backing
+                    .as_ref()
+                    .unwrap()
+                    .same_execution_target(&candidate));
+                assert!(st
+                    .headless_pane(tab_id, pane_id)
+                    .unwrap()
+                    .tmux_backing
+                    .as_ref()
+                    .unwrap()
+                    .same_execution_target(&candidate));
+            }
+            super::strip_prepared_tmux_backings(&state, tab_id, std::slice::from_ref(&prepared));
+            let st = state.borrow();
+            for actual in [
+                &st.find_tab(tab_id)
+                    .unwrap()
+                    .1
+                    .panes
+                    .first_leaf()
+                    .unwrap()
+                    .tmux_backing,
+                &st.headless_pane(tab_id, pane_id).unwrap().tmux_backing,
+            ] {
+                assert_eq!(actual.is_none(), should_strip);
+                if !should_strip {
+                    assert!(actual.as_ref().unwrap().same_execution_target(&candidate));
+                }
+            }
+            assert!(st
+                .headless_pane(other_tab_id, other_pane_id)
+                .unwrap()
+                .tmux_backing
+                .as_ref()
+                .unwrap()
+                .same_execution_target(&prepared));
+        }
     }
 
     struct ImmediateSuccessfulTmuxAdapter;
