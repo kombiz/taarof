@@ -127,6 +127,7 @@ pub(crate) fn subscribe_task_discovery(
     callback: impl FnOnce(CachedTaskDiscovery) + 'static,
 ) -> TaskDiscoverySubscription {
     let (id, key, generation, deadline, receiver) = register_subscription(target);
+    let target_for_delivery = target.clone();
     let completed = std::rc::Rc::new(std::cell::Cell::new(false));
     let completed_for_task = completed.clone();
     let task = glib::spawn_future_local(async move {
@@ -144,8 +145,16 @@ pub(crate) fn subscribe_task_discovery(
             }
         };
         completed_for_task.set(true);
-        if let Some(result) = result {
-            callback(result);
+        if result.is_some() {
+            // Recheck freshness once at dispatch, without starting work. GTK
+            // may have been blocked past Ready TTL, or a later request may
+            // already own a new Pending generation. Never resurrect a queued
+            // stale Ready payload or follow it with an autonomous retry.
+            let current = match cached_task_discovery(&target_for_delivery) {
+                CachedTaskDiscovery::Pending => CachedTaskDiscovery::Missing,
+                current => current,
+            };
+            callback(current);
         }
     });
     TaskDiscoverySubscription {
@@ -604,6 +613,75 @@ mod subscription_tests {
                     Some(CachedTaskDiscovery::Failed(DiscoveryFailure::Timeout)),
                     "GTK dispatch must not extend the original lease"
                 );
+                drop(subscription);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn timely_ready_completion_survives_delayed_dispatch_past_pending_lease() {
+        let _guard = task_discovery_test_guard();
+        clear_task_discovery_cache_for_test();
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let target = target("subscription-timely-ready");
+                let (_, generation) = prepare_task_discovery(&target);
+                let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let result_for_callback = result.clone();
+                let subscription = subscribe_task_discovery(&target, move |value| {
+                    *result_for_callback.borrow_mut() = Some(value)
+                });
+                complete_task_discovery(&target, generation, Ok(Vec::new()));
+                // Simulate a concluded lease with timely Ready queued, followed by
+                // GTK resuming later. Ready retains its independent45s lifetime.
+                set_ready_task_discovery_for_test(
+                    &target,
+                    Vec::new(),
+                    DISCOVERY_LEASE + Duration::from_secs(1),
+                );
+                while context.pending() {
+                    context.iteration(false);
+                }
+                assert_eq!(
+                    *result.borrow(),
+                    Some(CachedTaskDiscovery::Ready(Vec::new()))
+                );
+                assert_eq!(
+                    prepare_task_discovery(&target).0,
+                    TaskDiscoveryRequest::UseCached
+                );
+                drop(subscription);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn queued_ready_completion_past_ttl_settles_missing_without_retry() {
+        let _guard = task_discovery_test_guard();
+        clear_task_discovery_cache_for_test();
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let target = target("subscription-expired-ready");
+                let (_, generation) = prepare_task_discovery(&target);
+                let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let result_for_callback = result.clone();
+                let subscription = subscribe_task_discovery(&target, move |value| {
+                    *result_for_callback.borrow_mut() = Some(value)
+                });
+                complete_task_discovery(&target, generation, Ok(Vec::new()));
+                set_ready_task_discovery_for_test(
+                    &target,
+                    Vec::new(),
+                    TASK_DISCOVERY_TTL + Duration::from_secs(1),
+                );
+                while context.pending() {
+                    context.iteration(false);
+                }
+                assert_eq!(*result.borrow(), Some(CachedTaskDiscovery::Missing));
+                assert_eq!(cached_task_discovery(&target), CachedTaskDiscovery::Missing);
+                assert_eq!(task_subscriber_count_for_test(), 0);
                 drop(subscription);
             })
             .unwrap();
