@@ -550,9 +550,7 @@ impl ReviewPanel {
         } else {
             self.revisions.set_text("Base/current revision unavailable");
         }
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
-        }
+        crate::gtk_util::remove_all_children(&self.list);
         for file in &snapshot.files {
             self.list.append(&self.build_file_row(&snapshot, file));
         }

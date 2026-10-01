@@ -798,9 +798,7 @@ pub fn build_dashboard_widget(
 }
 
 fn populate_dashboard_placeholder(detail_box: &gtk::Box, message: &str) {
-    while let Some(child) = detail_box.first_child() {
-        detail_box.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(detail_box);
 
     let placeholder = gtk::Label::new(Some(message));
     placeholder.add_css_class("dim-label");
@@ -839,9 +837,7 @@ fn populate_detail_panel(
     window: &adw::ApplicationWindow,
     session_name: &str,
 ) {
-    while let Some(child) = detail_box.first_child() {
-        detail_box.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(detail_box);
 
     let st = state.borrow();
     let ds = st
@@ -1201,12 +1197,8 @@ pub fn refresh_dashboard_list(
         st.selected_dashboard_view.clone()
     };
 
-    while let Some(child) = session_list.first_child() {
-        session_list.remove(&child);
-    }
-    while let Some(child) = view_list.first_child() {
-        view_list.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(&session_list);
+    crate::gtk_util::remove_all_children(&view_list);
 
     let st = state.borrow();
     let dashboard_probe_state = st.dashboard_state.probe.state;
