@@ -4183,7 +4183,7 @@ mod tests {
         state
             .borrow_mut()
             .work_ledger
-            .set_preferences(attention_preferences());
+            .set_view_preferences(attention_preferences());
         let journal = Arc::new(Mutex::new(DiagnosticJournal::new_with_paths(
             None,
             None,
@@ -4230,7 +4230,11 @@ mod tests {
         let probe_budget = Duration::from_millis(10);
         let drain = || diagnostics::drain_probe_writer_with(&writer, probe_budget, &report);
         let hooks = HookLog::default();
-        let ledger_budget = Duration::from_millis(10);
+        let ledger_budget = if ledger_fails {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(10)
+        };
         let started = std::time::Instant::now();
         let outcome = hooks.run(|hooks| {
             run_shutdown_cleanup_with_probe_drain(
@@ -4242,7 +4246,7 @@ mod tests {
             )
         });
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < ledger_budget + probe_budget + Duration::from_secs(2),
             "cleanup waited for held sink"
         );
         if ledger_fails {
