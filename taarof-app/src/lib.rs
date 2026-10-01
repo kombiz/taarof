@@ -3934,8 +3934,7 @@ fn flush_work_ledger_for_shutdown(
 }
 
 fn report_ledger_shutdown_incomplete(message: &str) {
-    eprintln!("taarof: {message}");
-    crate::diagnostics::record_lifecycle("work_ledger_shutdown_incomplete", message, None);
+    crate::diagnostics::report_ledger_shutdown(message);
 }
 
 /// Escape special PCRE2 regex characters in a string for literal matching.
@@ -4138,6 +4137,163 @@ mod tests {
             filter: work_ledger::WorkStreamFilter::History,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn shared_shutdown_ledger_timeout_reaches_probe_timeout_with_journal_held() {
+        shutdown_ledger_incomplete_with_probe_sink_held(false, false);
+    }
+
+    #[test]
+    fn shared_shutdown_ledger_failure_reaches_probe_timeout_with_journal_held() {
+        shutdown_ledger_incomplete_with_probe_sink_held(true, false);
+    }
+
+    #[test]
+    fn shared_shutdown_ledger_timeout_reaches_probe_timeout_with_history_sink_held() {
+        shutdown_ledger_incomplete_with_probe_sink_held(false, true);
+    }
+
+    #[test]
+    fn shared_shutdown_ledger_failure_reaches_probe_timeout_with_history_sink_held() {
+        shutdown_ledger_incomplete_with_probe_sink_held(true, true);
+    }
+
+    fn shutdown_ledger_incomplete_with_probe_sink_held(ledger_fails: bool, hold_history: bool) {
+        use crate::diagnostics::{
+            self, probe_writer::ProbeWriter, DiagnosticJournal, DiagnosticRetention,
+        };
+        use std::sync::{mpsc, Arc, Mutex};
+        let (ledger_release, ledger_barrier) = mpsc::channel();
+        let (state, path) = ledger_shutdown_state(
+            if ledger_fails {
+                "probe-held-failed"
+            } else {
+                "probe-held-timeout"
+            },
+            move |_, _| {
+                if ledger_fails {
+                    Err(std::io::Error::other("injected ledger failure"))
+                } else {
+                    ledger_barrier.recv().unwrap();
+                    Ok(())
+                }
+            },
+        );
+        state
+            .borrow_mut()
+            .work_ledger
+            .set_preferences(attention_preferences());
+        let journal = Arc::new(Mutex::new(DiagnosticJournal::new_with_paths(
+            None,
+            None,
+            DiagnosticRetention::default(),
+        )));
+        let history = Arc::new(Mutex::new(None));
+        let journal_guard = (!hold_history).then(|| journal.lock().unwrap());
+        let history_guard = hold_history.then(|| history.lock().unwrap());
+        let sink_journal = journal.clone();
+        let sink_history = history.clone();
+        let (entered, waiting) = mpsc::channel();
+        let (written, observed) = mpsc::channel();
+        let writer = ProbeWriter::start(2, move |record| {
+            let first = record.action == "host-status";
+            let result = diagnostics::persist_probe_record(
+                record.clone(),
+                &sink_journal,
+                &sink_history,
+                &|_| {
+                    if first {
+                        entered.send(()).unwrap();
+                    }
+                },
+            );
+            written.send(record).unwrap();
+            result
+        });
+        assert!(writer.enqueue(diagnostics::probe_transition_record(
+            "host-status",
+            false,
+            "probe host-status is error".into(),
+            serde_json::json!({})
+        )));
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        let reports = RefCell::new(Vec::new());
+        let report = |message: &str| reports.borrow_mut().push(message.to_string());
+        let ledger_report = |message: &str| {
+            diagnostics::report_ledger_shutdown_with(
+                message,
+                &|record| writer.enqueue(record),
+                &report,
+            )
+        };
+        let probe_budget = Duration::from_millis(10);
+        let drain = || diagnostics::drain_probe_writer_with(&writer, probe_budget, &report);
+        let hooks = HookLog::default();
+        let ledger_budget = Duration::from_millis(10);
+        let started = std::time::Instant::now();
+        let outcome = hooks.run(|hooks| {
+            run_shutdown_cleanup_with_probe_drain(
+                &state,
+                hooks,
+                ledger_budget,
+                &ledger_report,
+                &drain,
+            )
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cleanup waited for held sink"
+        );
+        if ledger_fails {
+            assert!(matches!(outcome, work_ledger::LedgerShutdown::Failed(_)));
+        } else {
+            assert_eq!(outcome, work_ledger::LedgerShutdown::TimedOut);
+        }
+        assert_eq!(
+            *hooks.steps.borrow(),
+            ["stop", "save", "release"],
+            "independent history flush and release must remain reachable"
+        );
+        assert!(reports
+            .borrow()
+            .iter()
+            .any(|message| message.starts_with("work ledger persistence incomplete at shutdown:")));
+        assert!(reports.borrow().iter().any(
+            |message| message.contains("probe diagnostics shutdown incomplete: drained=false")
+        ));
+        assert!(
+            observed.try_recv().is_err(),
+            "sink must remain held through cleanup"
+        );
+        drop(journal_guard);
+        drop(history_guard);
+        if !ledger_fails {
+            ledger_release.send(()).unwrap();
+        }
+        let first = observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        let shutdown = observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(first.action, "host-status");
+        assert_eq!(
+            (
+                shutdown.level,
+                shutdown.category.as_str(),
+                shutdown.source.as_str(),
+                shutdown.action.as_str(),
+                shutdown.details
+            ),
+            (
+                diagnostics::DiagnosticLevel::Info,
+                "lifecycle",
+                "runtime",
+                "work_ledger_shutdown_incomplete",
+                None
+            )
+        );
+        assert!(shutdown
+            .message
+            .starts_with("work ledger persistence incomplete at shutdown:"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

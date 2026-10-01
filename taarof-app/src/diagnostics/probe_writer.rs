@@ -179,6 +179,39 @@ mod tests {
     }
 
     #[test]
+    fn ledger_shutdown_report_rejected_by_full_writer_remains_visible_and_incomplete() {
+        let (entered, waiting) = mpsc::channel();
+        let (release, barrier) = mpsc::channel();
+        let mut first = true;
+        let writer = ProbeWriter::start(1, move |_| {
+            if first {
+                first = false;
+                entered.send(()).unwrap();
+                barrier.recv().unwrap();
+            }
+            Ok(())
+        });
+        assert!(writer.enqueue(record(0)));
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(writer.enqueue(record(1)));
+        let reports = std::cell::RefCell::new(Vec::new());
+        let report = |message: &str| reports.borrow_mut().push(message.to_string());
+        super::super::report_ledger_shutdown_with(
+            "work ledger persistence incomplete at shutdown: test",
+            &|record| writer.enqueue(record),
+            &report,
+        );
+        assert_eq!(
+            reports.borrow()[0],
+            "work ledger persistence incomplete at shutdown: test"
+        );
+        assert!(reports.borrow()[1].contains("rejected admission"));
+        release.send(()).unwrap();
+        super::super::drain_probe_writer_with(&writer, Duration::from_secs(2), &report);
+        assert!(reports.borrow()[2].contains("drained=true, dropped=1"));
+    }
+
+    #[test]
     fn probe_writer_reports_actual_sink_failures() {
         let writer = ProbeWriter::start(2, |_| Err("test sink failed".into()));
         assert!(writer.enqueue(record(0)));

@@ -6,8 +6,9 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 pub(crate) mod probe_writer;
+use std::sync::Mutex;
 #[cfg(not(test))]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 const DEFAULT_RECENT_RECORD_LIMIT: usize = 64;
 const DEFAULT_LOG_MAX_BYTES: u64 = 256 * 1024;
@@ -542,22 +543,85 @@ fn probe_writer() -> &'static probe_writer::ProbeWriter {
     static WRITER: OnceLock<probe_writer::ProbeWriter> = OnceLock::new();
     WRITER.get_or_init(|| {
         probe_writer::ProbeWriter::start(probe_writer::CAPACITY, |record| {
-            let record = sanitize_record(record);
-            tagged_stderr(&record);
-            let journal_result = process_journal()
-                .lock()
-                .map_err(|_| "diagnostic journal lock poisoned".to_string())
-                .and_then(|mut journal| journal.record_reporting(record.clone()));
-            let sink = process_history_sink()
-                .lock()
-                .map_err(|_| "diagnostic history sink lock poisoned".to_string())?
-                .clone();
-            if let Some(sink) = sink {
-                sink.try_record_diagnostic(&record);
-            }
-            journal_result
+            persist_probe_record(
+                record,
+                process_journal(),
+                process_history_sink(),
+                &tagged_stderr,
+            )
         })
     })
+}
+
+pub(crate) fn persist_probe_record(
+    record: DiagnosticRecord,
+    journal: &Mutex<DiagnosticJournal>,
+    history: &Mutex<Option<crate::history::HistoryHandle>>,
+    stderr: &dyn Fn(&DiagnosticRecord),
+) -> Result<(), String> {
+    let record = sanitize_record(record);
+    stderr(&record);
+    let journal_result = journal
+        .lock()
+        .map_err(|_| "diagnostic journal lock poisoned".to_string())
+        .and_then(|mut journal| journal.record_reporting(record.clone()));
+    let sink = history
+        .lock()
+        .map_err(|_| "diagnostic history sink lock poisoned".to_string())?
+        .clone();
+    if let Some(sink) = sink {
+        sink.try_record_diagnostic(&record);
+    }
+    journal_result
+}
+
+/// The same reporting implementation is used by live cleanup and held-sink
+/// regressions. Its admission callback must never wait for persistence.
+pub(crate) fn report_ledger_shutdown_with(
+    message: &str,
+    enqueue: &dyn Fn(DiagnosticRecord) -> bool,
+    report: &dyn Fn(&str),
+) {
+    report(message);
+    let record = make_record(
+        DiagnosticLevel::Info,
+        "lifecycle",
+        "runtime",
+        "work_ledger_shutdown_incomplete",
+        message,
+        None,
+    );
+    if !enqueue(record) {
+        report("work ledger shutdown diagnostic persistence incomplete: bounded writer rejected admission");
+    }
+}
+
+pub(crate) fn report_ledger_shutdown(message: &str) {
+    report_ledger_shutdown_with(message, &enqueue_shutdown_diagnostic, &|message| {
+        eprintln!("taarof: {message}")
+    });
+}
+
+#[cfg(not(test))]
+fn enqueue_shutdown_diagnostic(record: DiagnosticRecord) -> bool {
+    probe_writer().enqueue(record)
+}
+
+#[cfg(test)]
+fn enqueue_shutdown_diagnostic(_record: DiagnosticRecord) -> bool {
+    false
+}
+
+pub(crate) fn drain_probe_writer_with(
+    writer: &probe_writer::ProbeWriter,
+    budget: std::time::Duration,
+    report: &dyn Fn(&str),
+) {
+    if let Some(outcome) = writer.shutdown(budget) {
+        if !outcome.completed || outcome.dropped != 0 || outcome.failed != 0 {
+            report(&format!("probe diagnostics shutdown incomplete: drained={}, dropped={}, journal/sink failures={}, budget={}ms; history durability requires its own flush", outcome.completed, outcome.dropped, outcome.failed, budget.as_millis()));
+        }
+    }
 }
 
 /// Called only after releasing the probe producer's AppState borrow.
@@ -573,11 +637,9 @@ pub(crate) fn enqueue_probe_transition(_record: DiagnosticRecord) {}
 /// independent flush. Reporting deliberately avoids journal/history locks.
 #[cfg(not(test))]
 pub(crate) fn shutdown_probe_transitions() {
-    if let Some(outcome) = probe_writer().shutdown(probe_writer::SHUTDOWN_BUDGET) {
-        if !outcome.completed || outcome.dropped != 0 || outcome.failed != 0 {
-            eprintln!("taarof: probe diagnostics shutdown incomplete: drained={}, dropped={}, journal/sink failures={}, budget={}ms; history durability requires its own flush", outcome.completed, outcome.dropped, outcome.failed, probe_writer::SHUTDOWN_BUDGET.as_millis());
-        }
-    }
+    drain_probe_writer_with(probe_writer(), probe_writer::SHUTDOWN_BUDGET, &|message| {
+        eprintln!("taarof: {message}")
+    });
 }
 
 #[cfg(test)]
