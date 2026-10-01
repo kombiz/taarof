@@ -242,6 +242,13 @@ pub(crate) trait RuntimeProbeSource {
     fn verified_executable_name(&self, _pid: i32) -> Option<String> {
         None
     }
+    fn verified_executable_with_cmdline(
+        &self,
+        pid: i32,
+        _argv: Option<&[String]>,
+    ) -> Option<String> {
+        self.verified_executable_name(pid)
+    }
     fn child_pids(&self, pid: i32) -> Vec<i32>;
     fn process_comm(&self, pid: i32) -> Option<String>;
     fn process_cmdline(&self, pid: i32) -> Option<Vec<String>>;
@@ -255,10 +262,18 @@ pub(crate) struct ProcProbeSource;
 
 impl RuntimeProbeSource for ProcProbeSource {
     fn verified_executable_name(&self, pid: i32) -> Option<String> {
+        self.verified_executable_with_cmdline(pid, agents::get_process_cmdline(pid).as_deref())
+    }
+
+    fn verified_executable_with_cmdline(
+        &self,
+        pid: i32,
+        argv: Option<&[String]>,
+    ) -> Option<String> {
         let executable = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
         // Native launchers can resolve to versioned filenames. A named argv[0]
         // is usable only when its actual file resolves to this process's exe.
-        let argv = agents::get_process_cmdline(pid)?;
+        let argv = argv?;
         if let Some(invocation) = argv.first() {
             let candidates: Vec<_> = if invocation.starts_with('/') {
                 vec![std::path::PathBuf::from(invocation)]
@@ -870,6 +885,7 @@ struct ProcessFacts {
     children: OnceCell<Vec<i32>>,
     comm: OnceCell<Option<String>>,
     cmdline: OnceCell<Option<Vec<String>>>,
+    executable: OnceCell<Option<String>>,
     cwd: OnceCell<Option<String>>,
     socket_inodes: OnceCell<Vec<u64>>,
 }
@@ -936,6 +952,18 @@ impl ProcessTreeCache {
         self.facts(pid)
             .cwd
             .get_or_init(|| source.process_cwd(pid))
+            .clone()
+    }
+
+    fn executable<S: RuntimeProbeSource + ?Sized>(
+        &mut self,
+        source: &S,
+        pid: i32,
+    ) -> Option<String> {
+        let argv = self.cmdline(source, pid);
+        self.facts(pid)
+            .executable
+            .get_or_init(|| source.verified_executable_with_cmdline(pid, argv.as_deref()))
             .clone()
     }
 
@@ -1051,13 +1079,7 @@ impl ProcessTreeCache {
         let cwd = self.cwd(source, root);
         let facts = tree
             .into_iter()
-            .map(|pid| {
-                (
-                    pid,
-                    source.verified_executable_name(pid),
-                    self.cmdline(source, pid),
-                )
-            })
+            .map(|pid| (pid, self.executable(source, pid), self.cmdline(source, pid)))
             .collect::<Vec<_>>();
         let exact = agents::detect_exact_agent_in_process_facts(cwd.as_deref(), &facts)?;
         // A native tool nested under an interpreted agent is not the pane
@@ -1145,6 +1167,28 @@ mod tests {
         cwd_reads: Cell<usize>,
         socket_reads: Cell<usize>,
         listen_reads: Cell<usize>,
+        executable_reads: Cell<usize>,
+    }
+
+    #[test]
+    fn within_build_executable_and_cmdline_reads_are_shared_and_identity_is_required() {
+        let mut source = FakeProbeSource::default();
+        source.comm.insert(42, "codex".into());
+        source.cmdline.insert(
+            42,
+            vec!["codex".into(), "--session".into(), "session".into()],
+        );
+        source.executables.insert(42, "codex".into());
+        let snapshot =
+            RuntimeProbeSnapshot::build(&source, 1, &[(1, vec![42])], &[(1, 1, 42), (1, 2, 42)]);
+        assert_eq!(snapshot.pane_exact_agents.len(), 2);
+        assert_eq!(source.cmdline_reads.get(), 1);
+        assert_eq!(source.executable_reads.get(), 1);
+        source.executables.clear();
+        let snapshot = RuntimeProbeSnapshot::build(&source, 2, &[(1, vec![42])], &[(1, 1, 42)]);
+        assert!(snapshot.pane_exact_agents.is_empty());
+        assert_eq!(source.cmdline_reads.get(), 2);
+        assert_eq!(source.executable_reads.get(), 2);
     }
 
     impl FakeProbeSource {
@@ -1185,7 +1229,16 @@ mod tests {
 
     impl RuntimeProbeSource for FakeProbeSource {
         fn verified_executable_name(&self, pid: i32) -> Option<String> {
+            self.executable_reads.set(self.executable_reads.get() + 1);
             self.executables.get(&pid).cloned()
+        }
+        fn verified_executable_with_cmdline(
+            &self,
+            pid: i32,
+            argv: Option<&[String]>,
+        ) -> Option<String> {
+            assert_eq!(argv, self.cmdline.get(&pid).map(Vec::as_slice));
+            self.verified_executable_name(pid)
         }
 
         fn probe_process_root(&self, pid: i32) -> Result<(Vec<i32>, Option<String>), String> {
