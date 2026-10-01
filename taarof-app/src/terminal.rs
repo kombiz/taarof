@@ -5898,6 +5898,31 @@ mod tests {
     }
 
     #[test]
+    fn termprop_activity_parser_pins_every_state_and_alias() {
+        for (wire, expected) in [
+            ("idle", AgentActivityState::Idle),
+            ("running", AgentActivityState::Running),
+            ("waiting-input", AgentActivityState::WaitingInput),
+            ("waiting", AgentActivityState::WaitingInput),
+            ("needs-input", AgentActivityState::WaitingInput),
+            ("errored", AgentActivityState::Errored),
+            ("error", AgentActivityState::Errored),
+            ("done", AgentActivityState::Done),
+        ] {
+            assert_eq!(parse_termprop_activity_state(Some(wire)), Some(expected));
+            let tolerant = format!("\t{}\n", wire.to_ascii_uppercase());
+            assert_eq!(
+                parse_termprop_activity_state(Some(&tolerant)),
+                Some(expected)
+            );
+        }
+        for wire in ["working", "waiting_input", "thinking", "", "   "] {
+            assert_eq!(parse_termprop_activity_state(Some(wire)), None);
+        }
+        assert_eq!(parse_termprop_activity_state(None), None);
+    }
+
+    #[test]
     fn test_is_taarof_activity_termprop_matches_phase_three_props() {
         assert!(is_taarof_activity_termprop("vte.ext.taarof.agent.state"));
         assert!(is_taarof_activity_termprop("vte.ext.taarof.agent.text"));

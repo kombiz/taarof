@@ -42,13 +42,107 @@ pub const DONE_ACTIVITY_VISIBILITY: Duration = Duration::from_secs(5);
 pub const EXPLICIT_ACTIVITY_FRESHNESS: Duration = Duration::from_secs(8);
 pub const OUTPUT_SCAN_ACTIVITY_FRESHNESS: Duration = Duration::from_secs(8);
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AgentActivityState {
     Idle,
     Running,
+    #[serde(rename = "waiting-input", alias = "waiting", alias = "needs-input")]
     WaitingInput,
+    #[serde(rename = "errored", alias = "error")]
     Errored,
     Done,
+}
+
+impl AgentActivityState {
+    /// Established activity payload and persisted-event vocabulary.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::WaitingInput => "waiting-input",
+            Self::Errored => "errored",
+            Self::Done => "done",
+        }
+    }
+
+    /// Strict persisted-event input; socket aliases are deliberately separate.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "idle" => Some(Self::Idle),
+            "running" => Some(Self::Running),
+            "waiting-input" => Some(Self::WaitingInput),
+            "errored" => Some(Self::Errored),
+            "done" => Some(Self::Done),
+            _ => None,
+        }
+    }
+
+    /// VTE termprops historically accept whitespace, case and socket aliases.
+    pub(crate) fn from_termprop(value: &str) -> Option<Self> {
+        let value = value.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "waiting" | "needs-input" => Some(Self::WaitingInput),
+            "error" => Some(Self::Errored),
+            value => Self::from_wire(value),
+        }
+    }
+}
+
+#[cfg(test)]
+mod activity_wire_tests {
+    use super::AgentActivityState;
+
+    #[test]
+    fn activity_wire_socket_and_termprop_inputs_preserve_contracts() {
+        for (state, wire) in [
+            (AgentActivityState::Idle, "idle"),
+            (AgentActivityState::Running, "running"),
+            (AgentActivityState::WaitingInput, "waiting-input"),
+            (AgentActivityState::Errored, "errored"),
+            (AgentActivityState::Done, "done"),
+        ] {
+            assert_eq!(state.as_wire(), wire);
+            assert_eq!(AgentActivityState::from_wire(wire), Some(state));
+            assert_eq!(
+                serde_json::from_value::<AgentActivityState>(serde_json::json!(wire)).unwrap(),
+                state
+            );
+            assert_eq!(
+                AgentActivityState::from_termprop(&format!(" {} ", wire.to_ascii_uppercase())),
+                Some(state)
+            );
+        }
+        for (alias, state) in [
+            ("waiting", AgentActivityState::WaitingInput),
+            ("needs-input", AgentActivityState::WaitingInput),
+            ("error", AgentActivityState::Errored),
+        ] {
+            assert_eq!(AgentActivityState::from_wire(alias), None);
+            assert_eq!(
+                serde_json::from_value::<AgentActivityState>(serde_json::json!(alias)).unwrap(),
+                state
+            );
+            assert_eq!(AgentActivityState::from_termprop(alias), Some(state));
+        }
+        for unsupported in [
+            "working",
+            "waiting_input",
+            "thinking",
+            "",
+            "Running",
+            " running ",
+        ] {
+            assert_eq!(AgentActivityState::from_wire(unsupported), None);
+            assert!(
+                serde_json::from_value::<AgentActivityState>(serde_json::json!(unsupported))
+                    .is_err()
+            );
+        }
+        for unsupported in ["working", "waiting_input", "thinking", ""] {
+            assert_eq!(AgentActivityState::from_termprop(unsupported), None);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
