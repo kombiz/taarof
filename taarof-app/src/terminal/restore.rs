@@ -806,33 +806,36 @@ pub(super) fn emit_probe_transition_event(
     payload: serde_json::Value,
     transition: &ProbeTransition,
     error: Option<&str>,
-) {
-    if should_record_probe_failure_diagnostic(transition) {
-        crate::diagnostics::record_probe_failure(
-            "terminal",
+) -> Option<crate::diagnostics::DiagnosticRecord> {
+    let diagnostic = if should_record_probe_failure_diagnostic(transition) {
+        Some(crate::diagnostics::probe_transition_record(
             probe,
+            false,
             format!("probe {probe} is {}", transition.current.label()),
-            Some(serde_json::json!({
+            serde_json::json!({
                 "previous_state": transition.previous.label(),
                 "state": transition.current.label(),
                 "error": error,
                 "payload": payload,
-            })),
-        );
+            }),
+        ))
     } else if transition.recovered() {
-        crate::diagnostics::record_lifecycle(
-            "probe-recovered",
+        Some(crate::diagnostics::probe_transition_record(
+            probe,
+            true,
             format!("probe {probe} recovered"),
-            Some(serde_json::json!({
+            serde_json::json!({
                 "previous_state": transition.previous.label(),
                 "state": transition.current.label(),
                 "payload": payload,
-            })),
-        );
-    }
+            }),
+        ))
+    } else {
+        None
+    };
 
     if !(transition.entered_degraded() || transition.recovered()) {
-        return;
+        return diagnostic;
     }
 
     state.event_store.emit(
@@ -845,6 +848,7 @@ pub(super) fn emit_probe_transition_event(
             "payload": payload,
         }),
     );
+    diagnostic
 }
 
 pub(super) fn should_record_probe_failure_diagnostic(transition: &ProbeTransition) -> bool {
@@ -1005,14 +1009,20 @@ pub fn poll_tmux_metadata(state: &Rc<RefCell<AppState>>, tab_list: &gtk::Box) {
                     }
                 }
             }
-            if let Some((transition, payload, error)) = event {
+            let diagnostic = if let Some((transition, payload, error)) = event {
                 emit_probe_transition_event(
                     &mut st,
                     "tmux-pane-info",
                     payload,
                     &transition,
                     error.as_deref(),
-                );
+                )
+            } else {
+                None
+            };
+            drop(st);
+            if let Some(record) = diagnostic {
+                crate::diagnostics::enqueue_probe_transition(record);
             }
         }
 
@@ -1085,14 +1095,20 @@ pub fn poll_host_status(state: &Rc<RefCell<AppState>>) {
                     ws.host_status.error.clone(),
                 ));
             }
-            if let Some((transition, payload, error)) = event {
+            let diagnostic = if let Some((transition, payload, error)) = event {
                 emit_probe_transition_event(
                     &mut st,
                     "host-status",
                     payload,
                     &transition,
                     error.as_deref(),
-                );
+                )
+            } else {
+                None
+            };
+            drop(st);
+            if let Some(record) = diagnostic {
+                crate::diagnostics::enqueue_probe_transition(record);
             }
         }
     });
@@ -1156,7 +1172,10 @@ pub(crate) struct DashboardPollOutcome<'a> {
     pub poll_context: &'a crate::dashboard::DashboardPollContext,
 }
 
-pub(crate) fn apply_dashboard_poll_results(state: &mut AppState, poll: DashboardPollOutcome<'_>) {
+pub(crate) fn apply_dashboard_poll_results(
+    state: &mut AppState,
+    poll: DashboardPollOutcome<'_>,
+) -> Option<crate::diagnostics::DiagnosticRecord> {
     let DashboardPollOutcome {
         current_commands,
         polled_detached_sessions,
@@ -1329,7 +1348,7 @@ pub(crate) fn apply_dashboard_poll_results(state: &mut AppState, poll: Dashboard
             }),
             &transition,
             error.as_deref(),
-        );
+        )
     } else {
         // Reconcile successful targets even when another target failed. Rows and
         // hosts for failed targets retain their last-known snapshot, while each
@@ -1381,7 +1400,9 @@ pub(crate) fn apply_dashboard_poll_results(state: &mut AppState, poll: Dashboard
                 }),
                 &transition,
                 error.as_deref(),
-            );
+            )
+        } else {
+            None
         }
     }
 }

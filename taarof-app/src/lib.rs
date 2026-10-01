@@ -3885,11 +3885,28 @@ fn run_shutdown_cleanup_within(
     ledger_budget: Duration,
     report_incomplete: &dyn Fn(&str),
 ) -> work_ledger::LedgerShutdown {
+    run_shutdown_cleanup_with_probe_drain(
+        state,
+        hooks,
+        ledger_budget,
+        report_incomplete,
+        &crate::diagnostics::shutdown_probe_transitions,
+    )
+}
+
+fn run_shutdown_cleanup_with_probe_drain(
+    state: &Rc<RefCell<AppState>>,
+    hooks: &ShutdownHooks<'_>,
+    ledger_budget: Duration,
+    report_incomplete: &dyn Fn(&str),
+    drain_probes: &dyn Fn(),
+) -> work_ledger::LedgerShutdown {
     (hooks.stop_background)();
     (hooks.save_session)();
     // The ledger barrier runs before the history flush because ledger appends
     // feed history.
     let ledger = flush_work_ledger_for_shutdown(state, ledger_budget, report_incomplete);
+    drain_probes();
     if let Err(error) = state.borrow().history.flush() {
         eprintln!("taarof: could not flush history during shutdown: {error}");
     }
@@ -3917,8 +3934,7 @@ fn flush_work_ledger_for_shutdown(
 }
 
 fn report_ledger_shutdown_incomplete(message: &str) {
-    eprintln!("taarof: {message}");
-    crate::diagnostics::record_lifecycle("work_ledger_shutdown_incomplete", message, None);
+    crate::diagnostics::report_ledger_shutdown(message);
 }
 
 /// Escape special PCRE2 regex characters in a string for literal matching.
@@ -4121,6 +4137,233 @@ mod tests {
             filter: work_ledger::WorkStreamFilter::History,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn shared_shutdown_ledger_timeout_reaches_probe_timeout_with_journal_held() {
+        shutdown_ledger_incomplete_with_probe_sink_held(false, false);
+    }
+
+    #[test]
+    fn shared_shutdown_ledger_failure_reaches_probe_timeout_with_journal_held() {
+        shutdown_ledger_incomplete_with_probe_sink_held(true, false);
+    }
+
+    #[test]
+    fn shared_shutdown_ledger_timeout_reaches_probe_timeout_with_history_sink_held() {
+        shutdown_ledger_incomplete_with_probe_sink_held(false, true);
+    }
+
+    #[test]
+    fn shared_shutdown_ledger_failure_reaches_probe_timeout_with_history_sink_held() {
+        shutdown_ledger_incomplete_with_probe_sink_held(true, true);
+    }
+
+    fn shutdown_ledger_incomplete_with_probe_sink_held(ledger_fails: bool, hold_history: bool) {
+        use crate::diagnostics::{
+            self, probe_writer::ProbeWriter, DiagnosticJournal, DiagnosticRetention,
+        };
+        use std::sync::{mpsc, Arc, Mutex};
+        let (ledger_release, ledger_barrier) = mpsc::channel();
+        let (state, path) = ledger_shutdown_state(
+            if ledger_fails {
+                "probe-held-failed"
+            } else {
+                "probe-held-timeout"
+            },
+            move |_, _| {
+                if ledger_fails {
+                    Err(std::io::Error::other("injected ledger failure"))
+                } else {
+                    ledger_barrier.recv().unwrap();
+                    Ok(())
+                }
+            },
+        );
+        state
+            .borrow_mut()
+            .work_ledger
+            .set_view_preferences(attention_preferences());
+        let journal = Arc::new(Mutex::new(DiagnosticJournal::new_with_paths(
+            None,
+            None,
+            DiagnosticRetention::default(),
+        )));
+        let history = Arc::new(Mutex::new(None));
+        let journal_guard = (!hold_history).then(|| journal.lock().unwrap());
+        let history_guard = hold_history.then(|| history.lock().unwrap());
+        let sink_journal = journal.clone();
+        let sink_history = history.clone();
+        let (entered, waiting) = mpsc::channel();
+        let (written, observed) = mpsc::channel();
+        let writer = ProbeWriter::start(2, move |record| {
+            let first = record.action == "host-status";
+            let result = diagnostics::persist_probe_record(
+                record.clone(),
+                &sink_journal,
+                &sink_history,
+                &|_| {
+                    if first {
+                        entered.send(()).unwrap();
+                    }
+                },
+            );
+            written.send(record).unwrap();
+            result
+        });
+        assert!(writer.enqueue(diagnostics::probe_transition_record(
+            "host-status",
+            false,
+            "probe host-status is error".into(),
+            serde_json::json!({})
+        )));
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        let reports = RefCell::new(Vec::new());
+        let report = |message: &str| reports.borrow_mut().push(message.to_string());
+        let ledger_report = |message: &str| {
+            diagnostics::report_ledger_shutdown_with(
+                message,
+                &|record| writer.enqueue(record),
+                &report,
+            )
+        };
+        let probe_budget = Duration::from_millis(10);
+        let drain = || diagnostics::drain_probe_writer_with(&writer, probe_budget, &report);
+        let hooks = HookLog::default();
+        let ledger_budget = if ledger_fails {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(10)
+        };
+        let started = std::time::Instant::now();
+        let outcome = hooks.run(|hooks| {
+            run_shutdown_cleanup_with_probe_drain(
+                &state,
+                hooks,
+                ledger_budget,
+                &ledger_report,
+                &drain,
+            )
+        });
+        assert!(
+            started.elapsed() < ledger_budget + probe_budget + Duration::from_secs(2),
+            "cleanup waited for held sink"
+        );
+        if ledger_fails {
+            assert!(matches!(outcome, work_ledger::LedgerShutdown::Failed(_)));
+        } else {
+            assert_eq!(outcome, work_ledger::LedgerShutdown::TimedOut);
+        }
+        assert_eq!(
+            *hooks.steps.borrow(),
+            ["stop", "save", "release"],
+            "independent history flush and release must remain reachable"
+        );
+        assert!(reports
+            .borrow()
+            .iter()
+            .any(|message| message.starts_with("work ledger persistence incomplete at shutdown:")));
+        assert!(reports.borrow().iter().any(
+            |message| message.contains("probe diagnostics shutdown incomplete: drained=false")
+        ));
+        assert!(
+            observed.try_recv().is_err(),
+            "sink must remain held through cleanup"
+        );
+        drop(journal_guard);
+        drop(history_guard);
+        if !ledger_fails {
+            ledger_release.send(()).unwrap();
+        }
+        let first = observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        let shutdown = observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(first.action, "host-status");
+        assert_eq!(
+            (
+                shutdown.level,
+                shutdown.category.as_str(),
+                shutdown.source.as_str(),
+                shutdown.action.as_str(),
+                shutdown.details
+            ),
+            (
+                diagnostics::DiagnosticLevel::Info,
+                "lifecycle",
+                "runtime",
+                "work_ledger_shutdown_incomplete",
+                None
+            )
+        );
+        assert!(shutdown
+            .message
+            .starts_with("work ledger persistence incomplete at shutdown:"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn shared_shutdown_drains_probe_writer_once_before_releasing_endpoints() {
+        use crate::diagnostics::probe_writer::ProbeWriter;
+        use std::sync::mpsc;
+        let state = Rc::new(RefCell::new(AppState::new()));
+        let (written, observed) = mpsc::channel();
+        let writer = ProbeWriter::start(2, move |record| {
+            written.send(record).unwrap();
+            Ok(())
+        });
+        assert!(writer.enqueue(crate::diagnostics::probe_transition_record(
+            "host-status",
+            true,
+            "probe host-status recovered".into(),
+            serde_json::json!({})
+        )));
+        let drain_count = Cell::new(0);
+        let released = Cell::new(0);
+        let hooks = ShutdownHooks {
+            stop_background: &|| {},
+            save_session: &|| {},
+            release_endpoints: &|| {
+                assert_eq!(drain_count.get(), 1);
+                if released.get() == 0 {
+                    assert_eq!(observed.try_recv().unwrap().action, "probe-recovered");
+                }
+                released.set(released.get() + 1);
+            },
+        };
+        let drain = || {
+            assert!(
+                state.try_borrow_mut().is_ok(),
+                "no AppState borrow during diagnostic drain"
+            );
+            if let Some(outcome) = writer.shutdown(Duration::from_secs(2)) {
+                assert!(outcome.completed);
+                assert_eq!((outcome.dropped, outcome.failed), (0, 0));
+                drain_count.set(drain_count.get() + 1);
+            }
+        };
+        let _ = run_shutdown_cleanup_with_probe_drain(
+            &state,
+            &hooks,
+            Duration::from_secs(2),
+            &|_| {},
+            &drain,
+        );
+        assert!(!writer.enqueue(crate::diagnostics::probe_transition_record(
+            "host-status",
+            true,
+            "late".into(),
+            serde_json::json!({})
+        )));
+        assert_eq!(
+            run_shutdown_cleanup_with_probe_drain(
+                &state,
+                &hooks,
+                Duration::from_secs(2),
+                &|_| {},
+                &drain
+            ),
+            work_ledger::LedgerShutdown::AlreadyShutDown
+        );
+        assert_eq!(released.get(), 2);
     }
 
     #[test]
