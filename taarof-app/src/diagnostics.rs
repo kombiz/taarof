@@ -5,6 +5,7 @@ use std::fs::{create_dir_all, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+pub(crate) mod probe_writer;
 #[cfg(not(test))]
 use std::sync::{Mutex, OnceLock};
 
@@ -131,12 +132,18 @@ impl DiagnosticJournal {
     }
 
     pub fn record(&mut self, record: DiagnosticRecord) {
+        let _ = self.record_reporting(record);
+    }
+
+    fn record_reporting(&mut self, record: DiagnosticRecord) -> Result<(), String> {
         let record = sanitize_record(record);
         self.apply_record(record.clone());
         if let Err(error) = self.persist_record(&record) {
             self.counters.write_failures += 1;
             eprintln!("taarof: diag[write-failure/journal] {error}");
+            return Err(error);
         }
+        Ok(())
     }
 
     fn load_persisted_records(&mut self) {
@@ -503,6 +510,79 @@ fn make_record(
     }
 }
 
+pub(crate) fn probe_transition_record(
+    probe: &str,
+    recovered: bool,
+    message: String,
+    details: Value,
+) -> DiagnosticRecord {
+    if recovered {
+        make_record(
+            DiagnosticLevel::Info,
+            "lifecycle",
+            "runtime",
+            "probe-recovered",
+            message,
+            Some(details),
+        )
+    } else {
+        make_record(
+            DiagnosticLevel::Warn,
+            "probe_failure",
+            "terminal",
+            probe,
+            message,
+            Some(details),
+        )
+    }
+}
+
+#[cfg(not(test))]
+fn probe_writer() -> &'static probe_writer::ProbeWriter {
+    static WRITER: OnceLock<probe_writer::ProbeWriter> = OnceLock::new();
+    WRITER.get_or_init(|| {
+        probe_writer::ProbeWriter::start(probe_writer::CAPACITY, |record| {
+            let record = sanitize_record(record);
+            tagged_stderr(&record);
+            let journal_result = process_journal()
+                .lock()
+                .map_err(|_| "diagnostic journal lock poisoned".to_string())
+                .and_then(|mut journal| journal.record_reporting(record.clone()));
+            let sink = process_history_sink()
+                .lock()
+                .map_err(|_| "diagnostic history sink lock poisoned".to_string())?
+                .clone();
+            if let Some(sink) = sink {
+                sink.try_record_diagnostic(&record);
+            }
+            journal_result
+        })
+    })
+}
+
+/// Called only after releasing the probe producer's AppState borrow.
+#[cfg(not(test))]
+pub(crate) fn enqueue_probe_transition(record: DiagnosticRecord) {
+    probe_writer().enqueue(record);
+}
+
+#[cfg(test)]
+pub(crate) fn enqueue_probe_transition(_record: DiagnosticRecord) {}
+
+/// Invoked by the existing once-only persistence cleanup, before history's
+/// independent flush. Reporting deliberately avoids journal/history locks.
+#[cfg(not(test))]
+pub(crate) fn shutdown_probe_transitions() {
+    if let Some(outcome) = probe_writer().shutdown(probe_writer::SHUTDOWN_BUDGET) {
+        if !outcome.completed || outcome.dropped != 0 || outcome.failed != 0 {
+            eprintln!("taarof: probe diagnostics shutdown incomplete: drained={}, dropped={}, journal/sink failures={}, budget={}ms; history durability requires its own flush", outcome.completed, outcome.dropped, outcome.failed, probe_writer::SHUTDOWN_BUDGET.as_millis());
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn shutdown_probe_transitions() {}
+
 fn web_asset_lookup_details(attempted_paths: &[PathBuf]) -> Value {
     let attempted_paths = attempted_paths
         .iter()
@@ -771,7 +851,7 @@ pub fn reset_journal_for_tests(_log_path: Option<PathBuf>, _archive_path: Option
 mod tests {
     use super::{DiagnosticJournal, DiagnosticLevel, DiagnosticRetention};
 
-    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+    pub(super) fn unique_temp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "taarof-diagnostics-{name}-{}-{}",
             std::process::id(),

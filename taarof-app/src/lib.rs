@@ -3890,6 +3890,7 @@ fn run_shutdown_cleanup_within(
     // The ledger barrier runs before the history flush because ledger appends
     // feed history.
     let ledger = flush_work_ledger_for_shutdown(state, ledger_budget, report_incomplete);
+    crate::diagnostics::shutdown_probe_transitions();
     if let Err(error) = state.borrow().history.flush() {
         eprintln!("taarof: could not flush history during shutdown: {error}");
     }

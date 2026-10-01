@@ -4113,6 +4113,70 @@ mod tests {
     }
 
     #[test]
+    fn probe_transition_writer_preserves_event_and_persistence_order_after_borrow_release() {
+        use crate::diagnostics::probe_writer::ProbeWriter;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let state = Rc::new(RefCell::new(AppState::new()));
+        let (entered, waiting) = mpsc::channel();
+        let (release, barrier) = mpsc::channel();
+        let (written, observed) = mpsc::channel();
+        let mut first = true;
+        let writer = ProbeWriter::start(2, move |record| {
+            if first {
+                first = false;
+                entered.send(()).unwrap();
+                barrier.recv().unwrap();
+            }
+            written.send(record).unwrap();
+            Ok(())
+        });
+        let baseline = state.borrow().event_store.len();
+        for (previous, current) in [
+            (ProbeState::Ok, ProbeState::Error),
+            (ProbeState::Error, ProbeState::Ok),
+        ] {
+            let diagnostic = {
+                let mut st = state.borrow_mut();
+                emit_probe_transition_event(
+                    &mut st,
+                    "host-status",
+                    serde_json::json!({"workspace_id": 1}),
+                    &ProbeTransition { previous, current },
+                    Some("timeout"),
+                )
+            }
+            .expect("transition diagnostic");
+            assert!(
+                state.try_borrow_mut().is_ok(),
+                "borrow must be released before enqueue"
+            );
+            assert!(writer.enqueue(diagnostic));
+            if current == ProbeState::Error {
+                waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+        }
+        let events = state.borrow().event_store.entries();
+        assert_eq!(events.len(), baseline + 2);
+        assert_eq!(events[baseline].payload["state"], "error");
+        assert_eq!(events[baseline + 1].payload["state"], "ok");
+        release.send(()).unwrap();
+        let outcome = writer.shutdown(Duration::from_secs(2)).unwrap();
+        assert!(outcome.completed);
+        assert_eq!((outcome.dropped, outcome.failed), (0, 0));
+        let failure = observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        let recovery = observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            (failure.category.as_str(), failure.action.as_str()),
+            ("probe_failure", "host-status")
+        );
+        assert_eq!(
+            (recovery.category.as_str(), recovery.action.as_str()),
+            ("lifecycle", "probe-recovered")
+        );
+    }
+
+    #[test]
     fn probe_transition_events_are_recorded_for_degraded_changes() {
         let mut state = AppState::new();
         let transition = ProbeTransition {
@@ -4120,7 +4184,7 @@ mod tests {
             current: ProbeState::Stale,
         };
 
-        emit_probe_transition_event(
+        let _ = emit_probe_transition_event(
             &mut state,
             "tmux-pane-info",
             serde_json::json!({ "tab_id": 7, "pane_id": 3 }),
@@ -4150,7 +4214,7 @@ mod tests {
             current: ProbeState::Ok,
         };
 
-        emit_probe_transition_event(
+        let _ = emit_probe_transition_event(
             &mut state,
             "host-status",
             serde_json::json!({ "workspace_id": 1 }),
@@ -4170,7 +4234,7 @@ mod tests {
             current: ProbeState::Stale,
         };
 
-        emit_probe_transition_event(
+        let _ = emit_probe_transition_event(
             &mut state,
             "dashboard-state",
             serde_json::json!({ "dashboard_targets": 2 }),
@@ -4241,7 +4305,7 @@ mod tests {
         let mut state = AppState::new();
         let poll_context = state.begin_dashboard_poll(&[]);
 
-        apply_dashboard_poll_results(
+        let _ = apply_dashboard_poll_results(
             &mut state,
             DashboardPollOutcome {
                 current_commands: &std::collections::HashMap::new(),
@@ -4302,7 +4366,7 @@ mod tests {
             crate::dashboard::detached_session_command_key(&TmuxTarget::Local, local_name);
         let poll_context = state.begin_dashboard_poll(&[TmuxTarget::Local, remote_target.clone()]);
 
-        apply_dashboard_poll_results(
+        let _ = apply_dashboard_poll_results(
             &mut state,
             DashboardPollOutcome {
                 current_commands: &std::collections::HashMap::new(),
@@ -4380,7 +4444,7 @@ mod tests {
             crate::dashboard::detached_session_command_key(&TmuxTarget::Local, missing_name);
         let poll_context = state.begin_dashboard_poll(&[TmuxTarget::Local]);
 
-        apply_dashboard_poll_results(
+        let _ = apply_dashboard_poll_results(
             &mut state,
             DashboardPollOutcome {
                 current_commands: &std::collections::HashMap::new(),
@@ -4439,7 +4503,7 @@ mod tests {
         let polled_detached_sessions = detached_poll_snapshot(&state);
         let poll_context = state.begin_dashboard_poll(std::slice::from_ref(&remote_target));
 
-        apply_dashboard_poll_results(
+        let _ = apply_dashboard_poll_results(
             &mut state,
             DashboardPollOutcome {
                 current_commands: &std::collections::HashMap::new(),
@@ -4500,7 +4564,7 @@ mod tests {
             finished: false,
         }];
 
-        apply_dashboard_poll_results(
+        let _ = apply_dashboard_poll_results(
             &mut state,
             DashboardPollOutcome {
                 current_commands: &current_commands,
@@ -4556,7 +4620,7 @@ mod tests {
         let polled_detached_sessions = detached_poll_snapshot(&state);
         let poll_context = state.begin_dashboard_poll(&[TmuxTarget::Local]);
 
-        apply_dashboard_poll_results(
+        let _ = apply_dashboard_poll_results(
             &mut state,
             DashboardPollOutcome {
                 current_commands: &std::collections::HashMap::new(),
@@ -4612,7 +4676,7 @@ mod tests {
         let poll_context = state.begin_dashboard_poll(&[TmuxTarget::Local, remote_target.clone()]);
 
         state.invalidate_dashboard_session_snapshot(&TmuxTarget::Local, local_name);
-        apply_dashboard_poll_results(
+        let _ = apply_dashboard_poll_results(
             &mut state,
             DashboardPollOutcome {
                 current_commands: &std::collections::HashMap::new(),
@@ -4683,7 +4747,7 @@ mod tests {
 
         state.detached_sessions.clear();
         state.invalidate_dashboard_session_snapshot(&TmuxTarget::Local, session_name);
-        apply_dashboard_poll_results(
+        let _ = apply_dashboard_poll_results(
             &mut state,
             DashboardPollOutcome {
                 current_commands: &std::collections::HashMap::new(),
@@ -4713,7 +4777,7 @@ mod tests {
         let older_poll = state.begin_dashboard_poll(&[TmuxTarget::Local]);
         let newer_poll = state.begin_dashboard_poll(&[TmuxTarget::Local]);
 
-        apply_dashboard_poll_results(
+        let _ = apply_dashboard_poll_results(
             &mut state,
             DashboardPollOutcome {
                 current_commands: &std::collections::HashMap::new(),
@@ -4727,7 +4791,7 @@ mod tests {
                 poll_context: &newer_poll,
             },
         );
-        apply_dashboard_poll_results(
+        let _ = apply_dashboard_poll_results(
             &mut state,
             DashboardPollOutcome {
                 current_commands: &std::collections::HashMap::new(),
@@ -4775,7 +4839,7 @@ mod tests {
         assert_eq!(targets, vec![crate::tmux::TmuxTarget::Local]);
         let poll_context = state.begin_dashboard_poll(&targets);
 
-        apply_dashboard_poll_results(
+        let _ = apply_dashboard_poll_results(
             &mut state,
             DashboardPollOutcome {
                 current_commands: &std::collections::HashMap::new(),
@@ -6675,7 +6739,7 @@ mod tests {
             .expect("confirmed missing is an authoritative close");
         {
             let mut st = state.borrow_mut();
-            apply_dashboard_poll_results(
+            let _ = apply_dashboard_poll_results(
                 &mut st,
                 DashboardPollOutcome {
                     current_commands: &std::collections::HashMap::new(),
