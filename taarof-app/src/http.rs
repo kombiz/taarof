@@ -225,6 +225,13 @@ pub struct HttpControlRequestGuard {
 }
 
 impl HttpControlRequestGuard {
+    #[cfg(test)]
+    pub(crate) fn cancelled_for_tests() -> Self {
+        let guard = Self::new();
+        assert!(guard.cancel_pending());
+        guard
+    }
+
     fn new() -> Self {
         Self {
             phase: Arc::new(AtomicU8::new(CONTROL_REQUEST_PENDING)),

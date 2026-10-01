@@ -647,8 +647,9 @@ fn dispatch_socket_message(
     response_tx: mpsc::Sender<SocketResponse>,
     control_guard: Option<crate::http::HttpControlRequestGuard>,
 ) {
+    let event_action = socket_message_event_action(&msg);
     if let SocketMessage::CloseTab { tab } = msg {
-        record_socket_message_event(state, &SocketMessage::CloseTab { tab: tab.clone() });
+        record_socket_message_event(state, event_action);
         dispatch_close_tab_socket(state, dispatch, &tab, response_tx);
         return;
     }
@@ -675,15 +676,7 @@ fn dispatch_socket_message(
             host,
             ssh_target,
         } => {
-            record_socket_message_event(
-                state,
-                &SocketMessage::AttachSession {
-                    expected_agent: expected_agent.clone(),
-                    session_name: session_name.clone(),
-                    host: host.clone(),
-                    ssh_target: ssh_target.clone(),
-                },
-            );
+            record_socket_message_event(state, event_action);
             if let Some(target) = expected_agent {
                 if target.session_name != session_name
                     || target.ssh_target != ssh_target
@@ -752,13 +745,7 @@ fn dispatch_socket_message(
             return;
         }
         SocketMessage::ClosePane { tab, pane } => {
-            record_socket_message_event(
-                state,
-                &SocketMessage::ClosePane {
-                    tab: tab.clone(),
-                    pane,
-                },
-            );
+            record_socket_message_event(state, event_action);
             dispatch_close_pane_socket(
                 state,
                 term_stack,
@@ -770,14 +757,7 @@ fn dispatch_socket_message(
             return;
         }
         SocketMessage::PromptAgent { tab, pane, prompt } => {
-            record_socket_message_event(
-                state,
-                &SocketMessage::PromptAgent {
-                    tab: tab.clone(),
-                    pane,
-                    prompt: String::new(),
-                },
-            );
+            record_socket_message_event(state, event_action);
             dispatch_prompt_agent_socket(state, window, &tab, pane, prompt, response_tx);
             return;
         }
@@ -787,15 +767,7 @@ fn dispatch_socket_message(
             scrollback,
             max_output_bytes,
         } => {
-            record_socket_message_event(
-                state,
-                &SocketMessage::WaitAgentTurn {
-                    turn_token: String::new(),
-                    timeout_seconds,
-                    scrollback,
-                    max_output_bytes,
-                },
-            );
+            record_socket_message_event(state, event_action);
             dispatch_wait_agent_turn(
                 state,
                 turn_token,
@@ -807,25 +779,13 @@ fn dispatch_socket_message(
             return;
         }
         SocketMessage::CancelAgentTurn { turn_token } => {
-            record_socket_message_event(
-                state,
-                &SocketMessage::CancelAgentTurn {
-                    turn_token: String::new(),
-                },
-            );
+            record_socket_message_event(state, event_action);
             let response = cancel_agent_turn(&turn_token);
             let _ = response_tx.send(response);
             return;
         }
         SocketMessage::SendKeys { tab, pane, keys } => {
-            record_socket_message_event(
-                state,
-                &SocketMessage::SendKeys {
-                    tab: tab.clone(),
-                    pane,
-                    keys: keys.clone(),
-                },
-            );
+            record_socket_message_event(state, event_action);
             dispatch_send_keys_socket(
                 state,
                 window,
@@ -842,15 +802,7 @@ fn dispatch_socket_message(
             cols,
             rows,
         } => {
-            record_socket_message_event(
-                state,
-                &SocketMessage::ResizePane {
-                    tab: tab.clone(),
-                    pane,
-                    cols,
-                    rows,
-                },
-            );
+            record_socket_message_event(state, event_action);
             dispatch_resize_pane_control(
                 state,
                 window,
@@ -876,14 +828,7 @@ fn dispatch_socket_message(
             host,
             working_dir,
         } => {
-            record_socket_message_event(
-                state,
-                &SocketMessage::CreateTmuxTab {
-                    name: name.clone(),
-                    host: host.clone(),
-                    working_dir: working_dir.clone(),
-                },
-            );
+            record_socket_message_event(state, event_action);
             dispatch_create_tmux_tab_socket(
                 state,
                 term_stack,
@@ -2499,7 +2444,9 @@ enum PaneControlTarget {
     Tmux(Box<crate::pane::TmuxBacking>),
 }
 
-fn record_socket_message_event(state: &Rc<RefCell<AppState>>, msg: &SocketMessage) {
+/// Capture before consuming a message. This event skip set intentionally differs
+/// from the broader read-only protocol classification.
+fn socket_message_event_action(msg: &SocketMessage) -> Option<&'static str> {
     if matches!(
         msg,
         SocketMessage::QueryState
@@ -2508,13 +2455,18 @@ fn record_socket_message_event(state: &Rc<RefCell<AppState>>, msg: &SocketMessag
             | SocketMessage::QueryAgentSessions { .. }
             | SocketMessage::ListTabs
     ) {
-        return;
+        return None;
     }
+    Some(socket_message_action(msg))
+}
+
+fn record_socket_message_event(state: &Rc<RefCell<AppState>>, action: Option<&'static str>) {
+    let Some(action) = action else { return };
 
     RuntimeHandle::from_shared_state(state.clone()).emit_event(
         "socket_message_received",
         serde_json::json!({
-            "action": socket_message_action(msg),
+            "action": action,
         }),
     );
 }
@@ -2526,7 +2478,7 @@ fn handle_socket_message(
     window: &adw::ApplicationWindow,
     msg: SocketMessage,
 ) -> SocketResponse {
-    record_socket_message_event(state, &msg);
+    record_socket_message_event(state, socket_message_event_action(&msg));
 
     match msg {
         SocketMessage::Notify { tab, message } => {
@@ -4197,6 +4149,7 @@ fn route_agent_workspace_socket_message(
     msg: SocketMessage,
     response_tx: &mpsc::Sender<SocketResponse>,
 ) -> Option<SocketMessage> {
+    let event_action = socket_message_event_action(&msg);
     let SocketMessage::AgentWorkspace {
         branch,
         command,
@@ -4206,15 +4159,7 @@ fn route_agent_workspace_socket_message(
     else {
         return Some(msg);
     };
-    record_socket_message_event(
-        state,
-        &SocketMessage::AgentWorkspace {
-            branch: branch.clone(),
-            command: command.clone(),
-            repo: repo.clone(),
-            timeout_seconds,
-        },
-    );
+    record_socket_message_event(state, event_action);
     dispatch_agent_workspace(
         &AgentWorkspaceDispatchContext {
             state: state.clone(),
@@ -4798,13 +4743,13 @@ mod tests {
         resolve_detached_session_for_attach, resolve_tab_id_for_target_in_state,
         resolve_workspace_id_for_target_in_state, retarget_tab_attention_to_remaining_activity,
         route_agent_workspace_socket_message, run_socket_handler_safely, select_runtime_dir,
-        socket_message_action, socket_message_is_read_only, socket_path_in,
-        spawn_socket_dispatch_router, spawn_socket_listener_thread, truncate_utf8_tail,
-        validate_agent_prompt, validate_agent_status_source, validate_agent_turn_output_limit,
-        validate_agent_turn_timeout, validate_get_text_scrollback, validate_runtime_dir,
-        validate_runtime_dir_attributes, validate_socket_command_input,
-        validate_socket_path_length, validate_split_idempotency_key, CloseTabPlan,
-        NativeTurnBoundary, PendingAgentTurn, RuntimeDirIssue, SocketActivityState,
+        socket_message_action, socket_message_event_action, socket_message_is_read_only,
+        socket_path_in, spawn_socket_dispatch_router, spawn_socket_listener_thread,
+        truncate_utf8_tail, validate_agent_prompt, validate_agent_status_source,
+        validate_agent_turn_output_limit, validate_agent_turn_timeout,
+        validate_get_text_scrollback, validate_runtime_dir, validate_runtime_dir_attributes,
+        validate_socket_command_input, validate_socket_path_length, validate_split_idempotency_key,
+        CloseTabPlan, NativeTurnBoundary, PendingAgentTurn, RuntimeDirIssue, SocketActivityState,
         SocketDispatchContext, SocketMessage, SocketRegistry, SocketResponse,
         SplitIdempotencyState, SplitTarget, AGENT_TURNS, AGENT_WORKSPACE_TEST_DELAY_FINISHED,
         AGENT_WORKSPACE_TEST_DELAY_MS, AGENT_WORKSPACE_TEST_DELAY_STARTED,
@@ -5878,6 +5823,7 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(1));
                 };
                 assert!(query.contains(r#""ok":true"#));
+                assert_socket_event_actions(&state, &["agent-workspace"]);
                 assert!(
                     heartbeat.get() > 0,
                     "GLib heartbeat should run during Git work"
@@ -5946,6 +5892,7 @@ mod tests {
                 listener_thread
                     .join()
                     .expect("bounded test socket listener should finish");
+                assert_socket_event_actions(&state, &["agent-workspace"]);
                 cleanup_socket(&socket_path);
                 let _ = std::fs::remove_dir_all(socket_dir);
             })
@@ -6707,19 +6654,321 @@ mod tests {
         );
         let state = Rc::new(RefCell::new(stub_app_state(vec![workspace], 11)));
 
-        record_socket_message_event(&state, &SocketMessage::QueryState);
         record_socket_message_event(
             &state,
-            &SocketMessage::QueryEvents {
+            socket_message_event_action(&SocketMessage::QueryState),
+        );
+        record_socket_message_event(
+            &state,
+            socket_message_event_action(&SocketMessage::QueryEvents {
                 since_seq: Some(1),
                 limit: Some(10),
-            },
+            }),
         );
-        record_socket_message_event(&state, &SocketMessage::ListTabs);
+        record_socket_message_event(
+            &state,
+            socket_message_event_action(&SocketMessage::ListTabs),
+        );
+        for raw in [
+            r#"{"action":"query-history"}"#,
+            r#"{"action":"query-agent-sessions"}"#,
+        ] {
+            let msg = serde_json::from_str::<SocketMessage>(raw).unwrap();
+            record_socket_message_event(&state, socket_message_event_action(&msg));
+        }
 
         let st = state.borrow();
         assert_eq!(st.event_store.len(), 0);
         assert_eq!(st.event_store.next_seq(), 1);
+    }
+
+    fn assert_socket_event_actions(state: &Rc<RefCell<AppState>>, expected: &[&str]) {
+        let response = handle_query_events(state, None, None);
+        let data = response.data.unwrap();
+        let events = data["events"].as_array().unwrap();
+        assert_eq!(events.len(), expected.len(), "{data}");
+        for (index, (event, action)) in events.iter().zip(expected).enumerate() {
+            assert_eq!(event["seq"], serde_json::json!(index + 1));
+            assert_eq!(event["event_type"], "socket_message_received");
+            assert_eq!(event["payload"], serde_json::json!({"action": action}));
+        }
+        assert_eq!(
+            state.borrow().event_store.next_seq(),
+            expected.len() as u64 + 1
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a display; run with xvfb-run and --include-ignored"]
+    fn socket_event_recording_gtk_dispatch_paths_and_timeout() {
+        let _glib_guard = crate::glib_main_context_test_guard();
+        gtk::init().expect("GTK dispatcher event test requires a display (use xvfb-run)");
+        let term_stack = gtk::Stack::new();
+        let tab_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let window = adw::ApplicationWindow::builder().build();
+        let dispatch =
+            SocketDispatchContext::gtk(term_stack.clone(), tab_list.clone(), window.clone());
+        // Literal wire requests exercise each recording branch before its
+        // validation failure, without spawning panes, commands, or Git work.
+        for (raw, action) in [
+            (r#"{"action":"close-tab","tab":"missing-d17"}"#, "close-tab"),
+            (
+                r#"{"action":"attach-session","session_name":"missing-d17"}"#,
+                "attach-session",
+            ),
+            (
+                r#"{"action":"close-pane","tab":"missing-d17","pane":99}"#,
+                "close-pane",
+            ),
+            (
+                r#"{"action":"prompt-agent","tab":"missing-d17","pane":99,"prompt":"synthetic prompt"}"#,
+                "prompt-agent",
+            ),
+            (
+                r#"{"action":"wait-agent-turn","turn_token":"synthetic-missing-d17"}"#,
+                "wait-agent-turn",
+            ),
+            (
+                r#"{"action":"cancel-agent-turn","turn_token":"synthetic-missing-d17"}"#,
+                "cancel-agent-turn",
+            ),
+            (
+                r#"{"action":"send-keys","tab":"missing-d17","pane":99,"keys":"synthetic keys"}"#,
+                "send-keys",
+            ),
+            (
+                r#"{"action":"resize-pane","tab":"missing-d17","pane":99,"cols":80,"rows":24}"#,
+                "resize-pane",
+            ),
+            (
+                r#"{"action":"create-tmux-tab","host":"d17-invalid-host !"}"#,
+                "create-tmux-tab",
+            ),
+            (
+                r#"{"action":"agent-workspace","branch":""}"#,
+                "agent-workspace",
+            ),
+            // Ordinary fallthrough is recorded by the direct handler once;
+            // work-context belongs to read-only but not the five skip variants.
+            (
+                r#"{"action":"work-context","tab":"missing-d17","pane":99}"#,
+                "work-context",
+            ),
+            (
+                r#"{"action":"rename-tab","tab":"missing-d17","name":"renamed"}"#,
+                "rename-tab",
+            ),
+        ] {
+            let state = Rc::new(RefCell::new(stub_app_state(vec![], 0)));
+            let (tx, rx) = mpsc::channel();
+            dispatch_socket_message(
+                &state,
+                &dispatch,
+                serde_json::from_str(raw).unwrap(),
+                tx,
+                None,
+            );
+            assert!(
+                !rx.recv_timeout(Duration::from_secs(2)).unwrap().ok,
+                "{action}"
+            );
+            assert_socket_event_actions(&state, &[action]);
+        }
+
+        for raw in [
+            r#"{"action":"query-state"}"#,
+            r#"{"action":"query-events"}"#,
+            r#"{"action":"query-history"}"#,
+            r#"{"action":"list-tabs"}"#,
+        ] {
+            let state = Rc::new(RefCell::new(stub_app_state(vec![], 0)));
+            let (tx, rx) = mpsc::channel();
+            dispatch_socket_message(
+                &state,
+                &dispatch,
+                serde_json::from_str(raw).unwrap(),
+                tx,
+                None,
+            );
+            let _response = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_socket_event_actions(&state, &[]);
+        }
+
+        // The direct producer preserves all five exclusions too. Testing the
+        // catalog query here avoids discovering operator sessions in this test.
+        for raw in [
+            r#"{"action":"query-state"}"#,
+            r#"{"action":"query-events"}"#,
+            r#"{"action":"query-history"}"#,
+            r#"{"action":"query-agent-sessions"}"#,
+            r#"{"action":"list-tabs"}"#,
+        ] {
+            let state = Rc::new(RefCell::new(stub_app_state(vec![], 0)));
+            let _response = super::handle_socket_message(
+                &state,
+                &term_stack,
+                &tab_list,
+                &window,
+                serde_json::from_str(raw).unwrap(),
+            );
+            assert_socket_event_actions(&state, &[]);
+        }
+
+        let state = Rc::new(RefCell::new(stub_app_state(vec![], 0)));
+        let response = super::handle_socket_message(
+            &state,
+            &term_stack,
+            &tab_list,
+            &window,
+            serde_json::from_str(r#"{"action":"rename-tab","tab":"missing-d17","name":"renamed"}"#)
+                .unwrap(),
+        );
+        assert!(!response.ok);
+        assert_socket_event_actions(&state, &["rename-tab"]);
+
+        // A lost reply does not cancel an already-dispatched mutation or make
+        // retries safe: the handler still applies and records exactly once.
+        let state = Rc::new(RefCell::new(stub_app_state(
+            vec![stub_workspace_with_id(11, "original", vec![], 0)],
+            11,
+        )));
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        dispatch_socket_message(
+            &state,
+            &dispatch,
+            serde_json::from_str(
+                r#"{"action":"rename-workspace","workspace":"11","name":"applied"}"#,
+            )
+            .unwrap(),
+            tx,
+            None,
+        );
+        assert_eq!(state.borrow().workspaces[0].name, "applied");
+        let data = handle_query_events(&state, None, None).data.unwrap();
+        let events = data["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["seq"], 1);
+        assert_eq!(events[0]["event_type"], "socket_message_received");
+        assert_eq!(
+            events[0]["payload"],
+            serde_json::json!({"action":"rename-workspace"})
+        );
+        assert_eq!(events[1]["seq"], 2);
+        assert_eq!(events[1]["event_type"], "workspace_renamed");
+        assert_eq!(
+            events[1]["payload"],
+            serde_json::json!({"name":"applied", "workspace_id":11})
+        );
+        assert_eq!(state.borrow().event_store.next_seq(), 3);
+
+        for (raw, expected) in [
+            (
+                r#"{"action":"rename-tab","tab":"missing-d17","name":"renamed"}"#,
+                &[][..],
+            ),
+            (r#"{"action":"agent-workspace","branch":""}"#, &[][..]),
+            // Specialized recording already precedes its own apply guard.
+            (
+                r#"{"action":"send-keys","tab":"missing-d17","pane":99,"keys":"synthetic keys"}"#,
+                &["send-keys"][..],
+            ),
+        ] {
+            let state = Rc::new(RefCell::new(stub_app_state(vec![], 0)));
+            let (tx, rx) = mpsc::channel();
+            dispatch_socket_message(
+                &state,
+                &dispatch,
+                serde_json::from_str(raw).unwrap(),
+                tx,
+                Some(crate::http::HttpControlRequestGuard::cancelled_for_tests()),
+            );
+            let response = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(!response.ok);
+            if expected.is_empty() {
+                assert_eq!(
+                    response.error.as_deref(),
+                    Some("HTTP control request timed out")
+                );
+            }
+            assert_socket_event_actions(&state, expected);
+        }
+    }
+
+    #[test]
+    fn socket_event_recording_headless_and_direct_workspace_paths() {
+        let worker = crate::tmux::TmuxWorker::with_adapter(
+            std::sync::Arc::new(ImmediateSuccessfulTmuxAdapter),
+            1,
+            8,
+        );
+        let dispatch = SocketDispatchContext::headless(
+            worker,
+            crate::config::TmuxCloseBehavior::Close,
+            Rc::new(Cell::new(0)),
+            None,
+        );
+        for (raw, expected) in [
+            (
+                r#"{"action":"close-tab","tab":"missing-d17"}"#,
+                &["close-tab"][..],
+            ),
+            (
+                r#"{"action":"attach-session","session_name":"missing-d17"}"#,
+                &[][..],
+            ),
+            (
+                r#"{"action":"work-context","tab":"missing-d17","pane":99}"#,
+                &[][..],
+            ),
+            (r#"{"action":"query-state"}"#, &[][..]),
+        ] {
+            let state = Rc::new(RefCell::new(stub_app_state(vec![], 0)));
+            let (tx, rx) = mpsc::channel();
+            dispatch_socket_message(
+                &state,
+                &dispatch,
+                serde_json::from_str(raw).unwrap(),
+                tx,
+                None,
+            );
+            let _response = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_socket_event_actions(&state, expected);
+        }
+
+        let state = Rc::new(RefCell::new(stub_app_state(vec![], 0)));
+        let (tx, rx) = mpsc::channel();
+        let result = route_agent_workspace_socket_message(
+            &state,
+            None,
+            None,
+            None,
+            serde_json::from_str(r#"{"action":"agent-workspace","branch":""}"#).unwrap(),
+            &tx,
+        );
+        assert!(result.is_none());
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("branch is required")
+        );
+        assert_socket_event_actions(&state, &["agent-workspace"]);
+        let fallback = route_agent_workspace_socket_message(
+            &state,
+            None,
+            None,
+            None,
+            serde_json::from_str(r#"{"action":"rename-tab","tab":"original","name":"unchanged"}"#)
+                .unwrap(),
+            &tx,
+        )
+        .unwrap();
+        assert!(
+            matches!(fallback, SocketMessage::RenameTab { tab, name } if tab == "original" && name == "unchanged")
+        );
+        assert_socket_event_actions(&state, &["agent-workspace"]);
     }
 
     #[test]
