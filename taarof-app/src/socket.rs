@@ -8559,8 +8559,8 @@ pub(crate) mod tests {
             }),
             pane_info: crate::probe::ProbeSnapshot::default(),
         };
-        state.borrow_mut().find_tab_mut(tab_id).unwrap().panes =
-            Box::new(PaneNode::Leaf(crate::pane::PaneLeaf {
+        *state.borrow_mut().find_tab_mut(tab_id).unwrap().panes =
+            PaneNode::Leaf(crate::pane::PaneLeaf {
                 pane_id,
                 work_origin: crate::pane::new_pane_work_origin(),
                 container: gtk::Box::new(gtk::Orientation::Vertical, 0),
@@ -8581,7 +8581,7 @@ pub(crate) mod tests {
                 agent_resume: None,
                 command_marks: Vec::new(),
                 broker: None,
-            }));
+            });
         let mut different_target = prepared.clone();
         different_target.target = crate::tmux::TmuxTarget::Remote {
             ssh_target: "fixture.invalid".into(),
