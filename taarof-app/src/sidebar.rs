@@ -6829,9 +6829,8 @@ mod tests {
     #[test]
     #[ignore = "requires owned Xvfb GTK display; run exact --ignored --test-threads=1"]
     fn work_stream_producer_actual_process_expiry_reaches_gate_gtk() {
-        use crate::runtime_probe::{
-            ProbeState, RuntimeProbeSnapshot, RuntimeProbeWorkerFailure, PROBE_TTL_MS,
-        };
+        use crate::probe::ProbeState;
+        use crate::runtime_probe::{RuntimeProbeSnapshot, RuntimeProbeWorkerFailure, PROBE_TTL_MS};
         use crate::work_ledger::ExecutionState;
         let _guard = crate::glib_main_context_test_guard();
         gtk::init().expect("owned display must initialize GTK");
