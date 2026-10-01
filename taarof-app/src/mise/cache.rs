@@ -81,7 +81,7 @@ fn register_subscription(
     u64,
     DiscoveryCacheKey,
     u64,
-    Duration,
+    Instant,
     tokio::sync::oneshot::Receiver<CachedTaskDiscovery>,
 ) {
     let key = DiscoveryCacheKey::from(target);
@@ -90,28 +90,25 @@ fn register_subscription(
     let mut cache = task_discovery_cache()
         .lock()
         .expect("task discovery cache lock should not be poisoned");
-    let (generation, remaining) = match cache.entries.get(&key) {
+    let (generation, deadline) = match cache.entries.get(&key) {
         Some(TaskDiscoveryCacheEntry::Pending {
             generation,
             started_at,
-        }) => (
-            *generation,
-            DISCOVERY_LEASE.saturating_sub(started_at.elapsed()),
-        ),
+        }) => (*generation, *started_at + DISCOVERY_LEASE),
         Some(TaskDiscoveryCacheEntry::Ready {
             tasks,
             completed_at,
         }) if completed_at.elapsed() <= TASK_DISCOVERY_TTL => {
             let _ = reply.send(CachedTaskDiscovery::Ready(tasks.clone()));
-            return (id, key, 0, Duration::ZERO, receiver);
+            return (id, key, 0, Instant::now(), receiver);
         }
         Some(TaskDiscoveryCacheEntry::Failed { reason, .. }) => {
             let _ = reply.send(CachedTaskDiscovery::Failed(*reason));
-            return (id, key, 0, Duration::ZERO, receiver);
+            return (id, key, 0, Instant::now(), receiver);
         }
         _ => {
             let _ = reply.send(CachedTaskDiscovery::Missing);
-            return (id, key, 0, Duration::ZERO, receiver);
+            return (id, key, 0, Instant::now(), receiver);
         }
     };
     cache.subscribers.insert(
@@ -122,14 +119,14 @@ fn register_subscription(
             reply,
         },
     );
-    (id, key, generation, remaining, receiver)
+    (id, key, generation, deadline, receiver)
 }
 
 pub(crate) fn subscribe_task_discovery(
     target: &DiscoveryTarget,
     callback: impl FnOnce(CachedTaskDiscovery) + 'static,
 ) -> TaskDiscoverySubscription {
-    let (id, key, generation, remaining, receiver) = register_subscription(target);
+    let (id, key, generation, deadline, receiver) = register_subscription(target);
     let completed = std::rc::Rc::new(std::cell::Cell::new(false));
     let completed_for_task = completed.clone();
     let task = glib::spawn_future_local(async move {
@@ -137,8 +134,8 @@ pub(crate) fn subscribe_task_discovery(
             receiver.await.ok()
         } else {
             use futures_util::future::{select, Either};
-            let deadline = glib::timeout_future(remaining);
-            match select(receiver, deadline).await {
+            let timeout = glib::timeout_future(deadline.saturating_duration_since(Instant::now()));
+            match select(receiver, timeout).await {
                 Either::Left((result, _)) => result.ok(),
                 Either::Right((_, receiver)) => {
                     expire_subscription(&key, generation);
@@ -272,6 +269,14 @@ pub(super) fn complete_task_discovery(
         return;
     }
     let completed_at = Instant::now();
+    // The deadline belongs to the worker generation, not the GTK dispatch
+    // time. A delayed main context must not turn an expired lease into Ready.
+    let result = if matches!(cache.entries.get(&key), Some(TaskDiscoveryCacheEntry::Pending { started_at, .. }) if completed_at.duration_since(*started_at) > DISCOVERY_LEASE)
+    {
+        Err(DiscoveryFailure::Timeout)
+    } else {
+        result
+    };
     let entry = match result {
         Ok(tasks) => TaskDiscoveryCacheEntry::Ready {
             tasks,
@@ -499,9 +504,9 @@ mod subscription_tests {
         clear_task_discovery_cache_for_test();
         let target = target("subscription-expiry");
         let (_, generation) = prepare_task_discovery(&target);
-        let (_, key, _, remaining, mut one) = register_subscription(&target);
+        let (_, key, _, deadline, mut one) = register_subscription(&target);
         let (_, _, _, _, mut two) = register_subscription(&target);
-        assert!(remaining <= DISCOVERY_LEASE);
+        assert!(deadline.saturating_duration_since(Instant::now()) <= DISCOVERY_LEASE);
         expire_subscription(&key, generation);
         assert_eq!(
             one.try_recv().unwrap(),
@@ -533,6 +538,75 @@ mod subscription_tests {
             retry.try_recv().unwrap(),
             CachedTaskDiscovery::Ready(Vec::new())
         );
+    }
+
+    #[test]
+    fn pending_completion_after_absolute_lease_is_timeout_before_main_dispatch() {
+        let _guard = task_discovery_test_guard();
+        clear_task_discovery_cache_for_test();
+        let target = target("subscription-late-worker");
+        let (_, generation) = prepare_task_discovery(&target);
+        let (_, key, _, _, mut first) = register_subscription(&target);
+        let (_, _, _, _, mut second) = register_subscription(&target);
+        if let Some(TaskDiscoveryCacheEntry::Pending { started_at, .. }) =
+            task_discovery_cache().lock().unwrap().entries.get_mut(&key)
+        {
+            *started_at = Instant::now() - DISCOVERY_LEASE - Duration::from_secs(1);
+        }
+        complete_task_discovery(&target, generation, Ok(Vec::new()));
+        assert_eq!(
+            first.try_recv().unwrap(),
+            CachedTaskDiscovery::Failed(DiscoveryFailure::Timeout)
+        );
+        assert_eq!(
+            second.try_recv().unwrap(),
+            CachedTaskDiscovery::Failed(DiscoveryFailure::Timeout)
+        );
+        assert_eq!(
+            cached_task_discovery(&target),
+            CachedTaskDiscovery::Failed(DiscoveryFailure::Timeout)
+        );
+        assert_eq!(
+            prepare_task_discovery(&target).0,
+            TaskDiscoveryRequest::UseCached
+        );
+    }
+
+    #[test]
+    fn local_subscription_uses_absolute_deadline_even_when_first_poll_is_delayed() {
+        let _guard = task_discovery_test_guard();
+        clear_task_discovery_cache_for_test();
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let target = target("subscription-delayed-dispatch");
+                prepare_task_discovery(&target);
+                if let Some(TaskDiscoveryCacheEntry::Pending { started_at, .. }) =
+                    task_discovery_cache()
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .get_mut(&DiscoveryCacheKey::from(&target))
+                {
+                    *started_at = Instant::now() - DISCOVERY_LEASE + Duration::from_millis(20);
+                }
+                let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+                let result_for_callback = result.clone();
+                let subscription = subscribe_task_discovery(&target, move |value| {
+                    *result_for_callback.borrow_mut() = Some(value)
+                });
+                std::thread::sleep(Duration::from_millis(40));
+                while context.pending() {
+                    context.iteration(false);
+                }
+                assert_eq!(
+                    *result.borrow(),
+                    Some(CachedTaskDiscovery::Failed(DiscoveryFailure::Timeout)),
+                    "GTK dispatch must not extend the original lease"
+                );
+                drop(subscription);
+            })
+            .unwrap();
     }
 
     #[test]
