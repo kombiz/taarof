@@ -1138,12 +1138,67 @@ fn process_start_unix_ms(pid: i32) -> Option<u64> {
     )
 }
 
-fn binding_process_start(binding: &PaneTranscriptBinding) -> Option<u64> {
-    binding.process_started_at_unix_ms.or_else(|| {
-        let shell_pid = binding.shell_pid?;
-        let agent_pid = find_agent_process_pid(shell_pid, &binding.agent)?;
-        process_start_unix_ms(agent_pid)
-    })
+trait TranscriptProcessSource {
+    fn agent_pid(&self, shell_pid: i32, agent: &str) -> Option<i32>;
+    fn start(&self, pid: i32) -> Option<u64>;
+    fn cwd(&self, pid: i32) -> Option<PathBuf>;
+    fn codex_home(&self, pid: i32) -> Option<OsString>;
+}
+
+struct ProcTranscriptSource;
+
+impl TranscriptProcessSource for ProcTranscriptSource {
+    fn agent_pid(&self, shell_pid: i32, agent: &str) -> Option<i32> {
+        find_agent_process_pid(shell_pid, agent)
+    }
+    fn start(&self, pid: i32) -> Option<u64> {
+        process_start_unix_ms(pid)
+    }
+    fn cwd(&self, pid: i32) -> Option<PathBuf> {
+        fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+    fn codex_home(&self, pid: i32) -> Option<OsString> {
+        process_environment_value(pid, "CODEX_HOME")
+    }
+}
+
+#[derive(Default)]
+struct BindingProcessFacts {
+    pid: std::cell::OnceCell<Option<i32>>,
+    start: std::cell::OnceCell<Option<u64>>,
+    cwd: std::cell::OnceCell<Option<PathBuf>>,
+}
+
+impl BindingProcessFacts {
+    fn pid(
+        &self,
+        binding: &PaneTranscriptBinding,
+        source: &impl TranscriptProcessSource,
+    ) -> Option<i32> {
+        *self
+            .pid
+            .get_or_init(|| source.agent_pid(binding.shell_pid?, &binding.agent))
+    }
+    fn start(
+        &self,
+        binding: &PaneTranscriptBinding,
+        source: &impl TranscriptProcessSource,
+    ) -> Option<u64> {
+        *self.start.get_or_init(|| {
+            binding
+                .process_started_at_unix_ms
+                .or_else(|| source.start(self.pid(binding, source)?))
+        })
+    }
+    fn cwd(
+        &self,
+        binding: &PaneTranscriptBinding,
+        source: &impl TranscriptProcessSource,
+    ) -> Option<PathBuf> {
+        self.cwd
+            .get_or_init(|| source.cwd(self.pid(binding, source)?))
+            .clone()
+    }
 }
 
 /// The directory the agent itself is running in, in canonical form.
@@ -1154,14 +1209,14 @@ fn binding_process_start(binding: &PaneTranscriptBinding) -> Option<u64> {
 /// matches a session recorded under `~/code/llm-hq`. Prefer the live agent
 /// process cwd, then canonicalize the pane cwd; keep the raw value only when
 /// the path does not resolve on this host.
-fn binding_agent_cwd(binding: &PaneTranscriptBinding) -> Option<String> {
-    let live_agent_cwd = binding.shell_pid.and_then(|shell_pid| {
-        let agent_pid = find_agent_process_pid(shell_pid, &binding.agent)?;
-        fs::read_link(format!("/proc/{agent_pid}/cwd"))
-            .ok()?
-            .to_str()
-            .map(str::to_owned)
-    });
+fn binding_agent_cwd(
+    binding: &PaneTranscriptBinding,
+    facts: &BindingProcessFacts,
+    source: &impl TranscriptProcessSource,
+) -> Option<String> {
+    let live_agent_cwd = facts
+        .cwd(binding, source)
+        .and_then(|cwd| cwd.to_str().map(str::to_owned));
     live_agent_cwd.or_else(|| binding.cwd.as_deref().map(canonical_cwd))
 }
 
@@ -1209,17 +1264,18 @@ fn process_environment_value(pid: i32, name: &str) -> Option<OsString> {
     }
 }
 
-fn binding_codex_sessions_root(binding: &PaneTranscriptBinding) -> Option<PathBuf> {
+fn binding_codex_sessions_root(
+    binding: &PaneTranscriptBinding,
+    facts: &BindingProcessFacts,
+    source: &impl TranscriptProcessSource,
+) -> Option<PathBuf> {
     if binding.agent != "codex" {
         return None;
     }
-    let shell_pid = binding.shell_pid?;
-    let agent_pid = find_agent_process_pid(shell_pid, &binding.agent)?;
-    let mut codex_home = PathBuf::from(process_environment_value(agent_pid, "CODEX_HOME")?);
+    let agent_pid = facts.pid(binding, source)?;
+    let mut codex_home = PathBuf::from(source.codex_home(agent_pid)?);
     if codex_home.is_relative() {
-        codex_home = fs::read_link(format!("/proc/{agent_pid}/cwd"))
-            .ok()?
-            .join(codex_home);
+        codex_home = facts.cwd(binding, source)?.join(codex_home);
     }
     codex_sessions_root(Some(codex_home), None)
 }
@@ -1952,17 +2008,17 @@ impl TranscriptTracker {
     /// a pane only appears in `ticks` when its folded state actually moved, so
     /// idle ticks are cheap.
     pub(crate) fn sync_and_poll(&self, bindings: &[PaneTranscriptBinding]) -> TranscriptPollResult {
-        let binding_process_starts: HashMap<PaneTranscriptKey, Option<u64>> = bindings
+        self.sync_and_poll_with_source(bindings, &ProcTranscriptSource)
+    }
+
+    fn sync_and_poll_with_source(
+        &self,
+        bindings: &[PaneTranscriptBinding],
+        source: &impl TranscriptProcessSource,
+    ) -> TranscriptPollResult {
+        let facts: HashMap<PaneTranscriptKey, BindingProcessFacts> = bindings
             .iter()
-            .map(|binding| (binding.key, binding_process_start(binding)))
-            .collect();
-        let binding_cwds: HashMap<PaneTranscriptKey, Option<String>> = bindings
-            .iter()
-            .map(|binding| (binding.key, binding_agent_cwd(binding)))
-            .collect();
-        let binding_provider_roots: HashMap<PaneTranscriptKey, Option<PathBuf>> = bindings
-            .iter()
-            .map(|binding| (binding.key, binding_codex_sessions_root(binding)))
+            .map(|binding| (binding.key, BindingProcessFacts::default()))
             .collect();
         let mut inner = self.inner.lock().expect("transcript tracker lock poisoned");
         let mut ticks = Vec::new();
@@ -1984,7 +2040,7 @@ impl TranscriptTracker {
                             .is_none_or(|session_id| tail.session_id == *session_id)
                         && (binding.session_id.is_some()
                             || tail.process_started_at_unix_ms
-                                == binding_process_starts.get(&key).copied().flatten())
+                                == facts[&key].start(binding, source))
                 })
             });
             if !keep {
@@ -2013,15 +2069,15 @@ impl TranscriptTracker {
             let tail = match inner.entry(binding.key) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
+                    let facts = &facts[&binding.key];
+                    let cwd = binding_agent_cwd(binding, facts, source);
+                    let process_start = facts.start(binding, source);
+                    let provider_root = binding_codex_sessions_root(binding, facts, source);
                     let Some(resolved) = adapter.resolve_path(
                         binding.session_id.as_deref(),
-                        binding_cwds
-                            .get(&binding.key)
-                            .and_then(|cwd| cwd.as_deref()),
-                        binding_process_starts.get(&binding.key).copied().flatten(),
-                        binding_provider_roots
-                            .get(&binding.key)
-                            .and_then(|root| root.as_deref()),
+                        cwd.as_deref(),
+                        process_start,
+                        provider_root.as_deref(),
                     ) else {
                         // Unresolvable session: insert nothing, degrade silently.
                         continue;
@@ -2037,10 +2093,7 @@ impl TranscriptTracker {
                     entry.insert(PaneTail {
                         agent: binding.agent.clone(),
                         session_id: resolved.session_id.clone(),
-                        process_started_at_unix_ms: binding_process_starts
-                            .get(&binding.key)
-                            .copied()
-                            .flatten(),
+                        process_started_at_unix_ms: process_start,
                         source_path: resolved.path.clone(),
                         tailer: TranscriptTailer::new(resolved.path),
                         state: TranscriptState {
@@ -2156,6 +2209,198 @@ mod tests {
     use crate::agents::TurnPhase;
     use std::fs;
     use std::io::Write;
+
+    #[derive(Default)]
+    struct CountingProcessSource {
+        reads: std::cell::Cell<[usize; 4]>,
+        start: std::cell::Cell<u64>,
+        cwd: Option<PathBuf>,
+    }
+    impl CountingProcessSource {
+        fn read(&self, index: usize) {
+            let mut reads = self.reads.get();
+            reads[index] += 1;
+            self.reads.set(reads);
+        }
+    }
+    impl TranscriptProcessSource for CountingProcessSource {
+        fn agent_pid(&self, shell_pid: i32, agent: &str) -> Option<i32> {
+            self.read(0);
+            (shell_pid == 42 && agent == "codex").then_some(43)
+        }
+        fn start(&self, pid: i32) -> Option<u64> {
+            assert_eq!(pid, 43);
+            self.read(1);
+            Some(self.start.get())
+        }
+        fn cwd(&self, pid: i32) -> Option<PathBuf> {
+            assert_eq!(pid, 43);
+            self.read(2);
+            Some(self.cwd.clone().unwrap_or_else(|| "/work".into()))
+        }
+        fn codex_home(&self, pid: i32) -> Option<OsString> {
+            assert_eq!(pid, 43);
+            self.read(3);
+            Some("relative-home".into())
+        }
+    }
+    struct CountingAdapter(PathBuf);
+    struct NativePathAdapter {
+        transcript: PathBuf,
+        expected_root: PathBuf,
+    }
+    impl TranscriptAdapter for NativePathAdapter {
+        fn agent_kind(&self) -> &'static str {
+            "codex"
+        }
+        fn resolve_path(
+            &self,
+            session: Option<&str>,
+            cwd: Option<&str>,
+            start: Option<u64>,
+            root: Option<&Path>,
+        ) -> Option<ResolvedTranscript> {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(session, Some("session"));
+            assert!(cwd.is_none());
+            assert_eq!(start, Some(0));
+            assert_eq!(
+                root.expect("native root must survive")
+                    .as_os_str()
+                    .as_bytes(),
+                self.expected_root.as_os_str().as_bytes()
+            );
+            Some(ResolvedTranscript {
+                path: self.transcript.clone(),
+                session_id: "session".into(),
+            })
+        }
+        fn ingest_lines(&self, _: &[String], _: &mut TranscriptState) -> TranscriptDelta {
+            TranscriptDelta::default()
+        }
+    }
+
+    #[test]
+    fn within_poll_relative_codex_home_preserves_non_utf8_cwd_bytes() {
+        let root = unique_temp_dir("native-cwd-bytes");
+        fs::create_dir_all(&root).unwrap();
+        let transcript = root.join("session.jsonl");
+        fs::write(&transcript, "").unwrap();
+        let cwd = PathBuf::from(OsString::from_vec(b"/work/non-utf8-\xff".to_vec()));
+        let expected_root = cwd.join("relative-home/sessions");
+        let tracker = TranscriptTracker::with_adapters(vec![Box::new(NativePathAdapter {
+            transcript,
+            expected_root,
+        })]);
+        let source = CountingProcessSource {
+            cwd: Some(cwd),
+            ..Default::default()
+        };
+        let binding = PaneTranscriptBinding {
+            key: (1, 1),
+            agent: "codex".into(),
+            session_id: Some("session".into()),
+            cwd: None,
+            shell_pid: Some(42),
+            process_started_at_unix_ms: None,
+        };
+        assert_eq!(
+            tracker
+                .sync_and_poll_with_source(std::slice::from_ref(&binding), &source)
+                .ticks
+                .len(),
+            1
+        );
+        assert_eq!(source.reads.get(), [1, 1, 1, 1]);
+        tracker.sync_and_poll_with_source(std::slice::from_ref(&binding), &source);
+        assert_eq!(source.reads.get(), [1, 1, 1, 1]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    impl TranscriptAdapter for CountingAdapter {
+        fn agent_kind(&self) -> &'static str {
+            "codex"
+        }
+        fn resolve_path(
+            &self,
+            session: Option<&str>,
+            cwd: Option<&str>,
+            start: Option<u64>,
+            root: Option<&Path>,
+        ) -> Option<ResolvedTranscript> {
+            if cwd != Some("/work")
+                || start.is_none()
+                || root != Some(Path::new("/work/relative-home/sessions"))
+                || session.is_some_and(|id| id != "session")
+            {
+                return None;
+            }
+            Some(ResolvedTranscript {
+                path: self.0.clone(),
+                session_id: "session".into(),
+            })
+        }
+        fn ingest_lines(&self, _: &[String], _: &mut TranscriptState) -> TranscriptDelta {
+            TranscriptDelta::default()
+        }
+    }
+    #[test]
+    fn within_poll_procfs_reuse_defers_resolution_and_preserves_invalidation() {
+        let root = unique_temp_dir("procfs-counts");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        fs::write(&path, "").unwrap();
+        let tracker = TranscriptTracker::with_adapters(vec![Box::new(CountingAdapter(path))]);
+        let source = CountingProcessSource::default();
+        let mut binding = PaneTranscriptBinding {
+            key: (1, 1),
+            agent: "codex".into(),
+            session_id: None,
+            cwd: None,
+            shell_pid: Some(42),
+            process_started_at_unix_ms: None,
+        };
+        assert_eq!(
+            tracker
+                .sync_and_poll_with_source(std::slice::from_ref(&binding), &source)
+                .ticks
+                .len(),
+            1
+        );
+        assert_eq!(source.reads.get(), [1, 1, 1, 1]);
+        tracker.sync_and_poll_with_source(std::slice::from_ref(&binding), &source);
+        assert_eq!(source.reads.get(), [2, 2, 1, 1]);
+        binding.session_id = Some("session".into());
+        tracker.sync_and_poll_with_source(std::slice::from_ref(&binding), &source);
+        assert_eq!(source.reads.get(), [2, 2, 1, 1]);
+        binding.session_id = None;
+        source.start.set(1);
+        assert_eq!(
+            tracker
+                .sync_and_poll_with_source(std::slice::from_ref(&binding), &source)
+                .removed,
+            vec![(1, 1)]
+        );
+        assert_eq!(source.reads.get(), [3, 3, 2, 2]);
+        binding.session_id = Some("wrong-session".into());
+        let result = tracker.sync_and_poll_with_source(std::slice::from_ref(&binding), &source);
+        assert_eq!(result.removed, vec![(1, 1)]);
+        assert!(result.ticks.is_empty());
+        binding.session_id = None;
+        binding.shell_pid = Some(99);
+        assert!(tracker
+            .sync_and_poll_with_source(std::slice::from_ref(&binding), &source)
+            .ticks
+            .is_empty());
+        binding.agent = "claude".into();
+        let before = source.reads.get();
+        assert!(tracker
+            .sync_and_poll_with_source(std::slice::from_ref(&binding), &source)
+            .ticks
+            .is_empty());
+        assert_eq!(source.reads.get(), before);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -3510,7 +3755,11 @@ mod tests {
 
         let expected_root = custom_home.join("sessions");
         let detected_root = (0..100).find_map(|_| {
-            let result = binding_codex_sessions_root(&binding);
+            let result = binding_codex_sessions_root(
+                &binding,
+                &BindingProcessFacts::default(),
+                &ProcTranscriptSource,
+            );
             if result.is_none() {
                 std::thread::sleep(Duration::from_millis(10));
             }
