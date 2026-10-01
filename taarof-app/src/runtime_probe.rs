@@ -1174,10 +1174,9 @@ mod tests {
     fn within_build_executable_and_cmdline_reads_are_shared_and_identity_is_required() {
         let mut source = FakeProbeSource::default();
         source.comm.insert(42, "codex".into());
-        source.cmdline.insert(
-            42,
-            vec!["codex".into(), "resume".into(), "session".into()],
-        );
+        source
+            .cmdline
+            .insert(42, vec!["codex".into(), "resume".into(), "session".into()]);
         source.executables.insert(42, "codex".into());
         let snapshot =
             RuntimeProbeSnapshot::build(&source, 1, &[(1, vec![42])], &[(1, 1, 42), (1, 2, 42)]);
