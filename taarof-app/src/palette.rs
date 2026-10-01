@@ -5189,6 +5189,59 @@ mod tests {
     }
 
     #[test]
+    fn task_viewer_worktree_direct_activation_rejects_away_back() {
+        let _guard = crate::mise::task_discovery_test_guard();
+        crate::mise::clear_task_discovery_cache_for_test();
+        let (state, project) = state_with_attention(false);
+        let project_path = project.to_string_lossy().into_owned();
+        let other_path = format!("{project_path}-other");
+        {
+            let mut st = state.borrow_mut();
+            st.create_workspace("other", Some(other_path.clone()));
+            st.active_ws_mut().unwrap().tabs.push(stub_tab(22, "other"));
+            st.register_task_tab_epoch(22);
+            st.activate_tab(11).unwrap();
+        }
+        let target = active_task_target(&state.borrow()).unwrap();
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                crate::mise::set_pending_task_discovery_for_test(&target);
+                let calls = Rc::new(RefCell::new(Vec::new()));
+                let palette_calls = calls.clone();
+                let palette = crate::mise::subscribe_task_discovery_for_viewer(
+                    &state,
+                    crate::mise::TaskViewerIdentity::for_active(&state.borrow()).unwrap(),
+                    &target,
+                    move |_| palette_calls.borrow_mut().push("old palette"),
+                );
+                let row_calls = calls.clone();
+                let row = crate::mise::subscribe_task_discovery_for_viewer(
+                    &state,
+                    crate::mise::TaskViewerIdentity::for_tab(&state.borrow(), 11).unwrap(),
+                    &target,
+                    move |_| row_calls.borrow_mut().push("current row"),
+                );
+                assert!(matches!(
+                    ensure_worktree_workspace_state(&state, &other_path),
+                    WorktreeWorkspaceState::Existing { tab_id: 22, .. }
+                ));
+                assert!(matches!(
+                    ensure_worktree_workspace_state(&state, &project_path),
+                    WorktreeWorkspaceState::Existing { tab_id: 11, .. }
+                ));
+                crate::mise::complete_current_task_discovery_for_test(&target, Ok(Vec::new()));
+                while context.pending() {
+                    context.iteration(false);
+                }
+                assert_eq!(*calls.borrow(), vec!["current row"]);
+                drop((palette, row));
+            })
+            .unwrap();
+        std::fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
     #[ignore = "requires an owned GTK display (xvfb-run)"]
     fn task_discovery_palette_subscription_gtk_lifecycle() {
         let _glib_guard = crate::glib_main_context_test_guard();
