@@ -486,10 +486,8 @@ pub(super) fn connect_command_mark_tracking(
     terminal.connect_termprop_changed(Some(SHELL_PRECMD_TERMPROP), move |term, _prop| {
         let (_col, row) = term.cursor_position();
         let mut st = state.borrow_mut();
-        if let Some(tab) = st.find_tab_mut(tab_id) {
-            if let Some(leaf) = tab.panes.leaf_mut(pane_id) {
-                leaf.push_command_mark(row);
-            }
+        if let Some(leaf) = st.leaf_mut(tab_id, pane_id) {
+            leaf.push_command_mark(row);
         }
     });
 }
