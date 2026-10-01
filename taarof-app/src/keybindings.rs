@@ -465,37 +465,37 @@ pub enum ChordTarget {
 ///
 /// GTK action names are stringly typed at the final boundary. Recording every
 /// registration through this ledger keeps that boundary tied to [`Action`]: a
-/// missing, duplicated, or renamed handler aborts startup instead of leaving a
+/// missing or duplicated handler aborts startup instead of leaving a
 /// shortcut that GTK silently ignores.
 #[derive(Default)]
 pub struct WindowActionLedger {
-    registrations: Vec<(Action, String)>,
+    registrations: Vec<Action>,
 }
 
 impl WindowActionLedger {
     /// Record one bindable window handler immediately before it is added.
-    pub fn register(&mut self, action: Action, name: &str) {
+    pub fn register(&mut self, action: Action) {
         assert!(
             action.gaction_name().starts_with("win."),
             "only win.* actions can be registered as window handlers"
         );
-        self.registrations.push((action, name.to_string()));
+        self.registrations.push(action);
     }
 
     /// Verify that the installed handlers and the bindable action vocabulary
     /// are a one-to-one mapping.
     pub fn validate(&self) -> Result<(), String> {
-        let registrations: Vec<(Action, &str)> = self
-            .registrations
-            .iter()
-            .map(|(action, name)| (*action, name.as_str()))
-            .collect();
-        validate_window_action_registrations(&registrations)
+        validate_window_action_registrations(&self.registrations)
     }
 
     /// Names of handlers that were added through the bindable registration seam.
     pub fn handler_names(&self) -> impl Iterator<Item = &str> {
-        self.registrations.iter().map(|(_, name)| name.as_str())
+        self.registrations.iter().map(|action| {
+            action
+                .gaction_name()
+                .strip_prefix("win.")
+                .expect("ledger contains only window actions")
+        })
     }
 }
 
@@ -506,9 +506,7 @@ impl WindowActionLedger {
 /// before a window action group can see it. Callers can only construct a
 /// [`WindowActionLedger`] with an [`Action`], which prevents an orphan window
 /// handler from bypassing the keybinding and shortcut-help vocabulary.
-pub fn validate_window_action_registrations(
-    registrations: &[(Action, &str)],
-) -> Result<(), String> {
+pub fn validate_window_action_registrations(registrations: &[Action]) -> Result<(), String> {
     let expected: Vec<(Action, &str)> = Action::ALL
         .iter()
         .copied()
@@ -525,28 +523,25 @@ pub fn validate_window_action_registrations(
         errors.push("no bindable window actions were registered".to_string());
     }
     for (action, expected_name) in &expected {
-        let names: Vec<&str> = registrations
+        match registrations
             .iter()
-            .filter_map(|(registered_action, registered_name)| {
-                (*registered_action == *action).then_some(*registered_name)
-            })
-            .collect();
-        match names.as_slice() {
-            [] => errors.push(format!("missing handler for win.{expected_name}")),
-            [registered_name] if *registered_name != *expected_name => errors.push(format!(
-                "handler for {action} was renamed to win.{registered_name}; expected win.{expected_name}"
-            )),
-            [_] => {}
+            .filter(|registered| **registered == *action)
+            .count()
+        {
+            0 => errors.push(format!("missing handler for win.{expected_name}")),
+            1 => {}
             _ => errors.push(format!("duplicate handlers for win.{expected_name}")),
         }
     }
 
-    for (action, name) in registrations {
+    for action in registrations {
         if !expected
             .iter()
             .any(|(expected_action, _)| action == expected_action)
         {
-            errors.push(format!("unbound Action {action} registered as win.{name}"));
+            errors.push(format!(
+                "unbound Action {action} registered as a window handler"
+            ));
         }
     }
 
@@ -963,9 +958,22 @@ pub fn get_terminal_bindings() -> Vec<TerminalBinding> {
 /// `&str` is the whole point: GTK resolves action names at runtime and silently
 /// does nothing when one is missing, so a raw `"win.…"` literal turns a rename
 /// or a typo into a dead button that still compiles. Routing through
-/// [`Action::gaction_name`] makes that a build failure instead.
+/// [`Action::gaction_name`] derives names; failed runtime resolution is reported.
 pub fn activate(widget: &impl gtk::prelude::IsA<gtk::Widget>, action: Action) {
-    let _ = gtk::prelude::WidgetExt::activate_action(widget, action.gaction_name(), None);
+    activate_with(
+        action,
+        || gtk::prelude::WidgetExt::activate_action(widget, action.gaction_name(), None).is_ok(),
+        |message| eprintln!("{message}"),
+    );
+}
+
+fn activate_with(action: Action, activate: impl FnOnce() -> bool, report: impl FnOnce(&str)) {
+    if !activate() {
+        report(&format!(
+            "taarof: no action registered for {}; typed activation did nothing",
+            action.gaction_name()
+        ));
+    }
 }
 
 pub fn matches_any_shortcut(
@@ -1537,23 +1545,49 @@ mod tests {
         ]
     }
 
-    fn complete_window_action_registrations() -> Vec<(Action, &'static str)> {
+    #[test]
+    fn typed_activation_reports_missing_handler_and_activates_registered_handler() {
+        use gio::prelude::*;
+        let group = gio::SimpleActionGroup::new();
+        let activate_new_tab = || {
+            let Some(handler) = group.lookup_action("new-tab") else {
+                return false;
+            };
+            handler.activate(None);
+            true
+        };
+        let mut diagnostic = String::new();
+        activate_with(Action::NewTab, activate_new_tab, |message| {
+            diagnostic = message.to_string()
+        });
+        assert_eq!(
+            diagnostic,
+            "taarof: no action registered for win.new-tab; typed activation did nothing"
+        );
+
+        let activated = std::rc::Rc::new(std::cell::Cell::new(false));
+        let handler = gio::SimpleAction::new("new-tab", None);
+        let observed = activated.clone();
+        handler.connect_activate(move |_, _| observed.set(true));
+        group.add_action(&handler);
+        activate_with(Action::NewTab, activate_new_tab, |_| {
+            panic!("registered handler must not report failure")
+        });
+        assert!(activated.get());
+    }
+
+    fn complete_window_action_registrations() -> Vec<Action> {
         Action::ALL
             .iter()
             .copied()
-            .filter_map(|action| {
-                action
-                    .gaction_name()
-                    .strip_prefix("win.")
-                    .map(|name| (action, name))
-            })
+            .filter(|action| action.gaction_name().starts_with("win."))
             .collect()
     }
 
     #[test]
     fn test_action_registration_missing_registration_fails_contract() {
         let mut registrations = complete_window_action_registrations();
-        registrations.retain(|(action, _)| *action != Action::NewTab);
+        registrations.retain(|action| *action != Action::NewTab);
 
         let error = validate_window_action_registrations(&registrations)
             .expect_err("removing a handler must fail the action contract");
@@ -1561,23 +1595,9 @@ mod tests {
     }
 
     #[test]
-    fn test_action_registration_renamed_registration_fails_contract() {
-        let mut registrations = complete_window_action_registrations();
-        let entry = registrations
-            .iter_mut()
-            .find(|(action, _)| *action == Action::NewTab)
-            .expect("NewTab must be a window action");
-        entry.1 = "renamed-new-tab";
-
-        let error = validate_window_action_registrations(&registrations)
-            .expect_err("renaming a handler must fail the action contract");
-        assert!(error.contains("new-tab"), "unexpected error: {error}");
-    }
-
-    #[test]
     fn test_action_registration_duplicate_registration_fails_contract() {
         let mut registrations = complete_window_action_registrations();
-        registrations.push((Action::NewTab, "new-tab"));
+        registrations.push(Action::NewTab);
 
         let error = validate_window_action_registrations(&registrations)
             .expect_err("registering an action twice must fail the action contract");
@@ -1589,6 +1609,18 @@ mod tests {
         let error = validate_window_action_registrations(&[])
             .expect_err("an empty action registration set must fail the contract");
         assert!(error.contains("no bindable"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn test_action_registration_rejects_terminal_only_action() {
+        let mut registrations = complete_window_action_registrations();
+        registrations.push(Action::Copy);
+        let error = validate_window_action_registrations(&registrations)
+            .expect_err("terminal-only action cannot be a window handler");
+        assert!(
+            error.contains("unbound Action copy"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

@@ -289,7 +289,7 @@ pub fn build_sidebar() -> Sidebar {
     new_btn.add_css_class("new-tab-button");
     new_btn.add_css_class("compact-hidden");
     new_btn.connect_clicked(move |button| {
-        activate_window_action(button, crate::keybindings::Action::NewTab);
+        crate::keybindings::activate(button, crate::keybindings::Action::NewTab);
     });
     sidebar.append(&new_btn);
 
@@ -301,7 +301,7 @@ pub fn build_sidebar() -> Sidebar {
     tmux_btn.set_tooltip_text(Some(&tmux_ui.tooltip));
     tmux_btn.set_sensitive(tmux_ui.available);
     tmux_btn.connect_clicked(move |button| {
-        activate_window_action(button, crate::keybindings::Action::NewTmuxTab);
+        crate::keybindings::activate(button, crate::keybindings::Action::NewTmuxTab);
     });
     sidebar.append(&tmux_btn);
 
@@ -1589,10 +1589,6 @@ fn widget_window(widget: &impl IsA<gtk::Widget>) -> Option<adw::ApplicationWindo
         .and_then(|root| root.downcast::<adw::ApplicationWindow>().ok())
 }
 
-fn activate_window_action(widget: &impl IsA<gtk::Widget>, action: crate::keybindings::Action) {
-    crate::keybindings::activate(widget, action);
-}
-
 fn copy_text_to_clipboard(text: &str) {
     if text.trim().is_empty() {
         return;
@@ -2374,7 +2370,7 @@ fn show_tab_row_menu(
         let term_stack = term_stack.clone();
         split_vertical_action.connect_activate(move |_, _| {
             activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::SplitVertical);
+            crate::keybindings::activate(&row, crate::keybindings::Action::SplitVertical);
         });
     }
     group.add_action(&split_vertical_action);
@@ -2387,7 +2383,7 @@ fn show_tab_row_menu(
         let term_stack = term_stack.clone();
         split_horizontal_action.connect_activate(move |_, _| {
             activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::SplitHorizontal);
+            crate::keybindings::activate(&row, crate::keybindings::Action::SplitHorizontal);
         });
     }
     group.add_action(&split_horizontal_action);
@@ -2402,7 +2398,7 @@ fn show_tab_row_menu(
         let term_stack = term_stack.clone();
         send_to_pane_action.connect_activate(move |_, _| {
             activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::SendToPane);
+            crate::keybindings::activate(&row, crate::keybindings::Action::SendToPane);
         });
     }
     group.add_action(&send_to_pane_action);
@@ -2415,7 +2411,7 @@ fn show_tab_row_menu(
         let term_stack = term_stack.clone();
         send_last_output_to_pane_action.connect_activate(move |_, _| {
             activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::SendLastOutputToPane);
+            crate::keybindings::activate(&row, crate::keybindings::Action::SendLastOutputToPane);
         });
     }
     group.add_action(&send_last_output_to_pane_action);
@@ -2428,7 +2424,7 @@ fn show_tab_row_menu(
         let term_stack = term_stack.clone();
         copy_last_message_action.connect_activate(move |_, _| {
             activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::CopyLastMessage);
+            crate::keybindings::activate(&row, crate::keybindings::Action::CopyLastMessage);
         });
     }
     group.add_action(&copy_last_message_action);
@@ -2441,7 +2437,7 @@ fn show_tab_row_menu(
         let term_stack = term_stack.clone();
         relay_last_message_action.connect_activate(move |_, _| {
             activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::RelayLastMessage);
+            crate::keybindings::activate(&row, crate::keybindings::Action::RelayLastMessage);
         });
     }
     group.add_action(&relay_last_message_action);
@@ -2456,7 +2452,7 @@ fn show_tab_row_menu(
         let term_stack = term_stack.clone();
         recent_files_action.connect_activate(move |_, _| {
             activate_tab_row(&tab_list, &state, &term_stack, tab_id, &row);
-            activate_window_action(&row, crate::keybindings::Action::RecentFiles);
+            crate::keybindings::activate(&row, crate::keybindings::Action::RecentFiles);
         });
     }
     group.add_action(&recent_files_action);

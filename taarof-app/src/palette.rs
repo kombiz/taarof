@@ -2362,7 +2362,7 @@ fn execute_action(
     match action {
         // ── Navigation / UI ──────────────────────────────────────────────────
         PaletteAction::Activate(action_name) => {
-            dispatch_activate(*action_name, window);
+            crate::keybindings::activate(window, *action_name);
             false
         }
         PaletteAction::Noop => true,
@@ -2726,54 +2726,6 @@ fn dispatch_send_to_pane(
 }
 
 // ── execute_action dispatch helpers ──────────────────────────────────────────
-
-/// Activate the typed window handler, reporting a missing registration.
-fn dispatch_activate(action: crate::keybindings::Action, window: &adw::ApplicationWindow) {
-    dispatch_activate_with(action, window, |message| eprintln!("{message}"));
-}
-
-fn dispatch_activate_with(
-    action: crate::keybindings::Action,
-    window: &impl IsA<gio::ActionMap>,
-    report: impl FnOnce(&str),
-) {
-    let gaction_name = action.gaction_name();
-    if let Some(name) = gaction_name.strip_prefix("win.") {
-        if let Some(gaction) = window.lookup_action(name) {
-            if let Some(simple) = gaction.downcast_ref::<gio::SimpleAction>() {
-                simple.activate(None);
-                return;
-            }
-        }
-    }
-    // The typed enum guarantees the *name* exists; it cannot guarantee the
-    // window registered a handler for it. Say so rather than no-oping silently.
-    report(&format!(
-        "taarof: no window action registered for {gaction_name}; palette entry did nothing"
-    ));
-}
-
-#[test]
-fn typed_palette_activation_reports_missing_handler_and_activates_registered_handler() {
-    let group = gio::SimpleActionGroup::new();
-    let mut diagnostic = String::new();
-    dispatch_activate_with(crate::keybindings::Action::NewTab, &group, |message| {
-        diagnostic = message.to_string();
-    });
-    assert_eq!(
-        diagnostic,
-        "taarof: no window action registered for win.new-tab; palette entry did nothing"
-    );
-    let activated = std::rc::Rc::new(std::cell::Cell::new(false));
-    let handler = gio::SimpleAction::new("new-tab", None);
-    let observed = activated.clone();
-    handler.connect_activate(move |_, _| observed.set(true));
-    group.add_action(&handler);
-    dispatch_activate_with(crate::keybindings::Action::NewTab, &group, |_| {
-        panic!("registered handler must not report a missing action");
-    });
-    assert!(activated.get());
-}
 
 /// Switch to the tab identified by `tab_id` and focus its terminal.
 fn dispatch_switch_tab(

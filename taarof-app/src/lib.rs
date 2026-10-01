@@ -1340,7 +1340,7 @@ fn register_bindable_window_action(
         .expect("only window actions can be installed as bindable handlers");
     let handler = gio::SimpleAction::new(name, None);
     configure(&handler);
-    ledger.register(action, name);
+    ledger.register(action);
     window.add_action(&handler);
 }
 
@@ -3965,6 +3965,10 @@ mod tests {
         .is_err());
         register_bindable_window_action(&group, &mut ledger, keybindings::Action::NewTab, |_| {});
         assert!(ledger.validate().unwrap_err().contains("duplicate"));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_window_action_contract(&group, &ledger);
+        }))
+        .is_err());
     }
 
     #[test]
