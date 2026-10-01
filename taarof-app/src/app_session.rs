@@ -464,6 +464,16 @@ fn register_signal_sources(
             );
         }
         if attach(&source, context) == 0 {
+            // An unattached source can retain its callback until its last
+            // reference drops even after destroy. Release local captures now.
+            unsafe {
+                glib::ffi::g_source_set_callback(
+                    source.to_glib_none().0,
+                    None,
+                    std::ptr::null_mut(),
+                    None,
+                );
+            }
             source.destroy();
             report(signum, "GLib could not attach Unix signal source");
         } else {
