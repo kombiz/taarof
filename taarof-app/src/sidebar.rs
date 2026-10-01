@@ -6901,11 +6901,9 @@ mod tests {
             ExecutionState::Running
         );
         assert!(ui.needs_rebuild(before.visible));
-        state
-            .runtime_probe
-            .as_mut()
-            .unwrap()
-            .process_observed_at_unix_ms = Some(now - PROBE_TTL_MS - 60_000);
+        let expired = state.runtime_probe.as_mut().unwrap();
+        expired.probed_at_unix_ms = now - PROBE_TTL_MS - 60_000;
+        expired.process_observed_at_unix_ms = Some(expired.probed_at_unix_ms);
         assert!(!crate::runtime_probe::runtime_process_truth_is_fresh(
             &state
         ));
