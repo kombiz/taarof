@@ -4,17 +4,9 @@ use super::*;
 
 pub(super) const SOCKET_MAX_CAPTURE_SCROLLBACK_LINES: u32 = 10_000;
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(super) enum SocketActivityState {
-    Idle,
-    Running,
-    #[serde(rename = "waiting-input", alias = "waiting", alias = "needs-input")]
-    WaitingInput,
-    #[serde(rename = "errored", alias = "error")]
-    Errored,
-    Done,
-}
+// The socket accepts exactly the activity domain, with its established serde
+// aliases. Keep the local name to make protocol callsites easy to recognize.
+pub(super) type SocketActivityState = AgentActivityState;
 
 /// JSON protocol for external notifications and agent activity updates.
 /// Usage: echo '{"action":"notify","tab":"Shell 1","message":"Build done"}' | socat - UNIX-CONNECT:$TAAROF_SOCK
