@@ -1,5 +1,14 @@
 # External provider adapters
 
+Built-in identity normalization belongs to `BuiltinRegistry` and its built-in
+adapter seam. The compatibility `normalize_agent_name` function delegates there;
+it preserves the existing aliases and trims/lowercases unknown names. Process
+recognition and presentation keep their own policies. Built-in resume arguments
+come from `plan_resume`; `build_resume_command` renders that structured plan for
+legacy copy/paste consumers, preserving Copilot's `--resume='value'` spelling.
+Direct calls to those planners/formatters still require canonical provider IDs:
+an alias passed directly retains the historic unknown-provider invocation.
+
 An adapter is explicitly trusted **same-user executable code**, not a sandbox.
 Only an enabled TOML manifest in `$XDG_CONFIG_HOME/agent/providers.d/` (default
 `~/.config/agent/providers.d/`) can add one. Finding a program on PATH never
