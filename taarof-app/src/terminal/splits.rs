@@ -490,10 +490,8 @@ pub(super) fn split_pane_for_tab(
     // Set tmux_backing on the new leaf after spawn
     if let Some(backing) = tmux_backing {
         let mut st = state.borrow_mut();
-        if let Some(tab) = st.find_tab_mut(tab_id) {
-            if let Some(leaf) = tab.panes.leaf_mut(new_pane_id) {
-                leaf.tmux_backing = Some(backing);
-            }
+        if let Some(leaf) = st.leaf_mut(tab_id, new_pane_id) {
+            leaf.tmux_backing = Some(backing);
         }
     }
 
@@ -741,10 +739,8 @@ fn register_detached_panes(
         }
     }
     for pane_id in pane_ids {
-        if let Some(tab) = st.find_tab_mut(tab_id) {
-            if let Some(leaf) = tab.panes.leaf_mut(*pane_id) {
-                leaf.tmux_backing = None;
-            }
+        if let Some(leaf) = st.leaf_mut(tab_id, *pane_id) {
+            leaf.tmux_backing = None;
         }
         if let Some(pane) = st.headless_pane_mut(tab_id, *pane_id) {
             pane.tmux_backing = None;
