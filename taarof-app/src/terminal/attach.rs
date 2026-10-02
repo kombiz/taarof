@@ -400,15 +400,13 @@ fn attach_session_after_validation(
 
                     {
                         let mut st = state.borrow_mut();
-                        if let Some(tab) = st.find_tab_mut(tab_id) {
-                            if let Some(leaf) = tab.panes.leaf_mut(pane_id) {
-                                leaf.tmux_backing = Some(crate::pane::TmuxBacking {
-                                    session_name: session_name.clone(),
-                                    target: target.clone(),
-                                    expected_generation: None,
-                                    pane_info: ProbeSnapshot::default(),
-                                });
-                            }
+                        if let Some(leaf) = st.leaf_mut(tab_id, pane_id) {
+                            leaf.tmux_backing = Some(crate::pane::TmuxBacking {
+                                session_name: session_name.clone(),
+                                target: target.clone(),
+                                expected_generation: None,
+                                pane_info: ProbeSnapshot::default(),
+                            });
                         }
                         st.detached_sessions
                             .retain(|d| !d.matches_target(&session_name, &target));

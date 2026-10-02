@@ -89,11 +89,9 @@ pub(super) fn spawn_terminal_process_with_callback(
             let handle = Rc::new(handle);
             {
                 let mut st = state.borrow_mut();
-                if let Some(tab) = st.find_tab_mut(tab_id) {
-                    if let Some(leaf) = tab.panes.leaf_mut(pane_id) {
-                        leaf.shell_pid = Some(pid);
-                        leaf.broker = Some(handle.clone());
-                    }
+                if let Some(leaf) = st.leaf_mut(tab_id, pane_id) {
+                    leaf.shell_pid = Some(pid);
+                    leaf.broker = Some(handle.clone());
                 }
             }
             install_broker_resize_forwarding(terminal, &handle);
