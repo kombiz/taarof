@@ -2085,8 +2085,7 @@ mod agent_resume_tests {
         struct Fixture(std::path::PathBuf);
         impl Fixture {
             fn command(&self) -> Command {
-                let mut command = Command::new("tmux");
-                crate::child_env::prepare_child_command(&mut command, &[]);
+                let mut command = crate::child_process::command("tmux");
                 command.args(["-f", "/dev/null", "-S"]);
                 command.arg(self.0.join("socket"));
                 command
@@ -2203,15 +2202,17 @@ mod agent_resume_tests {
             // Control mode supplies a real tmux client without a PTY. The
             // returned production command and its conditional branches stay
             // intact; only fixture-global socket/config/client options precede it.
-            let mut child = fixture
-                .command()
+            let mut command = fixture.command();
+            command
                 .arg("-C")
                 .args(&argv[1..])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("execute production attach command");
+                .stderr(Stdio::piped());
+            // Reaped synchronously below: try_wait polls the five-second deadline;
+            // timeout kills/waits, otherwise wait_with_output reaps this client.
+            #[allow(clippy::disallowed_methods)]
+            let mut child = command.spawn().expect("execute production attach command");
             let mut input = child.stdin.take().unwrap();
             // Query this very client after the guard, then detach to finish.
             // Broken pipe is permitted for a target-resolution rejection.
