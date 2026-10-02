@@ -111,6 +111,67 @@ mod tests {
     }
 
     #[test]
+    fn builtin_alias_lookup_preserves_normalization_and_adapter_plans() {
+        let registry = BuiltinRegistry::new(DiscoveryRoots::from_home(Some(
+            "/synthetic/unused-home".into(),
+        )));
+        for (canonical, aliases) in [
+            ("claude", vec!["claude", "claude-code", "claude code"]),
+            ("codex", vec!["codex", "codex-cli"]),
+            ("pi", vec!["pi", "pii"]),
+            ("kimi", vec!["kimi"]),
+            ("opencode", vec!["opencode", "open code"]),
+            ("copilot", vec!["copilot", "copilot-cli", "copilot cli"]),
+        ] {
+            let adapter = registry
+                .adapters()
+                .iter()
+                .find(|adapter| adapter.metadata().id == canonical)
+                .unwrap();
+            for alias in aliases {
+                let raw = format!("  {}  ", alias.to_ascii_uppercase());
+                assert_eq!(
+                    BuiltinRegistry::canonical_provider_id(&raw),
+                    Some(canonical)
+                );
+                assert_eq!(legacy::normalize_agent_name(&raw), canonical);
+                let input = record(&raw, "--resume=Opaque ID 'quoted'");
+                let expected = plan_resume(canonical, input.cwd.clone().into(), &input.session_id);
+                assert_eq!(adapter.plan_resume(&input), Some(expected));
+                assert_eq!(
+                    StableRef::new(&raw, "local.ts", &input.session_id).session_id,
+                    input.session_id
+                );
+                if alias != canonical {
+                    let direct = plan_resume(alias, input.cwd.clone().into(), &input.session_id);
+                    assert_eq!(direct.program, alias);
+                    assert_eq!(direct.argv, vec![input.session_id.clone()]);
+                    assert_eq!(
+                        legacy::build_resume_command(alias, "/tmp", "opaque"),
+                        format!("cd /tmp && {} opaque", legacy::shell_escape(alias))
+                    );
+                }
+            }
+        }
+        for raw in [
+            "codex cli",
+            "kimi-code",
+            " Custom Provider ",
+            "",
+            "CODEx_custom",
+        ] {
+            assert_eq!(BuiltinRegistry::canonical_provider_id(raw), None);
+            assert_eq!(
+                legacy::normalize_agent_name(raw),
+                raw.trim().to_ascii_lowercase()
+            );
+            let direct = plan_resume(raw, "/tmp".into(), "--resume=Opaque ID");
+            assert_eq!(direct.program, raw);
+            assert_eq!(direct.argv, vec!["--resume=Opaque ID"]);
+        }
+    }
+
+    #[test]
     fn catalog_merges_only_exact_provider_host_session_identity() {
         let mut older = record("codex", "same");
         older.updated_at_unix_ms = 1;

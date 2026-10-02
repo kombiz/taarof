@@ -853,7 +853,8 @@ fn file_stat_response(
     })
 }
 
-fn resolve_preview_path(
+// Prepare the shared request path without applying endpoint-specific containment.
+fn prepare_request_path(
     cwd: &str,
     raw_path: &str,
 ) -> Result<(PathBuf, PathBuf), FilePreviewRouteError> {
@@ -882,6 +883,14 @@ fn resolve_preview_path(
     } else {
         base.join(requested)
     };
+    Ok((base, candidate))
+}
+
+fn resolve_preview_path(
+    cwd: &str,
+    raw_path: &str,
+) -> Result<(PathBuf, PathBuf), FilePreviewRouteError> {
+    let (base, candidate) = prepare_request_path(cwd, raw_path)?;
     let resolved = candidate
         .canonicalize()
         .map_err(|_| FilePreviewRouteError::NotFound("file not found".to_string()))?;
@@ -897,31 +906,7 @@ fn resolve_missing_stat_path(
     cwd: &str,
     raw_path: &str,
 ) -> Result<(PathBuf, PathBuf), FilePreviewRouteError> {
-    let raw_path = raw_path.trim();
-    if raw_path.is_empty() {
-        return Err(FilePreviewRouteError::BadRequest(
-            "file path is required".to_string(),
-        ));
-    }
-
-    let base = Path::new(cwd)
-        .canonicalize()
-        .map_err(|_| FilePreviewRouteError::NotFound("pane cwd does not exist".to_string()))?;
-    let requested = Path::new(raw_path);
-    if requested
-        .components()
-        .any(|component| matches!(component, Component::Prefix(_)))
-    {
-        return Err(FilePreviewRouteError::BadRequest(
-            "unsupported file path".to_string(),
-        ));
-    }
-
-    let candidate = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        base.join(requested)
-    };
+    let (base, candidate) = prepare_request_path(cwd, raw_path)?;
     let normalized = normalize_stat_candidate(&candidate)?;
     if !normalized.starts_with(&base) {
         return Err(FilePreviewRouteError::Forbidden(
@@ -3332,6 +3317,143 @@ mod tests {
         assert!(json["error"]
             .as_str()
             .is_some_and(|error| !error.is_empty()));
+    }
+
+    #[test]
+    fn request_path_preparation_preserves_relative_absolute_and_trimmed_paths() {
+        let root = unique_temp_dir("request-path-forms");
+        let base = root.canonicalize().unwrap();
+        let cwd = root.to_str().unwrap();
+        let expected = base.join("nested/file.rs");
+        for raw in ["nested/file.rs", "  nested/file.rs  "] {
+            assert!(matches!(
+                prepare_request_path(cwd, raw),
+                Ok((actual_base, candidate)) if actual_base == base && candidate == expected
+            ));
+        }
+        assert!(matches!(
+            prepare_request_path(cwd, expected.to_str().unwrap()),
+            Ok((actual_base, candidate)) if actual_base == base && candidate == expected
+        ));
+        // Preparation leaves parent components for the endpoint's containment policy.
+        assert!(matches!(
+            prepare_request_path(cwd, "../outside.rs"),
+            Ok((actual_base, candidate))
+                if actual_base == base && candidate == base.join("../outside.rs")
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn path_resolvers_preserve_empty_and_missing_cwd_error_precedence() {
+        let root = unique_temp_dir("request-path-errors");
+        let missing_cwd = root.join("absent");
+        for resolver in [resolve_preview_path, resolve_missing_stat_path] {
+            assert!(matches!(
+                resolver(missing_cwd.to_str().unwrap(), " \t "),
+                Err(FilePreviewRouteError::BadRequest(message)) if message == "file path is required"
+            ));
+            assert!(matches!(
+                resolver(missing_cwd.to_str().unwrap(), "file.rs"),
+                Err(FilePreviewRouteError::NotFound(message)) if message == "pane cwd does not exist"
+            ));
+        }
+        assert!(matches!(
+            resolve_preview_path(root.to_str().unwrap(), "absent.rs"),
+            Err(FilePreviewRouteError::NotFound(message)) if message == "file not found"
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn path_resolvers_preserve_existing_and_missing_inside_cwd() {
+        let root = unique_temp_dir("request-path-contained");
+        std::fs::write(root.join("file.rs"), "inside").unwrap();
+        let base = root.canonicalize().unwrap();
+        let cwd = root.to_str().unwrap();
+        for raw in [
+            " file.rs ".to_string(),
+            base.join("file.rs").display().to_string(),
+        ] {
+            assert!(matches!(
+                resolve_preview_path(cwd, &raw),
+                Ok((actual_base, resolved)) if actual_base == base && resolved == base.join("file.rs")
+            ));
+        }
+        for raw in [
+            "nested/../absent.rs".to_string(),
+            base.join("absent.rs").display().to_string(),
+        ] {
+            assert!(matches!(
+                resolve_missing_stat_path(cwd, &raw),
+                Ok((actual_base, resolved)) if actual_base == base && resolved == base.join("absent.rs")
+            ));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn path_resolvers_reject_direct_outside_candidates() {
+        let root = unique_temp_dir("request-path-outside");
+        let cwd = root.join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(root.join("outside.rs"), "outside").unwrap();
+        for raw in [
+            "../outside.rs".to_string(),
+            root.join("outside.rs").display().to_string(),
+        ] {
+            assert!(matches!(
+                resolve_preview_path(cwd.to_str().unwrap(), &raw),
+                Err(FilePreviewRouteError::Forbidden(message))
+                    if message == "file preview is limited to the pane cwd"
+            ));
+        }
+        for raw in [
+            "../absent.rs".to_string(),
+            root.join("absent.rs").display().to_string(),
+        ] {
+            assert!(matches!(
+                resolve_missing_stat_path(cwd.to_str().unwrap(), &raw),
+                Err(FilePreviewRouteError::Forbidden(message))
+                    if message == "file stat is limited to the pane cwd"
+            ));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_path_rejects_existing_symlink_outside_cwd() {
+        let root = unique_temp_dir("preview-path-symlink");
+        let cwd = root.join("workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        let outside = root.join("outside.rs");
+        std::fs::write(&outside, "outside").unwrap();
+        std::os::unix::fs::symlink(outside, cwd.join("linked.rs")).unwrap();
+        assert!(matches!(
+            resolve_preview_path(cwd.to_str().unwrap(), "linked.rs"),
+            Err(FilePreviewRouteError::Forbidden(message))
+                if message == "file preview is limited to the pane cwd"
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_stat_path_rejects_absent_path_below_outside_symlink() {
+        let root = unique_temp_dir("stat-path-symlink");
+        let cwd = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(outside, cwd.join("linked")).unwrap();
+        // Walk past a missing parent before discovering the existing symlink ancestor.
+        assert!(matches!(
+            resolve_missing_stat_path(cwd.to_str().unwrap(), "linked/missing/absent.rs"),
+            Err(FilePreviewRouteError::Forbidden(message))
+                if message == "file stat is limited to the pane cwd"
+        ));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn file_preview_state(cwd: &Path, remote_shell: bool, cwd_host: Option<&str>) -> Value {
