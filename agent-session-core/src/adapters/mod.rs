@@ -113,7 +113,8 @@ impl ExternalRegistry {
                 {
                     return Err("invalid provider id");
                 }
-                if BUILTIN_IDS.contains(&crate::legacy::normalize_agent_name(&manifest.id).as_str())
+                if BUILTIN_IDS
+                    .contains(&crate::discovery::normalize_agent_name(&manifest.id).as_str())
                 {
                     return Err("built-in replacement is not configured or supported");
                 }

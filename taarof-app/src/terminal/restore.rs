@@ -1533,7 +1533,7 @@ impl AgentResumeOffer {
     /// that boundary; never read the compatibility command. Automatic restore
     /// bypasses the shell entirely and passes `argv()` to the spawn seam.
     pub(crate) fn shell_input(&self) -> String {
-        let escape = agent_session_core::legacy::shell_escape;
+        let escape = agent_session_core::discovery::shell_escape;
         let words = self
             .argv()
             .iter()

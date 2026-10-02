@@ -75,7 +75,7 @@ pub enum PtyAdapterResolution {
     /// The pane exists but is not broker-owned (legacy/already-running). The
     /// adapter advertises the `legacy_snapshot` capability instead of attaching.
     /// This also covers headless/restored panes, which are not yet broker-owned.
-    LegacySnapshot,
+    VteOwnedSnapshot,
     /// No such pane in the requested tab.
     NotFound,
 }
@@ -106,7 +106,7 @@ pub(crate) fn resolve_pty_adapter_target(
             if let Some(leaf) = tab.panes.leaf(pane_id) {
                 let Some(broker) = leaf.broker.as_ref() else {
                     // A live pane the broker does not own: never a raw attach.
-                    return PtyAdapterResolution::LegacySnapshot;
+                    return PtyAdapterResolution::VteOwnedSnapshot;
                 };
                 let pane = Arc::clone(broker.pane());
                 let (cols, rows) = pane.with_model(|model| {
@@ -119,7 +119,7 @@ pub(crate) fn resolve_pty_adapter_target(
             if state.headless_pane(tab.id, pane_id).is_some() {
                 // Restored/headless panes are represented by the legacy snapshot
                 // capability until they are re-materialized under the broker.
-                return PtyAdapterResolution::LegacySnapshot;
+                return PtyAdapterResolution::VteOwnedSnapshot;
             }
         }
     }
@@ -386,7 +386,7 @@ pub(super) async fn tab_pane_pty_ws(
 
     let handle = match query_pty_adapter_resolution(&state, tab_id, pane_id).await {
         Ok(PtyAdapterResolution::Brokered(handle)) => handle,
-        Ok(PtyAdapterResolution::LegacySnapshot) => {
+        Ok(PtyAdapterResolution::VteOwnedSnapshot) => {
             return (
                 StatusCode::CONFLICT,
                 Json(json!({
@@ -1257,7 +1257,7 @@ mod tests {
                                     rows: 24,
                                 })
                             }
-                            BridgeMode::Legacy => PtyAdapterResolution::LegacySnapshot,
+                            BridgeMode::Legacy => PtyAdapterResolution::VteOwnedSnapshot,
                             BridgeMode::NotFound => PtyAdapterResolution::NotFound,
                         };
                         let _ = reply.send(resolution);

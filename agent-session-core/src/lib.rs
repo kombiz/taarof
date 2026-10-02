@@ -8,11 +8,12 @@ pub mod adapters;
 mod cache;
 pub mod child_env;
 mod contract;
-pub mod legacy;
+pub mod discovery;
+pub use discovery as legacy;
 pub mod protocol;
 pub use cache::DiscoveryCache;
 pub use contract::*;
-pub use legacy::{
+pub use discovery::{
     AgentSessionDiscovery, AgentSessionProviderStatus, AgentSessionRecord, AgentSessionsSnapshot,
     DiscoveryRoots, LiveAgentBinding, RemoteHostStatus,
 };
@@ -22,6 +23,22 @@ mod legacy_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_module_preserves_legacy_paths_and_root_exports() {
+        fn same_record_type(
+            record: crate::discovery::AgentSessionRecord,
+        ) -> crate::legacy::AgentSessionRecord {
+            let root_record: crate::AgentSessionRecord = record;
+            root_record
+        }
+        let _: fn(crate::discovery::AgentSessionRecord) -> crate::legacy::AgentSessionRecord =
+            same_record_type;
+        assert_eq!(
+            crate::discovery::shell_escape("a b"),
+            crate::legacy::shell_escape("a b")
+        );
+    }
 
     #[test]
     fn continuity_actions_name_their_distinct_authorities() {

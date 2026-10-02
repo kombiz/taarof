@@ -4511,7 +4511,7 @@ async fn verify_live_attach(
                 && agent
                     .agent_name
                     .as_deref()
-                    .map(agent_session_core::legacy::normalize_agent_name)
+                    .map(agent_session_core::discovery::normalize_agent_name)
                     .as_deref()
                     == Some(target.stable_ref.provider_id.as_str())
                 && agent.session_id.as_deref() == Some(target.stable_ref.session_id.as_str())

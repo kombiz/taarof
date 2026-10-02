@@ -1,6 +1,6 @@
 //! Provider-neutral machine identity, display projection, and action planning.
 //! Opaque identifiers and action arguments are data, never display labels.
-use crate::legacy::*;
+use crate::discovery::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::HashSet;

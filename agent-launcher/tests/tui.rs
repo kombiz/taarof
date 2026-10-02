@@ -266,7 +266,7 @@ fn degraded_subtree_catalog_keeps_rows_and_refuses_local_execution() {
     std::fs::write(root.path().join("session.jsonl"),
         "{\"type\":\"session_meta\",\"payload\":{\"id\":\"survivor\",\"cwd\":\"/tmp\"}}\n{\"payload\":\"unfinished").unwrap();
     let (mut status, sessions) =
-        agent_session_core::legacy::discover_codex_sessions(Some(root.path()), 50);
+        agent_session_core::discovery::discover_codex_sessions(Some(root.path()), 50);
     // Traversal injection lives in core's private tests. Exercise its projected
     // status at the consumer boundary without weakening execution authority.
     status.ok = false;
@@ -551,7 +551,7 @@ fn tui_current_repository_includes_real_git_worktrees_and_excludes_other_roots()
         );
     }
     fn row(id: &str, time: u64, cwd: &Path) -> SessionRecord {
-        let raw = agent_session_core::legacy::parse_claude_session(
+        let raw = agent_session_core::discovery::parse_claude_session(
             Path::new("fixture.jsonl"),
             time,
             &[serde_json::json!({"sessionId":id,"cwd":cwd})],
