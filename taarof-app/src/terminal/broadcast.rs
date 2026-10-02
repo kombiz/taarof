@@ -843,7 +843,7 @@ pub(crate) fn resolve_last_agent_message(
         .filter(|agent| !agent.is_empty())
         .or(detected_agent);
     let reason = match agent {
-        Some("claude" | "codex" | "pi") => {
+        Some("claude" | "codex" | "pi" | "kimi") => {
             "no unambiguous native transcript matched this pane's identity and process metadata"
         }
         Some(_) => "this agent does not expose a supported native transcript",
@@ -1142,6 +1142,63 @@ mod tests {
                 agent: "Pi Agent".to_string(),
                 reason: "no unambiguous native transcript matched this pane's identity and process metadata".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn test_last_message_fallback_matches_registered_native_providers() {
+        for (provider, display) in [
+            ("claude", "Claude Code"),
+            ("codex", "Codex"),
+            ("pi", "Pi Agent"),
+            ("kimi", "kimi"),
+        ] {
+            assert_eq!(
+                resolve_last_agent_message(None, Some(provider)),
+                LastAgentMessageResolution::Unavailable {
+                    agent: display.to_string(),
+                    reason: "no unambiguous native transcript matched this pane's identity and process metadata".to_string(),
+                },
+                "{provider} has a registered native transcript adapter"
+            );
+        }
+        for provider in ["opencode", "copilot", "unknown"] {
+            assert_eq!(
+                resolve_last_agent_message(None, Some(provider)),
+                LastAgentMessageResolution::Unavailable {
+                    agent: provider.to_string(),
+                    reason: "this agent does not expose a supported native transcript".to_string(),
+                }
+            );
+        }
+        assert_eq!(
+            resolve_last_agent_message(None, None),
+            LastAgentMessageResolution::Unavailable {
+                agent: "Agent".to_string(),
+                reason: "no running agent was detected in this pane".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_kimi_transcript_identity_and_message_take_precedence() {
+        let mut transcript = crate::agents::TranscriptState {
+            agent: "kimi".to_string(),
+            last_message: Some(" \n\t".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_last_agent_message(Some(&transcript), Some("opencode")),
+            LastAgentMessageResolution::Unavailable {
+                agent: "kimi".to_string(),
+                reason: "no unambiguous native transcript matched this pane's identity and process metadata".to_string(),
+            }
+        );
+        let markdown = "## Kimi\n\nNative **message**.\n";
+        transcript.last_message = Some(markdown.to_string());
+        assert_eq!(
+            resolve_last_agent_message(Some(&transcript), Some("opencode")),
+            LastAgentMessageResolution::Transcript(markdown.to_string())
         );
     }
 
