@@ -2107,10 +2107,34 @@ mod agent_resume_tests {
                     .expect("tmux fixture command");
                 assert!(
                     output.status.success(),
-                    "fixture setup failed: {}",
+                    "fixture setup {args:?} failed: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
                 output
+            }
+
+            fn create_session(&self, name: &str) -> (String, String) {
+                let output = self.run(&[
+                    "new-session",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{session_id} #{pane_id}",
+                    "-s",
+                    name,
+                    "sleep 60",
+                ]);
+                let text = String::from_utf8(output.stdout).expect("fixture IDs must be UTF-8");
+                let fields: Vec<_> = text.split_whitespace().collect();
+                assert_eq!(fields.len(), 2, "unexpected fixture IDs: {text:?}");
+                for (id, prefix) in fields.iter().zip(['$', '%']) {
+                    let digits = id.strip_prefix(prefix).expect("fixture ID prefix");
+                    assert!(
+                        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+                        "invalid fixture ID: {id:?}"
+                    );
+                }
+                (fields[0].to_owned(), fields[1].to_owned())
             }
         }
         impl Drop for Fixture {
@@ -2133,12 +2157,12 @@ mod agent_resume_tests {
             .create(&dir)
             .expect("private fixture directory");
         let fixture = Fixture(dir);
-        fixture.run(&["new-session", "-d", "-s", "fixture", "sleep 60"]);
+        let (original_session_id, original_pane_id) = fixture.create_session("fixture");
         fixture.run(&["new-session", "-d", "-s", "anchor", "sleep 60"]);
         fixture.run(&[
             "set-option",
             "-t",
-            "=fixture",
+            &original_session_id,
             "@taarof-continuity-id",
             "11111111111111111111111111111111",
         ]);
@@ -2146,13 +2170,15 @@ mod agent_resume_tests {
             "display-message",
             "-p",
             "-t",
-            "=fixture",
+            &original_pane_id,
             "#{session_id} #{session_created}",
         ]);
         let identity = String::from_utf8(identity.stdout).unwrap();
         let mut words = identity.split_whitespace();
+        let session_id = words.next().unwrap();
+        assert_eq!(session_id, original_session_id);
         let expected = crate::session::SavedTmuxIdentity {
-            session_id: words.next().unwrap().into(),
+            session_id: session_id.into(),
             session_created: words.next().unwrap().parse().unwrap(),
             continuity_id: "11111111111111111111111111111111".into(),
         };
@@ -2224,12 +2250,12 @@ mod agent_resume_tests {
             matching
         );
 
-        fixture.run(&["kill-session", "-t", "=fixture"]);
+        fixture.run(&["kill-session", "-t", &original_session_id]);
         let names = fixture.run(&["list-sessions", "-F", "#{session_name}"]);
         assert_eq!(String::from_utf8(names.stdout).unwrap().trim(), "anchor");
         let missing = execute_consumed();
-        fixture.run(&["new-session", "-d", "-s", "fixture-one", "sleep 60"]);
-        fixture.run(&["new-session", "-d", "-s", "fixture-two", "sleep 60"]);
+        let (first_ambiguous_id, _) = fixture.create_session("fixture-one");
+        let (second_ambiguous_id, _) = fixture.create_session("fixture-two");
         let names = fixture.run(&["list-sessions", "-F", "#{session_name}"]);
         let names = String::from_utf8(names.stdout).unwrap();
         assert_eq!(
@@ -2241,13 +2267,13 @@ mod agent_resume_tests {
         );
         assert!(!names.lines().any(|name| name == "fixture"));
         let ambiguous = execute_consumed();
-        fixture.run(&["kill-session", "-t", "=fixture-one"]);
-        fixture.run(&["kill-session", "-t", "=fixture-two"]);
-        fixture.run(&["new-session", "-d", "-s", "fixture", "sleep 60"]);
+        fixture.run(&["kill-session", "-t", &first_ambiguous_id]);
+        fixture.run(&["kill-session", "-t", &second_ambiguous_id]);
+        let (replacement_session_id, replacement_pane_id) = fixture.create_session("fixture");
         fixture.run(&[
             "set-option",
             "-t",
-            "=fixture",
+            &replacement_session_id,
             "@taarof-continuity-id",
             "22222222222222222222222222222222",
         ]);
@@ -2255,10 +2281,14 @@ mod agent_resume_tests {
             "display-message",
             "-p",
             "-t",
-            "=fixture",
+            &replacement_pane_id,
             "#{session_id} #{@taarof-continuity-id}",
         ]);
         let replacement = String::from_utf8(replacement.stdout).unwrap();
+        assert_eq!(
+            replacement.split_whitespace().next().unwrap(),
+            replacement_session_id
+        );
         assert_ne!(
             replacement.split_whitespace().next().unwrap(),
             expected.session_id
