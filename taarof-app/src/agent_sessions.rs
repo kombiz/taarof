@@ -1,11 +1,11 @@
 // Local discovery and provider parsing live in the non-GTK core. This module
 // owns Taarof live/remote enrichment and the compatibility v1 projection.
-pub use agent_session_core::legacy::{
+pub use agent_session_core::discovery::{
     build_resume_command, most_recent_discovered_session, normalize_agent_name,
     AgentSessionDiscovery, AgentSessionProviderStatus, AgentSessionRecord, AgentSessionsSnapshot,
     DiscoveryRoots, LiveAgentBinding, RemoteHostStatus,
 };
-use agent_session_core::legacy::{
+use agent_session_core::discovery::{
     fallback_title, parse_claude_session, parse_codex_session, parse_pi_session, shell_escape,
     unix_time_ms,
 };

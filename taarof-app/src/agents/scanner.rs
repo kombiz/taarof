@@ -1142,7 +1142,7 @@ pub(crate) fn detect_exact_agent_in_process_facts(
 fn extract_exact_session_id(agent: &str, argv: &[String]) -> Option<String> {
     // Reuse the provider's structured resume syntax, not a second name table.
     const ID: &str = "__agent_identity__";
-    let provider = agent_session_core::legacy::normalize_agent_name(agent);
+    let provider = agent_session_core::discovery::normalize_agent_name(agent);
     let plan = agent_session_core::plan_resume(&provider, Default::default(), ID);
     let flag = plan.argv.first()?;
     let args: Vec<_> = argv

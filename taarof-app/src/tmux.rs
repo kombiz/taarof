@@ -198,7 +198,7 @@ fn create_attach_command_with_continuity_id(
         args.push(dir.to_string());
     }
     if let Some(continuity_id) = continuity_id {
-        let escaped_name = agent_session_core::legacy::shell_escape(name);
+        let escaped_name = agent_session_core::discovery::shell_escape(name);
         args.extend([
             TMUX_COMMAND_SEPARATOR.to_string(),
             "if-shell".to_string(),
@@ -311,7 +311,7 @@ pub fn resize_backing_command(
     cols: u32,
     rows: u32,
 ) -> Vec<String> {
-    let escaped_name = agent_session_core::legacy::shell_escape(&backing.session_name);
+    let escaped_name = agent_session_core::discovery::shell_escape(&backing.session_name);
     exact_backing_mutation_command(
         backing,
         format!("resize-pane -t {escaped_name} -x {cols} -y {rows}"),
@@ -321,8 +321,8 @@ pub fn resize_backing_command(
 }
 
 pub fn send_keys_backing_command(backing: &crate::pane::TmuxBacking, keys: &str) -> Vec<String> {
-    let escaped_name = agent_session_core::legacy::shell_escape(&backing.session_name);
-    let escaped_keys = agent_session_core::legacy::shell_escape(keys);
+    let escaped_name = agent_session_core::discovery::shell_escape(&backing.session_name);
+    let escaped_keys = agent_session_core::discovery::shell_escape(keys);
     exact_backing_mutation_command(
         backing,
         format!("send-keys -t {escaped_name} -l {escaped_keys}"),
@@ -683,7 +683,7 @@ pub fn exact_attach_command(
         return None;
     }
     let condition = exact_generation_condition(session_id, session_created, continuity_id)?;
-    let escaped_name = agent_session_core::legacy::shell_escape(session_name);
+    let escaped_name = agent_session_core::discovery::shell_escape(session_name);
     let tmux_args = vec![
         "tmux".to_string(),
         "if-shell".to_string(),
@@ -731,7 +731,7 @@ pub fn exact_kill_session_command(
         return None;
     }
     let condition = exact_generation_condition(session_id, session_created, continuity_id)?;
-    let escaped_name = agent_session_core::legacy::shell_escape(session_name);
+    let escaped_name = agent_session_core::discovery::shell_escape(session_name);
     Some(wrap_for_target_noninteractive(
         target,
         vec![

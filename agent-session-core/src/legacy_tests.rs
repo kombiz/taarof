@@ -1,4 +1,4 @@
-use crate::legacy::*;
+use crate::discovery::*;
 #[cfg(feature = "opencode-history")]
 use rusqlite::Connection;
 use std::fs;
