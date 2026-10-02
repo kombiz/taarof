@@ -373,3 +373,84 @@ fn shell_escape_handles_quotes() {
         "a persisted custom agent name must remain one shell word"
     );
 }
+
+#[test]
+fn resume_commands_preserve_exact_legacy_shell_text() {
+    let providers = [
+        ("claude", "claude --resume "),
+        ("codex", "codex resume "),
+        ("pi", "pi --session "),
+        ("kimi", "kimi --session "),
+        ("opencode", "opencode --session "),
+        ("copilot", "copilot --resume="),
+        ("custom; unsafe", "'custom; unsafe' "),
+        ("copilot-cli", "copilot-cli "),
+    ];
+    let ids = [
+        ("", "''"),
+        ("opaque:id/path", "opaque:id/path"),
+        ("with spaces", "'with spaces'"),
+        ("it's \"quoted\"", "'it'\"'\"'s \"quoted\"'"),
+        (
+            "; $(printf injected) `printf injected`",
+            "'; $(printf injected) `printf injected`'",
+        ),
+        ("--resume=opaque id", "'--resume=opaque id'"),
+        ("line\nbreak", "'line\nbreak'"),
+        ("会話", "'会話'"),
+    ];
+    for (provider, prefix) in providers {
+        for (id, quoted) in ids {
+            assert_eq!(
+                build_resume_command(provider, "/tmp/it's here", id),
+                format!("cd '/tmp/it'\"'\"'s here' && {prefix}{quoted}"),
+                "provider={provider}, id={id:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn resume_commands_shell_parse_to_structured_argv() {
+    for provider in [
+        "claude",
+        "codex",
+        "pi",
+        "kimi",
+        "opencode",
+        "copilot",
+        "custom; unsafe",
+        "copilot-cli",
+    ] {
+        for id in [
+            "",
+            "opaque:id/path",
+            "with spaces",
+            "it's \"quoted\"",
+            "; $(printf injected) `printf injected`",
+            "--resume=opaque id",
+            "line\nbreak",
+            "会話",
+        ] {
+            let plan = crate::plan_resume(provider, PathBuf::from("/tmp"), id);
+            let command = build_resume_command(provider, "/tmp", id);
+            let invocation = command.strip_prefix("cd /tmp && ").unwrap();
+            // Parse shell words with the real POSIX shell, but never execute a
+            // provider. A cleared environment also excludes ambient credentials.
+            let output = std::process::Command::new("/bin/sh")
+                .env_clear()
+                .args(["-c", &format!("set -- {invocation}; printf '%s\\0' \"$@\"")])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert!(output.stderr.is_empty());
+            let mut expected = vec![plan.program];
+            expected.extend(plan.argv);
+            assert_eq!(
+                output.stdout,
+                format!("{}\0", expected.join("\0")).as_bytes(),
+                "provider={provider}, id={id:?}"
+            );
+        }
+    }
+}

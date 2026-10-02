@@ -976,17 +976,22 @@ fn find_repo_root(path: &Path) -> Option<PathBuf> {
 }
 
 pub fn build_resume_command(provider: &str, cwd: &str, session_id: &str) -> String {
-    let escaped_cwd = shell_escape(cwd);
-    let escaped_session_id = shell_escape(session_id);
-    let command = match provider {
-        "claude" => format!("claude --resume {escaped_session_id}"),
-        "codex" => format!("codex resume {escaped_session_id}"),
-        "pi" => format!("pi --session {escaped_session_id}"),
-        "kimi" => format!("kimi --session {escaped_session_id}"),
-        "copilot" => format!("copilot --resume={escaped_session_id}"),
-        "opencode" => format!("opencode --session {escaped_session_id}"),
-        other => format!("{} {escaped_session_id}", shell_escape(other)),
-    };
+    let plan = crate::plan_resume(provider, PathBuf::from(cwd), session_id);
+    let escaped_cwd = shell_escape(plan.cwd.to_str().expect("cwd originated as UTF-8"));
+    let command = std::iter::once(shell_escape(&plan.program))
+        .chain(plan.argv.iter().map(|arg| {
+            // Keep the legacy copy/paste spelling of Copilot's joined option.
+            // Only the structured Copilot plan has this form; an opaque ID in
+            // another provider's argv must never be interpreted as an option.
+            if plan.program == "copilot" && plan.argv.len() == 1 {
+                if let Some(value) = arg.strip_prefix("--resume=") {
+                    return format!("--resume={}", shell_escape(value));
+                }
+            }
+            shell_escape(arg)
+        }))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!("cd {escaped_cwd} && {command}")
 }
 
@@ -1004,14 +1009,9 @@ pub fn shell_escape(value: &str) -> String {
 }
 
 pub fn normalize_agent_name(raw: &str) -> String {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "claude code" | "claude-code" => "claude".to_string(),
-        "codex-cli" => "codex".to_string(),
-        "copilot-cli" | "copilot cli" => "copilot".to_string(),
-        "opencode" | "open code" => "opencode".to_string(),
-        "pii" | "pi" => "pi".to_string(),
-        other => other.to_string(),
-    }
+    crate::BuiltinRegistry::canonical_provider_id(raw)
+        .map(str::to_owned)
+        .unwrap_or_else(|| raw.trim().to_ascii_lowercase())
 }
 
 pub fn most_recent_discovered_session<'a>(

@@ -448,6 +448,19 @@ struct BuiltinAdapter {
     id: &'static str,
     roots: DiscoveryRoots,
 }
+impl BuiltinAdapter {
+    fn matches_name(id: &str, name: &str) -> bool {
+        id == name
+            || match id {
+                "claude" => matches!(name, "claude code" | "claude-code"),
+                "codex" => name == "codex-cli",
+                "copilot" => matches!(name, "copilot-cli" | "copilot cli"),
+                "opencode" => name == "open code",
+                "pi" => name == "pii",
+                _ => false,
+            }
+    }
+}
 impl ProviderAdapter for BuiltinAdapter {
     fn metadata(&self) -> ProviderMetadata {
         ProviderMetadata {
@@ -498,6 +511,15 @@ pub struct BuiltinRegistry {
     adapters: Vec<Box<dyn ProviderAdapter>>,
 }
 impl BuiltinRegistry {
+    /// Resolve built-in identity without constructing adapters or discovering stores.
+    /// Process recognition and presentation aliases are separate contracts.
+    pub fn canonical_provider_id(raw: &str) -> Option<&'static str> {
+        let name = raw.trim().to_ascii_lowercase();
+        BUILTIN_IDS
+            .into_iter()
+            .find(|id| BuiltinAdapter::matches_name(id, &name))
+    }
+
     pub fn new(roots: DiscoveryRoots) -> Self {
         Self {
             adapters: BUILTIN_IDS
