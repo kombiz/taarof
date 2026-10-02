@@ -215,6 +215,42 @@ test("cancel drops pending frames and a new identity has its own retained journa
   assert(next.flush()?.entries.map((entry) => entry.text).join(",") === "separate", "a replacement controller must not inherit another identity's journal");
 });
 
+test("queued observations retain capture names across a same-key rename before flush", () => {
+  const storage = new CountingStorage();
+  const scheduler = new ManualScheduler();
+  const now = Date.now();
+  const identity = {
+    ...createTestPaneIdentity(),
+    tabNameAtCapture: "Original tab",
+    workspaceNameAtCapture: "Original workspace",
+    displayName: "Original display",
+  };
+  const controller = createPaneJournalController({ storage, identity, scheduler });
+  controller.observe({ source: "raw", text: "before rename", seenAtUnixMs: now });
+  assert(controller.pendingCount() === 1, "the pre-rename observation must still be queued");
+  controller.updateIdentity({
+    ...identity,
+    tabNameAtCapture: "Renamed tab",
+    workspaceNameAtCapture: "Renamed workspace",
+    displayName: "Renamed display",
+  });
+  assert(storage.setItemCount === 0, "renaming must not bypass the scheduled flush");
+  controller.flush();
+  const before = loadPaneJournal(storage, identity.paneKey, now + 1);
+  assert(before.entries.length === 1 && before.entries[0].text === "before rename", "the queued pre-rename text must persist");
+  assert(before.entries[0].tabNameAtCapture === "Original tab", "the queued frame must retain the original tab name");
+  assert(before.entries[0].workspaceNameAtCapture === "Original workspace", "the queued frame must retain the original workspace name");
+  assert(before.entries[0].displayName === "Original display", "the queued frame must retain the original display name");
+
+  controller.observe({ source: "raw", text: "after rename", seenAtUnixMs: now + 2 });
+  controller.flush();
+  const after = loadPaneJournal(storage, identity.paneKey, now + 3);
+  assert(after.entries.map((entry) => entry.text).join(",") === "before rename,after rename", "both observations must persist in order");
+  assert(after.entries[1].tabNameAtCapture === "Renamed tab", "the later frame must capture the renamed tab");
+  assert(after.entries[1].workspaceNameAtCapture === "Renamed workspace", "the later frame must capture the renamed workspace");
+  assert(after.entries[1].displayName === "Renamed display", "the later frame must capture the renamed display name");
+});
+
 test("same-key metadata updates preserve unsaved frames and capture new names on recovery", () => {
   const storage = new FailingReplacementStorage();
   const identity = createTestPaneIdentity();
