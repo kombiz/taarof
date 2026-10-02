@@ -942,65 +942,58 @@ pub(crate) fn poll_tmux_metadata(
         for ((tab_id, pane_id, _, _, captured), mut result) in results {
             let mut st = state.borrow_mut();
             let mut event = None;
-            if let Some(tab) = st.find_tab_mut(tab_id) {
-                if let Some(leaf) = tab.panes.leaf_mut(pane_id) {
-                    if leaf.tmux_backing.is_some() {
-                        let (
+            if let Some(leaf) = st.leaf_mut(tab_id, pane_id) {
+                if leaf.tmux_backing.is_some() {
+                    let (
+                        transition,
+                        changed,
+                        location_update,
+                        session_name,
+                        ssh_target,
+                        probe_error,
+                    ) = {
+                        let backing = leaf.tmux_backing.as_mut().expect("checked above");
+                        if !super::observation::accept_pane_result(backing, &captured, &mut result)
+                        {
+                            continue;
+                        }
+                        let location_update = result
+                            .as_ref()
+                            .ok()
+                            .and_then(|info| remote_tmux_location(&backing.target, info));
+                        let (transition, changed) = match result {
+                            Ok(info) => backing.pane_info.record_success_reporting(info),
+                            Err(error) => backing.pane_info.record_failure_reporting(error),
+                        };
+                        (
                             transition,
                             changed,
                             location_update,
-                            session_name,
-                            ssh_target,
-                            probe_error,
-                        ) = {
-                            let backing = leaf.tmux_backing.as_mut().expect("checked above");
-                            if !super::observation::accept_pane_result(
-                                backing,
-                                &captured,
-                                &mut result,
-                            ) {
-                                continue;
-                            }
-                            let location_update = result
-                                .as_ref()
-                                .ok()
-                                .and_then(|info| remote_tmux_location(&backing.target, info));
-                            let (transition, changed) = match result {
-                                Ok(info) => backing.pane_info.record_success_reporting(info),
-                                Err(error) => backing.pane_info.record_failure_reporting(error),
-                            };
-                            (
-                                transition,
-                                changed,
-                                location_update,
-                                backing.session_name.clone(),
-                                backing.target.ssh_target_string(),
-                                backing.pane_info.error.clone(),
-                            )
-                        };
-                        let location_changed =
-                            location_update.as_ref().is_some_and(|(cwd, host)| {
-                                leaf.location_state.cwd.as_deref() != Some(cwd.as_str())
-                                    || leaf.location_state.cwd_host.as_deref()
-                                        != Some(host.as_str())
-                            });
-                        if let Some((cwd, host)) = location_update {
-                            if location_changed {
-                                leaf.update_location_cache(Some(cwd), Some(host));
-                            }
+                            backing.session_name.clone(),
+                            backing.target.ssh_target_string(),
+                            backing.pane_info.error.clone(),
+                        )
+                    };
+                    let location_changed = location_update.as_ref().is_some_and(|(cwd, host)| {
+                        leaf.location_state.cwd.as_deref() != Some(cwd.as_str())
+                            || leaf.location_state.cwd_host.as_deref() != Some(host.as_str())
+                    });
+                    if let Some((cwd, host)) = location_update {
+                        if location_changed {
+                            leaf.update_location_cache(Some(cwd), Some(host));
                         }
-                        any_changed |= changed || location_changed;
-                        event = Some((
-                            transition,
-                            serde_json::json!({
-                                "tab_id": tab_id,
-                                "pane_id": pane_id,
-                                "session_name": session_name,
-                                "ssh_target": ssh_target,
-                            }),
-                            probe_error,
-                        ));
                     }
+                    any_changed |= changed || location_changed;
+                    event = Some((
+                        transition,
+                        serde_json::json!({
+                            "tab_id": tab_id,
+                            "pane_id": pane_id,
+                            "session_name": session_name,
+                            "ssh_target": ssh_target,
+                        }),
+                        probe_error,
+                    ));
                 }
             }
             let diagnostic = if let Some((transition, payload, error)) = event {

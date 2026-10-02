@@ -328,6 +328,11 @@ impl AppState {
             .find(|t| t.id == tab_id)
     }
 
+    /// Find a live leaf in a tab, including tabs in inactive workspaces.
+    pub fn leaf_mut(&mut self, tab_id: u32, pane_id: u32) -> Option<&mut pane::PaneLeaf> {
+        self.find_tab_mut(tab_id)?.panes.leaf_mut(pane_id)
+    }
+
     /// Apply a persisted work origin while rejecting malformed or duplicate
     /// values. The tab's freshly generated token remains for legacy, template,
     /// corrupt, or colliding session data.
@@ -942,12 +947,8 @@ impl AppState {
             self.record_pane_binding_change(tab_id, pane_id, previous.as_ref(), Some(&binding));
             return Ok(binding);
         }
-        let tab = self
-            .find_tab_mut(tab_id)
-            .ok_or(crate::task_binding::PaneTaskBindingError::PaneNotFound)?;
-        let leaf = tab
-            .panes
-            .leaf_mut(pane_id)
+        let leaf = self
+            .leaf_mut(tab_id, pane_id)
             .ok_or(crate::task_binding::PaneTaskBindingError::PaneNotFound)?;
         leaf.current_task = Some(binding.clone());
         self.record_pane_binding_change(tab_id, pane_id, previous.as_ref(), Some(&binding));
@@ -979,12 +980,8 @@ impl AppState {
             self.record_pane_binding_change(tab_id, pane_id, previous.as_ref(), Some(&binding));
             return Ok(binding);
         }
-        let tab = self
-            .find_tab_mut(tab_id)
-            .ok_or(crate::task_binding::PaneTaskBindingError::PaneNotFound)?;
-        let leaf = tab
-            .panes
-            .leaf_mut(pane_id)
+        let leaf = self
+            .leaf_mut(tab_id, pane_id)
             .ok_or(crate::task_binding::PaneTaskBindingError::PaneNotFound)?;
         if crate::terminal::is_remote_host(leaf.location_state.cwd_host.as_deref())
             || leaf.process_state.remote_shell
@@ -1020,8 +1017,7 @@ impl AppState {
             return removed.is_some();
         }
         if let Some(removed) = self
-            .find_tab_mut(tab_id)
-            .and_then(|tab| tab.panes.leaf_mut(pane_id))
+            .leaf_mut(tab_id, pane_id)
             .and_then(|leaf| leaf.current_task.take())
         {
             self.record_pane_binding_change(tab_id, pane_id, Some(&removed), None);
@@ -1495,6 +1491,23 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("test dir should be created");
         root
+    }
+
+    #[test]
+    fn leaf_mut_missing_tab_and_headless_stub_return_none() {
+        let mut state = AppState::new();
+        assert!(state.leaf_mut(u32::MAX, 0).is_none());
+        let workspace = state.active_workspace;
+        let (tab, pane) = crate::seed_headless_terminal_tab(
+            &mut state,
+            workspace,
+            "stub",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .unwrap();
+        assert!(state.leaf_mut(tab, pane).is_none());
+        assert!(state.leaf_mut(tab, u32::MAX).is_none());
+        assert!(state.headless_pane(tab, pane).is_some());
     }
 
     #[test]

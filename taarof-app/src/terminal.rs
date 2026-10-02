@@ -2285,10 +2285,8 @@ fn cache_pane_location(
     cwd_host: Option<String>,
 ) {
     let mut st = state.borrow_mut();
-    if let Some(tab) = st.find_tab_mut(tab_id) {
-        if let Some(leaf) = tab.panes.leaf_mut(pane_id) {
-            leaf.update_location_cache(cwd, cwd_host);
-        }
+    if let Some(leaf) = st.leaf_mut(tab_id, pane_id) {
+        leaf.update_location_cache(cwd, cwd_host);
     }
 }
 
@@ -3591,10 +3589,8 @@ pub fn create_terminal(
     // Set tmux_backing on the leaf after spawn
     if let Some(backing) = tmux_backing {
         let mut st = state.borrow_mut();
-        if let Some(tab) = st.find_tab_mut(tab_id) {
-            if let Some(leaf) = tab.panes.leaf_mut(pane_id) {
-                leaf.tmux_backing = Some(backing);
-            }
+        if let Some(leaf) = st.leaf_mut(tab_id, pane_id) {
+            leaf.tmux_backing = Some(backing);
         }
     }
 
@@ -3656,10 +3652,8 @@ fn create_tmux_terminal_with_callback(
 
     if let Some(backing) = tmux_backing {
         let mut st = state.borrow_mut();
-        if let Some(tab) = st.find_tab_mut(tab_id) {
-            if let Some(leaf) = tab.panes.leaf_mut(pane_id) {
-                leaf.tmux_backing = Some(backing);
-            }
+        if let Some(leaf) = st.leaf_mut(tab_id, pane_id) {
+            leaf.tmux_backing = Some(backing);
         }
     }
 
@@ -3905,6 +3899,58 @@ mod tests {
     use std::ffi::{c_void, CString};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    #[ignore = "requires an owned GTK display (xvfb-run)"]
+    fn appstate_leaf_mut_targets_split_leaf_and_releases_borrow() {
+        let _glib_guard = crate::glib_main_context_test_guard();
+        gtk::init().expect("owned GTK display");
+        let leaf = |id| {
+            PaneNode::Leaf(super::build_pane_leaf(
+                id,
+                &vte::Terminal::new(),
+                &gtk::Box::new(gtk::Orientation::Vertical, 0),
+                None,
+            ))
+        };
+        let runtime = crate::RuntimeHandle::new();
+        let state = runtime.shared_state();
+        let tab_id = runtime.register_terminal_tab(crate::runtime::TerminalTabRegistration {
+            name: "leaf composition".into(),
+            panes: Box::new(PaneNode::Split {
+                direction: crate::pane::SplitDirection::Horizontal,
+                first: Box::new(leaf(7)),
+                second: Box::new(leaf(8)),
+                widget: gtk::Paned::new(gtk::Orientation::Horizontal),
+            }),
+            focused_pane_id: 7,
+            next_pane_id: 9,
+            close_on_exit: false,
+            respawn_on_exit: None,
+        });
+        state.borrow_mut().create_workspace("away", None);
+        {
+            let mut st = state.borrow_mut();
+            assert!(st.leaf_mut(u32::MAX, 7).is_none());
+            assert!(st.leaf_mut(tab_id, 99).is_none());
+            st.leaf_mut(tab_id, 8).unwrap().was_busy = true;
+            let tab = st.find_tab_mut(tab_id).unwrap();
+            assert!(!tab.panes.leaf(7).unwrap().was_busy);
+            assert!(tab.panes.leaf(8).unwrap().was_busy);
+            assert_eq!(tab.focused_pane_id, 7);
+        }
+        assert!(state.try_borrow_mut().is_ok());
+        super::cache_pane_location(&state, tab_id, 8, Some("/d21a".into()), None);
+        assert!(state.try_borrow_mut().is_ok());
+        let st = state.borrow();
+        let tab = st.find_tab(tab_id).unwrap().1;
+        assert_eq!(
+            tab.panes.leaf(8).unwrap().location_state.cwd.as_deref(),
+            Some("/d21a")
+        );
+        assert!(tab.panes.leaf(7).unwrap().location_state.cwd.is_none());
+        assert_eq!(tab.focused_pane_id, 7);
+    }
 
     #[test]
     #[ignore = "requires an owned GTK display (xvfb-run)"]
