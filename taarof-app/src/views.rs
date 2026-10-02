@@ -677,9 +677,7 @@ fn populate_attention_list_view(
 }
 
 fn clear_detail_box(detail_box: &gtk::Box) {
-    while let Some(child) = detail_box.first_child() {
-        detail_box.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(detail_box);
 }
 
 fn append_header(detail_box: &gtk::Box, title: &str, subtitle: Option<&str>) {

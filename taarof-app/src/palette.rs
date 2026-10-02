@@ -647,9 +647,7 @@ fn repopulate_palette_list(palette: &CommandPalette, state: &Rc<RefCell<AppState
 fn render_palette_list(palette: &CommandPalette, state: &Rc<RefCell<AppState>>, query: &str) {
     let entries = palette_entries(palette, state);
     let filtered = filtered_entries(&entries, query);
-    while let Some(child) = palette.list.first_child() {
-        palette.list.remove(&child);
-    }
+    crate::gtk_util::remove_all_children(&palette.list);
     for entry in filtered {
         palette.list.append(&make_row(entry));
     }
