@@ -109,7 +109,7 @@ export function createPaneJournalController({
   }
   // Keep the narrowed identity separate from the nullable input captured by closures.
   let paneIdentity = identity;
-  const pending: PaneObservationInput[] = [];
+  const pending: Array<{ identity: PaneIdentity; frame: PaneObservationInput }> = [];
   let timer: unknown = null;
   let journal: PaneJournal | null = loadPaneJournal(storage, paneIdentity.paneKey);
   let cancelled = false;
@@ -135,8 +135,8 @@ export function createPaneJournalController({
   function observe(frame: PaneObservationInput) {
     if (cancelled || !enabled) return;
     const previous = pending[pending.length - 1];
-    if (!previous || !isConsecutiveDuplicate(previous, frame)) {
-      pending.push(frame);
+    if (!previous || !isConsecutiveDuplicate(previous.frame, frame)) {
+      pending.push({ identity: { ...paneIdentity }, frame });
     }
     scheduleFlush();
   }
@@ -156,8 +156,8 @@ export function createPaneJournalController({
     }
 
     const frames = pending.splice(0, pending.length);
-    for (const frame of frames) {
-      journal = appendPaneTextObservation(persistence, paneIdentity, frame, journal ?? undefined).journal;
+    for (const { identity: captureIdentity, frame } of frames) {
+      journal = appendPaneTextObservation(persistence, captureIdentity, frame, journal ?? undefined).journal;
     }
 
     if (journal && notify) {
