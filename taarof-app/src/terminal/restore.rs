@@ -1548,9 +1548,8 @@ impl AgentResumeOffer {
     }
 }
 
-/// A single leaf's planned spawn, produced without touching GTK. Mirrors what
-/// [`build_restored_pane_tree`] pushes into its spawn list, so a lazily restored
-/// tab spawns exactly the same processes on first activation.
+/// A single leaf's planned spawn, produced without touching GTK. The GTK tree
+/// consumer uses the same internal plan, including its exact tmux backing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedRestoreSpawn {
     pub pane_id: u32,
@@ -1572,17 +1571,34 @@ pub fn plan_restored_spawns(
     saved: &SavedPaneNode,
     auto_resume_agents: bool,
 ) -> Vec<PlannedRestoreSpawn> {
-    let mut next_pane_id = 0u32;
+    plan_restored_leaves(saved, auto_resume_agents, 0)
+        .into_iter()
+        .map(|leaf| leaf.spawn)
+        .collect()
+}
+
+struct PlannedRestoreLeaf<'a> {
+    saved: &'a SavedPaneNode,
+    spawn: PlannedRestoreSpawn,
+    backing: Option<crate::pane::TmuxBacking>,
+}
+
+fn plan_restored_leaves(
+    saved: &SavedPaneNode,
+    auto_resume_agents: bool,
+    first_pane_id: u32,
+) -> Vec<PlannedRestoreLeaf<'_>> {
+    let mut next_pane_id = first_pane_id;
     let mut out = Vec::new();
     plan_restored_spawns_inner(saved, auto_resume_agents, &mut next_pane_id, &mut out);
     out
 }
 
-fn plan_restored_spawns_inner(
-    saved: &SavedPaneNode,
+fn plan_restored_spawns_inner<'a>(
+    saved: &'a SavedPaneNode,
     auto_resume_agents: bool,
     next_pane_id: &mut u32,
-    out: &mut Vec<PlannedRestoreSpawn>,
+    out: &mut Vec<PlannedRestoreLeaf<'a>>,
 ) {
     match saved {
         SavedPaneNode::Leaf {
@@ -1597,7 +1613,7 @@ fn plan_restored_spawns_inner(
         } => {
             let pane_id = *next_pane_id;
             *next_pane_id += 1;
-            let (spawn_cwd, spawn_cmd, _backing, agent_resume) = restored_leaf_spawn(
+            let (spawn_cwd, spawn_cmd, backing, agent_resume) = restored_leaf_spawn(
                 cwd.as_deref(),
                 ssh_command.as_ref(),
                 tmux_session.as_deref(),
@@ -1607,21 +1623,25 @@ fn plan_restored_spawns_inner(
                 auto_resume_agents,
             );
             let (saved_cwd, saved_cwd_host) = saved_cwd_location(cwd.as_deref());
-            out.push(PlannedRestoreSpawn {
-                pane_id,
-                cwd: saved_cwd,
-                cwd_host: saved_cwd_host,
-                remote_shell: ssh_command.is_some() || tmux_host.is_some(),
-                spawn_cwd,
-                spawn_cmd,
-                // Preserve the saved name as display metadata even when a
-                // legacy snapshot lacks exact generation authority. The
-                // absence of `spawn_cmd`/backing remains the fail-closed
-                // execution decision.
-                tmux_session: tmux_session.clone(),
-                tmux_host: tmux_host.clone(),
-                current_task: current_task.clone(),
-                agent_resume,
+            out.push(PlannedRestoreLeaf {
+                saved,
+                backing,
+                spawn: PlannedRestoreSpawn {
+                    pane_id,
+                    cwd: saved_cwd,
+                    cwd_host: saved_cwd_host,
+                    remote_shell: ssh_command.is_some() || tmux_host.is_some(),
+                    spawn_cwd,
+                    spawn_cmd,
+                    // Preserve the saved name as display metadata even when a
+                    // legacy snapshot lacks exact generation authority. The
+                    // absence of `spawn_cmd`/backing remains the fail-closed
+                    // execution decision.
+                    tmux_session: tmux_session.clone(),
+                    tmux_host: tmux_host.clone(),
+                    current_task: current_task.clone(),
+                    agent_resume,
+                },
             });
         }
         SavedPaneNode::Split { first, second, .. } => {
@@ -1638,30 +1658,61 @@ pub(super) fn build_restored_pane_tree(
     spawns: &mut Vec<RestoredPaneSpawn>,
     auto_resume_agents: bool,
 ) -> PaneNode {
+    let mut planned = plan_restored_leaves(saved, auto_resume_agents, *next_pane_id).into_iter();
+    let tree = build_restored_pane_tree_inner(saved, cfg, next_pane_id, spawns, &mut planned);
+    assert!(
+        planned.next().is_none(),
+        "restore plan has unconsumed leaves"
+    );
+    tree
+}
+
+/// Consume the owned decision while checking the borrowed leaf identity. Both
+/// walks borrow the same immutable saved tree for the lifetime of this plan.
+fn consume_restored_leaf<'a>(
+    saved: &'a SavedPaneNode,
+    next_pane_id: &mut u32,
+    planned: &mut impl Iterator<Item = PlannedRestoreLeaf<'a>>,
+) -> PlannedRestoreLeaf<'a> {
+    let leaf = planned.next().expect("restore plan is missing a leaf");
+    assert!(
+        std::ptr::eq(leaf.saved, saved),
+        "restore plan leaf identity differs"
+    );
+    assert_eq!(
+        leaf.spawn.pane_id, *next_pane_id,
+        "restore plan pane order differs"
+    );
+    *next_pane_id += 1;
+    leaf
+}
+
+fn build_restored_pane_tree_inner<'a>(
+    saved: &'a SavedPaneNode,
+    cfg: &GhosttyConfig,
+    next_pane_id: &mut u32,
+    spawns: &mut Vec<RestoredPaneSpawn>,
+    planned: &mut impl Iterator<Item = PlannedRestoreLeaf<'a>>,
+) -> PaneNode {
     match saved {
         SavedPaneNode::Leaf {
             work_origin,
-            cwd,
-            ssh_command,
             tmux_session,
             tmux_host,
-            tmux_identity,
             current_task,
             agent_session,
+            ..
         } => {
-            let pane_id = *next_pane_id;
-            *next_pane_id += 1;
+            let PlannedRestoreLeaf { spawn, backing, .. } =
+                consume_restored_leaf(saved, next_pane_id, planned);
+            let PlannedRestoreSpawn {
+                pane_id,
+                spawn_cwd,
+                spawn_cmd,
+                agent_resume,
+                ..
+            } = spawn;
             let (terminal, container) = build_terminal(cfg);
-
-            let (spawn_cwd, spawn_cmd, backing, agent_resume) = restored_leaf_spawn(
-                cwd.as_deref(),
-                ssh_command.as_ref(),
-                tmux_session.as_deref(),
-                tmux_host.as_deref(),
-                tmux_identity.as_ref(),
-                agent_session.as_ref(),
-                auto_resume_agents,
-            );
 
             let restored_spawn_kind = (spawn_cmd.is_some() && agent_resume.is_some())
                 .then_some(crate::pane::RestoredSpawnKind::AgentResume);
@@ -1702,9 +1753,9 @@ pub(super) fn build_restored_pane_tree(
                 crate::pane::SplitDirection::Horizontal => gtk::Orientation::Vertical,
             };
             let first_node =
-                build_restored_pane_tree(first, cfg, next_pane_id, spawns, auto_resume_agents);
+                build_restored_pane_tree_inner(first, cfg, next_pane_id, spawns, planned);
             let second_node =
-                build_restored_pane_tree(second, cfg, next_pane_id, spawns, auto_resume_agents);
+                build_restored_pane_tree_inner(second, cfg, next_pane_id, spawns, planned);
             let paned = gtk::Paned::new(orientation);
             paned.set_hexpand(true);
             paned.set_vexpand(true);
@@ -1849,6 +1900,422 @@ mod agent_resume_tests {
             session_id: "session-123".into(),
             host_identity: Some("build.ts".into()),
             source: SavedAgentSessionSource::Argv,
+        }
+    }
+
+    fn nested_tree() -> SavedPaneNode {
+        SavedPaneNode::Split {
+            direction: "horizontal".into(),
+            ratio: 0.4,
+            first: Box::new(leaf(None)),
+            second: Box::new(SavedPaneNode::Split {
+                direction: "vertical".into(),
+                ratio: 0.6,
+                first: Box::new(leaf(Some(codex_session()))),
+                second: Box::new(leaf(None)),
+            }),
+        }
+    }
+
+    #[test]
+    fn shared_plan_consumer_preserves_nested_preorder_and_leaf_identity() {
+        let saved = nested_tree();
+        let SavedPaneNode::Split { first, second, .. } = &saved else {
+            unreachable!()
+        };
+        let SavedPaneNode::Split {
+            first: middle,
+            second: last,
+            ..
+        } = second.as_ref()
+        else {
+            unreachable!()
+        };
+        for policy in [false, true] {
+            let public = plan_restored_spawns(&saved, policy);
+            let mut planned = super::plan_restored_leaves(&saved, policy, 0).into_iter();
+            let mut next = 0;
+            for (index, identity) in [first.as_ref(), middle.as_ref(), last.as_ref()]
+                .into_iter()
+                .enumerate()
+            {
+                let consumed = super::consume_restored_leaf(identity, &mut next, &mut planned);
+                assert_eq!(consumed.spawn, public[index]);
+                assert_eq!(consumed.spawn.pane_id, index as u32);
+                assert!(consumed.backing.is_none());
+            }
+            assert_eq!(next, 3);
+            assert!(planned.next().is_none());
+            assert_eq!(public[1].spawn_cmd.is_some(), policy);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "restore plan leaf identity differs")]
+    fn shared_plan_consumer_rejects_equal_but_different_saved_leaf() {
+        let saved = leaf(None);
+        let other = saved.clone();
+        let mut plan = super::plan_restored_leaves(&saved, false, 0).into_iter();
+        super::consume_restored_leaf(&other, &mut 0, &mut plan);
+    }
+
+    #[test]
+    #[should_panic(expected = "restore plan pane order differs")]
+    fn shared_plan_consumer_rejects_wrong_pane_order() {
+        let saved = leaf(None);
+        let mut plan = super::plan_restored_leaves(&saved, false, 7).into_iter();
+        super::consume_restored_leaf(&saved, &mut 0, &mut plan);
+    }
+
+    #[test]
+    #[should_panic(expected = "restore plan is missing a leaf")]
+    fn shared_plan_consumer_rejects_missing_entry() {
+        let saved = leaf(None);
+        super::consume_restored_leaf(&saved, &mut 0, &mut std::iter::empty());
+    }
+
+    #[test]
+    fn shared_plan_tmux_backing_and_command_keep_exact_continuity() {
+        let mut saved = leaf(Some(codex_session()));
+        let SavedPaneNode::Leaf { tmux_session, .. } = &mut saved else {
+            unreachable!()
+        };
+        *tmux_session = Some("same-name".into());
+        for identity in [
+            None,
+            Some(crate::session::SavedTmuxIdentity {
+                session_id: "$1".into(),
+                session_created: 1711720000,
+                continuity_id: "invalid".into(),
+            }),
+        ] {
+            let SavedPaneNode::Leaf { tmux_identity, .. } = &mut saved else {
+                unreachable!()
+            };
+            *tmux_identity = identity;
+            let mut plan = super::plan_restored_leaves(&saved, true, 0).into_iter();
+            let consumed = super::consume_restored_leaf(&saved, &mut 0, &mut plan);
+            assert!(consumed.spawn.spawn_cmd.is_none());
+            assert!(consumed.backing.is_none());
+            assert!(consumed.spawn.agent_resume.is_none());
+        }
+        let mut commands = Vec::new();
+        for nonce in [
+            "11111111111111111111111111111111",
+            "22222222222222222222222222222222",
+        ] {
+            let expected = crate::session::SavedTmuxIdentity {
+                session_id: "$1".into(),
+                session_created: 1711720000,
+                continuity_id: nonce.into(),
+            };
+            let SavedPaneNode::Leaf { tmux_identity, .. } = &mut saved else {
+                unreachable!()
+            };
+            *tmux_identity = Some(expected.clone());
+            let mut plan = super::plan_restored_leaves(&saved, true, 0).into_iter();
+            let consumed = super::consume_restored_leaf(&saved, &mut 0, &mut plan);
+            assert_eq!(
+                consumed.backing.unwrap().expected_generation,
+                Some(expected)
+            );
+            let command = consumed.spawn.spawn_cmd.unwrap();
+            assert!(command[5].contains(nonce));
+            assert!(command[7].contains("exit 75"));
+            commands.push(command);
+        }
+        assert_ne!(commands[0], commands[1]);
+    }
+
+    #[test]
+    #[ignore = "requires GTK display; supervisor owns native lease"]
+    fn shared_restore_gtk_consumer_matches_nested_eager_and_lazy_plan() {
+        gtk::init().expect("GTK display required");
+        let saved = nested_tree();
+        let cfg = crate::config::ghostty_config();
+        for policy in [
+            SessionRestoreResumePolicy::eager(false, true),
+            SessionRestoreResumePolicy::lazy(false),
+        ] {
+            let expected = plan_restored_spawns(&saved, policy.enabled());
+            let mut next = 0;
+            let mut spawns = Vec::new();
+            let tree = super::build_restored_pane_tree(
+                &saved,
+                &cfg,
+                &mut next,
+                &mut spawns,
+                policy.enabled(),
+            );
+            assert_eq!(next, 3);
+            assert_eq!(spawns.len(), expected.len());
+            for ((id, _, cwd, command), expected) in spawns.iter().zip(&expected) {
+                assert_eq!(*id, expected.pane_id);
+                assert_eq!(cwd, &expected.spawn_cwd);
+                assert_eq!(command, &expected.spawn_cmd);
+                let leaf = tree.leaf(*id).expect("planned pane must exist in GTK tree");
+                assert_eq!(leaf.agent_resume, expected.agent_resume);
+                assert_eq!(
+                    leaf.restored_spawn_kind.is_some(),
+                    expected.spawn_cmd.is_some() && expected.agent_resume.is_some()
+                );
+            }
+            let crate::pane::PaneNode::Split { first, second, .. } = tree else {
+                panic!("outer split lost")
+            };
+            assert_eq!(first.first_leaf().unwrap().pane_id, 0);
+            let crate::pane::PaneNode::Split { first, second, .. } = *second else {
+                panic!("nested split lost")
+            };
+            assert_eq!(first.first_leaf().unwrap().pane_id, 1);
+            assert_eq!(second.first_leaf().unwrap().pane_id, 2);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires isolated native tmux fixture; supervisor owns native lease"]
+    fn shared_restore_tmux_consumer_rejects_missing_ambiguous_and_replaced_backing() {
+        use std::io::Write;
+        use std::os::unix::fs::DirBuilderExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        // No ambient tmux server: every command pins this private socket, and
+        // an empty config disables operator hooks. Cleanup owns only this dir.
+        struct Fixture(std::path::PathBuf);
+        impl Fixture {
+            fn command(&self) -> Command {
+                let mut command = crate::child_process::command("tmux");
+                command.args(["-f", "/dev/null", "-S"]);
+                command.arg(self.0.join("socket"));
+                command
+            }
+
+            fn run(&self, args: &[&str]) -> std::process::Output {
+                let output = self
+                    .command()
+                    .args(args)
+                    .output()
+                    .expect("tmux fixture command");
+                assert!(
+                    output.status.success(),
+                    "fixture setup {args:?} failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                output
+            }
+
+            fn create_session(&self, name: &str) -> (String, String) {
+                let output = self.run(&[
+                    "new-session",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{session_id} #{pane_id}",
+                    "-s",
+                    name,
+                    "sleep 60",
+                ]);
+                let text = String::from_utf8(output.stdout).expect("fixture IDs must be UTF-8");
+                let fields: Vec<_> = text.split_whitespace().collect();
+                assert_eq!(fields.len(), 2, "unexpected fixture IDs: {text:?}");
+                for (id, prefix) in fields.iter().zip(['$', '%']) {
+                    let digits = id.strip_prefix(prefix).expect("fixture ID prefix");
+                    assert!(
+                        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+                        "invalid fixture ID: {id:?}"
+                    );
+                }
+                (fields[0].to_owned(), fields[1].to_owned())
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.command().arg("kill-server").output();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "d21c-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .expect("private fixture directory");
+        let fixture = Fixture(dir);
+        let (original_session_id, original_pane_id) = fixture.create_session("fixture");
+        fixture.run(&["new-session", "-d", "-s", "anchor", "sleep 60"]);
+        fixture.run(&[
+            "set-option",
+            "-t",
+            &original_session_id,
+            "@taarof-continuity-id",
+            "11111111111111111111111111111111",
+        ]);
+        let identity = fixture.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &original_pane_id,
+            "#{session_id} #{session_created}",
+        ]);
+        let identity = String::from_utf8(identity.stdout).unwrap();
+        let mut words = identity.split_whitespace();
+        let session_id = words.next().unwrap();
+        assert_eq!(session_id, original_session_id);
+        let expected = crate::session::SavedTmuxIdentity {
+            session_id: session_id.into(),
+            session_created: words.next().unwrap().parse().unwrap(),
+            continuity_id: "11111111111111111111111111111111".into(),
+        };
+        let mut saved = leaf(Some(codex_session()));
+        let SavedPaneNode::Leaf {
+            tmux_session,
+            tmux_identity,
+            ..
+        } = &mut saved
+        else {
+            unreachable!()
+        };
+        *tmux_session = Some("fixture".into());
+        *tmux_identity = Some(expected.clone());
+
+        let execute_consumed = || {
+            let mut planned = super::plan_restored_leaves(&saved, true, 0).into_iter();
+            let consumed = super::consume_restored_leaf(&saved, &mut 0, &mut planned);
+            assert_eq!(
+                consumed.backing.unwrap().expected_generation,
+                Some(expected.clone())
+            );
+            assert!(
+                consumed.spawn.agent_resume.is_none(),
+                "tmux must never substitute agent resume"
+            );
+            let argv = consumed.spawn.spawn_cmd.expect("exact attach decision");
+            assert_eq!(argv[0], "tmux");
+            // Control mode supplies a real tmux client without a PTY. The
+            // returned production command and its conditional branches stay
+            // intact; only fixture-global socket/config/client options precede it.
+            let mut command = fixture.command();
+            command
+                .arg("-C")
+                .args(&argv[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // Reaped synchronously below: try_wait polls the five-second deadline;
+            // timeout kills/waits, otherwise wait_with_output reaps this client.
+            #[allow(clippy::disallowed_methods)]
+            let mut child = command.spawn().expect("execute production attach command");
+            let mut input = child.stdin.take().unwrap();
+            // Query this very client after the guard, then detach to finish.
+            // Broken pipe is permitted for a target-resolution rejection.
+            let _ = input.write_all(
+                b"display-message -p 'D21C_ATTACHED:#{client_session}'\ndetach-client\n",
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if child.try_wait().expect("poll fixture client").is_some() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated attach client timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(input);
+            child.wait_with_output().expect("reap fixture client")
+        };
+
+        let matching = execute_consumed();
+        assert!(
+            String::from_utf8_lossy(&matching.stdout)
+                .lines()
+                .any(|line| line == "D21C_ATTACHED:fixture"),
+            "positive control must actually attach: {:?}",
+            matching
+        );
+
+        fixture.run(&["kill-session", "-t", &original_session_id]);
+        let names = fixture.run(&["list-sessions", "-F", "#{session_name}"]);
+        assert_eq!(String::from_utf8(names.stdout).unwrap().trim(), "anchor");
+        let missing = execute_consumed();
+        let (first_ambiguous_id, _) = fixture.create_session("fixture-one");
+        let (second_ambiguous_id, _) = fixture.create_session("fixture-two");
+        let names = fixture.run(&["list-sessions", "-F", "#{session_name}"]);
+        let names = String::from_utf8(names.stdout).unwrap();
+        assert_eq!(
+            names
+                .lines()
+                .filter(|name| name.starts_with("fixture"))
+                .count(),
+            2
+        );
+        assert!(!names.lines().any(|name| name == "fixture"));
+        let ambiguous = execute_consumed();
+        fixture.run(&["kill-session", "-t", &first_ambiguous_id]);
+        fixture.run(&["kill-session", "-t", &second_ambiguous_id]);
+        let (replacement_session_id, replacement_pane_id) = fixture.create_session("fixture");
+        fixture.run(&[
+            "set-option",
+            "-t",
+            &replacement_session_id,
+            "@taarof-continuity-id",
+            "22222222222222222222222222222222",
+        ]);
+        let replacement = fixture.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &replacement_pane_id,
+            "#{session_id} #{@taarof-continuity-id}",
+        ]);
+        let replacement = String::from_utf8(replacement.stdout).unwrap();
+        assert_eq!(
+            replacement.split_whitespace().next().unwrap(),
+            replacement_session_id
+        );
+        assert_ne!(
+            replacement.split_whitespace().next().unwrap(),
+            expected.session_id
+        );
+        assert!(replacement.contains("22222222222222222222222222222222"));
+        let replaced = execute_consumed();
+        for (case, output) in [
+            ("missing", missing),
+            ("ambiguous", ambiguous),
+            ("replaced", replaced),
+        ] {
+            assert!(
+                !String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line
+                        .strip_prefix("D21C_ATTACHED:")
+                        .is_some_and(|session| !session.is_empty())),
+                "{case} attached a wrong live generation: {output:?}"
+            );
+            // tmux may return success for the outer if-shell even though its
+            // nested run-shell exits 75. Observe attachment and diagnostics,
+            // never equate that nested exit with the client's exit status.
+            let diagnostic = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                diagnostic.contains("can't find session")
+                    || diagnostic.contains("ambiguous")
+                    || diagnostic.contains("Reattach unavailable:"),
+                "{case} did not expose a guard/target rejection: {output:?}"
+            );
         }
     }
 
