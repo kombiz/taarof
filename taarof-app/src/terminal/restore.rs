@@ -2080,6 +2080,222 @@ mod agent_resume_tests {
     }
 
     #[test]
+    #[ignore = "requires isolated native tmux fixture; supervisor owns native lease"]
+    fn shared_restore_tmux_consumer_rejects_missing_ambiguous_and_replaced_backing() {
+        use std::io::Write;
+        use std::os::unix::fs::DirBuilderExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        // No ambient tmux server: every command pins this private socket, and
+        // an empty config disables operator hooks. Cleanup owns only this dir.
+        struct Fixture(std::path::PathBuf);
+        impl Fixture {
+            fn command(&self) -> Command {
+                let mut command = Command::new("tmux");
+                crate::child_env::prepare_child_command(&mut command, &[]);
+                command.args(["-f", "/dev/null", "-S"]);
+                command.arg(self.0.join("socket"));
+                command
+            }
+
+            fn run(&self, args: &[&str]) -> std::process::Output {
+                let output = self
+                    .command()
+                    .args(args)
+                    .output()
+                    .expect("tmux fixture command");
+                assert!(
+                    output.status.success(),
+                    "fixture setup failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                output
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.command().arg("kill-server").output();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "d21c-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .expect("private fixture directory");
+        let fixture = Fixture(dir);
+        fixture.run(&["new-session", "-d", "-s", "fixture", "sleep 60"]);
+        fixture.run(&["new-session", "-d", "-s", "anchor", "sleep 60"]);
+        fixture.run(&[
+            "set-option",
+            "-t",
+            "=fixture",
+            "@taarof-continuity-id",
+            "11111111111111111111111111111111",
+        ]);
+        let identity = fixture.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            "=fixture",
+            "#{session_id} #{session_created}",
+        ]);
+        let identity = String::from_utf8(identity.stdout).unwrap();
+        let mut words = identity.split_whitespace();
+        let expected = crate::session::SavedTmuxIdentity {
+            session_id: words.next().unwrap().into(),
+            session_created: words.next().unwrap().parse().unwrap(),
+            continuity_id: "11111111111111111111111111111111".into(),
+        };
+        let mut saved = leaf(Some(codex_session()));
+        let SavedPaneNode::Leaf {
+            tmux_session,
+            tmux_identity,
+            ..
+        } = &mut saved
+        else {
+            unreachable!()
+        };
+        *tmux_session = Some("fixture".into());
+        *tmux_identity = Some(expected.clone());
+
+        let execute_consumed = || {
+            let mut planned = super::plan_restored_leaves(&saved, true, 0).into_iter();
+            let consumed = super::consume_restored_leaf(&saved, &mut 0, &mut planned);
+            assert_eq!(
+                consumed.backing.unwrap().expected_generation,
+                Some(expected.clone())
+            );
+            assert!(
+                consumed.spawn.agent_resume.is_none(),
+                "tmux must never substitute agent resume"
+            );
+            let argv = consumed.spawn.spawn_cmd.expect("exact attach decision");
+            assert_eq!(argv[0], "tmux");
+            // Control mode supplies a real tmux client without a PTY. The
+            // returned production command and its conditional branches stay
+            // intact; only fixture-global socket/config/client options precede it.
+            let mut child = fixture
+                .command()
+                .arg("-C")
+                .args(&argv[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("execute production attach command");
+            let mut input = child.stdin.take().unwrap();
+            // Query this very client after the guard, then detach to finish.
+            // Broken pipe is permitted for a target-resolution rejection.
+            let _ = input.write_all(
+                b"display-message -p 'D21C_ATTACHED:#{client_session}'\ndetach-client\n",
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if child.try_wait().expect("poll fixture client").is_some() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated attach client timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(input);
+            child.wait_with_output().expect("reap fixture client")
+        };
+
+        let matching = execute_consumed();
+        assert!(
+            String::from_utf8_lossy(&matching.stdout)
+                .lines()
+                .any(|line| line == "D21C_ATTACHED:fixture"),
+            "positive control must actually attach: {:?}",
+            matching
+        );
+
+        fixture.run(&["kill-session", "-t", "=fixture"]);
+        let names = fixture.run(&["list-sessions", "-F", "#{session_name}"]);
+        assert_eq!(String::from_utf8(names.stdout).unwrap().trim(), "anchor");
+        let missing = execute_consumed();
+        fixture.run(&["new-session", "-d", "-s", "fixture-one", "sleep 60"]);
+        fixture.run(&["new-session", "-d", "-s", "fixture-two", "sleep 60"]);
+        let names = fixture.run(&["list-sessions", "-F", "#{session_name}"]);
+        let names = String::from_utf8(names.stdout).unwrap();
+        assert_eq!(
+            names
+                .lines()
+                .filter(|name| name.starts_with("fixture"))
+                .count(),
+            2
+        );
+        assert!(!names.lines().any(|name| name == "fixture"));
+        let ambiguous = execute_consumed();
+        fixture.run(&["kill-session", "-t", "=fixture-one"]);
+        fixture.run(&["kill-session", "-t", "=fixture-two"]);
+        fixture.run(&["new-session", "-d", "-s", "fixture", "sleep 60"]);
+        fixture.run(&[
+            "set-option",
+            "-t",
+            "=fixture",
+            "@taarof-continuity-id",
+            "22222222222222222222222222222222",
+        ]);
+        let replacement = fixture.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            "=fixture",
+            "#{session_id} #{@taarof-continuity-id}",
+        ]);
+        let replacement = String::from_utf8(replacement.stdout).unwrap();
+        assert_ne!(
+            replacement.split_whitespace().next().unwrap(),
+            expected.session_id
+        );
+        assert!(replacement.contains("22222222222222222222222222222222"));
+        let replaced = execute_consumed();
+        for (case, output) in [
+            ("missing", missing),
+            ("ambiguous", ambiguous),
+            ("replaced", replaced),
+        ] {
+            assert!(
+                !String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line
+                        .strip_prefix("D21C_ATTACHED:")
+                        .is_some_and(|session| !session.is_empty())),
+                "{case} attached a wrong live generation: {output:?}"
+            );
+            // tmux may return success for the outer if-shell even though its
+            // nested run-shell exits 75. Observe attachment and diagnostics,
+            // never equate that nested exit with the client's exit status.
+            let diagnostic = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                diagnostic.contains("can't find session")
+                    || diagnostic.contains("ambiguous")
+                    || diagnostic.contains("Reattach unavailable:"),
+                "{case} did not expose a guard/target rejection: {output:?}"
+            );
+        }
+    }
+
+    #[test]
     fn default_restore_offers_exact_resume_command_without_executing_it() {
         let plan = plan_restored_spawns(&leaf(Some(codex_session())), false);
         assert_eq!(plan.len(), 1);
