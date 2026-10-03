@@ -84,6 +84,10 @@ entries are **Taarof** and **Taarof Development (kmux)**. Builds are cached unde
 `${XDG_CACHE_HOME:-~/.cache}/taarof-install`. Failed builds leave the installed
 channel alone; unexpected changes in a build worktree are retained for inspection.
 
+The development app shows **DEVELOPMENT · kmux** above its workspace list (**DEV**
+in compact mode), with **Taarof Development (kmux)** as its window title. Debug
+builds outside that channel show **DEVELOPMENT · local**.
+
 Development always launches the existing named session `kmux`; production uses
 the default session. This separates GTK application identity, socket/registry,
 saved workspace layout and default history files. It does **not** copy existing

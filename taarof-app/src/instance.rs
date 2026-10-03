@@ -98,6 +98,29 @@ pub fn session_name() -> Option<String> {
     normalize_session_name(raw.as_deref())
 }
 
+fn development_label_for(session: Option<&str>, debug_build: bool) -> Option<&'static str> {
+    if session == Some("kmux") {
+        Some("kmux")
+    } else if debug_build {
+        Some("local")
+    } else {
+        None
+    }
+}
+
+/// The installed kmux channel uses release optimization, so debug assertions
+/// alone cannot identify development builds. Other named sessions are not channels.
+pub(crate) fn development_label() -> Option<&'static str> {
+    development_label_for(session_name().as_deref(), cfg!(debug_assertions))
+}
+
+pub(crate) fn display_name() -> String {
+    match development_label() {
+        Some(label) => format!("Taarof Development ({label})"),
+        None => "Taarof".to_string(),
+    }
+}
+
 pub fn session_slug() -> Option<String> {
     session_name().map(|name| sanitize_file_component(&name))
 }
@@ -124,6 +147,21 @@ mod tests {
         application_id_for_session, normalize_session_name, sanitize_app_id_component,
         sanitize_file_component, session_digest, session_storage_key_for, SESSION_SLUG_PREFIX_MAX,
     };
+
+    #[test]
+    fn development_channel_is_independent_of_build_optimization() {
+        assert_eq!(
+            super::development_label_for(Some("kmux"), false),
+            Some("kmux")
+        );
+        assert_eq!(
+            super::development_label_for(Some("kmux"), true),
+            Some("kmux")
+        );
+        assert_eq!(super::development_label_for(None, true), Some("local"));
+        assert_eq!(super::development_label_for(None, false), None);
+        assert_eq!(super::development_label_for(Some("review"), false), None);
+    }
 
     #[test]
     fn session_name_trims_empty_values() {
