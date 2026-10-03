@@ -280,6 +280,16 @@ pub fn build_sidebar() -> Sidebar {
     }
     sidebar.append(&brand);
 
+    if let Some(channel) = crate::instance::development_label() {
+        let designation = gtk::Label::new(Some(&format!("DEVELOPMENT · {channel}")));
+        designation.add_css_class("sidebar-section-label");
+        designation.add_css_class("warning");
+        designation.set_halign(gtk::Align::Start);
+        designation.set_tooltip_text(Some(&crate::instance::display_name()));
+        // Keep the designation visible even when compact mode hides the brand.
+        sidebar.append(&designation);
+    }
+
     // Divider
     let div = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     div.add_css_class("sidebar-divider");
