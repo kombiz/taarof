@@ -188,6 +188,14 @@ fn compact_visibility_override(compact: bool, runtime_owned: bool) -> Option<boo
 }
 
 fn set_compact_hidden_visibility(widget: &gtk::Widget, compact: bool) {
+    if widget.has_css_class("development-designation") {
+        if let (Some(label), Some(channel)) = (
+            widget.downcast_ref::<gtk::Label>(),
+            crate::instance::development_label(),
+        ) {
+            label.set_text(&development_designation_text(channel, compact));
+        }
+    }
     if widget.has_css_class("compact-hidden") {
         if let Some(visible) =
             compact_visibility_override(compact, widget.has_css_class("runtime-visibility"))
@@ -199,6 +207,14 @@ fn set_compact_hidden_visibility(widget: &gtk::Widget, compact: bool) {
     while let Some(current) = child {
         set_compact_hidden_visibility(&current, compact);
         child = current.next_sibling();
+    }
+}
+
+fn development_designation_text(channel: &str, compact: bool) -> String {
+    if compact {
+        "DEV".to_string()
+    } else {
+        format!("DEVELOPMENT · {channel}")
     }
 }
 
@@ -279,6 +295,17 @@ pub fn build_sidebar() -> Sidebar {
         });
     }
     sidebar.append(&brand);
+
+    if let Some(channel) = crate::instance::development_label() {
+        let designation = gtk::Label::new(Some(&development_designation_text(channel, false)));
+        designation.add_css_class("development-designation");
+        designation.add_css_class("sidebar-section-label");
+        designation.add_css_class("warning");
+        designation.set_halign(gtk::Align::Start);
+        designation.set_tooltip_text(Some(&crate::instance::display_name()));
+        // Keep the designation visible even when compact mode hides the brand.
+        sidebar.append(&designation);
+    }
 
     // Divider
     let div = gtk::Box::new(gtk::Orientation::Horizontal, 0);

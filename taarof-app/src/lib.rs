@@ -3069,12 +3069,16 @@ fn build_ui(app: &adw::Application, resume_agents_after_reload: bool) {
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("taarof")
+        .title(instance::display_name())
         .default_width(1200)
         .default_height(800)
         .content(&toast_overlay)
         .build();
-    window.set_icon_name(Some(DESKTOP_APP_ID));
+    if instance::session_name().as_deref() == Some("kmux") {
+        window.set_icon_name(app.application_id().as_deref());
+    } else {
+        window.set_icon_name(Some(DESKTOP_APP_ID));
+    }
 
     // The dock is built once so a runtime toggle is instant, but starts hidden
     // unless `[dock] visible = true`. Task and PR polling remain independently
