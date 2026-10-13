@@ -249,6 +249,9 @@ pub(crate) trait RuntimeProbeSource {
     ) -> Option<String> {
         self.verified_executable_name(pid)
     }
+    fn process_start_unix_ms(&self, _pid: i32) -> Option<u64> {
+        None
+    }
     fn child_pids(&self, pid: i32) -> Vec<i32>;
     fn process_comm(&self, pid: i32) -> Option<String>;
     fn process_cmdline(&self, pid: i32) -> Option<Vec<String>>;
@@ -298,6 +301,10 @@ impl RuntimeProbeSource for ProcProbeSource {
         agents::try_get_root_process_facts(pid)
     }
 
+    fn process_start_unix_ms(&self, pid: i32) -> Option<u64> {
+        agents::process_start_unix_ms(pid)
+    }
+
     fn child_pids(&self, pid: i32) -> Vec<i32> {
         agents::get_child_pids(pid)
     }
@@ -332,6 +339,8 @@ pub(crate) struct RuntimeProbeSnapshot {
     pub pane_pids: BTreeMap<PaneKey, i32>,
     pub pane_process_states: HashMap<PaneKey, PaneProcessState>,
     pub pane_agents: HashMap<PaneKey, AgentStatus>,
+    /// Current provider process identity for display-only completion payloads.
+    pub pane_agent_generations: HashMap<PaneKey, (i32, u64)>,
     /// Strict executable + explicit session identity; advisory matches never enter.
     pub pane_exact_agents: HashMap<PaneKey, AgentStatus>,
     pub tab_agents: HashMap<u32, AgentStatus>,
@@ -349,6 +358,8 @@ impl RuntimeProbeSnapshot {
         self.pane_process_states
             .retain(|(tab, _), _| live.contains(tab));
         self.pane_agents.retain(|(tab, _), _| live.contains(tab));
+        self.pane_agent_generations
+            .retain(|(tab, _), _| live.contains(tab));
         self.pane_exact_agents
             .retain(|(tab, _), _| live.contains(tab));
         self.tab_agents.retain(|tab, _| live.contains(tab));
@@ -372,6 +383,7 @@ impl RuntimeProbeSnapshot {
         }
         let mut pane_process_states = HashMap::new();
         let mut pane_agents = HashMap::new();
+        let mut pane_agent_generations = HashMap::new();
         let mut pane_exact_agents = HashMap::new();
 
         for (tab_id, pane_id, pid) in pane_pids {
@@ -383,6 +395,14 @@ impl RuntimeProbeSnapshot {
                 (*tab_id, *pane_id),
                 cache.agent_status_for_root(source, *pid),
             );
+            if let Some(agent) = pane_agents
+                .get(&(*tab_id, *pane_id))
+                .and_then(|status| status.agent_name.as_deref())
+            {
+                if let Some(generation) = cache.agent_generation_for_root(source, *pid, agent) {
+                    pane_agent_generations.insert((*tab_id, *pane_id), generation);
+                }
+            }
             if let Some(status) = cache.exact_agent_status_for_root(source, *pid) {
                 pane_exact_agents.insert((*tab_id, *pane_id), status);
             }
@@ -437,6 +457,7 @@ impl RuntimeProbeSnapshot {
             pane_pids: pane_pid_key(pane_pids),
             pane_process_states,
             pane_agents,
+            pane_agent_generations,
             pane_exact_agents,
             tab_agents,
             tab_ports,
@@ -462,6 +483,7 @@ impl RuntimeProbeSnapshot {
             pane_pids: pane_pid_key(pane_pids),
             pane_process_states: HashMap::new(),
             pane_agents: HashMap::new(),
+            pane_agent_generations: HashMap::new(),
             pane_exact_agents: HashMap::new(),
             tab_agents: HashMap::new(),
             tab_ports: HashMap::new(),
@@ -475,6 +497,7 @@ impl RuntimeProbeSnapshot {
     pub(crate) fn reconcile(mut self, previous: Option<&Self>) -> Self {
         if !matches!(self.process_probe, ProbeState::Ok) {
             self.pane_exact_agents.clear();
+            self.pane_agent_generations.clear();
             if let Some(previous) = previous.filter(|previous| {
                 previous.process_observed_at_unix_ms.is_some()
                     && (self
@@ -1088,6 +1111,23 @@ impl ProcessTreeCache {
         (self.agent_status_for_root(source, root) == exact).then_some(exact)
     }
 
+    fn agent_generation_for_root<S: RuntimeProbeSource + ?Sized>(
+        &mut self,
+        source: &S,
+        root: i32,
+        expected_agent: &str,
+    ) -> Option<(i32, u64)> {
+        let cwd = self.cwd(source, root);
+        for pid in self.collect_agent_tree(source, root) {
+            let fact = self.process_tuple(source, pid);
+            let status = agents::detect_agent_in_process_facts(cwd.as_deref(), &[fact]);
+            if status.running && status.agent_name.as_deref() == Some(expected_agent) {
+                return source.process_start_unix_ms(pid).map(|start| (pid, start));
+            }
+        }
+        None
+    }
+
     fn agent_status_for_root<S: RuntimeProbeSource + ?Sized>(
         &mut self,
         source: &S,
@@ -1154,6 +1194,7 @@ mod tests {
         children: HashMap<i32, Vec<i32>>,
         comm: HashMap<i32, String>,
         executables: HashMap<i32, String>,
+        starts: HashMap<i32, u64>,
         cmdline: HashMap<i32, Vec<String>>,
         cwd: HashMap<i32, String>,
         socket_inodes: HashMap<i32, Vec<u64>>,
@@ -1168,6 +1209,48 @@ mod tests {
         socket_reads: Cell<usize>,
         listen_reads: Cell<usize>,
         executable_reads: Cell<usize>,
+    }
+
+    #[test]
+    fn completion_generation_follows_the_owning_agent_and_rejects_missing_or_stale_proof() {
+        let mut source = multi_agent_fixture();
+        source.starts.insert(21, 100);
+        source.starts.insert(31, 200);
+        source.starts.insert(40, 300);
+        let snapshot = multi_agent_snapshot(&source);
+        assert_eq!(
+            snapshot.pane_agent_generations.get(&(1, 7)),
+            Some(&(21, 100))
+        );
+        assert_eq!(
+            snapshot.pane_agent_generations.get(&(1, 8)),
+            Some(&(31, 200))
+        );
+        assert_eq!(
+            snapshot.pane_agent_generations.get(&(1, 9)),
+            Some(&(40, 300))
+        );
+        source.starts.insert(21, 400);
+        let restarted = multi_agent_snapshot(&source);
+        assert_eq!(
+            restarted.pane_agent_generations.get(&(1, 7)),
+            Some(&(21, 400))
+        );
+        source.starts.clear();
+        assert!(multi_agent_snapshot(&source)
+            .pane_agent_generations
+            .is_empty());
+        let failed = RuntimeProbeSnapshot::worker_failure(
+            1_001,
+            &[(1, vec![20, 30, 40])],
+            &[(1, 7, 20), (1, 8, 30), (1, 9, 40)],
+            RuntimeProbeWorkerFailure::Cancelled,
+        )
+        .reconcile(Some(&snapshot));
+        assert!(
+            failed.pane_agent_generations.is_empty(),
+            "stale fallback has no fresh generation authority"
+        );
     }
 
     #[test]
@@ -1227,6 +1310,10 @@ mod tests {
     }
 
     impl RuntimeProbeSource for FakeProbeSource {
+        fn process_start_unix_ms(&self, pid: i32) -> Option<u64> {
+            self.starts.get(&pid).copied()
+        }
+
         fn verified_executable_name(&self, pid: i32) -> Option<String> {
             self.executable_reads.set(self.executable_reads.get() + 1);
             self.executables.get(&pid).cloned()

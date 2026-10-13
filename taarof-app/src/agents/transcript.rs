@@ -122,6 +122,8 @@ pub(crate) struct TranscriptState {
     /// last_message so an old reply or tool-step preamble cannot become a
     /// completion notification. Unknown finality leaves this absent.
     pub completion_reply: Option<String>,
+    /// Agent PID and start time observed by the existing off-thread tracker.
+    pub process_generation: Option<(i32, u64)>,
     /// Distinct files the agent touched, most-recent-last, capped.
     pub files_touched: Vec<String>,
     /// Files the agent created or edited (not read), deduped by path keeping the
@@ -1141,7 +1143,7 @@ fn find_agent_process_pid(shell_pid: i32, agent: &str) -> Option<i32> {
     None
 }
 
-fn process_start_unix_ms(pid: i32) -> Option<u64> {
+pub(crate) fn process_start_unix_ms(pid: i32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = stat.rsplit_once(") ")?.1;
     // `after_comm` begins at field 3 (state); process start ticks are field 22.
@@ -2176,6 +2178,13 @@ impl TranscriptTracker {
                 continue;
             }
             let snapshot = tail.state.clone();
+            let generation = facts[&binding.key]
+                .pid(binding, source)
+                .zip(facts[&binding.key].start(binding, source));
+            if tail.state.process_generation != generation {
+                tail.state.completion_reply = None;
+                tail.state.process_generation = generation;
+            }
             let delta = adapter.ingest_lines(&lines, &mut tail.state);
             let mut work_events = Vec::with_capacity(delta.items.len());
             for item in delta.items {

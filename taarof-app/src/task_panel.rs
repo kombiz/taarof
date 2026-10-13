@@ -5374,6 +5374,7 @@ mod tests {
             pane_pids: std::collections::BTreeMap::new(),
             pane_process_states: HashMap::new(),
             pane_exact_agents: std::collections::HashMap::new(),
+            pane_agent_generations: Default::default(),
             pane_agents: HashMap::from([(
                 (tab_id, pane_id),
                 crate::agents::AgentStatus {
@@ -5430,6 +5431,7 @@ mod tests {
             pane_pids: std::collections::BTreeMap::new(),
             pane_process_states: HashMap::new(),
             pane_exact_agents: std::collections::HashMap::new(),
+            pane_agent_generations: Default::default(),
             pane_agents: HashMap::from([(
                 (tab_id, pane_id),
                 crate::agents::AgentStatus {

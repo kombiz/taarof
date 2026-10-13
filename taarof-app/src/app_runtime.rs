@@ -380,19 +380,25 @@ pub(crate) fn update_agent_indicators(
                         tab.notified = true;
                         if let Some(app) = window.application() {
                             let notification = gio::Notification::new("taarof — Tab ready");
-                            let expected_session = target_pane.and_then(|pane| {
+                            let expected_agent = target_pane.and_then(|pane| {
                                 agents_view
                                     .agents
                                     .iter()
                                     .find(|(id, _)| *id == pane)
-                                    .and_then(|(_, status)| status.session_id.as_deref())
+                                    .map(|(_, status)| status)
+                            });
+                            let generation = target_pane.and_then(|pane| {
+                                snapshot
+                                    .pane_agent_generations
+                                    .get(&(tab.id, pane))
+                                    .copied()
                             });
                             let body = agent_completion_body(
                                 project,
                                 &notification_window,
                                 tab,
                                 target_pane,
-                                expected_session,
+                                expected_agent.zip(generation),
                                 pane_transcripts,
                                 crate::events::unix_time_ms(),
                             );
@@ -551,15 +557,22 @@ fn agent_completion_body(
     window: &str,
     tab: &crate::workspace::Tab,
     target_pane: Option<u32>,
-    expected_session: Option<&str>,
+    expected: Option<(&crate::agents::AgentStatus, (i32, u64))>,
     transcripts: &std::collections::HashMap<(u32, u32), crate::agents::TranscriptState>,
     now_ms: u64,
 ) -> String {
     let transcript = target_pane
         .and_then(|pane| transcripts.get(&(tab.id, pane)).map(|state| (pane, state)))
         .filter(|(pane, state)| {
-            expected_session == Some(state.session_id.as_str())
-                && !state.session_id.is_empty()
+            expected.is_some_and(|(status, generation)| {
+                status.running
+                    && status.agent_name.as_deref() == Some(state.agent.as_str())
+                    && status
+                        .session_id
+                        .as_deref()
+                        .is_none_or(|session| session == state.session_id)
+                    && state.process_generation == Some(generation)
+            }) && !state.session_id.is_empty()
                 && state.turn.phase == crate::agents::TurnPhase::Completed
                 && state.turn.is_fresh(now_ms)
                 && tab.pane_turn(*pane) == Some(state.turn)
@@ -846,16 +859,34 @@ mod tests {
                 session_id: "session".into(),
                 last_message: Some("older generic text".into()),
                 completion_reply: Some("Final reply".into()),
+                process_generation: Some((42, 1)),
                 turn,
                 ..Default::default()
             },
         )]);
+        let status = crate::agents::AgentStatus {
+            agent_name: Some("codex".into()),
+            session_id: Some("session".into()),
+            running: true,
+        };
+        let fresh = crate::agents::AgentStatus {
+            session_id: None,
+            ..status.clone()
+        };
+        let wrong = crate::agents::AgentStatus {
+            session_id: Some("replacement".into()),
+            ..status.clone()
+        };
+        let provider = crate::agents::AgentStatus {
+            agent_name: Some("claude".into()),
+            ..status.clone()
+        };
         let body = agent_completion_body(
             "project",
             "window",
             tab,
             Some(pane_id),
-            Some("session"),
+            Some((&status, (42, 1))),
             &transcripts,
             now,
         );
@@ -871,13 +902,25 @@ mod tests {
         assert_eq!(header["project"], "project");
         assert!(header["thread"].as_str().unwrap().contains("session"));
         assert_eq!(header["window"], "window");
-        for (pane, session) in [
-            (Some(pane_id + 1), Some("session")),
-            (Some(pane_id), Some("replacement")),
-            (None, Some("session")),
+        assert!(agent_completion_body(
+            "project",
+            "window",
+            tab,
+            Some(pane_id),
+            Some((&fresh, (42, 1))),
+            &transcripts,
+            now
+        )
+        .ends_with("\nFinal reply"));
+        for (pane, expected) in [
+            (Some(pane_id + 1), Some((&status, (42, 1)))),
+            (Some(pane_id), Some((&wrong, (42, 1)))),
+            (Some(pane_id), Some((&provider, (42, 1)))),
+            (Some(pane_id), Some((&fresh, (43, 2)))),
+            (None, Some((&status, (42, 1)))),
         ] {
             let body =
-                agent_completion_body("project", "window", tab, pane, session, &transcripts, now);
+                agent_completion_body("project", "window", tab, pane, expected, &transcripts, now);
             assert!(body.ends_with("\nfallback"));
             assert!(!body.contains("Final reply"));
         }
@@ -888,7 +931,7 @@ mod tests {
             "window",
             tab,
             Some(pane_id),
-            Some("session"),
+            Some((&status, (42, 1))),
             &transcripts,
             now
         )
@@ -899,7 +942,7 @@ mod tests {
             "window",
             tab,
             Some(pane_id),
-            Some("session"),
+            Some((&status, (42, 1))),
             &transcripts,
             now + 3_600_000
         )
@@ -917,7 +960,7 @@ mod tests {
             "window",
             tab,
             Some(pane_id),
-            Some("session"),
+            Some((&status, (42, 1))),
             &transcripts,
             now + 1
         )

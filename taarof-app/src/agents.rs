@@ -38,8 +38,8 @@ pub(crate) use scanner::{
     try_build_listen_table, try_get_root_process_facts, ListenTableProbe, ProcessFact,
 };
 pub(crate) use transcript::{
-    collect_transcript_bindings, resolve_touched_file_path, FileOp, ProviderNativeTurnId,
-    TranscriptState, TranscriptTracker, TranscriptWorkEvent,
+    collect_transcript_bindings, process_start_unix_ms, resolve_touched_file_path, FileOp,
+    ProviderNativeTurnId, TranscriptState, TranscriptTracker, TranscriptWorkEvent,
 };
 
 /// Provider-neutral evidence for a headless child agent discovered inside a
