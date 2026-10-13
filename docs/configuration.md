@@ -663,3 +663,19 @@ navigator labels missing or stale process observations UNKNOWN.
 Adapters are same-user executable code; PATH discovery does not enable them.
 See [adapter protocol and conformance](agent-provider-adapters.md) for the
 manifest, synthetic example, bounds, and no-secrets/no-transcripts contract.
+
+## Agent completion notices
+
+Taarof keeps its native completion notification and exact tab/pane Open action.
+When the exact pane has fresh completed native turn evidence and a matching
+provider session, its bounded final reply appears in the notification. The
+workspace name, provider session with tab/pane, and app window ID appear as
+Attention Rail display context. These labels do not grant focus authority.
+
+The existing transcript tracker supplies the in-memory reply. No new reader or
+history store is added. Claude final responses, Codex final-channel responses,
+and successful Pi final responses can supply text. Tool steps, child sessions,
+empty finals, stale turns, changed sessions, and ambiguous finality retain the
+existing notification fallback. The full body is limited to 2,000 characters.
+Use the native Taarof notice for these sessions; do not enable a second CLI
+notification producer in their pane.

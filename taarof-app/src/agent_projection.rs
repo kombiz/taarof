@@ -281,6 +281,7 @@ mod tests {
             pane_pids: std::collections::BTreeMap::new(),
             pane_process_states: std::collections::HashMap::new(),
             pane_exact_agents: std::collections::HashMap::new(),
+            pane_agent_generations: Default::default(),
             pane_agents: pane_ids
                 .iter()
                 .map(|pane_id| {

@@ -118,6 +118,12 @@ pub(crate) struct TranscriptState {
     pub session_id: String,
     /// Last assistant message text (raw markdown), if any.
     pub last_message: Option<String>,
+    /// Bounded final assistant text for this native turn only. Separate from
+    /// last_message so an old reply or tool-step preamble cannot become a
+    /// completion notification. Unknown finality leaves this absent.
+    pub completion_reply: Option<String>,
+    /// Agent PID and start time observed by the existing off-thread tracker.
+    pub process_generation: Option<(i32, u64)>,
     /// Distinct files the agent touched, most-recent-last, capped.
     pub files_touched: Vec<String>,
     /// Files the agent created or edited (not read), deduped by path keeping the
@@ -802,8 +808,30 @@ fn apply_turn_marker(
     let Some(marker) = marker else {
         return;
     };
+    if matches!(marker, TurnMarker::Started | TurnMarker::Errored) {
+        state.completion_reply = None;
+    }
     let at = record_timestamp_unix_ms(value).unwrap_or(fold_at_unix_ms);
     state.turn = PaneTurn::new(marker.phase(), at);
+}
+
+fn bounded_completion_reply(text: &str) -> Option<String> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    const LIMIT: usize = 2_000;
+    const MARKER: &str = "\n[shortened]";
+    let mut chars = text.chars();
+    let prefix: String = chars.by_ref().take(LIMIT).collect();
+    Some(if chars.next().is_some() {
+        prefix
+            .chars()
+            .take(LIMIT - MARKER.chars().count())
+            .collect::<String>()
+            + MARKER
+    } else {
+        prefix
+    })
 }
 
 fn bounded_native_id(value: Option<&str>) -> Option<String> {
@@ -1080,7 +1108,13 @@ fn command_basename(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn process_matches_agent(pid: i32, agent: &str) -> bool {
+/// Native process identity shared by transcript and runtime generation probes.
+/// Wrapper arguments beyond the script position cannot establish agent identity.
+pub(crate) fn native_process_matches_agent(
+    agent: &str,
+    comm: Option<&str>,
+    argv: Option<&[String]>,
+) -> bool {
     let aliases: &[&str] = match agent {
         "claude" => &["claude"],
         "codex" => &["codex"],
@@ -1088,16 +1122,18 @@ fn process_matches_agent(pid: i32, agent: &str) -> bool {
         "kimi" => &["kimi", "kimi-code"],
         _ => return false,
     };
-    crate::agents::get_process_comm(pid)
-        .into_iter()
-        .chain(
-            crate::agents::get_process_cmdline(pid)
-                .into_iter()
-                .flatten()
-                .take(2),
-        )
-        .map(|value| command_basename(&value))
+    comm.into_iter()
+        .chain(argv.into_iter().flatten().take(2).map(String::as_str))
+        .map(command_basename)
         .any(|candidate| aliases.contains(&candidate.as_str()))
+}
+
+fn process_matches_agent(pid: i32, agent: &str) -> bool {
+    native_process_matches_agent(
+        agent,
+        crate::agents::get_process_comm(pid).as_deref(),
+        crate::agents::get_process_cmdline(pid).as_deref(),
+    )
 }
 
 fn find_agent_process_pid(shell_pid: i32, agent: &str) -> Option<i32> {
@@ -1115,7 +1151,7 @@ fn find_agent_process_pid(shell_pid: i32, agent: &str) -> Option<i32> {
     None
 }
 
-fn process_start_unix_ms(pid: i32) -> Option<u64> {
+pub(crate) fn process_start_unix_ms(pid: i32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = stat.rsplit_once(") ")?.1;
     // `after_comm` begins at field 3 (state); process start ticks are field 22.
@@ -1496,6 +1532,14 @@ impl TranscriptAdapter for ClaudeTranscriptAdapter {
             }
 
             let joined = text_parts.concat();
+            // Sidechains and tool steps never supply the parent pane's final reply.
+            if value.get("isSidechain").and_then(Value::as_bool) != Some(true) {
+                state.completion_reply = if marker == Some(TurnMarker::Completed) {
+                    bounded_completion_reply(&joined)
+                } else {
+                    None
+                };
+            }
             if !joined.is_empty() {
                 state.last_message = Some(joined);
             }
@@ -1672,6 +1716,13 @@ impl TranscriptAdapter for CodexTranscriptAdapter {
             fold_codex_child_agents(&value, state, now);
             apply_native_turn_id(state, self, &value, now);
             apply_turn_marker(state, &value, marker, now);
+            if value.get("type").and_then(Value::as_str) == Some("event_msg") {
+                if let Some("turn_aborted" | "shutdown_complete") =
+                    value.pointer("/payload/type").and_then(Value::as_str)
+                {
+                    state.completion_reply = None;
+                }
+            }
             if value.get("type").and_then(Value::as_str) != Some("response_item") {
                 continue;
             }
@@ -1694,6 +1745,14 @@ impl TranscriptAdapter for CodexTranscriptAdapter {
                         })
                         .filter_map(|block| block.get("text").and_then(Value::as_str))
                         .collect::<String>();
+                    state.completion_reply =
+                        if value.pointer("/payload/channel").and_then(Value::as_str)
+                            == Some("final")
+                        {
+                            bounded_completion_reply(&text)
+                        } else {
+                            None
+                        };
                     if !text.is_empty() {
                         state.last_message = Some(text);
                     }
@@ -1805,6 +1864,14 @@ impl TranscriptAdapter for PiTranscriptAdapter {
                 .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
                 .filter_map(|block| block.get("text").and_then(Value::as_str))
                 .collect::<String>();
+            state.completion_reply = if matches!(
+                value.pointer("/message/stopReason").and_then(Value::as_str),
+                Some("stop" | "endTurn" | "maxTokens")
+            ) {
+                bounded_completion_reply(&text)
+            } else {
+                None
+            };
             if !text.is_empty() {
                 state.last_message = Some(text);
             }
@@ -2119,6 +2186,13 @@ impl TranscriptTracker {
                 continue;
             }
             let snapshot = tail.state.clone();
+            let generation = facts[&binding.key]
+                .pid(binding, source)
+                .zip(facts[&binding.key].start(binding, source));
+            if tail.state.process_generation != generation {
+                tail.state.completion_reply = None;
+                tail.state.process_generation = generation;
+            }
             let delta = adapter.ingest_lines(&lines, &mut tail.state);
             let mut work_events = Vec::with_capacity(delta.items.len());
             for item in delta.items {
@@ -3496,6 +3570,77 @@ mod tests {
 
     fn at(timestamp: &str) -> u64 {
         parse_rfc3339_unix_ms(timestamp).expect("fixture timestamp should parse")
+    }
+
+    #[test]
+    fn completion_reply_excludes_old_turns_tool_steps_and_sidechains() {
+        let adapter = ClaudeTranscriptAdapter::default();
+        let mut state = fold(
+            &adapter,
+            &[
+                serde_json::json!({"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"final"}]}}),
+            ],
+        );
+        assert_eq!(state.completion_reply.as_deref(), Some("final"));
+        adapter.ingest_lines(&[serde_json::json!({"type":"assistant","isSidechain":true,"message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"child"}]}}).to_string()], &mut state);
+        assert_eq!(state.completion_reply.as_deref(), Some("final"));
+        adapter.ingest_lines(
+            &[
+                serde_json::json!({"type":"user","message":{"role":"user","content":"next"}})
+                    .to_string(),
+            ],
+            &mut state,
+        );
+        assert!(state.completion_reply.is_none());
+        assert!(
+            state.last_message.is_some(),
+            "generic cache behavior remains available"
+        );
+        adapter.ingest_lines(&[serde_json::json!({"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"text","text":"preamble"},{"type":"tool_use","name":"Read"}]}}).to_string()], &mut state);
+        assert!(state.completion_reply.is_none());
+        adapter.ingest_lines(&[serde_json::json!({"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[]}}).to_string()], &mut state);
+        assert!(
+            state.completion_reply.is_none(),
+            "empty final does not reuse a tool preamble"
+        );
+    }
+
+    #[test]
+    fn completion_reply_requires_codex_final_channel_and_successful_completion() {
+        let adapter = CodexTranscriptAdapter::default();
+        let response = |channel: &str, text: &str| serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","channel":channel,"content":[{"type":"output_text","text":text}]}});
+        let mut state = fold(&adapter, &[response("commentary", "preamble")]);
+        assert!(state.completion_reply.is_none());
+        adapter.ingest_lines(&[response("final", "🙂").to_string()], &mut state);
+        assert_eq!(state.completion_reply.as_deref(), Some("🙂"));
+        adapter.ingest_lines(
+            &[
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}})
+                    .to_string(),
+            ],
+            &mut state,
+        );
+        assert_eq!(state.completion_reply.as_deref(), Some("🙂"));
+        adapter.ingest_lines(
+            &[
+                serde_json::json!({"type":"event_msg","payload":{"type":"user_message"}})
+                    .to_string(),
+            ],
+            &mut state,
+        );
+        assert!(state.completion_reply.is_none());
+        adapter.ingest_lines(
+            &[
+                response("final", "cancelled reply").to_string(),
+                serde_json::json!({"type":"event_msg","payload":{"type":"turn_aborted"}})
+                    .to_string(),
+            ],
+            &mut state,
+        );
+        assert!(state.completion_reply.is_none());
+        let long = super::bounded_completion_reply(&"🙂".repeat(4_000)).unwrap();
+        assert_eq!(long.chars().count(), 2_000);
+        assert!(long.ends_with("[shortened]"));
     }
 
     fn fold(adapter: &dyn TranscriptAdapter, lines: &[serde_json::Value]) -> TranscriptState {
