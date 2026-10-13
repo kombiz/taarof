@@ -1108,7 +1108,13 @@ fn command_basename(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn process_matches_agent(pid: i32, agent: &str) -> bool {
+/// Native process identity shared by transcript and runtime generation probes.
+/// Wrapper arguments beyond the script position cannot establish agent identity.
+pub(crate) fn native_process_matches_agent(
+    agent: &str,
+    comm: Option<&str>,
+    argv: Option<&[String]>,
+) -> bool {
     let aliases: &[&str] = match agent {
         "claude" => &["claude"],
         "codex" => &["codex"],
@@ -1116,16 +1122,18 @@ fn process_matches_agent(pid: i32, agent: &str) -> bool {
         "kimi" => &["kimi", "kimi-code"],
         _ => return false,
     };
-    crate::agents::get_process_comm(pid)
-        .into_iter()
-        .chain(
-            crate::agents::get_process_cmdline(pid)
-                .into_iter()
-                .flatten()
-                .take(2),
-        )
-        .map(|value| command_basename(&value))
+    comm.into_iter()
+        .chain(argv.into_iter().flatten().take(2).map(String::as_str))
+        .map(command_basename)
         .any(|candidate| aliases.contains(&candidate.as_str()))
+}
+
+fn process_matches_agent(pid: i32, agent: &str) -> bool {
+    native_process_matches_agent(
+        agent,
+        crate::agents::get_process_comm(pid).as_deref(),
+        crate::agents::get_process_cmdline(pid).as_deref(),
+    )
 }
 
 fn find_agent_process_pid(shell_pid: i32, agent: &str) -> Option<i32> {

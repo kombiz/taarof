@@ -1117,11 +1117,13 @@ impl ProcessTreeCache {
         root: i32,
         expected_agent: &str,
     ) -> Option<(i32, u64)> {
-        let cwd = self.cwd(source, root);
         for pid in self.collect_agent_tree(source, root) {
-            let fact = self.process_tuple(source, pid);
-            let status = agents::detect_agent_in_process_facts(cwd.as_deref(), &[fact]);
-            if status.running && status.agent_name.as_deref() == Some(expected_agent) {
+            let (_, comm, argv) = self.process_tuple(source, pid);
+            if agents::native_process_matches_agent(
+                expected_agent,
+                comm.as_deref(),
+                argv.as_deref(),
+            ) {
                 return source.process_start_unix_ms(pid).map(|start| (pid, start));
             }
         }
@@ -1251,6 +1253,41 @@ mod tests {
             failed.pane_agent_generations.is_empty(),
             "stale fallback has no fresh generation authority"
         );
+    }
+
+    #[test]
+    fn completion_generation_uses_native_pid_through_proxy_and_secret_wrappers() {
+        for (wrapper, argv) in [
+            ("bash", vec!["bash", "/opt/bin/codex-proxy"]),
+            ("infisical", vec!["infisical", "run", "--", "codex"]),
+        ] {
+            let mut source = FakeProbeSource::default();
+            source.children.insert(10, vec![20]);
+            source.children.insert(20, vec![30]);
+            source.comm.insert(10, "zsh".into());
+            source.comm.insert(20, wrapper.into());
+            source.comm.insert(30, "codex".into());
+            source
+                .cmdline
+                .insert(20, argv.into_iter().map(String::from).collect());
+            source.cmdline.insert(30, vec!["/opt/bin/codex".into()]);
+            source.starts.insert(20, 100);
+            source.starts.insert(30, 200);
+            let snapshot = RuntimeProbeSnapshot::build(&source, 1, &[(1, vec![10])], &[(1, 7, 10)]);
+            assert_eq!(
+                snapshot.pane_agents[&(1, 7)].agent_name.as_deref(),
+                Some("codex")
+            );
+            assert_eq!(
+                snapshot.pane_agent_generations.get(&(1, 7)),
+                Some(&(30, 200))
+            );
+            assert!(!agents::native_process_matches_agent(
+                "codex",
+                source.comm.get(&20).map(String::as_str),
+                source.cmdline.get(&20).map(Vec::as_slice),
+            ));
+        }
     }
 
     #[test]
