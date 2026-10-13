@@ -256,7 +256,20 @@ pub(crate) fn update_agent_indicators(
             let process_projection_available =
                 matches!(snapshot.process_probe, ProbeState::Ok | ProbeState::Stale);
             let process_projection_fresh = matches!(snapshot.process_probe, ProbeState::Ok);
-            for tab in st.all_tabs_mut() {
+            let crate::AppState {
+                workspaces,
+                pane_transcripts,
+                ..
+            } = &mut *st;
+            let notification_window = format!(
+                "Taarof window {} (process {})",
+                window.id(),
+                std::process::id()
+            );
+            for (project, tab) in workspaces.iter_mut().flat_map(|workspace| {
+                let project = workspace.name.as_str();
+                workspace.tabs.iter_mut().map(move |tab| (project, tab))
+            }) {
                 if process_projection_available {
                     for leaf in tab.panes.leaves_mut() {
                         if let Some(process_state) =
@@ -367,8 +380,23 @@ pub(crate) fn update_agent_indicators(
                         tab.notified = true;
                         if let Some(app) = window.application() {
                             let notification = gio::Notification::new("taarof — Tab ready");
-                            let body = tab.notification_msg.as_deref().unwrap_or(&tab.name);
-                            notification.set_body(Some(body));
+                            let expected_session = target_pane.and_then(|pane| {
+                                agents_view
+                                    .agents
+                                    .iter()
+                                    .find(|(id, _)| *id == pane)
+                                    .and_then(|(_, status)| status.session_id.as_deref())
+                            });
+                            let body = agent_completion_body(
+                                project,
+                                &notification_window,
+                                tab,
+                                target_pane,
+                                expected_session,
+                                pane_transcripts,
+                                crate::events::unix_time_ms(),
+                            );
+                            notification.set_body(Some(&body));
                             // Target the exact tab + pane so activation focuses the
                             // right pane, not just the tab.
                             let (action, notif_id) =
@@ -514,6 +542,67 @@ pub(crate) fn update_agent_indicators(
             crate::dashboard::refresh_dashboard_if_open(&state, &term_stack);
         }
     });
+}
+
+/// Format only the exact pane's completed native reply. Reported labels are
+/// display context; the existing application action remains the focus authority.
+fn agent_completion_body(
+    project: &str,
+    window: &str,
+    tab: &crate::workspace::Tab,
+    target_pane: Option<u32>,
+    expected_session: Option<&str>,
+    transcripts: &std::collections::HashMap<(u32, u32), crate::agents::TranscriptState>,
+    now_ms: u64,
+) -> String {
+    let transcript = target_pane
+        .and_then(|pane| transcripts.get(&(tab.id, pane)).map(|state| (pane, state)))
+        .filter(|(pane, state)| {
+            expected_session == Some(state.session_id.as_str())
+                && !state.session_id.is_empty()
+                && state.turn.phase == crate::agents::TurnPhase::Completed
+                && state.turn.is_fresh(now_ms)
+                && tab.pane_turn(*pane) == Some(state.turn)
+                && tab
+                    .pane_agent_activity(*pane)
+                    .is_none_or(|activity| activity.observed_at_unix_ms <= state.turn.at_unix_ms)
+        });
+    let thread = transcript
+        .map(|(pane, state)| format!("{} (tab {}, pane {})", state.session_id, tab.id, pane));
+    let label = |text: &str| {
+        let text = text.trim();
+        (!text.is_empty() && text.chars().count() <= 200 && !text.chars().any(char::is_control))
+            .then_some(text.to_string())
+    };
+    let mut header = format!(
+        "Attention-Rail-Agent: {}\n",
+        serde_json::json!({
+            "project": label(project),
+            "thread": thread.as_deref().and_then(label),
+            "window": label(window),
+        })
+    );
+    if header.len() > 2_048 {
+        header = "Attention-Rail-Agent: {}\n".to_string();
+    }
+    let message = transcript
+        .and_then(|(_, state)| state.completion_reply.as_deref())
+        .unwrap_or_else(|| tab.notification_msg.as_deref().unwrap_or(&tab.name));
+    const LIMIT: usize = 2_000;
+    const MARKER: &str = "\n[shortened]";
+    let capacity = LIMIT.saturating_sub(header.chars().count());
+    let mut chars = message.chars();
+    let text: String = chars.by_ref().take(capacity).collect();
+    if chars.next().is_some() {
+        header
+            + &text
+                .chars()
+                .take(capacity.saturating_sub(MARKER.chars().count()))
+                .collect::<String>()
+            + MARKER
+    } else {
+        header + &text
+    }
 }
 
 /// Poll each running pane agent's on-disk transcript for newly appended
@@ -727,10 +816,149 @@ pub(crate) fn update_pane_transcripts(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_transcript_turn_for_session, focus_pane_notification};
+    use super::{
+        agent_completion_body, apply_transcript_turn_for_session, focus_pane_notification,
+    };
     use crate::agents::{PaneTurn, TurnPhase};
     use crate::attention::{pane_attention_evidence_at, AttentionReason};
     use crate::workspace::{AgentActivity, AgentActivityOrigin, AgentActivityState};
+
+    #[test]
+    fn completion_notice_uses_only_matching_current_pane_reply() {
+        use crate::agents::TranscriptState;
+        let now = crate::events::unix_time_ms();
+        let mut state = crate::AppState::new();
+        let workspace_id = state.active_workspace;
+        let (tab_id, pane_id) = crate::seed_headless_terminal_tab(
+            &mut state,
+            workspace_id,
+            "fallback",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .expect("pane");
+        let tab = state.find_tab_mut(tab_id).unwrap();
+        let turn = PaneTurn::new(TurnPhase::Completed, now);
+        tab.set_pane_turn(pane_id, turn);
+        let mut transcripts = std::collections::HashMap::from([(
+            (tab_id, pane_id),
+            TranscriptState {
+                agent: "codex".into(),
+                session_id: "session".into(),
+                last_message: Some("older generic text".into()),
+                completion_reply: Some("Final reply".into()),
+                turn,
+                ..Default::default()
+            },
+        )]);
+        let body = agent_completion_body(
+            "project",
+            "window",
+            tab,
+            Some(pane_id),
+            Some("session"),
+            &transcripts,
+            now,
+        );
+        assert!(body.ends_with("\nFinal reply"));
+        let header: serde_json::Value = serde_json::from_str(
+            body.lines()
+                .next()
+                .unwrap()
+                .strip_prefix("Attention-Rail-Agent: ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(header["project"], "project");
+        assert!(header["thread"].as_str().unwrap().contains("session"));
+        assert_eq!(header["window"], "window");
+        for (pane, session) in [
+            (Some(pane_id + 1), Some("session")),
+            (Some(pane_id), Some("replacement")),
+            (None, Some("session")),
+        ] {
+            let body =
+                agent_completion_body("project", "window", tab, pane, session, &transcripts, now);
+            assert!(body.ends_with("\nfallback"));
+            assert!(!body.contains("Final reply"));
+        }
+        transcripts.get_mut(&(tab_id, pane_id)).unwrap().turn =
+            PaneTurn::new(TurnPhase::Active, now);
+        assert!(agent_completion_body(
+            "project",
+            "window",
+            tab,
+            Some(pane_id),
+            Some("session"),
+            &transcripts,
+            now
+        )
+        .ends_with("\nfallback"));
+        transcripts.get_mut(&(tab_id, pane_id)).unwrap().turn = turn;
+        assert!(agent_completion_body(
+            "project",
+            "window",
+            tab,
+            Some(pane_id),
+            Some("session"),
+            &transcripts,
+            now + 3_600_000
+        )
+        .ends_with("\nfallback"));
+        let mut activity = AgentActivity::socket(
+            AgentActivityState::Running,
+            "next turn",
+            Some("codex".into()),
+        )
+        .unwrap();
+        activity.observed_at_unix_ms = now + 1;
+        tab.set_pane_agent_activity(pane_id, Some(activity));
+        assert!(agent_completion_body(
+            "project",
+            "window",
+            tab,
+            Some(pane_id),
+            Some("session"),
+            &transcripts,
+            now + 1
+        )
+        .ends_with("\nfallback"));
+    }
+
+    #[test]
+    fn completion_notice_bounds_unicode_and_rejects_bad_context() {
+        let mut state = crate::AppState::new();
+        let ws = state.active_workspace;
+        let (tab_id, _) = crate::seed_headless_terminal_tab(
+            &mut state,
+            ws,
+            "fallback",
+            crate::HeadlessPaneSeed::default(),
+        )
+        .unwrap();
+        let tab = state.find_tab_mut(tab_id).unwrap();
+        tab.notification_msg = Some("🙂".repeat(4_000));
+        let body = agent_completion_body(
+            "bad\nproject",
+            "window",
+            tab,
+            None,
+            None,
+            &Default::default(),
+            0,
+        );
+        assert_eq!(body.chars().count(), 2_000);
+        assert!(body.ends_with("[shortened]"));
+        let line = body
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("Attention-Rail-Agent: ")
+            .unwrap();
+        let context: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(context["project"].is_null());
+        assert!(context["thread"].is_null());
+        assert_eq!(context["window"], "window");
+    }
 
     #[test]
     fn focus_pane_notification_targets_the_driving_pane() {
