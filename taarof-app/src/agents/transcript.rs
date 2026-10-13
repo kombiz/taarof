@@ -1707,9 +1707,10 @@ impl TranscriptAdapter for CodexTranscriptAdapter {
             apply_native_turn_id(state, self, &value, now);
             apply_turn_marker(state, &value, marker, now);
             if value.get("type").and_then(Value::as_str) == Some("event_msg") {
-                match value.pointer("/payload/type").and_then(Value::as_str) {
-                    Some("turn_aborted" | "shutdown_complete") => state.completion_reply = None,
-                    _ => {}
+                if let Some("turn_aborted" | "shutdown_complete") =
+                    value.pointer("/payload/type").and_then(Value::as_str)
+                {
+                    state.completion_reply = None;
                 }
             }
             if value.get("type").and_then(Value::as_str) != Some("response_item") {
