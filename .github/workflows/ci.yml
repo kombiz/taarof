@@ -44,6 +44,13 @@ jobs:
         run: cargo fmt --manifest-path wasm-sidebar/Cargo.toml --all --check
 
   security:
+    # rustsec/audit-check posts advisory warnings (e.g. unmaintained crates) as a
+    # check run on push events, which needs checks: write. Job-level permissions
+    # replace the workflow default, so contents: read is restated here. Fork pull
+    # requests still receive a read-only token.
+    permissions:
+      contents: read
+      checks: write
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
     steps:
       - name: Checkout repository
