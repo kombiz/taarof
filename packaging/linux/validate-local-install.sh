@@ -35,6 +35,7 @@ trap cleanup EXIT
 
 bash "$repo_root/testing/test-release-bundle-provenance.sh"
 python3 "$repo_root/testing/test_bundle_provenance.py"
+python3 "$repo_root/testing/test_agent_launcher_smoke.py"
 python3 "$repo_root/testing/test_install_channel.py"
 
 manifest_license="$(
@@ -94,6 +95,21 @@ test -x "$bundle_prefix/bin/taarof"
 test -x "$bundle_prefix/bin/agent"
 HOME="$bundle_prefix" "$bundle_prefix/bin/agent" providers >/dev/null
 cmp "$prefix/share/taarof/bundle-manifest.json" "$bundle_prefix/share/taarof/bundle-manifest.json"
+# Exercise both supported install routes against the exact packaged command bytes.
+# A persistent CI receipt is optional; the default stays in this disposable prefix.
+source_sha="$(git -C "$repo_root" rev-parse HEAD)"
+receipt_dir="${TAAROF_LAUNCHER_RECEIPT_DIR:-$release_out_dir/receipts}"
+mkdir -p "$receipt_dir"
+for route in local bundle; do
+    installed_prefix="$prefix"
+    [[ "$route" != bundle ]] || installed_prefix="$bundle_prefix"
+    bash "$repo_root/testing/e2e-gui/run-agent-launcher-e2e.sh" \
+        --prefix "$installed_prefix" \
+        --package-dir "$bundle_extract_dir/taarof-linux-x86_64" \
+        --package-archive "$release_tarball_path" \
+        --source-sha "$source_sha" \
+        --receipt "$receipt_dir/$route.json"
+done
 test -f "$bundle_prefix/share/applications/$desktop_id.desktop"
 test -f "$bundle_prefix/share/metainfo/$desktop_id.metainfo.xml"
 test -f "$bundle_prefix/share/icons/hicolor/scalable/apps/$desktop_id.svg"

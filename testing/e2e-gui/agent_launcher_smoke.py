@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
@@ -66,10 +66,20 @@ def identity(prefix, package, source, archive=None):
     }
     if archive:
         with tarfile.open(archive, "r:gz") as handle:
-            members = handle.getmembers()
-            require(len(members) < 20000, "archive_member_limit")
+            members = []
+            names = set()
+            for member in handle:
+                require(len(members) < 20000, "archive_member_limit")
+                path = PurePosixPath(member.name)
+                require(not path.is_absolute() and ".." not in path.parts
+                        and path.parts and path.parts[0] == "taarof-linux-x86_64",
+                        "archive_path_invalid")
+                require(member.isfile() or member.isdir(), "archive_member_type_invalid")
+                require(str(path) not in names, "archive_member_duplicate")
+                names.add(str(path))
+                members.append(member)
             for name, artifact in artifacts.items():
-                matches = [m for m in members if m.name.endswith("/bin/" + name)]
+                matches = [m for m in members if m.name == "taarof-linux-x86_64/bin/" + name]
                 require(len(matches) == 1 and matches[0].isfile(), "archive_artifact_ambiguous")
                 with handle.extractfile(matches[0]) as stream:
                     require(hashlib.file_digest(stream, "sha256").hexdigest() == artifact["sha256"], "archive_artifact_hash_mismatch")
@@ -154,6 +164,14 @@ def automated_smoke(agent):
         cwd.mkdir()
         runtime = home / "runtime"
         runtime.mkdir(mode=0o700)
+        binaries = home / "bin"
+        binaries.mkdir()
+        # The launch PATH contains only fixtures, even on hosts with providers installed.
+        native = binaries / "codex"
+        native.write_text("#!" + sys.executable + "\nimport sys\n"
+                          "assert sys.argv[1:] in ([], ['resume', 'native-fixture'])\n"
+                          "print('NATIVE_EXEC_OK')\n")
+        native.chmod(0o755)
         providers = home / ".config/agent/providers.d"
         providers.mkdir(parents=True)
         adapter = home / "fixture-adapter.py"
@@ -164,7 +182,7 @@ def automated_smoke(agent):
             "assert sys.argv[2] == (\"opaque 'quotes' and spaces\" if sys.argv[1]=='plan-resume' else '')\n"
             "print('SYNTHETIC_EXEC_OK')\n")
         env = {"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
-               "XDG_RUNTIME_DIR": str(runtime), "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
+               "XDG_RUNTIME_DIR": str(runtime), "PATH": str(binaries), "LANG": "C.UTF-8",
                "SMOKE_ENV_SENTINEL": "SYNTHETIC_ENV_MUST_NOT_APPEAR"}
         # No Taarof discovery files or sockets can exist in this fresh root.
         for provider in ("synthetic-fixture", "slow-fixture"):
@@ -195,6 +213,22 @@ def automated_smoke(agent):
         run(["doctor"])
         for args in (["--new", "synthetic-fixture"], ["--resume", "opaque 'quotes' and spaces"]):
             require(run(args).strip() == b"SYNTHETIC_EXEC_OK", "structured_execution_mismatch")
+        for args in (["--new", "codex"], ["--resume", "native-fixture"]):
+            require(run(args).strip() == b"NATIVE_EXEC_OK", "native_local_fallback_failed")
+        native.unlink()
+        report = json.loads(run(["providers"]))
+        require(any(p["id"] == "codex" and not p["executable_available"]
+                    for p in report["providers"]), "missing_provider_not_reported")
+        for args in (["--new", "codex"], ["--resume", "native-fixture"],
+                     ["--new", "../codex"], ["--new", "codex; false"]):
+            code, out, err = run_command(agent, args, env, cwd)
+            outputs.extend((out, err))
+            require(code != 0 and not out, "missing_or_hostile_provider_launched")
+        remaining = json.loads(run(["--json"]))
+        require(any(row["stable_ref"]["provider_id"] == "synthetic-fixture"
+                    for row in remaining["sessions"]), "missing_provider_hid_healthy_rows")
+        require(run(["--new", "synthetic-fixture"]).strip() == b"SYNTHETIC_EXEC_OK",
+                "missing_provider_broke_healthy_launch")
         manifest = providers / "synthetic-fixture.toml"
         manifest.write_text(manifest.read_text().replace("enabled = true", "enabled = false"))
         disabled = json.loads(run(["--json"]))
@@ -203,7 +237,8 @@ def automated_smoke(agent):
             require(not any(marker in data for marker in (b"SYNTHETIC_PROMPT_MUST_NOT_APPEAR", b"SYNTHETIC_ENV_MUST_NOT_APPEAR", b"HOSTILE_TITLE")), "private_fixture_leaked")
     return {name: "pass" for name in (
         "hostile_display_inert", "quoted_cwd_and_session_execution", "catalog_diagnostic_privacy",
-        "external_timeout_isolation", "disabled_manifest_removal", "isolated_no_taarof_local_fallback")}
+        "external_timeout_isolation", "disabled_manifest_removal", "isolated_no_taarof_local_fallback",
+        "native_new_resume_fallback", "missing_provider_isolation", "hostile_provider_rejected")}
 
 
 def main():

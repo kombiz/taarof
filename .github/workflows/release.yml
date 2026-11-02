@@ -40,6 +40,7 @@ jobs:
             libadwaita-1-dev \
             libgtk-4-dev \
             libgtksourceview-5-dev \
+            libsqlite3-dev \
             libvte-2.91-gtk4-dev \
             pkg-config \
             tar
@@ -98,6 +99,28 @@ jobs:
         run: sha256sum -c taarof-linux-x86_64.tar.gz.sha256
         working-directory: dist/release
 
+      - name: Prove exact-head launcher installations
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -eu
+          source_sha="$(git rev-parse HEAD)"
+          receipts="$GITHUB_WORKSPACE/dist/launcher-receipts"
+          mkdir -p "$receipts"
+          for route in local bundle; do
+            prefix="$(mktemp -d)"
+            if [ "$route" = local ]; then
+              bash packaging/linux/install-local.sh "$prefix"
+            else
+              bash dist/release/taarof-linux-x86_64/install.sh "$prefix"
+            fi
+            bash testing/e2e-gui/run-agent-launcher-e2e.sh \
+              --prefix "$prefix" \
+              --package-dir "$GITHUB_WORKSPACE/dist/release/taarof-linux-x86_64" \
+              --package-archive "$GITHUB_WORKSPACE/dist/release/taarof-linux-x86_64.tar.gz" \
+              --source-sha "$source_sha" \
+              --receipt "$receipts/$route.json"
+          done
+
       # Provenance is a release asset, not an optional enhancement. If the
       # configured GitHub attestation service cannot persist this bundle, stop
       # here: neither the workflow artifact nor a tag release may proceed.
@@ -128,6 +151,14 @@ jobs:
             dist/release/taarof-linux-x86_64.tar.gz
             dist/release/taarof-linux-x86_64.tar.gz.sha256
             dist/release/taarof-linux-x86_64.tar.gz.intoto.jsonl
+          if-no-files-found: error
+
+      - name: Retain exact-head launcher receipts
+        if: always() && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact-head-launcher-receipts
+          path: dist/launcher-receipts/*.json
           if-no-files-found: error
 
   publish-github-release:

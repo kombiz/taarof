@@ -265,7 +265,17 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Validate Linux packaging
+        env:
+          TAAROF_LAUNCHER_RECEIPT_DIR: ${{ github.workspace }}/dist/launcher-receipts
         run: bash packaging/linux/validate-local-install.sh
+
+      - name: Retain launcher installation receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: launcher-receipts
+          path: dist/launcher-receipts/*.json
+          if-no-files-found: error
 
       - name: Restore host workspace ownership
         if: always()

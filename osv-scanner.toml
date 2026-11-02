@@ -1,0 +1,15 @@
+# Match deny.toml's unmaintained = "workspace": informational notices for
+# transitive dependencies are allowed; vulnerability advisories still fail.
+# These standalone crates moved into zbus 6. They remain transitive through
+# notify-rust's zbus 5 dependency until that upstream migration is available.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0370"
+reason = "RustSec informational=unmaintained for transitive zvariant; matches cargo-deny workspace-only maintenance policy."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0371"
+reason = "RustSec informational=unmaintained for transitive zbus_names; matches cargo-deny workspace-only maintenance policy."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0372"
+reason = "RustSec informational=unmaintained for transitive zvariant_derive; matches cargo-deny workspace-only maintenance policy."

@@ -14,6 +14,7 @@ RUN pacman -Syu --noconfirm && pacman -S --noconfirm --needed \
     python \
     zsh \
     fish \
+    inetutils \
     jq \
     curl \
     rsync \
