@@ -89,3 +89,10 @@ merge ref; push CI proves the merged development commit. File/fixture parity
 does not establish attended desktop or real-provider acceptance. No local
 installation, runtime restart, version tag or release publication is part of
 this task.
+
+PR CI on the first port head found a newly yanked `async-executor` 1.14.0 in
+the existing lockfile. The Rust advisory audit found no vulnerabilities, but
+`cargo-deny` correctly refused the yanked version. Updated only that package
+to the next non-yanked patch, 1.14.1, with `cargo update -p async-executor
+--precise 1.14.1`. No policy exception or other dependency change was added.
+This prerequisite is included in the new head and needs fresh CI and review.
