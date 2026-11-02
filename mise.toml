@@ -22,6 +22,7 @@ description = "Build the release binary"
 run = [
   "cargo build --release --manifest-path agent-launcher/Cargo.toml",
   "cargo build --release --manifest-path taarof-app/Cargo.toml",
+  'bash packaging/linux/emit-artifact-provenance.sh "${CARGO_TARGET_DIR:-taarof-app/target}/release/taarof-app"',
 ]
 
 [tasks.install]
@@ -87,6 +88,7 @@ run = [
   "cargo test --manifest-path agent-session-core/Cargo.toml --no-default-features",
   "cargo test --manifest-path agent-launcher/Cargo.toml",
   "python3 testing/test_bundle_provenance.py",
+  "python3 testing/test_agent_launcher_smoke.py",
   "python3 testing/test_install_channel.py",
   "cargo test --manifest-path taarof-app/Cargo.toml",
   "python3 taarof-cli/test_taarof_cli.py",

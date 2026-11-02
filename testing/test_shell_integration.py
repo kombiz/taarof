@@ -101,11 +101,11 @@ class ShellIntegration(unittest.TestCase):
             os.close(slave)
             try:
                 if shell == "bash":
-                    setup = "PS0=PRESERVED_PS0; PROMPT_COMMAND=('printf PRESERVED_HOOK'); trap ':' DEBUG"
+                    setup = "PS1=PROMPT_END_MARKER; PS0=PRESERVED_PS0; PROMPT_COMMAND=('printf PRESERVED_HOOK'); trap ':' DEBUG"
                 elif shell == "zsh":
-                    setup = "autoload -Uz add-zsh-hook; inert_hook() { printf PRESERVED_HOOK; }; add-zsh-hook precmd inert_hook"
+                    setup = "PS1=PROMPT_END_MARKER; autoload -Uz add-zsh-hook; inert_hook() { printf PRESERVED_HOOK; }; add-zsh-hook precmd inert_hook"
                 else:
-                    setup = "function inert_hook --on-event fish_prompt; printf PRESERVED_HOOK; end"
+                    setup = "function fish_prompt; printf PROMPT_END_MARKER; end; function inert_hook --on-event fish_prompt; printf PRESERVED_HOOK; end"
                 commands = [setup]
                 for _ in range(2):
                     commands += [
@@ -118,6 +118,7 @@ class ShellIntegration(unittest.TestCase):
                     lambda data: (
                         b"READY_MARKER" in data
                         and b"]133;A" in data.split(b"READY_MARKER", 1)[1]
+                        and b"PROMPT_END_MARKER" in data.split(b"READY_MARKER", 1)[1]
                     ),
                 )
                 os.write(
@@ -130,16 +131,16 @@ class ShellIntegration(unittest.TestCase):
                         b"CWD_MARKER" in data
                         and b"]133;A" in data.split(b"CWD_MARKER", 1)[1]
                         and b"PRESERVED_HOOK" in data.split(b"CWD_MARKER", 1)[1]
+                        and b"PROMPT_END_MARKER" in data.split(b"CWD_MARKER", 1)[1]
                     ),
                 )
-                # Wait for the entire prompt rather than observing a partial write.
-                time.sleep(0.05)
-                while select.select([master], [], [], 0)[0]:
-                    output += os.read(master, 65536)
+                # The primary prompt runs after the event/precmd hooks. Fish
+                # does not promise their order; a fixed 50ms drain can miss OSC7
+                # when its hostname subprocess runs after the OSC133 handler.
                 prompt = output.split(b"CWD_MARKER", 1)[1]
                 paths = re.findall(rb"\x1b\]7;file://[^/]*(.*?)(?:\x1b\\|\x07)", prompt)
                 self.assertEqual(
-                    len(paths), 1, "repeated sourcing must not duplicate CWD hooks"
+                    len(paths), 1, f"repeated sourcing must emit one CWD hook: {prompt!r}"
                 )
                 self.assertEqual(unquote(paths[0].decode()), str(cwd))
                 self.assertIn(b"%20", paths[0])

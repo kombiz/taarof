@@ -336,8 +336,27 @@ stop/restart, independent exact-head review and external gate receipts remain
 separate requirements. Even a passing smoke emits
 `release_status: pending_attended_proof`.
 
+`bash packaging/linux/validate-local-install.sh` runs this smoke for both the
+source installer and the release-bundle installer. It checks each against the
+same archive and clean source SHA. Set `TAAROF_LAUNCHER_RECEIPT_DIR` to a new
+directory to keep the two receipts (`local.json` and `bundle.json`). CI retains
+them as the `launcher-receipts` artifact, including failed receipts when present.
+Archive proof rejects absolute paths, `..` traversal, links, duplicate members,
+and commands outside the supported bundle root before claiming parity.
+
+For proof of a reviewed PR head, dispatch the existing Release rehearsal with its
+full commit SHA. It installs both routes without launching the desktop app and
+uploads `exact-head-launcher-receipts`. PR CI uses GitHub's standard merge-ref
+checkout; its receipts identify that merge-ref SHA, not the PR head. Neither
+route changes the owner installation or supplies attended acceptance.
+
+The synthetic launch PATH contains fixture executables only. A missing native
+provider must report unavailable and fail its new/resume action while a healthy
+adapter stays usable. Unknown provider names, including shell text and traversal
+paths, fail selection. Spaces, quotes and shell metacharacters inside opaque
+session IDs remain literal argv data; they are never evaluated as shell code.
+
 For a graphical/container release rehearsal, prepare the candidate using the
-supported `testing/kasm/container-run.sh` or
-`testing/e2e-gui/container-run.sh` and packaging install scripts. Run this harness
-inside that same prepared environment against the installed prefix. Never use
-`docker compose run` to build the candidate.
+supported `testing/kasm/container-run.sh` and packaging install scripts. Run this
+harness inside that same prepared environment against the installed prefix.
+Never use `docker compose run` to build the candidate.
