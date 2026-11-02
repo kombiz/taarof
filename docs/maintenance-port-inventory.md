@@ -1,6 +1,7 @@
 # BD-0490 maintenance port inventory
 
-Status: inventory and public-safety review complete; implementation ready for CI
+Implementation checkpoint (before CI and review): inventory and public-safety
+review complete; implementation ready for CI
 and independent exact-head review. Next: green PR CI, reviewed pinned merge,
 green development-branch push CI, then authorized fast-forward promotion.
 
@@ -30,12 +31,12 @@ heads; dropping them here neither merges nor closes them at their source.
 | 6c79fc1 | port | Install `inetutils` for the Arch Fish regression environment. |
 | 742e5c1 | drop | Source-to-public export rehearsal only; superseded by the next source commit and unnecessary in the destination. |
 | 7d355b5 | drop | Source-to-public trusted export dispatch only; this destination has its own Release rehearsal. |
-| PR #529 | drop | Unmerged account/profile and AI-synopsis design with failed app/contracts CI. It depends on the old discovery layer and would add model/history integration beyond a maintenance port. Keep the current provider-adapter contract; no claims that these features are already present. |
-| PR #537 | drop | Draft gateway re-pin integration: the public workspace has no control-gateway crate, service, or remote-terminal runbook to maintain. Do not add that separate service as part of this port. |
-| PR #541 | drop | Source book/history refresh only; host-specific observations are not public product evidence. |
-| PR #543 | already in taarof | Its 16 task proposals are implemented by the public simplification queue: discovery/child/atomic/lifecycle/tmux/ledger/procfs/diagnostics/signals/SHA/path/socket/options/sidebar/PR refresh work (examples below). Do not import conflicting task IDs. |
-| PR #544 | drop | Draft detached-notification redesign still has pending isolated desktop/activation evidence and explicitly recorded a reviewed-draft stopping point. Keep the existing detached notices and separately merged native completion notices (#86); do not claim the draft redesign is present. |
-| PR #548 | drop | fast-uri update targets the same absent protocol npm package as e7f5c2a; copying its lockfile would create an unused dependency surface. |
+| source proposal `529` | drop | Unmerged account/profile and AI-synopsis design with failed app/contracts CI. It depends on the old discovery layer and would add model/history integration beyond a maintenance port. Keep the current provider-adapter contract; no claims that these features are already present. |
+| source proposal `537` | drop | Draft gateway re-pin integration: the public workspace has no control-gateway crate, service, or remote-terminal runbook to maintain. Do not add that separate service as part of this port. |
+| source proposal `541` | drop | Source book/history refresh only; host-specific observations are not public product evidence. |
+| source proposal `543` | already in taarof | Its 16 task proposals are implemented by the public simplification queue: discovery/child/atomic/lifecycle/tmux/ledger/procfs/diagnostics/signals/SHA/path/socket/options/sidebar/PR refresh work (examples below). Do not import conflicting task IDs. |
+| source proposal `544` | drop | Draft detached-notification redesign still has pending isolated desktop/activation evidence and explicitly recorded a reviewed-draft stopping point. Keep the existing detached notices and separately merged native completion notices (#86); do not claim the draft redesign is present. |
+| source proposal `548` | drop | fast-uri update targets the same absent protocol npm package as e7f5c2a; copying its lockfile would create an unused dependency surface. |
 
 ## Tree-level reconciliation
 
@@ -54,7 +55,7 @@ socket code, the Arch image, installed smoke and its regression suite, source
 workflow contracts, and shell regressions. No additional post-export source
 product change was hidden by the 18-commit inventory.
 
-Public queue matches for PR #543 include `c78fe18` (discovery), `49f4dd6`
+Public queue matches for source proposal `543` include `c78fe18` (discovery), `49f4dd6`
 (child environment), `a5e97d6` (atomic ledger), #63 (lifecycle), `3062697`
 (tmux runners), `0cdeb43` (probe batching), `1d1cbfc` (ledger projections),
 `9533435` (process facts), #66 (diagnostics), `d33d3fb` (Unix signals),
