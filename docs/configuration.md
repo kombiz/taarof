@@ -61,6 +61,7 @@ aliases, but generated files always use underscores.
 ```toml
 # App chrome. Every color must be exactly six hexadecimal RGB digits.
 [appearance]
+font_scale = 1.0           # App-chrome text size multiplier, 0.75..2.0. Terminal text uses Ghostty font-size.
 base = "#14110c"           # Main app background.
 mantle = "#100d09"         # Sidebar/deeper background.
 crust = "#0b0906"          # Darkest background layer.

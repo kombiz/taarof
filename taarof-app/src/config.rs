@@ -343,6 +343,9 @@ fn user_config_dir_fallbacks_are_concrete_and_safe() {
 /// their alpha-channel uses) before GTK parses the stylesheet.
 #[derive(Debug, Clone, Default)]
 pub struct AppearanceConfig {
+    /// Multiplier for every `px` font size in the app stylesheet. `None` keeps
+    /// the shipped sizes. Terminal panes keep their Ghostty `font-size`.
+    pub font_scale: Option<f64>,
     pub base: Option<String>,
     pub mantle: Option<String>,
     pub crust: Option<String>,
@@ -418,8 +421,49 @@ impl AppearanceConfig {
                 css = css.replace(&rgb_placeholder, &replacement_rgb);
             }
         }
-        css
+        scale_px_font_sizes(&css, self.effective_font_scale())
     }
+
+    pub fn effective_font_scale(&self) -> f64 {
+        self.font_scale.unwrap_or(1.0)
+    }
+}
+
+/// Accepted `[appearance].font_scale` range. Outside it the sidebar either
+/// becomes unreadable or stops fitting any normal window.
+pub const FONT_SCALE_RANGE: std::ops::RangeInclusive<f64> = 0.75..=2.0;
+
+/// Multiply each `font-size: <n>px` declaration by `scale`. Relative units
+/// (`em`, `%`) already follow their parent, so they stay as written.
+fn scale_px_font_sizes(css: &str, scale: f64) -> String {
+    if (scale - 1.0).abs() < f64::EPSILON {
+        return css.to_string();
+    }
+    const KEY: &str = "font-size:";
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(index) = rest.find(KEY) {
+        let (head, tail) = rest.split_at(index + KEY.len());
+        out.push_str(head);
+        let value = tail.trim_start();
+        out.push_str(&tail[..tail.len() - value.len()]);
+        let digits = value
+            .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+            .unwrap_or(value.len());
+        match (
+            value[..digits].parse::<f64>(),
+            value[digits..].starts_with("px"),
+        ) {
+            (Ok(size), true) => {
+                let scaled = (size * scale * 10.0).round() / 10.0;
+                out.push_str(&format!("{scaled}px"));
+                rest = &value[digits + 2..];
+            }
+            _ => rest = value,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn is_six_digit_hex(value: &str) -> bool {
@@ -887,6 +931,10 @@ pub fn sidebar_compact() -> bool {
     with_live_config(|config| config.app.sidebar.compact)
 }
 
+pub fn font_scale() -> f64 {
+    with_live_config(|config| config.app.appearance.effective_font_scale())
+}
+
 pub fn appearance_css(base_css: &str) -> String {
     with_live_config(|config| config.app.appearance.apply_to_css(base_css))
 }
@@ -1042,6 +1090,8 @@ struct RawAppConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawAppearanceConfig {
+    #[serde(alias = "font-scale")]
+    font_scale: Option<f64>,
     base: Option<String>,
     mantle: Option<String>,
     crust: Option<String>,
@@ -1270,6 +1320,10 @@ fn parse_update_config(raw: Option<RawUpdateConfig>) -> UpdateConfig {
 
 fn parse_appearance_config(raw: RawAppearanceConfig) -> AppearanceConfig {
     AppearanceConfig {
+        font_scale: raw
+            .font_scale
+            .filter(|scale| scale.is_finite())
+            .map(|scale| scale.clamp(*FONT_SCALE_RANGE.start(), *FONT_SCALE_RANGE.end())),
         base: raw.base.as_deref().map(normalize_color),
         mantle: raw.mantle.as_deref().map(normalize_color),
         crust: raw.crust.as_deref().map(normalize_color),
@@ -2011,6 +2065,28 @@ pub fn validate_app_config_str(contents: &str) -> Vec<Finding> {
     // Full-app appearance roles participate in rgba() substitutions, so they
     // require exact six-digit RGB hex values rather than named/short colours.
     if let Some(appearance) = table.get("appearance").and_then(|v| v.as_table()) {
+        for key in ["font_scale", "font-scale"] {
+            if let Some(raw) = appearance.get(key) {
+                let value = raw
+                    .as_float()
+                    .or_else(|| raw.as_integer().map(|value| value as f64));
+                match value {
+                    Some(value) if FONT_SCALE_RANGE.contains(&value) => {}
+                    Some(value) => findings.push(Finding::warning(
+                        FILE,
+                        format!(
+                            "appearance.{key} {value} is outside {}..={}; it will be clamped",
+                            FONT_SCALE_RANGE.start(),
+                            FONT_SCALE_RANGE.end()
+                        ),
+                    )),
+                    None => findings.push(Finding::error(
+                        FILE,
+                        format!("appearance.{key} must be a number such as 1.25"),
+                    )),
+                }
+            }
+        }
         for key in [
             "base",
             "mantle",
@@ -2106,6 +2182,9 @@ pub fn generate_default_config_toml() -> String {
 # `taarof-app config-default`. Keybindings live in a separate keybindings.toml.
 
 [appearance]
+# Scale every app-chrome font (sidebar, palette, dialogs); 0.75..2.0.
+# Terminal-pane text still follows font-size in ~/.config/ghostty/config.
+# font_scale = 1.0
 # Full-app Majlis colour roles. Values must be six-digit RGB hex colours.
 # Terminal-pane colours still come from ~/.config/ghostty/config.
 # base = "#14110c"
@@ -2724,6 +2803,50 @@ running = "#abcdef"
         }
         .apply_to_css(".base{color:#14110c}.accent{color:#e0a43a}");
         assert_eq!(no_cascade, ".base{color:#e0a43a}.accent{color:#123456}");
+    }
+
+    #[test]
+    fn appearance_font_scale_multiplies_px_font_sizes_only() {
+        let config = parse_app_config_from_str("[appearance]\nfont_scale = 1.25\n")
+            .expect("font scale should parse");
+        assert_eq!(config.appearance.font_scale, Some(1.25));
+
+        let css = config.appearance.apply_to_css(
+            ".a{font-size: 8px;}.b{font-size:11px}.c{font-size: 0.85em;}.d{padding: 8px;}",
+        );
+        assert_eq!(
+            css,
+            ".a{font-size: 10px;}.b{font-size:13.8px}.c{font-size: 0.85em;}.d{padding: 8px;}"
+        );
+
+        let unchanged = AppearanceConfig::default().apply_to_css(".a{font-size: 9px;}");
+        assert_eq!(unchanged, ".a{font-size: 9px;}");
+    }
+
+    #[test]
+    fn appearance_font_scale_is_clamped_and_validated() {
+        let config = parse_app_config_from_str("[appearance]\nfont-scale = 5\n")
+            .expect("integer font scale should parse");
+        assert_eq!(config.appearance.font_scale, Some(2.0));
+
+        assert!(validate_app_config_str("[appearance]\nfont_scale = 1.3\n").is_empty());
+        // Out of range is a warning, not an error, so live reload clamps the
+        // value the same way startup does instead of rejecting the file.
+        let findings = validate_app_config_str("[appearance]\nfont_scale = 0.2\n");
+        assert!(findings.iter().any(|finding| {
+            finding.severity == Severity::Warning
+                && finding.message.contains("appearance.font_scale")
+        }));
+        assert!(findings
+            .iter()
+            .all(|finding| finding.severity != Severity::Error));
+        let findings = validate_app_config_str("[appearance]\nfont_scale = \"big\"\n");
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("font_scale")),
+            "a non-number font scale must be reported"
+        );
     }
 
     #[test]
