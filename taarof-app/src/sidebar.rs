@@ -219,10 +219,16 @@ fn development_designation_text(channel: &str, compact: bool) -> String {
 }
 
 fn sidebar_width_for_mode(compact: bool) -> i32 {
+    sidebar_width_for_mode_at_scale(compact, crate::config::font_scale())
+}
+
+/// The full sidebar grows with `[appearance].font_scale` so larger labels keep
+/// room to breathe. The compact rail holds icons only, so it stays fixed.
+fn sidebar_width_for_mode_at_scale(compact: bool, font_scale: f64) -> i32 {
     if compact {
         64
     } else {
-        220
+        (220.0 * font_scale.max(1.0)).round() as i32
     }
 }
 
@@ -240,7 +246,7 @@ pub fn apply_compact_mode(sidebar: &gtk::Box, compact: bool) {
 /// Build the sidebar: logo, scrollable tab list, new-tab button, session info.
 pub fn build_sidebar() -> Sidebar {
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    sidebar.set_width_request(220);
+    sidebar.set_width_request(sidebar_width_for_mode(false));
     sidebar.add_css_class("sidebar");
 
     // ── Majlis mark + wordmark ──
@@ -7320,13 +7326,13 @@ mod tests {
         format_tab_agents_tooltip, next_tab_after_close,
         register_worktree_detach_after_confirmation, resolve_tab_move_dispatch,
         resolve_work_stream_filter_selection, runtime_probe_sidebar_ui, select_agent_pane_target,
-        sidebar_width_for_mode, tab_alert_binding, tab_indicator_state, tab_matches_query,
-        tab_move_menu_entries, tab_status_badge_text, work_stream_control_key,
-        work_stream_is_at_bottom, work_stream_legend_actions, work_stream_legend_text,
-        work_stream_legend_tooltip, work_stream_pane_metadata, work_stream_scroll_target,
-        workspace_header_meta_snapshot, PlanMonitorState, SidebarViewModel, TabIndicatorState,
-        WorkStreamControlRole, WorkStreamLegendActions, WorkStreamRestoreStep,
-        TAB_MENU_ACTION_GROUP, WORK_STREAM_RESTORE_ORDER,
+        sidebar_width_for_mode, sidebar_width_for_mode_at_scale, tab_alert_binding,
+        tab_indicator_state, tab_matches_query, tab_move_menu_entries, tab_status_badge_text,
+        work_stream_control_key, work_stream_is_at_bottom, work_stream_legend_actions,
+        work_stream_legend_text, work_stream_legend_tooltip, work_stream_pane_metadata,
+        work_stream_scroll_target, workspace_header_meta_snapshot, PlanMonitorState,
+        SidebarViewModel, TabIndicatorState, WorkStreamControlRole, WorkStreamLegendActions,
+        WorkStreamRestoreStep, TAB_MENU_ACTION_GROUP, WORK_STREAM_RESTORE_ORDER,
     };
     use crate::pane::PaneNode;
     use crate::workspace::{TabKind, TabPrimaryState};
@@ -7344,6 +7350,9 @@ mod tests {
     fn compact_sidebar_uses_minimal_width() {
         assert_eq!(sidebar_width_for_mode(false), 220);
         assert_eq!(sidebar_width_for_mode(true), 64);
+        assert_eq!(sidebar_width_for_mode_at_scale(false, 1.25), 275);
+        assert_eq!(sidebar_width_for_mode_at_scale(false, 0.8), 220);
+        assert_eq!(sidebar_width_for_mode_at_scale(true, 1.5), 64);
     }
 
     fn dummy_terminal_tab(id: u32, name: &str) -> Tab {
