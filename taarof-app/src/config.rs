@@ -2072,7 +2072,7 @@ pub fn validate_app_config_str(contents: &str) -> Vec<Finding> {
                     .or_else(|| raw.as_integer().map(|value| value as f64));
                 match value {
                     Some(value) if FONT_SCALE_RANGE.contains(&value) => {}
-                    Some(value) => findings.push(Finding::error(
+                    Some(value) => findings.push(Finding::warning(
                         FILE,
                         format!(
                             "appearance.{key} {value} is outside {}..={}; it will be clamped",
@@ -2830,10 +2830,16 @@ running = "#abcdef"
         assert_eq!(config.appearance.font_scale, Some(2.0));
 
         assert!(validate_app_config_str("[appearance]\nfont_scale = 1.3\n").is_empty());
+        // Out of range is a warning, not an error, so live reload clamps the
+        // value the same way startup does instead of rejecting the file.
         let findings = validate_app_config_str("[appearance]\nfont_scale = 0.2\n");
+        assert!(findings.iter().any(|finding| {
+            finding.severity == Severity::Warning
+                && finding.message.contains("appearance.font_scale")
+        }));
         assert!(findings
             .iter()
-            .any(|finding| finding.message.contains("appearance.font_scale")));
+            .all(|finding| finding.severity != Severity::Error));
         let findings = validate_app_config_str("[appearance]\nfont_scale = \"big\"\n");
         assert!(
             findings
