@@ -1514,7 +1514,7 @@ class WorkspaceManifestTests(unittest.TestCase):
         self.assertIn('remote = "remote.example"', manifest)
         payload = report["workspaces"][0]["tabs"][0]["payload"]
         self.assertNotIn("working_dir", payload)
-        self.assertTrue(payload["command"].startswith("ssh -t remote.example "))
+        self.assertTrue(payload["command"].startswith("ssh -t -- remote.example "))
         self.assertIn("cd /srv/remote-repo", payload["command"])
 
     def test_apply_warns_but_preserves_ssh_to_local_hostname(self) -> None:
@@ -1548,11 +1548,41 @@ cwd = "/work/local-repo"
             {
                 "action": "create-tab",
                 "name": "shell",
-                "command": "ssh -t devbox 'cd /work/local-repo && exec $SHELL -l'",
+                "command": "ssh -t -- devbox 'cd /work/local-repo && exec $SHELL -l'",
             },
         )
         self.assertIn("intentional SSH-to-self", tab_report["warning"])
         self.assertIn("not shareable", tab_report["warning"])
+
+    def test_apply_rejects_ssh_options_before_any_launch(self) -> None:
+        cli = load_cli_module()
+        cases = [
+            'remote = "-oProxyCommand=true"',
+            'tmux_host = "-Fbad-config"\ntmux_session = "work"',
+            'tmux_host = "builder"\ntmux_session = "work"',
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            config = home / ".config" / "taarof" / "config.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text('[hosts.builder]\naddress = "-Jbad-hop"\n')
+            manifest_path = home / "workspace.toml"
+            for target in cases:
+                with self.subTest(target=target):
+                    manifest_path.write_text(
+                        '[[workspace]]\nname = "main"\n'
+                        '[[workspace.tab]]\nname = "earlier"\ntmux_session = "local"\n'
+                        '[[workspace.tab]]\nname = "unsafe"\n' + target + "\n"
+                    )
+                    with (
+                        patch.object(cli.Path, "home", return_value=home),
+                        patch.object(cli.subprocess, "run") as run,
+                        patch.object(cli, "socket_send") as send,
+                        self.assertRaisesRegex(SystemExit, "invalid SSH destination.*unsafe"),
+                    ):
+                        cli.main(["workspace", "apply", str(manifest_path)])
+                    run.assert_not_called()
+                    send.assert_not_called()
 
     def test_local_hostname_warning_matches_short_name_to_fqdn(self) -> None:
         cli = load_cli_module()
@@ -1602,7 +1632,7 @@ cwd = "/work/local-repo"
         tab_report = report["workspaces"][0]["tabs"][0]
         self.assertEqual(
             shlex.split(tab_report["payload"]["command"]),
-            ["ssh", "-t", "builder.example", "tmux attach -t remote-session"],
+            ["ssh", "-t", "--", "builder.example", "tmux attach -t remote-session"],
         )
         self.assertIn("using tmux_host", tab_report["warning"])
         self.assertNotIn("recreating tab locally", tab_report["warning"])
@@ -1642,6 +1672,7 @@ cwd = "{cwd}"
             [
                 "ssh",
                 "-t",
+                "--",
                 "remote.example",
                 f"tmux attach -t {shlex.quote(session)}",
             ],
@@ -1651,6 +1682,7 @@ cwd = "{cwd}"
             [
                 "ssh",
                 "-t",
+                "--",
                 "remote.example",
                 f"cd {shlex.quote(cwd)} && exec $SHELL -l",
             ],
