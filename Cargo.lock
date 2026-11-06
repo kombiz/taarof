@@ -2450,6 +2450,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "taarof-remote"
+version = "0.1.0"
+dependencies = [
+ "agent-session-core",
+ "libc",
+ "serde_json",
+ "signal-hook",
+]
+
+[[package]]
 name = "target-lexicon"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

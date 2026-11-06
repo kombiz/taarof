@@ -11,6 +11,8 @@ mod contract;
 pub mod discovery;
 pub use discovery as legacy;
 pub mod protocol;
+pub mod remote_enumeration;
+pub mod remote_stream;
 pub use cache::DiscoveryCache;
 pub use contract::*;
 pub use discovery::{

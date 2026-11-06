@@ -55,6 +55,8 @@ description = "Check Rust formatting and fail on clippy warnings"
 run = [
   "cargo fmt --manifest-path agent-session-core/Cargo.toml --check",
   "cargo clippy --manifest-path agent-session-core/Cargo.toml --all-targets --all-features -- -D warnings",
+  "cargo fmt --manifest-path taarof-remote/Cargo.toml --check",
+  "cargo clippy --manifest-path taarof-remote/Cargo.toml --all-targets -- -D warnings",
   "cargo fmt --manifest-path agent-launcher/Cargo.toml --check",
   "cargo clippy --manifest-path agent-launcher/Cargo.toml --all-targets -- -D warnings",
   "cargo fmt --manifest-path taarof-app/Cargo.toml --all --check",
@@ -86,6 +88,7 @@ description = "Run app and web tests"
 run = [
   "cargo test --manifest-path agent-session-core/Cargo.toml",
   "cargo test --manifest-path agent-session-core/Cargo.toml --no-default-features",
+  "cargo test --manifest-path taarof-remote/Cargo.toml",
   "cargo test --manifest-path agent-launcher/Cargo.toml",
   "python3 testing/test_bundle_provenance.py",
   "python3 testing/test_agent_launcher_smoke.py",

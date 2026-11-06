@@ -36,7 +36,7 @@ pub struct LiveAgentBinding {
     pub pane_id: u32,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct AgentSessionRecord {
     pub agent: String,
     pub session_id: String,
