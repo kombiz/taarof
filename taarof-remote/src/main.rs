@@ -13,13 +13,25 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-fn nonblocking(fd: i32) -> io::Result<()> {
+struct NonblockingFd {
+    fd: i32,
+    flags: i32,
+}
+impl Drop for NonblockingFd {
+    fn drop(&mut self) {
+        // Inherited stdout can share an open-file description with the shell.
+        // Restore its flags before exit, including on EOF, errors and signals.
+        unsafe { libc::fcntl(self.fd, libc::F_SETFL, self.flags) };
+    }
+}
+
+fn nonblocking(fd: i32) -> io::Result<NonblockingFd> {
     // All callers own a live descriptor; preserve its existing status flags.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    Ok(NonblockingFd { fd, flags })
 }
 
 struct Lifecycle(Arc<AtomicBool>);
@@ -135,7 +147,7 @@ fn stream(options: Options) -> io::Result<()> {
     signal_hook::flag::register(signal_hook::consts::SIGINT, stopped.clone())?;
     signal_hook::flag::register(signal_hook::consts::SIGPIPE, stopped.clone())?;
     let lifecycle = Lifecycle(stopped);
-    nonblocking(1)?;
+    let _stdout_flags = nonblocking(1)?;
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))?
         .trim()

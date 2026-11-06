@@ -45,7 +45,7 @@ pub fn output(
             .spawn()?,
     );
     let mut pipe = child.0.stdout.take().expect("piped stdout");
-    crate::nonblocking(pipe.as_raw_fd())?;
+    let _pipe_flags = crate::nonblocking(pipe.as_raw_fd())?;
     let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
     let mut eof = false;
