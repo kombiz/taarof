@@ -9,13 +9,16 @@
 //! that keeps failing falls back to the shell probe for a while. The supervisor
 //! then tries the stream again, so a later install takes effect on its own.
 
+use agent_session_core::discovery::unix_time_ms;
 use agent_session_core::remote_stream::{
     Event, Metrics, Stats, MAX_EVENT_LINE_BYTES, PROTOCOL_VERSION,
 };
 use agent_session_core::AgentSessionRecord;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
+use std::os::fd::AsRawFd;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -67,6 +70,9 @@ pub(crate) struct Tuning {
     pub fallback_retry: Duration,
     /// How long one `ensure` keeps a host wanted.
     pub wanted_for: Duration,
+    /// A connection resets the failure count only after delivering a good
+    /// snapshot and staying up this long.
+    pub healthy_after: Duration,
     pub tick: Duration,
 }
 
@@ -80,6 +86,7 @@ impl Default for Tuning {
             failures_before_fallback: 3,
             fallback_retry: Duration::from_secs(600),
             wanted_for: Duration::from_secs(300),
+            healthy_after: Duration::from_secs(60),
             tick: Duration::from_millis(200),
         }
     }
@@ -92,11 +99,19 @@ struct HostState {
     /// Bumped per connection. A reader from an older connection never writes.
     generation: u64,
     hello: bool,
+    /// The last good records and stats. Kept across reconnects, so a failed
+    /// first sample on a new connection cannot erase them.
     snapshot: Option<(Vec<AgentSessionRecord>, Stats)>,
+    /// When `snapshot` was last confirmed: a good snapshot, or a heartbeat
+    /// while the latest sample was good.
+    records_at: Option<(Instant, u64)>,
+    /// A snapshot, good or failed, arrived on the current connection.
+    sampled: bool,
+    /// A good snapshot arrived on the current connection.
+    good_sample: bool,
     enumeration_failed: bool,
     metrics: Option<Metrics>,
     last_event: Option<Instant>,
-    last_event_unix_ms: Option<u64>,
     /// Why the shell probe is in use. Kept through the retry, cleared by the
     /// first good snapshot.
     fallback_note: Option<String>,
@@ -210,10 +225,12 @@ impl RemoteStreams for StreamHub {
     fn live(&self, ssh_target: &str) -> Option<LiveHost> {
         let slot = self.slot(ssh_target)?;
         let state = lock(&slot);
-        let observed_at = state.last_event?;
-        if !state.hello || observed_at.elapsed() >= self.tuning.stale_after {
+        let last_event = state.last_event?;
+        if !state.hello || !state.sampled || last_event.elapsed() >= self.tuning.stale_after {
             return None;
         }
+        // Never-good records would only overwrite the shell probe's cache.
+        let (observed_at, observed_at_unix_ms) = state.records_at?;
         let (sessions, stats) = state.snapshot.clone()?;
         Some(LiveHost {
             sessions,
@@ -222,7 +239,7 @@ impl RemoteStreams for StreamHub {
                 .enumeration_failed
                 .then(|| "taarof-remote enumeration failed or timed out".to_string()),
             observed_at,
-            observed_at_unix_ms: state.last_event_unix_ms?,
+            observed_at_unix_ms,
             metrics: state.metrics.clone(),
         })
     }
@@ -238,7 +255,12 @@ enum Outcome {
     Unwanted,
     HelperMissing,
     ProtocolMismatch(u32),
-    Ended { was_live: bool, error: String },
+    /// `healthy`: the connection delivered a good snapshot and stayed up
+    /// for [`Tuning::healthy_after`].
+    Ended {
+        healthy: bool,
+        error: String,
+    },
 }
 
 fn wanted(slot: &Slot) -> bool {
@@ -291,8 +313,8 @@ fn supervise(target: &str, slot: &Slot, tuning: Tuning, command: &CommandFactory
                      {PROTOCOL_VERSION}; using the shell probe."
                 ));
             }
-            Outcome::Ended { was_live, error } => {
-                if was_live {
+            Outcome::Ended { healthy, error } => {
+                if healthy {
                     failures = 0;
                 }
                 failures += 1;
@@ -332,35 +354,46 @@ fn connect(target: &str, slot: &Slot, tuning: &Tuning, command: &CommandFactory)
         Ok(child) => child,
         Err(error) => {
             return Outcome::Ended {
-                was_live: false,
+                healthy: false,
                 error: format!("could not start ssh: {error}"),
             }
         }
     };
     // Held, never written: EOF on stdin is the helper's signal to exit.
     let stdin = child.stdin.take();
-    let stderr = child.stderr.take().map(drain_stderr);
+    // Both pipe readers poll this flag, so teardown can end them even when a
+    // descendant of ssh still holds a pipe open.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let stderr = child
+        .stderr
+        .take()
+        .and_then(|pipe| drain_stderr(Cancellable::new(pipe, cancel.clone())));
     let generation = {
         let mut state = lock(slot);
         state.generation += 1;
         state.hello = false;
-        state.snapshot = None;
+        state.sampled = false;
+        state.good_sample = false;
         state.enumeration_failed = false;
         state.metrics = None;
         state.last_event = None;
         state.generation
     };
     let (ended, reader_end) = mpsc::sync_channel(1);
+    let mut reader = None;
     if let Some(stdout) = child.stdout.take() {
         let reader_slot = slot.clone();
-        let spawned = std::thread::Builder::new()
+        let stdout = Cancellable::new(stdout, cancel.clone());
+        match std::thread::Builder::new()
             .name("taarof-remote-stream-read".into())
             .spawn(move || {
                 let end = read_events(stdout, &reader_slot, generation);
                 let _ = ended.send(end);
-            });
-        if spawned.is_err() {
-            let _ = child.kill();
+            }) {
+            Ok(handle) => reader = Some(handle),
+            Err(_) => {
+                let _ = child.kill();
+            }
         }
     }
 
@@ -413,20 +446,26 @@ fn connect(target: &str, slot: &Slot, tuning: &Tuning, command: &CommandFactory)
         }
     };
     drop(stdin);
-    let reader_result = reader_result.or_else(|| {
-        // A lingering grandchild can hold the pipe open; never wait forever.
-        reader_end.recv_timeout(Duration::from_secs(2)).ok()
-    });
+    // Let the reader finish lines already in the pipe, then cancel both
+    // readers and join them. A descendant holding a pipe cannot keep them.
+    let reader_result =
+        reader_result.or_else(|| reader_end.recv_timeout(Duration::from_millis(500)).ok());
+    cancel.store(true, Ordering::Relaxed);
+    if let Some(reader) = reader {
+        let _ = reader.join();
+    }
     let stderr = stderr
-        .and_then(|rx| rx.recv_timeout(Duration::from_millis(500)).ok())
+        .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
-    let was_live = {
+    let (saw_hello, healthy) = {
         let mut state = lock(slot);
-        let was_live = state.hello && state.snapshot.is_some();
+        let saw_hello = state.hello;
+        let healthy = state.good_sample && started.elapsed() >= tuning.healthy_after;
         // Nothing from this connection may read as live any more.
         state.generation += 1;
         state.hello = false;
-        was_live
+        state.sampled = false;
+        (saw_hello, healthy)
     };
     if unwanted {
         return Outcome::Unwanted;
@@ -435,17 +474,17 @@ fn connect(target: &str, slot: &Slot, tuning: &Tuning, command: &CommandFactory)
         Some(ReadEnd::Mismatch(version)) => return Outcome::ProtocolMismatch(version),
         Some(ReadEnd::Protocol(message)) => {
             return Outcome::Ended {
-                was_live,
+                healthy,
                 error: message,
             }
         }
         _ => {}
     }
-    if status.and_then(|s| s.code()) == Some(127) && !was_live {
+    if status.and_then(|s| s.code()) == Some(127) && !saw_hello {
         return Outcome::HelperMissing;
     }
     Outcome::Ended {
-        was_live,
+        healthy,
         error: describe_end(stalled, status, &stderr, tuning),
     }
 }
@@ -479,9 +518,8 @@ fn describe_end(
 
 /// Keep the first 4 KiB of stderr for the error text; drain the rest so the
 /// child never blocks on a full pipe.
-fn drain_stderr(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let _ = std::thread::Builder::new()
+fn drain_stderr(mut pipe: impl Read + Send + 'static) -> Option<std::thread::JoinHandle<String>> {
+    std::thread::Builder::new()
         .name("taarof-remote-stream-err".into())
         .spawn(move || {
             let mut kept = Vec::new();
@@ -497,9 +535,63 @@ fn drain_stderr(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> 
                     Err(_) => break,
                 }
             }
-            let _ = sender.send(String::from_utf8_lossy(&kept).into_owned());
-        });
-    receiver
+            String::from_utf8_lossy(&kept).into_owned()
+        })
+        .ok()
+}
+
+/// A pipe whose reads give up once `cancel` is set. Data already waiting is
+/// still read, for a bounded number of reads, so final lines and error text
+/// survive a normal exit.
+struct Cancellable<R> {
+    inner: R,
+    cancel: Arc<AtomicBool>,
+    reads_after_cancel: u32,
+}
+
+impl<R> Cancellable<R> {
+    fn new(inner: R, cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            inner,
+            cancel,
+            reads_after_cancel: 0,
+        }
+    }
+}
+
+impl<R: Read + AsRawFd> Read for Cancellable<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let cancelled = self.cancel.load(Ordering::Relaxed);
+            if cancelled {
+                self.reads_after_cancel += 1;
+                if self.reads_after_cancel > 64 {
+                    return Ok(0);
+                }
+            }
+            let mut fd = libc::pollfd {
+                fd: self.inner.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout = if cancelled { 0 } else { 100 };
+            // The descriptor is owned by `inner` and open for this call.
+            let ready = unsafe { libc::poll(&mut fd, 1, timeout) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if ready > 0 {
+                return self.inner.read(buf);
+            }
+            if cancelled {
+                return Ok(0);
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -549,25 +641,31 @@ fn read_events(stdout: impl Read, slot: &Slot, generation: u64) -> ReadEnd {
                 return ReadEnd::Protocol("the stream sent a second hello".to_string())
             }
             (true, Event::Snapshot { sessions, stats }) => {
+                state.sampled = true;
                 if stats.enumeration_failed {
-                    // Keep the last good records; report the failed sample.
+                    // Keep the last good records and their time; report the
+                    // failed sample. This is not a recovery.
                     state.enumeration_failed = true;
-                    if state.snapshot.is_none() {
-                        state.snapshot = Some((Vec::new(), stats));
-                    }
                 } else {
                     state.enumeration_failed = false;
+                    state.good_sample = true;
                     state.snapshot = Some((sessions, stats));
+                    state.records_at = Some((Instant::now(), unix_time_ms()));
+                    state.fallback_note = None;
                 }
-                // A successful sample shows the stream is fine again.
-                state.fallback_note = None;
             }
-            (true, Event::Heartbeat { metrics, .. }) => state.metrics = Some(metrics),
+            (true, Event::Heartbeat { metrics, .. }) => {
+                state.metrics = Some(metrics);
+                // Snapshots are sent on change only, so a heartbeat after a
+                // good sample confirms the records are still current.
+                if state.good_sample && !state.enumeration_failed {
+                    state.records_at = Some((Instant::now(), unix_time_ms()));
+                }
+            }
             (true, Event::Unknown) => {}
         }
-        state.last_event = Some(Instant::now());
         // App clock, not the remote's: it is compared with local times.
-        state.last_event_unix_ms = Some(agent_session_core::discovery::unix_time_ms());
+        state.last_event = Some(Instant::now());
     }
 }
 

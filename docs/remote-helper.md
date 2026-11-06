@@ -102,13 +102,17 @@ or dead host never holds up GTK or another host.
   from 2 seconds, doubling to at most 60 seconds.
 - **Fallback.** Exit 127 (helper missing), another `protocol_version`, or three
   failed connections in a row switch the host to the shell probe for 10
-  minutes. `RemoteHostStatus.warning` says why. The stream is then tried
+  minutes. A connection resets the failure count only after it delivers a
+  good snapshot and stays up for 60 seconds. `RemoteHostStatus.warning` says why. The stream is then tried
   again, and its first good snapshot clears the note.
 - **Bad input.** A line over 1 MiB, a line that is not an event, a stream that
   does not start with `hello`, or a second `hello` ends the connection and
   counts as a failure.
 - **Failed samples.** A snapshot with `enumeration_failed` keeps the last good
-  records and marks the host degraded, like a failed shell probe.
+  records, including those from an earlier connection, and their observation
+  time. It marks the host degraded, like a failed shell probe.
+- **Teardown.** Both pipe readers are cancellable and joined, so a descendant
+  of ssh that keeps a pipe open cannot leave threads behind.
 
 Heartbeat metrics come from the helper's last finished sample. During a slow
 sample they can lag `observed_at_unix_ms` by up to one poll plus the 10-second

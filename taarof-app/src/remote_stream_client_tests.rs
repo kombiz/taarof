@@ -3,6 +3,7 @@
 //! the process that holds the pipe.
 use super::*;
 use agent_session_core::remote_stream::{event_line, Memory};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn tuning() -> Tuning {
     Tuning {
@@ -13,6 +14,7 @@ fn tuning() -> Tuning {
         failures_before_fallback: 3,
         fallback_retry: Duration::from_secs(60),
         wanted_for: Duration::from_secs(60),
+        healthy_after: Duration::from_secs(5),
         tick: Duration::from_millis(10),
     }
 }
@@ -280,6 +282,92 @@ fn a_failed_sample_keeps_the_last_good_sessions_and_reports_it() {
     });
     assert_eq!(hub.live("slow.ts").unwrap().sessions.len(), 1);
     stop(&hub, &["slow.ts"]);
+}
+
+#[test]
+fn a_failed_first_sample_after_reconnect_keeps_the_last_good_sessions() {
+    let (hub, tries) = hub_with(|_, attempt| {
+        if attempt == 1 {
+            script(
+                &[
+                    hello(PROTOCOL_VERSION),
+                    snapshot(&["a"], false),
+                    heartbeat(),
+                ],
+                "sleep 0.3; exit 1",
+            )
+        } else {
+            script(
+                &[hello(PROTOCOL_VERSION), snapshot(&[], true), heartbeat()],
+                "exec sleep 30",
+            )
+        }
+    });
+    hub.ensure(&["re.ts".to_string()]);
+    wait_until("first live", || hub.live("re.ts").is_some());
+    let first = hub.live("re.ts").unwrap().observed_at_unix_ms;
+    wait_until("failed sample on the second connection", || {
+        attempts(&tries, "re.ts") == 2 && hub.live("re.ts").is_some_and(|l| l.error.is_some())
+    });
+    let live = hub.live("re.ts").unwrap();
+    assert_eq!(live.sessions.len(), 1, "the good records survive");
+    assert_eq!(live.sessions[0].session_id, "a");
+    assert!(
+        live.observed_at_unix_ms >= first
+            && live.observed_at.elapsed() >= Duration::from_millis(250),
+        "the records keep their own observation time"
+    );
+    stop(&hub, &["re.ts"]);
+}
+
+#[test]
+fn streams_that_die_after_a_snapshot_still_fall_back() {
+    let (hub, tries) = hub_with(|_, _| {
+        script(
+            &[hello(PROTOCOL_VERSION), snapshot(&["a"], false)],
+            "exit 1",
+        )
+    });
+    hub.ensure(&["crashy.ts".to_string()]);
+    wait_until("fallback note", || hub.fallback_note("crashy.ts").is_some());
+    assert!(hub
+        .fallback_note("crashy.ts")
+        .unwrap()
+        .contains("failed 3 times"));
+    assert_eq!(attempts(&tries, "crashy.ts"), 3);
+    stop(&hub, &["crashy.ts"]);
+}
+
+#[test]
+fn cancelled_pipe_reads_end_while_a_writer_still_holds_the_pipe() {
+    let (read_end, _write_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut pipe = Cancellable::new(read_end, cancel.clone());
+    let reader = std::thread::spawn(move || {
+        let mut bytes = [0u8; 16];
+        pipe.read(&mut bytes)
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!reader.is_finished(), "an open, idle pipe blocks");
+    cancel.store(true, Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !reader.is_finished() {
+        assert!(Instant::now() < deadline, "cancel must end the read");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(reader.join().unwrap().unwrap(), 0);
+}
+
+#[test]
+fn cancelled_pipes_still_return_data_already_waiting() {
+    use std::io::Write;
+    let (read_end, mut write_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    write_end.write_all(b"last words\n").unwrap();
+    let cancel = Arc::new(AtomicBool::new(true));
+    let mut pipe = Cancellable::new(read_end, cancel);
+    let mut text = String::new();
+    pipe.read_to_string(&mut text).unwrap();
+    assert_eq!(text, "last words\n");
 }
 
 #[test]
