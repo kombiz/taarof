@@ -90,10 +90,17 @@ fn script(lines: &[String], tail: &str) -> String {
 fn hub_with(
     scripts: impl Fn(&str, usize) -> String + Send + Sync + 'static,
 ) -> (Arc<StreamHub>, Arc<Mutex<HashMap<String, usize>>>) {
+    hub_with_tuning(tuning(), scripts)
+}
+
+fn hub_with_tuning(
+    tuning: Tuning,
+    scripts: impl Fn(&str, usize) -> String + Send + Sync + 'static,
+) -> (Arc<StreamHub>, Arc<Mutex<HashMap<String, usize>>>) {
     let attempts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
     let counter = attempts.clone();
     let hub = StreamHub::new(
-        tuning(),
+        tuning,
         Arc::new(move |host: &str| {
             let attempt = {
                 let mut attempts = counter.lock().unwrap();
@@ -336,6 +343,61 @@ fn streams_that_die_after_a_snapshot_still_fall_back() {
         .contains("failed 3 times"));
     assert_eq!(attempts(&tries, "crashy.ts"), 3);
     stop(&hub, &["crashy.ts"]);
+}
+
+#[test]
+fn failed_samples_after_one_good_sample_are_not_healthy_uptime() {
+    let beat = heartbeat();
+    let (hub, tries) = hub_with_tuning(
+        Tuning {
+            healthy_after: Duration::from_millis(200),
+            ..tuning()
+        },
+        move |_, _| {
+            // Up well past healthy_after, but every sample after the first
+            // one failed.
+            format!(
+                "{} for i in 1 2 3 4 5 6; do printf '%s\\n' '{beat}'; sleep 0.08; done; exit 1",
+                script(
+                    &[
+                        hello(PROTOCOL_VERSION),
+                        snapshot(&["a"], false),
+                        snapshot(&[], true),
+                    ],
+                    ""
+                )
+            )
+        },
+    );
+    hub.ensure(&["sick.ts".to_string()]);
+    wait_until("fallback note", || hub.fallback_note("sick.ts").is_some());
+    assert_eq!(attempts(&tries, "sick.ts"), 3);
+    stop(&hub, &["sick.ts"]);
+}
+
+#[test]
+fn sustained_good_samples_reset_the_failure_count() {
+    let beat = heartbeat();
+    let (hub, tries) = hub_with_tuning(
+        Tuning {
+            healthy_after: Duration::from_millis(200),
+            ..tuning()
+        },
+        move |_, _| {
+            format!(
+                "{} for i in 1 2 3 4 5 6; do printf '%s\\n' '{beat}'; sleep 0.08; done; exit 1",
+                script(&[hello(PROTOCOL_VERSION), snapshot(&["a"], false)], "")
+            )
+        },
+    );
+    hub.ensure(&["fine.ts".to_string()]);
+    wait_until("four connections", || attempts(&tries, "fine.ts") >= 4);
+    assert_eq!(
+        hub.fallback_note("fine.ts"),
+        None,
+        "healthy runs never fall back"
+    );
+    stop(&hub, &["fine.ts"]);
 }
 
 #[test]

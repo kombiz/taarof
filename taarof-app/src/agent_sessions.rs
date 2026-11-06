@@ -612,8 +612,14 @@ impl RemoteSessionProbe {
     }
 
     /// A fresh stream view for this host, stamped, or None.
+    /// A degraded stream (its latest sample failed) is not used: the shell
+    /// probe runs instead, and the newest successful records from either
+    /// source stay in the cache, as for any failed host.
     fn live(&self, target: &RemoteHostTarget) -> Option<RemoteHostCache> {
         let live = self.streams.as_ref()?.live(&target.ssh_target)?;
+        if live.error.is_some() {
+            return None;
+        }
         Some(live_cache(target, live))
     }
 
@@ -1369,6 +1375,43 @@ mod tests {
             let (statuses, sessions) = probe.sections();
             assert_eq!(statuses[0].session_count, 1);
             assert_eq!(sessions[0].session_id, "s1");
+        }
+
+        #[test]
+        fn test_remote_stream_degraded_sample_keeps_newer_shell_results() {
+            let runner = Arc::new(ScriptedRunner::new(vec![Ok(remote_output())]));
+            let streams = Arc::new(FakeStreams::default());
+            let probe = RemoteSessionProbe::manual_with_streams(
+                Arc::clone(&runner) as Arc<dyn RemoteCommandRunner>,
+                Arc::new(FixedHosts(vec![gpu_box()])),
+                Arc::clone(&streams) as Arc<dyn RemoteStreams>,
+            );
+            // The shell probe found two newer sessions.
+            probe.refresh_blocking();
+            assert_eq!(probe.sections().0[0].session_count, 2);
+
+            // The stream reconnects and its first sample fails; it still
+            // holds an older one-session set.
+            streams.live.lock().unwrap().insert(
+                gpu_box().ssh_target,
+                LiveHost {
+                    sessions: vec![streamed_record("old")],
+                    stats: agent_session_core::remote_stream::Stats::default(),
+                    error: Some("taarof-remote enumeration failed or timed out".into()),
+                    observed_at: Instant::now(),
+                    observed_at_unix_ms: 1,
+                    metrics: None,
+                },
+            );
+            let (statuses, sessions) = probe.sections();
+            assert_eq!(statuses[0].session_count, 2, "older stream records lose");
+            assert!(sessions.iter().all(|s| s.session_id != "old"));
+            probe.refresh_blocking();
+            assert_eq!(
+                runner.calls().len(),
+                2,
+                "a degraded stream does not skip the shell probe"
+            );
         }
 
         #[test]

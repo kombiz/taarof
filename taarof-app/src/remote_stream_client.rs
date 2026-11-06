@@ -107,8 +107,9 @@ struct HostState {
     records_at: Option<(Instant, u64)>,
     /// A snapshot, good or failed, arrived on the current connection.
     sampled: bool,
-    /// A good snapshot arrived on the current connection.
-    good_sample: bool,
+    /// Start of the current unbroken run of good samples on this connection.
+    /// A failed sample clears it.
+    healthy_since: Option<Instant>,
     enumeration_failed: bool,
     metrics: Option<Metrics>,
     last_event: Option<Instant>,
@@ -255,8 +256,8 @@ enum Outcome {
     Unwanted,
     HelperMissing,
     ProtocolMismatch(u32),
-    /// `healthy`: the connection delivered a good snapshot and stayed up
-    /// for [`Tuning::healthy_after`].
+    /// `healthy`: the connection ended inside an unbroken run of good
+    /// samples at least [`Tuning::healthy_after`] long.
     Ended {
         healthy: bool,
         error: String,
@@ -373,7 +374,7 @@ fn connect(target: &str, slot: &Slot, tuning: &Tuning, command: &CommandFactory)
         state.generation += 1;
         state.hello = false;
         state.sampled = false;
-        state.good_sample = false;
+        state.healthy_since = None;
         state.enumeration_failed = false;
         state.metrics = None;
         state.last_event = None;
@@ -460,7 +461,9 @@ fn connect(target: &str, slot: &Slot, tuning: &Tuning, command: &CommandFactory)
     let (saw_hello, healthy) = {
         let mut state = lock(slot);
         let saw_hello = state.hello;
-        let healthy = state.good_sample && started.elapsed() >= tuning.healthy_after;
+        let healthy = state
+            .healthy_since
+            .is_some_and(|since| since.elapsed() >= tuning.healthy_after);
         // Nothing from this connection may read as live any more.
         state.generation += 1;
         state.hello = false;
@@ -644,11 +647,13 @@ fn read_events(stdout: impl Read, slot: &Slot, generation: u64) -> ReadEnd {
                 state.sampled = true;
                 if stats.enumeration_failed {
                     // Keep the last good records and their time; report the
-                    // failed sample. This is not a recovery.
+                    // failed sample. This is not a recovery, and it ends
+                    // any healthy run.
                     state.enumeration_failed = true;
+                    state.healthy_since = None;
                 } else {
                     state.enumeration_failed = false;
-                    state.good_sample = true;
+                    state.healthy_since.get_or_insert_with(Instant::now);
                     state.snapshot = Some((sessions, stats));
                     state.records_at = Some((Instant::now(), unix_time_ms()));
                     state.fallback_note = None;
@@ -658,7 +663,7 @@ fn read_events(stdout: impl Read, slot: &Slot, generation: u64) -> ReadEnd {
                 state.metrics = Some(metrics);
                 // Snapshots are sent on change only, so a heartbeat after a
                 // good sample confirms the records are still current.
-                if state.good_sample && !state.enumeration_failed {
+                if state.healthy_since.is_some() {
                     state.records_at = Some((Instant::now(), unix_time_ms()));
                 }
             }
