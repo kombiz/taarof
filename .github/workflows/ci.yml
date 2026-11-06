@@ -44,13 +44,12 @@ jobs:
         run: cargo fmt --manifest-path wasm-sidebar/Cargo.toml --all --check
 
   security:
-    # rustsec/audit-check posts advisory warnings (e.g. unmaintained crates) as a
-    # check run on push events, which needs checks: write. Job-level permissions
-    # replace the workflow default, so contents: read is restated here. Fork pull
-    # requests still receive a read-only token.
+    # cargo audit runs directly: it fails on vulnerabilities and prints
+    # warnings (unmaintained, unsound) to the log without failing. The
+    # rustsec/audit-check action failed the job while posting those warnings as
+    # a check run (taarof#94), so no checks: write token is needed here.
     permissions:
       contents: read
-      checks: write
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
     steps:
       - name: Checkout repository
@@ -59,11 +58,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
       - name: Audit Rust dependencies
-        uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: .
+        run: cargo audit
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@cargo-deny
