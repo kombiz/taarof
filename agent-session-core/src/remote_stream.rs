@@ -79,20 +79,36 @@ pub fn event_line(event: &Event) -> serde_json::Result<Vec<u8>> {
 
 /// A snapshot line no longer than [`MAX_EVENT_LINE_BYTES`]. Sessions arrive
 /// newest first, so the oldest are dropped first.
+///
+/// Each record is sized once and the list is trimmed in one pass. The fixed
+/// overhead is measured with the largest omitted count this call can report,
+/// so the estimate never undercounts; at the exact limit it may drop one more
+/// session than strictly needed.
 pub fn snapshot_line(
     mut sessions: Vec<AgentSessionRecord>,
     mut stats: Stats,
 ) -> serde_json::Result<Vec<u8>> {
-    loop {
-        let line = event_line(&Event::Snapshot {
-            sessions: sessions.clone(),
-            stats: stats.clone(),
-        })?;
-        if line.len() <= MAX_EVENT_LINE_BYTES || sessions.pop().is_none() {
-            return Ok(line);
-        }
-        stats.sessions_omitted += 1;
+    let sizes = sessions
+        .iter()
+        .map(|session| serde_json::to_vec(session).map(|bytes| bytes.len()))
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    let mut worst = stats.clone();
+    worst.sessions_omitted += sessions.len();
+    let overhead = event_line(&Event::Snapshot {
+        sessions: vec![],
+        stats: worst,
+    })?
+    .len();
+    let mut keep = sessions.len();
+    // Records plus the commas between them.
+    let mut total = overhead + sizes.iter().sum::<usize>() + keep.saturating_sub(1);
+    while keep > 0 && total > MAX_EVENT_LINE_BYTES {
+        keep -= 1;
+        total -= sizes[keep] + usize::from(keep > 0);
     }
+    stats.sessions_omitted += sessions.len() - keep;
+    sessions.truncate(keep);
+    event_line(&Event::Snapshot { sessions, stats })
 }
 
 #[cfg(test)]
@@ -202,6 +218,18 @@ mod tests {
         assert!(stats.sessions_omitted > 0);
         // The newest sessions are kept.
         assert_eq!(sessions[0].session_id, "s0");
+
+        // Trimming keeps as many sessions as fit: one more would not.
+        let kept = sessions.len();
+        let one_more: Vec<_> = (0..=kept)
+            .map(|id| record(id, "t".repeat(200_000)))
+            .collect();
+        let untrimmed = event_line(&Event::Snapshot {
+            sessions: one_more,
+            stats: Stats::default(),
+        })
+        .unwrap();
+        assert!(untrimmed.len() > MAX_EVENT_LINE_BYTES);
 
         let small = snapshot_line(vec![record(0, "t".into())], Stats::default()).unwrap();
         let Event::Snapshot { stats, .. } = serde_json::from_slice(&small).unwrap() else {

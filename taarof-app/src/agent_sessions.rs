@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::remote_stream_client::{LiveHost, RemoteStreams};
 use crate::workspace::Tab;
 use crate::AppState;
 
@@ -290,6 +291,9 @@ struct RemoteHostCache {
     ssh_target: String,
     sessions: Vec<AgentSessionRecord>,
     stats: RemoteParseStats,
+    /// Under-reporting summary for these records, from whichever source
+    /// produced them.
+    warning: Option<String>,
     observed_at: Option<Instant>,
     observed_at_unix_ms: Option<u64>,
     last_error: Option<String>,
@@ -316,6 +320,9 @@ pub struct RemoteSessionProbe {
     /// interval on purpose — see [`REMOTE_FRESHNESS_WINDOW`].
     freshness_window: Duration,
     background_refresh: bool,
+    /// `taarof-remote` streams. A host with a fresh stream skips the shell
+    /// probe; every other host is probed exactly as before.
+    streams: Option<Arc<dyn RemoteStreams>>,
     state: Mutex<RemoteProbeState>,
 }
 
@@ -327,9 +334,54 @@ impl Default for RemoteSessionProbe {
             refresh_interval: REMOTE_REFRESH_INTERVAL,
             freshness_window: REMOTE_FRESHNESS_WINDOW,
             background_refresh: true,
+            streams: Some(crate::remote_stream_client::hub()),
             state: Mutex::new(RemoteProbeState::default()),
         }
     }
+}
+
+/// Stamp a stream snapshot from our own configured identity. The helper's
+/// records are unstamped by contract, and a remote record never claims a
+/// local pane.
+fn live_cache(target: &RemoteHostTarget, live: LiveHost) -> RemoteHostCache {
+    let mut sessions = live.sessions;
+    for session in &mut sessions {
+        session.live_binding = None;
+    }
+    agent_session_core::remote_enumeration::stamp_remote_records(
+        &mut sessions,
+        &target.host,
+        &target.ssh_target,
+    );
+    RemoteHostCache {
+        ssh_target: target.ssh_target.clone(),
+        sessions,
+        warning: stream_warning(&live.stats),
+        stats: live.stats.records,
+        observed_at: Some(live.observed_at),
+        observed_at_unix_ms: Some(live.observed_at_unix_ms),
+        last_error: live.error,
+        ever_succeeded: true,
+    }
+}
+
+fn stream_warning(stats: &agent_session_core::remote_stream::Stats) -> Option<String> {
+    let mut parts: Vec<String> = stats.records.warning().into_iter().collect();
+    if stats.output_truncated {
+        parts.push("The host's enumeration output reached its 8 MiB cap.".to_string());
+    }
+    if stats.sessions_omitted > 0 {
+        parts.push(format!(
+            "{} older session(s) were left out to fit the stream's 1 MiB line limit.",
+            stats.sessions_omitted
+        ));
+    }
+    join_warnings(parts)
+}
+
+fn join_warnings(parts: impl IntoIterator<Item = String>) -> Option<String> {
+    let parts: Vec<String> = parts.into_iter().collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 impl RemoteSessionProbe {
@@ -360,7 +412,21 @@ impl RemoteSessionProbe {
             refresh_interval,
             freshness_window: REMOTE_FRESHNESS_WINDOW,
             background_refresh: true,
+            streams: None,
             state: Mutex::new(RemoteProbeState::default()),
+        }
+    }
+
+    /// A manual probe that consults injected streams first.
+    #[cfg(test)]
+    fn manual_with_streams(
+        runner: Arc<dyn RemoteCommandRunner>,
+        inventory: Arc<dyn RemoteHostInventory>,
+        streams: Arc<dyn RemoteStreams>,
+    ) -> Self {
+        Self {
+            streams: Some(streams),
+            ..Self::manual(runner, inventory)
         }
     }
 
@@ -409,8 +475,18 @@ impl RemoteSessionProbe {
 
     fn run_round(&self) {
         let targets = self.inventory.hosts();
+        if let Some(streams) = &self.streams {
+            let ssh_targets: Vec<String> = targets.iter().map(|t| t.ssh_target.clone()).collect();
+            streams.ensure(&ssh_targets);
+        }
         let mut observed: Vec<(String, RemoteHostCache)> = Vec::new();
         for target in targets {
+            if let Some(live) = self.live(&target) {
+                // Keep the stream's view as this round's cache, so a stream
+                // that drops degrades exactly like a shell probe would.
+                observed.push((target.host.clone(), live));
+                continue;
+            }
             let previous = self.cached_host(&target.host);
             let outcome = self
                 .runner
@@ -421,6 +497,7 @@ impl RemoteSessionProbe {
                     RemoteHostCache {
                         ssh_target: target.ssh_target.clone(),
                         sessions,
+                        warning: stats.warning(),
                         stats,
                         observed_at: Some(Instant::now()),
                         observed_at_unix_ms: Some(unix_time_ms()),
@@ -434,6 +511,7 @@ impl RemoteSessionProbe {
                         ssh_target: target.ssh_target.clone(),
                         sessions: previous.sessions,
                         stats: previous.stats,
+                        warning: previous.warning,
                         observed_at: previous.observed_at,
                         observed_at_unix_ms: previous.observed_at_unix_ms,
                         last_error: Some(error),
@@ -457,15 +535,28 @@ impl RemoteSessionProbe {
     /// silence would read as "no remote agents", which is a different claim.
     fn sections(&self) -> (Vec<RemoteHostStatus>, Vec<AgentSessionRecord>) {
         let targets = self.inventory.hosts();
+        // Read the streams before the probe state; the two locks never nest.
+        let streamed: Vec<(Option<RemoteHostCache>, Option<String>)> = targets
+            .iter()
+            .map(|target| {
+                let note = self
+                    .streams
+                    .as_ref()
+                    .and_then(|streams| streams.fallback_note(&target.ssh_target));
+                (self.live(target), note)
+            })
+            .collect();
         let state = self.lock_state();
         let mut statuses = Vec::new();
         let mut sessions = Vec::new();
-        for target in targets {
-            let cache = state
-                .hosts
-                .iter()
-                .find(|(name, _)| name == &target.host)
-                .map(|(_, cache)| cache);
+        for (target, (live, note)) in targets.into_iter().zip(streamed) {
+            let cache = live.as_ref().or_else(|| {
+                state
+                    .hosts
+                    .iter()
+                    .find(|(name, _)| name == &target.host)
+                    .map(|(_, cache)| cache)
+            });
             let Some(cache) = cache else {
                 statuses.push(RemoteHostStatus {
                     host: target.host,
@@ -476,9 +567,12 @@ impl RemoteSessionProbe {
                     session_count: 0,
                     dropped_lines: 0,
                     truncated_files: 0,
-                    warning: Some(
-                        "This host has not been probed yet; its first results arrive with the next refresh."
-                            .to_string(),
+                    warning: join_warnings(
+                        std::iter::once(
+                            "This host has not been probed yet; its first results arrive with the next refresh."
+                                .to_string(),
+                        )
+                        .chain(note),
                     ),
                     observed_at_unix_ms: None,
                 });
@@ -499,7 +593,7 @@ impl RemoteSessionProbe {
                 session_count: cache.sessions.len(),
                 dropped_lines: cache.stats.lost_lines(),
                 truncated_files: cache.stats.truncated_files,
-                warning: cache.stats.warning(),
+                warning: join_warnings(cache.warning.clone().into_iter().chain(note)),
                 observed_at_unix_ms: cache.observed_at_unix_ms,
             });
             sessions.extend(cache.sessions.iter().cloned());
@@ -515,6 +609,12 @@ impl RemoteSessionProbe {
     #[cfg(test)]
     fn completed_a_round(&self) -> bool {
         self.lock_state().last_round_at.is_some()
+    }
+
+    /// A fresh stream view for this host, stamped, or None.
+    fn live(&self, target: &RemoteHostTarget) -> Option<RemoteHostCache> {
+        let live = self.streams.as_ref()?.live(&target.ssh_target)?;
+        Some(live_cache(target, live))
     }
 
     fn cached_host(&self, host: &str) -> Option<RemoteHostCache> {
@@ -1165,6 +1265,141 @@ mod tests {
             )
             .expect("local codex fixture should write");
             DiscoveryRoots::from_home(Some(dir))
+        }
+
+        /// Injected stand-in for the `taarof-remote` stream hub.
+        #[derive(Default)]
+        struct FakeStreams {
+            live: Mutex<HashMap<String, LiveHost>>,
+            notes: Mutex<HashMap<String, String>>,
+            ensured: Mutex<Vec<Vec<String>>>,
+        }
+
+        impl RemoteStreams for FakeStreams {
+            fn ensure(&self, ssh_targets: &[String]) {
+                self.ensured.lock().unwrap().push(ssh_targets.to_vec());
+            }
+            fn live(&self, ssh_target: &str) -> Option<LiveHost> {
+                self.live.lock().unwrap().get(ssh_target).cloned()
+            }
+            fn fallback_note(&self, ssh_target: &str) -> Option<String> {
+                self.notes.lock().unwrap().get(ssh_target).cloned()
+            }
+        }
+
+        fn streamed_record(id: &str) -> AgentSessionRecord {
+            AgentSessionRecord {
+                agent: "codex".into(),
+                session_id: id.into(),
+                title: "streamed".into(),
+                cwd: "/srv/project".into(),
+                host: Some("forged-by-remote".into()),
+                repo_root: None,
+                started_at_unix_ms: None,
+                updated_at_unix_ms: 1,
+                last_user_message_at_unix_ms: None,
+                status: "recent".into(),
+                live_binding: Some(LiveAgentBinding {
+                    agent: "codex".into(),
+                    session_id: None,
+                    cwd: None,
+                    workspace_id: 1,
+                    workspace_name: "forged".into(),
+                    tab_id: 1,
+                    tab_name: "forged".into(),
+                    pane_id: 1,
+                }),
+                resume_command: Some("forged".into()),
+                resume_unavailable_reason: None,
+            }
+        }
+
+        #[test]
+        fn test_remote_stream_live_host_skips_the_shell_probe_and_is_stamped_locally() {
+            let runner = Arc::new(ScriptedRunner::new(vec![]));
+            let streams = Arc::new(FakeStreams::default());
+            streams.live.lock().unwrap().insert(
+                gpu_box().ssh_target,
+                LiveHost {
+                    sessions: vec![streamed_record("s1")],
+                    stats: agent_session_core::remote_stream::Stats {
+                        sessions_omitted: 2,
+                        ..Default::default()
+                    },
+                    error: None,
+                    observed_at: Instant::now(),
+                    observed_at_unix_ms: 42,
+                    metrics: None,
+                },
+            );
+            let probe = RemoteSessionProbe::manual_with_streams(
+                Arc::clone(&runner) as Arc<dyn RemoteCommandRunner>,
+                Arc::new(FixedHosts(vec![gpu_box()])),
+                Arc::clone(&streams) as Arc<dyn RemoteStreams>,
+            );
+
+            // Sections read a fresh stream at once, before any round.
+            let (statuses, sessions) = probe.sections();
+            assert_eq!(statuses[0].session_count, 1);
+            assert!(!statuses[0].stale);
+            assert!(statuses[0].ok);
+            assert_eq!(statuses[0].observed_at_unix_ms, Some(42));
+            assert!(statuses[0]
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("2 older session(s)")));
+            assert_eq!(sessions[0].host.as_deref(), Some("gpu-box"));
+            assert!(sessions[0].live_binding.is_none());
+            let resume = sessions[0].resume_command.as_deref().unwrap();
+            assert!(resume.contains("kombiz@gpu-box.ts"), "{resume}");
+
+            probe.refresh_blocking();
+            assert!(
+                runner.calls().is_empty(),
+                "a live stream replaces the ssh probe"
+            );
+            assert_eq!(
+                *streams.ensured.lock().unwrap(),
+                vec![vec!["kombiz@gpu-box.ts".to_string()]]
+            );
+
+            // The stream drops: the round's cached copy carries on, as a
+            // shell result would.
+            streams.live.lock().unwrap().clear();
+            let (statuses, sessions) = probe.sections();
+            assert_eq!(statuses[0].session_count, 1);
+            assert_eq!(sessions[0].session_id, "s1");
+        }
+
+        #[test]
+        fn test_remote_stream_fallback_keeps_the_shell_probe_and_says_so() {
+            let runner = Arc::new(ScriptedRunner::new(vec![Ok(remote_output())]));
+            let streams = Arc::new(FakeStreams::default());
+            streams.notes.lock().unwrap().insert(
+                gpu_box().ssh_target,
+                "taarof-remote is not installed on this host; using the shell probe.".into(),
+            );
+            let probe = RemoteSessionProbe::manual_with_streams(
+                Arc::clone(&runner) as Arc<dyn RemoteCommandRunner>,
+                Arc::new(FixedHosts(vec![gpu_box()])),
+                Arc::clone(&streams) as Arc<dyn RemoteStreams>,
+            );
+            let (statuses, _) = probe.sections();
+            assert!(statuses[0]
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("not been probed yet") && w.contains("not installed")));
+
+            probe.refresh_blocking();
+            assert_eq!(runner.calls().len(), 1, "the shell probe runs as before");
+            let (statuses, sessions) = probe.sections();
+            assert_eq!(statuses[0].session_count, 2);
+            assert!(!statuses[0].stale);
+            assert_eq!(
+                statuses[0].warning.as_deref(),
+                Some("taarof-remote is not installed on this host; using the shell probe.")
+            );
+            assert_eq!(sessions.len(), 2);
         }
 
         #[test]

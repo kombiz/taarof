@@ -1,4 +1,4 @@
-# Remote helper (slice 1 of #96)
+# Remote helper (#96)
 
 `taarof-remote` is a small Linux binary. It has no GTK, libadwaita or VTE
 dependency. It observes the current user's host and session metadata over SSH
@@ -37,7 +37,7 @@ Rules for readers:
   always absent. The consumer stamps both from its own configured host and SSH
   target (`stamp_remote_records`). The `hello` hostname is never identity.
 
-Slice 1 emits replacement snapshots rather than deltas. Metrics change on
+The helper emits replacement snapshots rather than deltas. Metrics change on
 every read, so they ride heartbeats; a snapshot never repeats only because
 load or memory moved. `metrics` fields are `load` (one-minute load), `mem`
 (`total_bytes`, `used_bytes`), `nproc`, and `tmux_session_count`. Memory uses `MemTotal - MemAvailable`, as current
@@ -68,8 +68,8 @@ metadata, not permission to execute; consumers must revalidate attachments.
 The helper polls every two seconds by default. It compares parsed sessions and
 stats rather than serializing raw record files into the output. Probe time
 adds to the poll interval. Heartbeats continue during child probes after the
-initial snapshot. This first slice still invokes the shared shell sampler on each poll;
-it makes no traffic or CPU speedup claim.
+initial snapshot. The helper still invokes the shared shell sampler on each poll; it makes no
+traffic or CPU speedup claim.
 
 ## Build and host ownership
 
@@ -82,7 +82,37 @@ mise tool configuration, with an approved source/version, and install through
 mise. Do not hand-copy a binary from the desktop, use a curl installer, or add
 a second tool owner. This slice does not change fleet tool pins or install it.
 
-The GTK consumer, one persistent SSH connection per host, reconnect/backoff,
-stale-host handling, and fallback to the existing shell probe are slice 2.
-The app still uses its current remote probe. Remote process-tree observation,
-performance baselines, hook push, and delta events are outside this slice.
+## App consumer (slice 2)
+
+taarof-app keeps one `ssh -T -o BatchMode=yes -o ConnectTimeout=5`
+connection per remote host that agent-session discovery already probes. The
+remote command adds `~/.local/share/mise/shims` to PATH when non-interactive
+SSH does not find the helper. Each host has its own supervisor thread; a slow
+or dead host never holds up GTK or another host.
+
+- **Identity.** Records are stamped from the configured host name and SSH
+  target. `hello.host` is ignored. A streamed record never carries a live
+  pane binding.
+- **Freshness.** A stream is fresh for 25 seconds after its last event (two
+  missed default heartbeats plus slack). A fresh stream replaces the shell
+  probe for that host's sessions and for the workspace host status. Otherwise
+  the host falls back to the shell probe, and the last streamed records age
+  through the usual 90-second window.
+- **Stalls.** No event for 35 seconds ends the connection. Reconnects back off
+  from 2 seconds, doubling to at most 60 seconds.
+- **Fallback.** Exit 127 (helper missing), another `protocol_version`, or three
+  failed connections in a row switch the host to the shell probe for 10
+  minutes. `RemoteHostStatus.warning` says why. The stream is then tried
+  again, and its first good snapshot clears the note.
+- **Bad input.** A line over 1 MiB, a line that is not an event, a stream that
+  does not start with `hello`, or a second `hello` ends the connection and
+  counts as a failure.
+- **Failed samples.** A snapshot with `enumeration_failed` keeps the last good
+  records and marks the host degraded, like a failed shell probe.
+
+Heartbeat metrics come from the helper's last finished sample. During a slow
+sample they can lag `observed_at_unix_ms` by up to one poll plus the 10-second
+sampler deadline. That is fine for the load and memory gauges they feed.
+
+Remote process-tree observation, performance baselines, hook push, delta
+events, and installing the helper through mise remain outside this work.

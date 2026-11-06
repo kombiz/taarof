@@ -63,14 +63,20 @@ pub(super) fn accept_pane_result(
     true
 }
 
+/// `streamed` returns fresh `taarof-remote` heartbeat metrics for a host. A
+/// host with them skips its ssh round; any other host is probed as before.
 pub(super) fn observe_hosts(
     targets: Vec<(u32, String)>,
+    streamed: impl Fn(&str) -> Option<crate::host::HostStatus> + Sync,
     run: impl Fn(&[String]) -> Result<String, String> + Sync,
 ) -> Vec<HostResult> {
     let mut hosts: Vec<String> = targets.iter().map(|(_, host)| host.clone()).collect();
     hosts.sort();
     hosts.dedup();
     let observations = bounded_map(&hosts, |host| {
+        if let Some(status) = streamed(host) {
+            return (host.clone(), Ok(status));
+        }
         let status = run(&crate::host::probe_status_command(host)).and_then(|output| {
             crate::host::parse_probe_output(&output)
                 .ok_or_else(|| "host probe returned invalid status output".to_string())

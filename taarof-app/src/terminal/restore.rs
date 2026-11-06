@@ -1054,7 +1054,12 @@ pub(crate) fn poll_host_status(
     glib::spawn_future_local(async move {
         let _guard = guard;
         let results: Vec<super::observation::HostResult> = gio::spawn_blocking(move || {
-            super::observation::observe_hosts(targets, run_tmux_command_sync_result)
+            let streams = crate::remote_stream_client::hub();
+            super::observation::observe_hosts(
+                targets,
+                |host| streams.host_status(host),
+                run_tmux_command_sync_result,
+            )
         })
         .await
         .unwrap_or_default();
