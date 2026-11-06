@@ -9,6 +9,7 @@ pub use agent_session_core::discovery::{
 use serde_json::Value;
 use std::cmp::Reverse;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -20,13 +21,14 @@ use crate::AppState;
 
 const AGENT_SESSION_SCAN_TTL: Duration = Duration::from_secs(20);
 
-pub use agent_session_core::remote_enumeration::{
-    remote_enumeration_script, remote_resume_command, RemoteParseStats, REMOTE_MAX_OUTPUT_BYTES,
+pub(crate) use agent_session_core::remote_enumeration::{
+    remote_enumeration_script, RemoteParseStats, REMOTE_MAX_OUTPUT_BYTES,
 };
 #[cfg(test)]
 use agent_session_core::remote_enumeration::{
-    REMOTE_BLOCK_END, REMOTE_BLOCK_HEADER, REMOTE_MAX_BLOCK_BYTES, REMOTE_MAX_FILES_PER_PROVIDER,
-    REMOTE_MAX_LINE_CHARS, REMOTE_MAX_SAMPLE_LINES, REMOTE_MAX_SCANNED_LINES,
+    remote_resume_command, REMOTE_BLOCK_END, REMOTE_BLOCK_HEADER, REMOTE_MAX_BLOCK_BYTES,
+    REMOTE_MAX_FILES_PER_PROVIDER, REMOTE_MAX_LINE_CHARS, REMOTE_MAX_SAMPLE_LINES,
+    REMOTE_MAX_SCANNED_LINES,
 };
 /// Wall-clock deadline for one remote enumeration, connect included.
 const REMOTE_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
