@@ -54,8 +54,8 @@ metadata, not permission to execute; consumers must revalidate attachments.
 
 The helper polls every two seconds by default. It compares the bounded parsed
 state rather than serializing raw record files into the output. Probe time
-adds to the poll interval. A slow probe can delay a heartbeat by its bounded
-runtime. This first slice still invokes the shared shell sampler on each poll;
+adds to the poll interval. Heartbeats continue during child probes after the
+initial snapshot. This first slice still invokes the shared shell sampler on each poll;
 it makes no traffic or CPU speedup claim.
 
 ## Build and host ownership

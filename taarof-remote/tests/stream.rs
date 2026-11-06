@@ -223,3 +223,20 @@ fn sigterm_exits_cleanly() {
     );
     stream.exited();
 }
+
+#[test]
+fn slow_sampler_keeps_heartbeats_and_stdin_shutdown_responsive() {
+    let mut stream = Stream::start();
+    stream.initial();
+    // Replace only this fixture's sampler shell; no real user records or tmux.
+    let shell = stream.home.join("bin/sh");
+    fs::write(&shell, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+    fs::set_permissions(shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let start = Instant::now();
+    for _ in 0..3 {
+        assert!(matches!(stream.next(), Event::Heartbeat { .. }));
+        assert!(start.elapsed() < Duration::from_secs(4));
+    }
+    stream.child.stdin.take();
+    stream.exited();
+}

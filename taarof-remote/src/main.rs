@@ -141,6 +141,51 @@ fn options() -> Result<Options, &'static str> {
     Ok(options)
 }
 
+// One bounded sampler at a time. Child deadlines run independently of stdout
+// backpressure; the foreground loop can keep sending heartbeats during probes.
+struct Probe {
+    result: std::sync::mpsc::Receiver<Event>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    stopped: Arc<AtomicBool>,
+}
+impl Probe {
+    fn start(host: String, stopped: Arc<AtomicBool>) -> Self {
+        let (sender, result) = std::sync::mpsc::sync_channel(1);
+        let flag = stopped.clone();
+        let worker = std::thread::spawn(move || {
+            let snapshot = sample::snapshot(&host, || {
+                if flag.load(Ordering::Relaxed) {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(())
+                }
+            });
+            let _ = sender.send(snapshot);
+        });
+        Self {
+            result,
+            worker: Some(worker),
+            stopped,
+        }
+    }
+    fn finish(mut self) -> io::Result<()> {
+        self.worker
+            .take()
+            .expect("sampler worker")
+            .join()
+            .map_err(|_| io::Error::other("sampler worker failed"))
+    }
+}
+impl Drop for Probe {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            self.stopped.store(true, Ordering::Relaxed);
+            // Cancellation reaches every child probe before this join returns.
+            let _ = worker.join();
+        }
+    }
+}
+
 fn stream(options: Options) -> io::Result<()> {
     let stopped = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, stopped.clone())?;
@@ -158,21 +203,36 @@ fn stream(options: Options) -> io::Result<()> {
         host: host.clone(),
     })?;
     let mut previous = None;
+    let mut probe: Option<Probe> = None;
     let mut next_poll = Instant::now();
     let mut next_heartbeat = Instant::now() + options.heartbeat;
     loop {
         lifecycle.check()?;
-        if Instant::now() >= next_poll {
-            let snapshot = sample::snapshot(&host, || lifecycle.check());
-            lifecycle.check()?;
-            // Compare the bounded, typed state; timestamps are not part of it.
-            if previous.as_ref() != Some(&snapshot) {
-                lifecycle.emit(&snapshot)?;
-                previous = Some(snapshot);
-            }
-            next_poll = Instant::now() + options.poll;
+        if probe.is_none() && Instant::now() >= next_poll {
+            probe = Some(Probe::start(host.clone(), lifecycle.0.clone()));
         }
-        if Instant::now() >= next_heartbeat {
+        if let Some(active) = &probe {
+            match active.result.try_recv() {
+                Ok(snapshot) => {
+                    probe.take().expect("active probe").finish()?;
+                    // Compare bounded typed state; observation time is excluded.
+                    if previous.as_ref() != Some(&snapshot) {
+                        lifecycle.emit(&snapshot)?;
+                        if previous.is_none() {
+                            next_heartbeat = Instant::now() + options.heartbeat;
+                        }
+                        previous = Some(snapshot);
+                    }
+                    next_poll = Instant::now() + options.poll;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(io::Error::other("sampler worker disconnected"));
+                }
+            }
+        }
+        // Preserve hello -> initial snapshot even when startup sampling is slow.
+        if previous.is_some() && Instant::now() >= next_heartbeat {
             lifecycle.emit(&Event::Heartbeat {
                 observed_at_unix_ms: unix_time_ms(),
             })?;
