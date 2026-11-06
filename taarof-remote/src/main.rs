@@ -4,7 +4,7 @@ mod sample;
 
 use agent_session_core::{
     discovery::unix_time_ms,
-    remote_stream::{Event, PROTOCOL_VERSION},
+    remote_stream::{Event, PROTOCOL_VERSION, event_line, snapshot_line},
 };
 use std::io;
 use std::sync::{
@@ -88,9 +88,11 @@ impl Lifecycle {
     }
 
     fn emit(&self, event: &Event) -> io::Result<()> {
-        let mut bytes = serde_json::to_vec(event)?;
-        bytes.push(b'\n');
-        let mut remaining = bytes.as_slice();
+        self.emit_line(&event_line(event)?)
+    }
+
+    fn emit_line(&self, bytes: &[u8]) -> io::Result<()> {
+        let mut remaining = bytes;
         while !remaining.is_empty() {
             self.check()?;
             let n = unsafe { libc::write(1, remaining.as_ptr().cast(), remaining.len()) };
@@ -144,16 +146,16 @@ fn options() -> Result<Options, &'static str> {
 // One bounded sampler at a time. Child deadlines run independently of stdout
 // backpressure; the foreground loop can keep sending heartbeats during probes.
 struct Probe {
-    result: std::sync::mpsc::Receiver<Event>,
+    result: std::sync::mpsc::Receiver<sample::Sample>,
     worker: Option<std::thread::JoinHandle<()>>,
     stopped: Arc<AtomicBool>,
 }
 impl Probe {
-    fn start(host: String, stopped: Arc<AtomicBool>) -> Self {
+    fn start(stopped: Arc<AtomicBool>) -> Self {
         let (sender, result) = std::sync::mpsc::sync_channel(1);
         let flag = stopped.clone();
         let worker = std::thread::spawn(move || {
-            let snapshot = sample::snapshot(&host, || {
+            let snapshot = sample::sample(|| {
                 if flag.load(Ordering::Relaxed) {
                     Err(io::ErrorKind::BrokenPipe.into())
                 } else {
@@ -200,29 +202,34 @@ fn stream(options: Options) -> io::Result<()> {
     lifecycle.emit(&Event::Hello {
         protocol_version: PROTOCOL_VERSION,
         helper_version: env!("CARGO_PKG_VERSION").into(),
-        host: host.clone(),
+        host,
     })?;
     let mut previous = None;
+    let mut metrics = None;
     let mut probe: Option<Probe> = None;
     let mut next_poll = Instant::now();
     let mut next_heartbeat = Instant::now() + options.heartbeat;
     loop {
         lifecycle.check()?;
         if probe.is_none() && Instant::now() >= next_poll {
-            probe = Some(Probe::start(host.clone(), lifecycle.0.clone()));
+            probe = Some(Probe::start(lifecycle.0.clone()));
         }
         if let Some(active) = &probe {
             match active.result.try_recv() {
-                Ok(snapshot) => {
+                Ok(sample) => {
                     probe.take().expect("active probe").finish()?;
-                    // Compare bounded typed state; observation time is excluded.
-                    if previous.as_ref() != Some(&snapshot) {
-                        lifecycle.emit(&snapshot)?;
+                    // Snapshots follow sessions and stats only. Metrics move
+                    // on every read, so they ride heartbeats instead.
+                    let state = (sample.sessions, sample.stats);
+                    if previous.as_ref() != Some(&state) {
+                        lifecycle.emit_line(&snapshot_line(state.0.clone(), state.1.clone())?)?;
                         if previous.is_none() {
-                            next_heartbeat = Instant::now() + options.heartbeat;
+                            // First metrics go out at once, not a heartbeat later.
+                            next_heartbeat = Instant::now();
                         }
-                        previous = Some(snapshot);
+                        previous = Some(state);
                     }
+                    metrics = Some(sample.metrics);
                     next_poll = Instant::now() + options.poll;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -232,9 +239,13 @@ fn stream(options: Options) -> io::Result<()> {
             }
         }
         // Preserve hello -> initial snapshot even when startup sampling is slow.
-        if previous.is_some() && Instant::now() >= next_heartbeat {
+        if let Some(metrics) = metrics
+            .as_ref()
+            .filter(|_| Instant::now() >= next_heartbeat)
+        {
             lifecycle.emit(&Event::Heartbeat {
                 observed_at_unix_ms: unix_time_ms(),
+                metrics: metrics.clone(),
             })?;
             next_heartbeat = Instant::now() + options.heartbeat;
         }

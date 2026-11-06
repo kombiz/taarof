@@ -1,6 +1,6 @@
 //! Only synthetic session files are read; never the developer's real HOME.
 use agent_session_core::remote_enumeration::{
-    parse_remote_enumeration_output, remote_enumeration_script,
+    parse_remote_enumeration_records, remote_enumeration_script,
 };
 use agent_session_core::remote_stream::{Event, PROTOCOL_VERSION};
 use std::fs;
@@ -134,16 +134,12 @@ impl Drop for Stream {
 #[test]
 fn helper_records_match_shell_probe_and_report_loss() {
     let mut stream = Stream::start();
-    let (
-        host,
-        Event::Snapshot {
-            host: metrics,
-            sessions,
-            stats,
-        },
-    ) = stream.initial()
-    else {
+    let (_host, Event::Snapshot { sessions, stats }) = stream.initial() else {
         unreachable!()
+    };
+    // Metrics travel on the heartbeat sent right after the first snapshot.
+    let Event::Heartbeat { metrics, .. } = stream.next() else {
+        panic!("heartbeat with metrics follows the first snapshot")
     };
     // This is the same shared shell/parser entry point used by taarof-app.
     let shell = Command::new("sh")
@@ -155,9 +151,16 @@ fn helper_records_match_shell_probe_and_report_loss() {
         .unwrap();
     assert!(shell.status.success());
     let (expected, counts) =
-        parse_remote_enumeration_output(&host, &host, &String::from_utf8(shell.stdout).unwrap());
+        parse_remote_enumeration_records(&String::from_utf8(shell.stdout).unwrap());
     assert_eq!(sessions, expected);
     assert_eq!(sessions.len(), 4);
+    // Records are unstamped; the consumer stamps them from its SSH target.
+    assert!(
+        sessions
+            .iter()
+            .all(|s| s.host.is_none() && s.resume_command.is_none())
+    );
+    assert_eq!(stats.sessions_omitted, 0);
     assert_eq!(stats.records, counts);
     assert!(!stats.enumeration_failed);
     assert_eq!(metrics.nproc, Some(4));
@@ -190,9 +193,11 @@ fn heartbeat_and_stdin_eof() {
     loop {
         if let Event::Heartbeat {
             observed_at_unix_ms,
+            metrics,
         } = stream.next()
         {
             assert!(observed_at_unix_ms > 0);
+            assert_eq!(metrics.nproc, Some(4));
             break;
         }
         assert!(Instant::now() < deadline);
@@ -237,6 +242,32 @@ fn slow_sampler_keeps_heartbeats_and_stdin_shutdown_responsive() {
         assert!(matches!(stream.next(), Event::Heartbeat { .. }));
         assert!(start.elapsed() < Duration::from_secs(4));
     }
+    stream.child.stdin.take();
+    stream.exited();
+}
+
+#[test]
+fn metric_drift_alone_sends_no_new_snapshot() {
+    let mut stream = Stream::start();
+    stream.initial();
+    // Real /proc load and MemAvailable change between the 1 s polls, but the
+    // fixture sessions do not: only heartbeats may follow.
+    let until = Instant::now() + Duration::from_millis(3500);
+    let mut heartbeats = 0;
+    while Instant::now() < until {
+        match stream.lines.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => match serde_json::from_str::<Event>(&line).unwrap() {
+                Event::Heartbeat { .. } => heartbeats += 1,
+                other => panic!("unexpected event while sessions are unchanged: {other:?}"),
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(error) => panic!("stream closed: {error}"),
+        }
+    }
+    assert!(
+        heartbeats >= 2,
+        "heartbeats keep metrics fresh: {heartbeats}"
+    );
     stream.child.stdin.take();
     stream.exited();
 }

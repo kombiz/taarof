@@ -4,7 +4,11 @@ use crate::discovery::{
     parse_pi_session, shell_escape, AgentSessionRecord,
 };
 use serde_json::Value;
-use std::{cmp::Reverse, path::PathBuf};
+use std::{cmp::Reverse, path::PathBuf, time::Duration};
+
+/// Wall-clock deadline for one remote enumeration. The app's SSH probe and the
+/// stdio helper share it, so a host that works with one works with the other.
+pub const REMOTE_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Newest record files enumerated per provider on a remote host.
 pub const REMOTE_MAX_FILES_PER_PROVIDER: usize = 20;
@@ -251,6 +255,31 @@ pub fn parse_remote_enumeration_output(
     ssh_target: &str,
     output: &str,
 ) -> (Vec<AgentSessionRecord>, RemoteParseStats) {
+    let (mut sessions, stats) = parse_remote_enumeration_records(output);
+    stamp_remote_records(&mut sessions, host, ssh_target);
+    (sessions, stats)
+}
+
+/// Stamp parsed remote records with the consumer's own host label and SSH
+/// target: the host identity and a resume command that SSHes to that target.
+pub fn stamp_remote_records(sessions: &mut [AgentSessionRecord], host: &str, ssh_target: &str) {
+    for session in sessions {
+        session.host = Some(host.to_string());
+        session.resume_command = Some(remote_resume_command(
+            ssh_target,
+            &session.agent,
+            &session.cwd,
+            &session.session_id,
+        ));
+    }
+}
+
+/// Parse one host's enumeration output without stamping: `host` and
+/// `resume_command` stay `None`, because only the consumer knows which SSH
+/// target reached this host. The stdio helper sends records in this form.
+pub fn parse_remote_enumeration_records(
+    output: &str,
+) -> (Vec<AgentSessionRecord>, RemoteParseStats) {
     let output = if output.len() > REMOTE_MAX_OUTPUT_BYTES {
         let end = output
             .char_indices()
@@ -285,13 +314,8 @@ pub fn parse_remote_enumeration_output(
         for mut session in parsed {
             // A remote cwd must never be probed against the local filesystem.
             session.repo_root = None;
-            session.host = Some(host.to_string());
-            session.resume_command = Some(remote_resume_command(
-                ssh_target,
-                &session.agent,
-                &session.cwd,
-                &session.session_id,
-            ));
+            session.host = None;
+            session.resume_command = None;
             sessions.push(session);
         }
     }

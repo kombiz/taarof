@@ -22,13 +22,25 @@ The shared serde contract is `agent_session_core::remote_stream`.
 
 | Event | Fields and meaning |
 | --- | --- |
-| `hello` | First line. `protocol_version: 1`, `helper_version`, `host` (kernel hostname). |
-| `snapshot` | Full replacement: `host`, `sessions`, `stats`. Sent initially and when the bounded typed state changes. |
-| `heartbeat` | `observed_at_unix_ms`. Sent every 10 seconds by default, even without a change. |
+| `hello` | First line. `protocol_version: 1`, `helper_version`, `host` (kernel hostname, for display only). |
+| `snapshot` | Full replacement: `sessions`, `stats`. Sent first, then only when sessions or stats change. |
+| `heartbeat` | `observed_at_unix_ms`, `metrics`. Sent right after the first snapshot, then every 10 seconds by default. |
 
-Slice 1 emits replacement snapshots rather than deltas. Host fields are
-`load` (one-minute load), `mem` (`total_bytes`, `used_bytes`), `nproc`, and
-`tmux_session_count`. Memory uses `MemTotal - MemAvailable`, as current
+Rules for readers:
+
+- **Line size.** No line is longer than 1 MiB (`MAX_EVENT_LINE_BYTES`), newline
+  included. A snapshot that would be longer drops its oldest sessions and
+  counts them in `stats.sessions_omitted`.
+- **Unknown input.** Ignore unknown fields. Skip a line whose `type` you do not
+  know; the Rust contract decodes it as `Event::Unknown`.
+- **Identity.** Session records are unstamped: `host` and `resume_command` are
+  always absent. The consumer stamps both from its own configured host and SSH
+  target (`stamp_remote_records`). The `hello` hostname is never identity.
+
+Slice 1 emits replacement snapshots rather than deltas. Metrics change on
+every read, so they ride heartbeats; a snapshot never repeats only because
+load or memory moved. `metrics` fields are `load` (one-minute load), `mem`
+(`total_bytes`, `used_bytes`), `nproc`, and `tmux_session_count`. Memory uses `MemTotal - MemAvailable`, as current
 `free` does. Divide load by nproc and multiply by 100 for the app's CPU
 load percentage. Unavailable metrics are `null`; a failed tmux query is
 not reported as zero sessions. Load and memory come from `/proc`. `nproc`
@@ -46,14 +58,15 @@ existing remote probe. This keeps provider paths, sorting and limits unchanged:
 `stats` reports `dropped_lines`, `unparsable_lines`, `truncated_files`, and
 `blocks_without_session`. `output_truncated` reports the aggregate reader
 cap. `enumeration_failed` reports a failed or timed-out sampler; that event
-has no session records. The sampler has a five-second deadline. Stats describe
+has no session records. The sampler has the same 10-second deadline as the
+app's SSH probe (`REMOTE_SCAN_TIMEOUT`). Stats describe
 this sample, not lifetime totals. Enumeration is read-only, but like the shell
 probe it may include an early prompt as a session title. Treat the stream as
 private user metadata. Do not log it indiscriminately. Resume strings are
 metadata, not permission to execute; consumers must revalidate attachments.
 
-The helper polls every two seconds by default. It compares the bounded parsed
-state rather than serializing raw record files into the output. Probe time
+The helper polls every two seconds by default. It compares parsed sessions and
+stats rather than serializing raw record files into the output. Probe time
 adds to the poll interval. Heartbeats continue during child probes after the
 initial snapshot. This first slice still invokes the shared shell sampler on each poll;
 it makes no traffic or CPU speedup claim.

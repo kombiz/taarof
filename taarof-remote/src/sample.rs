@@ -1,24 +1,31 @@
+use agent_session_core::AgentSessionRecord;
 use agent_session_core::remote_enumeration::{
-    REMOTE_MAX_OUTPUT_BYTES, parse_remote_enumeration_output, remote_enumeration_script,
+    REMOTE_MAX_OUTPUT_BYTES, REMOTE_SCAN_TIMEOUT, parse_remote_enumeration_records,
+    remote_enumeration_script,
 };
-use agent_session_core::remote_stream::{Event, Host, Memory, Stats};
+use agent_session_core::remote_stream::{Memory, Metrics, Stats};
 use std::{fs, io, time::Duration};
 
-pub fn snapshot(host: &str, mut alive: impl FnMut() -> io::Result<()>) -> Event {
+/// One sample. Sessions and stats drive snapshots; metrics ride heartbeats.
+pub struct Sample {
+    pub sessions: Vec<AgentSessionRecord>,
+    pub stats: Stats,
+    pub metrics: Metrics,
+}
+
+pub fn sample(mut alive: impl FnMut() -> io::Result<()>) -> Sample {
     let mut stats = Stats::default();
     let sessions = match crate::process::output(
         crate::process::command("sh").args(["-c", &remote_enumeration_script()]),
-        Duration::from_secs(5),
+        REMOTE_SCAN_TIMEOUT,
         REMOTE_MAX_OUTPUT_BYTES,
         &mut alive,
     ) {
         Ok(output) => {
             stats.output_truncated = output.truncated;
-            let (sessions, records) = parse_remote_enumeration_output(
-                host,
-                host,
-                &String::from_utf8_lossy(&output.bytes),
-            );
+            // Unstamped: the consumer stamps host and resume from its target.
+            let (sessions, records) =
+                parse_remote_enumeration_records(&String::from_utf8_lossy(&output.bytes));
             stats.records = records;
             sessions
         }
@@ -66,15 +73,15 @@ pub fn snapshot(host: &str, mut alive: impl FnMut() -> io::Result<()>) -> Event 
             None
         }
     });
-    Event::Snapshot {
-        host: Host {
+    Sample {
+        sessions,
+        stats,
+        metrics: Metrics {
             load,
             mem,
             nproc,
             tmux_session_count,
         },
-        sessions,
-        stats,
     }
 }
 

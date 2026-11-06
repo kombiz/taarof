@@ -22,7 +22,7 @@ use crate::AppState;
 const AGENT_SESSION_SCAN_TTL: Duration = Duration::from_secs(20);
 
 pub(crate) use agent_session_core::remote_enumeration::{
-    remote_enumeration_script, RemoteParseStats, REMOTE_MAX_OUTPUT_BYTES,
+    remote_enumeration_script, RemoteParseStats, REMOTE_MAX_OUTPUT_BYTES, REMOTE_SCAN_TIMEOUT,
 };
 #[cfg(test)]
 use agent_session_core::remote_enumeration::{
@@ -30,8 +30,6 @@ use agent_session_core::remote_enumeration::{
     REMOTE_MAX_FILES_PER_PROVIDER, REMOTE_MAX_LINE_CHARS, REMOTE_MAX_SAMPLE_LINES,
     REMOTE_MAX_SCANNED_LINES,
 };
-/// Wall-clock deadline for one remote enumeration, connect included.
-const REMOTE_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a background round is kicked. Matches the catalog TTL: a scan that
 /// misses the cache is the signal that remote data is worth refreshing.
 const REMOTE_REFRESH_INTERVAL: Duration = AGENT_SESSION_SCAN_TTL;
