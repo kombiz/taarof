@@ -265,6 +265,15 @@ until the unvalidated areas above have been exercised.
   - `taarof-linux-x86_64.tar.gz.intoto.jsonl`
 8. Draft or refine the generated GitHub release notes from the merged changes.
 
+## taarof-remote helper releases
+
+The remote helper releases on its own tags, `taarof-remote-v<version>`, through
+`.github/workflows/release-remote.yml`. These releases publish only the static
+helper asset, as a pre-release that never becomes "Latest". The promotion and
+sign-off steps above apply to the desktop app's `v*` releases, not to the
+helper. See `docs/remote-helper.md` for the asset, the rehearsal, and the
+mise pin.
+
 ## GitHub release tarball policy
 
 - `.github/workflows/release.yml` permits non-publishing exact-commit rehearsals

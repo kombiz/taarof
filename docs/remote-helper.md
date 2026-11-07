@@ -77,13 +77,18 @@ For local work, build on a headless Linux host with
 `cargo build -p taarof-remote --release`. This selects only the helper and its
 non-GTK dependencies. The workspace's default member remains the desktop app.
 
-Releases ship the helper as its own asset, built static for
-`x86_64-unknown-linux-musl` so it runs on every fleet host whatever its glibc:
+The helper has its own release line, separate from the desktop app's `v*`
+releases. Push an annotated tag `taarof-remote-v<version>`, where `<version>`
+is the `taarof-remote/Cargo.toml` version; `.github/workflows/release-remote.yml`
+refuses a tag that does not match. The workflow builds the helper static for
+`x86_64-unknown-linux-musl`, so it runs on every fleet host whatever its glibc.
+It publishes a pre-release that never becomes "Latest", with these assets:
 
 - `taarof-remote-x86_64-unknown-linux-musl.tar.gz`: one directory holding
   `taarof-remote` and the licenses
 - `….tar.gz.sha256` and `….tar.gz.intoto.jsonl` (build provenance)
 
+Rehearse without publishing: `gh workflow run release-remote.yml -f commit=<sha>`.
 `packaging/linux/remote-helper-bundle.sh` builds the asset and refuses a
 dynamically linked binary. `testing/test-remote-helper-bundle.sh` checks its
 layout, checksum and reproducibility.
@@ -91,7 +96,7 @@ layout, checksum and reproducibility.
 Mise owns installation on each host. The dotfiles dev-host tier pins it:
 
 ```toml
-"github:kombiz/taarof" = { version = "<release>", asset_pattern = "taarof-remote-x86_64-unknown-linux-musl.tar.gz", os = ["linux"] }
+"github:kombiz/taarof" = { version = "<version>", version_prefix = "taarof-remote-v", asset_pattern = "taarof-remote-x86_64-unknown-linux-musl.tar.gz", os = ["linux"] }
 ```
 
 Do not hand-copy a binary from the desktop, use a curl installer, or add a
