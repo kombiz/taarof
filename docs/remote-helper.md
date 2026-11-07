@@ -88,7 +88,10 @@ It publishes a pre-release that never becomes "Latest", with these assets:
   `taarof-remote` and the licenses
 - `….tar.gz.sha256` and `….tar.gz.intoto.jsonl` (build provenance)
 
-Rehearse without publishing: `gh workflow run release-remote.yml -f commit=<sha>`.
+Rehearse without publishing, on the exact tip of a branch:
+`gh workflow run release-remote.yml --ref <branch> -f commit=<that branch's tip SHA>`.
+The workflow refuses any other commit, so the rehearsal's attestation always
+describes the commit it built.
 `packaging/linux/remote-helper-bundle.sh` builds the asset and refuses a
 dynamically linked binary. `testing/test-remote-helper-bundle.sh` checks its
 layout, checksum and reproducibility.

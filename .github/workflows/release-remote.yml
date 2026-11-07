@@ -55,13 +55,18 @@ jobs:
       - name: Trust checkout directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      # Provenance names GITHUB_SHA, the dispatch ref's tip. Rehearse only that
+      # exact tip, so the attestation describes the commit actually built.
       - name: Validate rehearsal commit
         if: github.event_name == 'workflow_dispatch'
         env:
           REQUESTED_COMMIT: ${{ inputs.commit }}
         run: |
           printf '%s\n' "$REQUESTED_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
-          test "$REQUESTED_COMMIT" = "$GITHUB_SHA"
+          if [ "$REQUESTED_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "::error::commit $REQUESTED_COMMIT is not the tip of $GITHUB_REF ($GITHUB_SHA). Dispatch with --ref set to a branch whose tip is that commit."
+            exit 1
+          fi
           test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
 
       # mise pins the crate version; the tag must carry exactly that version.
