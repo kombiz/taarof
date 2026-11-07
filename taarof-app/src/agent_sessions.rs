@@ -572,11 +572,12 @@ impl RemoteSessionProbe {
                 .iter()
                 .find(|(name, _)| name == &target.host)
                 .map(|(_, cache)| cache);
-            // A healthy stream wins. A degraded one keeps its records only
-            // when they are newer than the cache's.
+            // A healthy stream wins. A degraded one loses only to strictly
+            // newer cached records; on a tie (the cache holds a copy of the
+            // same records) its failure must show.
             let cache = match live.as_ref() {
                 Some(live) if live.last_error.is_none() => Some(live),
-                Some(live) if cached.is_some_and(|c| c.observed_at >= live.observed_at) => cached,
+                Some(live) if cached.is_some_and(|c| c.observed_at > live.observed_at) => cached,
                 Some(live) => Some(live),
                 None => cached,
             };
@@ -1492,6 +1493,49 @@ mod tests {
             let (statuses, sessions) = probe.sections();
             assert_eq!(sessions[0].session_id, "newer");
             assert_eq!(statuses[0].error.as_deref(), Some("ssh: timed out"));
+        }
+
+        #[test]
+        fn test_remote_stream_failed_sample_shows_even_when_the_cache_holds_the_same_records() {
+            let runner = Arc::new(ScriptedRunner::new(vec![]));
+            let streams = Arc::new(FakeStreams::default());
+            let probe = RemoteSessionProbe::manual_with_streams(
+                Arc::clone(&runner) as Arc<dyn RemoteCommandRunner>,
+                Arc::new(FixedHosts(vec![gpu_box()])),
+                Arc::clone(&streams) as Arc<dyn RemoteStreams>,
+            );
+            let at = Instant::now();
+            let live = |error: Option<&str>| LiveHost {
+                sessions: vec![streamed_record("a")],
+                stats: agent_session_core::remote_stream::Stats::default(),
+                error: error.map(str::to_string),
+                observed_at: at,
+                observed_at_unix_ms: 7,
+                metrics: None,
+            };
+            let target = gpu_box().ssh_target;
+            // A healthy round caches snapshot A.
+            streams
+                .live
+                .lock()
+                .unwrap()
+                .insert(target.clone(), live(None));
+            probe.refresh_blocking();
+            let (statuses, _) = probe.sections();
+            assert!(statuses[0].ok && !statuses[0].stale && statuses[0].error.is_none());
+
+            // The next sample fails; the stream retains A at the same time.
+            let failure = "taarof-remote enumeration failed or timed out";
+            streams
+                .live
+                .lock()
+                .unwrap()
+                .insert(target, live(Some(failure)));
+            let (statuses, sessions) = probe.sections();
+            assert_eq!(sessions[0].session_id, "a");
+            assert!(!statuses[0].ok, "a failed sample is not ok");
+            assert!(statuses[0].stale, "a failed sample is degraded");
+            assert_eq!(statuses[0].error.as_deref(), Some(failure));
         }
 
         #[test]
