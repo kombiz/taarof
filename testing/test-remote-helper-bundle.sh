@@ -26,6 +26,17 @@ fi
 grep -F "dynamically linked" "$fixture/err" >/dev/null
 test ! -e "$fixture/dist/$artifact.tar.gz"
 
+# A file readelf cannot inspect is refused, not packaged.
+printf '%s\n' 'not an ELF file' >"$release_dir/taarof-remote"
+chmod 755 "$release_dir/taarof-remote"
+if bash "$repo_root/packaging/linux/remote-helper-bundle.sh" "$fixture/dist" \
+    >/dev/null 2>"$fixture/err"; then
+    echo "remote helper bundle accepted a file it could not inspect" >&2
+    exit 1
+fi
+grep -F "could not read ELF program headers" "$fixture/err" >/dev/null
+test ! -e "$fixture/dist/$artifact.tar.gz"
+
 # The dynamic loader has no program interpreter of its own, so it stands in
 # for a static binary without needing the musl target here.
 loader="$(readelf -l "$(type -P env)" | sed -n 's/.*program interpreter: \(.*\)]/\1/p')"

@@ -18,8 +18,13 @@ if [[ ! -x "$binary_path" ]]; then
     exit 1
 fi
 # The asset must run on every fleet host whatever its glibc. A dynamically
-# linked binary names a program interpreter; refuse one.
-if readelf -l "$binary_path" | grep -q 'program interpreter'; then
+# linked binary names a program interpreter; refuse one. A failed inspection
+# is a failure, not a pass.
+if ! program_headers="$(LC_ALL=C readelf -lW "$binary_path")"; then
+    echo "could not read ELF program headers of $binary_path" >&2
+    exit 1
+fi
+if grep -q 'program interpreter' <<<"$program_headers"; then
     echo "taarof-remote is dynamically linked; build it for $target" >&2
     exit 1
 fi
