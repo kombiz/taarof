@@ -34,6 +34,7 @@ cleanup() {
 trap cleanup EXIT
 
 bash "$repo_root/testing/test-release-bundle-provenance.sh"
+bash "$repo_root/testing/test-remote-helper-bundle.sh"
 python3 "$repo_root/testing/test_bundle_provenance.py"
 python3 "$repo_root/testing/test_agent_launcher_smoke.py"
 python3 "$repo_root/testing/test_install_channel.py"

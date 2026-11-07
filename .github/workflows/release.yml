@@ -68,6 +68,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # taarof-remote ships as a static musl binary (see below).
+          targets: x86_64-unknown-linux-musl
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -95,8 +98,20 @@ jobs:
       - name: Build Linux release tarball
         run: bash packaging/linux/release-bundle.sh dist/release
 
-      - name: Verify release checksum
-        run: sha256sum -c taarof-linux-x86_64.tar.gz.sha256
+      # The remote helper runs on every fleet host over SSH, whatever its
+      # glibc (Ubuntu 24.04 has 2.39; this image has 2.41). Build it static.
+      # mise installs this asset on each host (docs/remote-helper.md).
+      - name: Build taarof-remote helper asset
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl --manifest-path taarof-remote/Cargo.toml
+          bash packaging/linux/remote-helper-bundle.sh dist/release
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/usr/src/taarof
+
+      - name: Verify release checksums
+        run: |
+          sha256sum -c taarof-linux-x86_64.tar.gz.sha256
+          sha256sum -c taarof-remote-x86_64-unknown-linux-musl.tar.gz.sha256
         working-directory: dist/release
 
       - name: Prove exact-head launcher installations
@@ -137,11 +152,27 @@ jobs:
             dist/release/taarof-linux-x86_64.tar.gz.intoto.jsonl
           test -s dist/release/taarof-linux-x86_64.tar.gz.intoto.jsonl
 
+      - name: Attest taarof-remote provenance
+        id: attest-remote
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz.sha256
+
+      - name: Stage taarof-remote provenance bundle
+        run: |
+          cp \
+            "${{ steps.attest-remote.outputs.bundle-path }}" \
+            dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz.intoto.jsonl
+          test -s dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz.intoto.jsonl
+
       - name: Verify release artifact set
         run: |
           test -s dist/release/taarof-linux-x86_64.tar.gz
           test -s dist/release/taarof-linux-x86_64.tar.gz.sha256
           test -s dist/release/taarof-linux-x86_64.tar.gz.intoto.jsonl
+          test -s dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz
+          test -s dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz.sha256
+          test -s dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz.intoto.jsonl
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -151,6 +182,9 @@ jobs:
             dist/release/taarof-linux-x86_64.tar.gz
             dist/release/taarof-linux-x86_64.tar.gz.sha256
             dist/release/taarof-linux-x86_64.tar.gz.intoto.jsonl
+            dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz
+            dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz.sha256
+            dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz.intoto.jsonl
           if-no-files-found: error
 
       - name: Retain exact-head launcher receipts
@@ -182,8 +216,10 @@ jobs:
           name: taarof-linux-x86_64
           path: dist/release
 
-      - name: Verify downloaded release checksum
-        run: sha256sum -c taarof-linux-x86_64.tar.gz.sha256
+      - name: Verify downloaded release checksums
+        run: |
+          sha256sum -c taarof-linux-x86_64.tar.gz.sha256
+          sha256sum -c taarof-remote-x86_64-unknown-linux-musl.tar.gz.sha256
         working-directory: dist/release
 
       - name: Verify downloaded release asset set
@@ -191,6 +227,9 @@ jobs:
           test -s dist/release/taarof-linux-x86_64.tar.gz
           test -s dist/release/taarof-linux-x86_64.tar.gz.sha256
           test -s dist/release/taarof-linux-x86_64.tar.gz.intoto.jsonl
+          test -s dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz
+          test -s dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz.sha256
+          test -s dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz.intoto.jsonl
 
       # The preceding checksum verification already proves the tarball and its
       # checksum are present; the asset-set check proves provenance is present
@@ -202,5 +241,8 @@ jobs:
             dist/release/taarof-linux-x86_64.tar.gz
             dist/release/taarof-linux-x86_64.tar.gz.sha256
             dist/release/taarof-linux-x86_64.tar.gz.intoto.jsonl
+            dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz
+            dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz.sha256
+            dist/release/taarof-remote-x86_64-unknown-linux-musl.tar.gz.intoto.jsonl
           fail_on_unmatched_files: true
           generate_release_notes: true
