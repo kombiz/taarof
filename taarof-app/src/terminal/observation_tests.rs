@@ -164,6 +164,7 @@ fn host_round_deduplicates_exact_hosts_and_preserves_failure_fanout() {
     let calls = AtomicUsize::new(0);
     let results = observe_hosts(
         vec![(1, "a.ts".into()), (2, "a.ts".into()), (3, "b.ts".into())],
+        |_| None,
         |argv| {
             calls.fetch_add(1, Ordering::SeqCst);
             Err(format!("fixture failure {}", argv[5]))
@@ -173,6 +174,27 @@ fn host_round_deduplicates_exact_hosts_and_preserves_failure_fanout() {
     assert_eq!(results.len(), 3);
     assert_eq!(results[0].2, results[1].2);
     assert_ne!(results[0].2, results[2].2);
+}
+
+#[test]
+fn host_round_uses_streamed_metrics_and_probes_only_the_rest() {
+    let calls = std::sync::Mutex::new(Vec::new());
+    let streamed = crate::host::HostStatus {
+        session_count: 2,
+        cpu_load_percent: 10.0,
+        memory_used_percent: 20.0,
+    };
+    let results = observe_hosts(
+        vec![(1, "streamed.ts".into()), (2, "probed.ts".into())],
+        |host| (host == "streamed.ts").then(|| streamed.clone()),
+        |argv| {
+            calls.lock().unwrap().push(argv[5].clone());
+            Err("fixture failure".into())
+        },
+    );
+    assert_eq!(*calls.lock().unwrap(), vec!["probed.ts".to_string()]);
+    assert_eq!(results[0].2, Ok(streamed));
+    assert!(results[1].2.is_err());
 }
 
 #[test]

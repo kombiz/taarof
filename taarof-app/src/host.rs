@@ -144,6 +144,24 @@ pub fn parse_probe_output(output: &str) -> Option<HostStatus> {
     })
 }
 
+/// Host status from a `taarof-remote` heartbeat, with the same rules as
+/// [`parse_probe_output`]: load and memory are required, nproc defaults to 4,
+/// and a missing tmux count reads as zero sessions.
+pub fn status_from_metrics(
+    metrics: &agent_session_core::remote_stream::Metrics,
+) -> Option<HostStatus> {
+    let load = metrics
+        .load
+        .filter(|load| load.is_finite() && *load >= 0.0)?;
+    let mem = metrics.mem.as_ref().filter(|mem| mem.total_bytes > 0)?;
+    let nproc = f64::from(metrics.nproc.filter(|n| *n > 0).unwrap_or(4));
+    Some(HostStatus {
+        session_count: metrics.tmux_session_count.unwrap_or(0),
+        cpu_load_percent: (load / nproc) * 100.0,
+        memory_used_percent: (mem.used_bytes as f64 / mem.total_bytes as f64) * 100.0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +324,47 @@ Mem:  16000  8000   4000    200   2400  5400
 ";
 
         assert!(parse_probe_output(output).is_none());
+    }
+
+    #[test]
+    fn test_status_from_stream_metrics_matches_probe_rules() {
+        use agent_session_core::remote_stream::{Memory, Metrics};
+        let metrics = Metrics {
+            load: Some(2.4),
+            mem: Some(Memory {
+                total_bytes: 32_000,
+                used_bytes: 16_000,
+            }),
+            nproc: Some(8),
+            tmux_session_count: Some(5),
+        };
+        let status = status_from_metrics(&metrics).expect("complete metrics");
+        assert_eq!(status.session_count, 5);
+        assert!((status.cpu_load_percent - 30.0).abs() < 0.01);
+        assert!((status.memory_used_percent - 50.0).abs() < 0.01);
+
+        let partial = Metrics {
+            nproc: None,
+            tmux_session_count: None,
+            ..metrics.clone()
+        };
+        let status = status_from_metrics(&partial).expect("optional fields default");
+        assert_eq!(status.session_count, 0);
+        assert!((status.cpu_load_percent - 60.0).abs() < 0.01);
+
+        assert!(status_from_metrics(&Metrics {
+            load: None,
+            ..metrics.clone()
+        })
+        .is_none());
+        assert!(status_from_metrics(&Metrics {
+            mem: Some(Memory {
+                total_bytes: 0,
+                used_bytes: 0
+            }),
+            ..metrics
+        })
+        .is_none());
     }
 
     #[test]

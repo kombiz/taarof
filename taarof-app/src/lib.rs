@@ -33,6 +33,7 @@ mod probe;
 mod project_config;
 mod projects;
 pub mod pty_broker;
+mod remote_stream_client;
 mod review;
 mod runtime;
 pub mod runtime_identity;

@@ -140,7 +140,7 @@ pub(crate) fn wrap_for_target_noninteractive(
     }
 }
 
-fn quote_remote_shell_arg(arg: String) -> String {
+pub(crate) fn quote_remote_shell_arg(arg: String) -> String {
     if arg.is_empty() {
         return "''".to_string();
     }
