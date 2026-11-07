@@ -73,14 +73,30 @@ traffic or CPU speedup claim.
 
 ## Build and host ownership
 
-Build on a headless Linux host with `cargo build -p taarof-remote --release`.
-This selects only the helper and its non-GTK dependencies. The workspace's
-default member remains the desktop app.
+For local work, build on a headless Linux host with
+`cargo build -p taarof-remote --release`. This selects only the helper and its
+non-GTK dependencies. The workspace's default member remains the desktop app.
 
-Mise owns installation on each host. Register the helper in that host's managed
-mise tool configuration, with an approved source/version, and install through
-mise. Do not hand-copy a binary from the desktop, use a curl installer, or add
-a second tool owner. This slice does not change fleet tool pins or install it.
+Releases ship the helper as its own asset, built static for
+`x86_64-unknown-linux-musl` so it runs on every fleet host whatever its glibc:
+
+- `taarof-remote-x86_64-unknown-linux-musl.tar.gz`: one directory holding
+  `taarof-remote` and the licenses
+- `….tar.gz.sha256` and `….tar.gz.intoto.jsonl` (build provenance)
+
+`packaging/linux/remote-helper-bundle.sh` builds the asset and refuses a
+dynamically linked binary. `testing/test-remote-helper-bundle.sh` checks its
+layout, checksum and reproducibility.
+
+Mise owns installation on each host. The dotfiles dev-host tier pins it:
+
+```toml
+"github:kombiz/taarof" = { version = "<release>", asset_pattern = "taarof-remote-x86_64-unknown-linux-musl.tar.gz", os = ["linux"] }
+```
+
+Do not hand-copy a binary from the desktop, use a curl installer, or add a
+second tool owner. Non-interactive SSH may lack mise's shims on PATH; the app's
+remote command adds `~/.local/share/mise/shims` for that case.
 
 ## App consumer (slice 2)
 
