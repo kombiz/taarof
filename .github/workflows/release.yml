@@ -168,6 +168,14 @@ jobs:
     permissions:
       contents: write
     steps:
+      # linux-tarball runs as root in a container over this shared workspace
+      # and can leave a root-owned dist/release on this runner. Reclaim it so
+      # the download can overwrite earlier assets (#101).
+      - name: Reclaim workspace ownership
+        run: |
+          sudo -n chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" \
+            || echo "::warning::Could not reclaim workspace ownership; the download may fail on root-owned leftovers (#101)."
+
       - name: Download release artifact
         uses: actions/download-artifact@v4
         with:
