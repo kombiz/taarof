@@ -379,6 +379,20 @@ fn stream_warning(stats: &agent_session_core::remote_stream::Stats) -> Option<St
     join_warnings(parts)
 }
 
+/// The cache entry whose good records were observed last. Ties keep `cached`.
+fn newest(
+    cached: Option<RemoteHostCache>,
+    streamed: Option<RemoteHostCache>,
+) -> Option<RemoteHostCache> {
+    match (cached, streamed) {
+        (Some(cached), Some(streamed)) if streamed.observed_at > cached.observed_at => {
+            Some(streamed)
+        }
+        (Some(cached), _) => Some(cached),
+        (None, streamed) => streamed,
+    }
+}
+
 fn join_warnings(parts: impl IntoIterator<Item = String>) -> Option<String> {
     let parts: Vec<String> = parts.into_iter().collect();
     (!parts.is_empty()).then(|| parts.join(" "))
@@ -481,13 +495,16 @@ impl RemoteSessionProbe {
         }
         let mut observed: Vec<(String, RemoteHostCache)> = Vec::new();
         for target in targets {
-            if let Some(live) = self.live(&target) {
+            let live = self.live(&target);
+            if let Some(live) = live.clone().filter(|live| live.last_error.is_none()) {
                 // Keep the stream's view as this round's cache, so a stream
                 // that drops degrades exactly like a shell probe would.
                 observed.push((target.host.clone(), live));
                 continue;
             }
-            let previous = self.cached_host(&target.host);
+            // No stream, or its latest sample failed: the shell probe runs.
+            // If it fails too, keep the newest good records from either source.
+            let previous = newest(self.cached_host(&target.host), live);
             let outcome = self
                 .runner
                 .run(&remote_enumeration_command(&target.ssh_target));
@@ -550,13 +567,19 @@ impl RemoteSessionProbe {
         let mut statuses = Vec::new();
         let mut sessions = Vec::new();
         for (target, (live, note)) in targets.into_iter().zip(streamed) {
-            let cache = live.as_ref().or_else(|| {
-                state
-                    .hosts
-                    .iter()
-                    .find(|(name, _)| name == &target.host)
-                    .map(|(_, cache)| cache)
-            });
+            let cached = state
+                .hosts
+                .iter()
+                .find(|(name, _)| name == &target.host)
+                .map(|(_, cache)| cache);
+            // A healthy stream wins. A degraded one keeps its records only
+            // when they are newer than the cache's.
+            let cache = match live.as_ref() {
+                Some(live) if live.last_error.is_none() => Some(live),
+                Some(live) if cached.is_some_and(|c| c.observed_at >= live.observed_at) => cached,
+                Some(live) => Some(live),
+                None => cached,
+            };
             let Some(cache) = cache else {
                 statuses.push(RemoteHostStatus {
                     host: target.host,
@@ -612,14 +635,10 @@ impl RemoteSessionProbe {
     }
 
     /// A fresh stream view for this host, stamped, or None.
-    /// A degraded stream (its latest sample failed) is not used: the shell
-    /// probe runs instead, and the newest successful records from either
-    /// source stay in the cache, as for any failed host.
+    /// The stream's view for this host, stamped. A degraded stream (latest
+    /// sample failed) carries `last_error` and its last good records.
     fn live(&self, target: &RemoteHostTarget) -> Option<RemoteHostCache> {
         let live = self.streams.as_ref()?.live(&target.ssh_target)?;
-        if live.error.is_some() {
-            return None;
-        }
         Some(live_cache(target, live))
     }
 
@@ -1386,7 +1405,10 @@ mod tests {
                 Arc::new(FixedHosts(vec![gpu_box()])),
                 Arc::clone(&streams) as Arc<dyn RemoteStreams>,
             );
-            // The shell probe found two newer sessions.
+            // The stream's records were observed first; then the shell probe
+            // found two newer sessions.
+            let stream_observed_at = Instant::now();
+            std::thread::sleep(Duration::from_millis(5));
             probe.refresh_blocking();
             assert_eq!(probe.sections().0[0].session_count, 2);
 
@@ -1398,7 +1420,7 @@ mod tests {
                     sessions: vec![streamed_record("old")],
                     stats: agent_session_core::remote_stream::Stats::default(),
                     error: Some("taarof-remote enumeration failed or timed out".into()),
-                    observed_at: Instant::now(),
+                    observed_at: stream_observed_at,
                     observed_at_unix_ms: 1,
                     metrics: None,
                 },
@@ -1412,6 +1434,64 @@ mod tests {
                 2,
                 "a degraded stream does not skip the shell probe"
             );
+        }
+
+        #[test]
+        fn test_remote_stream_newer_snapshot_survives_failed_sample_and_failed_shell() {
+            let runner = Arc::new(ScriptedRunner::new(vec![Err("ssh: timed out".into())]));
+            let streams = Arc::new(FakeStreams::default());
+            let probe = RemoteSessionProbe::manual_with_streams(
+                Arc::clone(&runner) as Arc<dyn RemoteCommandRunner>,
+                Arc::new(FixedHosts(vec![gpu_box()])),
+                Arc::clone(&streams) as Arc<dyn RemoteStreams>,
+            );
+            let live = |id: &str, error: Option<&str>, at: Instant| LiveHost {
+                sessions: vec![streamed_record(id)],
+                stats: agent_session_core::remote_stream::Stats::default(),
+                error: error.map(str::to_string),
+                observed_at: at,
+                observed_at_unix_ms: 1,
+                metrics: None,
+            };
+            let target = gpu_box().ssh_target;
+            // A round caches snapshot "older".
+            streams
+                .live
+                .lock()
+                .unwrap()
+                .insert(target.clone(), live("older", None, Instant::now()));
+            probe.refresh_blocking();
+            // Between rounds the stream delivers "newer", then a sample fails.
+            std::thread::sleep(Duration::from_millis(5));
+            let newer_at = Instant::now();
+            streams
+                .live
+                .lock()
+                .unwrap()
+                .insert(target.clone(), live("newer", None, newer_at));
+            assert_eq!(probe.sections().1[0].session_id, "newer");
+            streams.live.lock().unwrap().insert(
+                target.clone(),
+                live(
+                    "newer",
+                    Some("taarof-remote enumeration failed or timed out"),
+                    newer_at,
+                ),
+            );
+            let (statuses, sessions) = probe.sections();
+            assert_eq!(
+                sessions[0].session_id, "newer",
+                "newer stream records survive"
+            );
+            assert!(statuses[0].stale, "a failed sample is degraded");
+
+            // The shell probe runs and fails too; "newer" is what gets cached.
+            probe.refresh_blocking();
+            assert_eq!(runner.calls().len(), 1);
+            streams.live.lock().unwrap().clear();
+            let (statuses, sessions) = probe.sections();
+            assert_eq!(sessions[0].session_id, "newer");
+            assert_eq!(statuses[0].error.as_deref(), Some("ssh: timed out"));
         }
 
         #[test]
