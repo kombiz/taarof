@@ -1,0 +1,172 @@
+name: Release taarof-remote
+
+# The remote helper ships on its own tags (taarof-remote-v<crate version>),
+# separate from the desktop app's v* releases and their promotion and
+# sign-off playbook (docs/release.md). Mise installs it on each fleet host
+# from these releases (docs/remote-helper.md).
+on:
+  push:
+    tags:
+      - "taarof-remote-v*"
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Exact commit SHA to rehearse without publishing
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && 'dispatch' || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+env:
+  ASSET: taarof-remote-x86_64-unknown-linux-musl.tar.gz
+
+jobs:
+  helper-asset:
+    if: github.repository == 'kombiz/taarof'
+    runs-on: [self-hosted, onlyarag-taarof-x64]
+    container:
+      image: mirror.gcr.io/library/debian:trixie-slim
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            git \
+            gzip \
+            tar
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit || github.sha }}
+          persist-credentials: false
+
+      - name: Trust checkout directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # Provenance names GITHUB_SHA, the dispatch ref's tip. Rehearse only that
+      # exact tip, so the attestation describes the commit actually built.
+      - name: Validate rehearsal commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REQUESTED_COMMIT: ${{ inputs.commit }}
+        run: |
+          printf '%s\n' "$REQUESTED_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+          if [ "$REQUESTED_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "::error::commit $REQUESTED_COMMIT is not the tip of $GITHUB_REF ($GITHUB_SHA). Dispatch with --ref set to a branch whose tip is that commit."
+            exit 1
+          fi
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+
+      # mise pins the crate version; the tag must carry exactly that version.
+      - name: Validate tag matches the crate version
+        if: github.event_name == 'push'
+        run: |
+          tag_version="${GITHUB_REF_NAME#taarof-remote-v}"
+          crate_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' taarof-remote/Cargo.toml | head -n 1)"
+          echo "tag=$tag_version crate=$crate_version"
+          test -n "$crate_version"
+          test "$tag_version" = "$crate_version"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      # Static, so it runs on every fleet host whatever its glibc.
+      - name: Build taarof-remote helper asset
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl --manifest-path taarof-remote/Cargo.toml
+          bash testing/test-remote-helper-bundle.sh
+          bash packaging/linux/remote-helper-bundle.sh dist/release
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/usr/src/taarof
+
+      - name: Verify checksum and smoke-run the helper
+        run: |
+          sha256sum -c "$ASSET.sha256"
+          extract="$(mktemp -d)"
+          tar -xzf "$ASSET" -C "$extract"
+          helper="$extract/taarof-remote-x86_64-unknown-linux-musl/taarof-remote"
+          # stdin stays open for five seconds; the first line must be hello.
+          first="$( (sleep 5) | timeout 20 "$helper" stream | head -n 1)"
+          printf '%s\n' "$first" | grep -q '"type":"hello"'
+        working-directory: dist/release
+
+      - name: Attest provenance
+        id: attest
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/release/${{ env.ASSET }}.sha256
+
+      - name: Stage provenance bundle
+        run: |
+          cp "${{ steps.attest.outputs.bundle-path }}" "dist/release/$ASSET.intoto.jsonl"
+          test -s "dist/release/$ASSET.intoto.jsonl"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: taarof-remote-x86_64-unknown-linux-musl
+          path: |
+            dist/release/${{ env.ASSET }}
+            dist/release/${{ env.ASSET }}.sha256
+            dist/release/${{ env.ASSET }}.intoto.jsonl
+          if-no-files-found: error
+
+      - name: Restore host workspace ownership
+        if: always()
+        run: chown -R 1000:1000 "$GITHUB_WORKSPACE"
+
+  publish:
+    needs: helper-asset
+    if: github.repository == 'kombiz/taarof' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/taarof-remote-v')
+    runs-on: [self-hosted, onlyarag-taarof-x64]
+    permissions:
+      contents: write
+    steps:
+      # The container job above shares this runner's workspace (#101).
+      - name: Reclaim workspace ownership
+        run: |
+          sudo -n chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" \
+            || echo "::warning::Could not reclaim workspace ownership; the download may fail on root-owned leftovers (#101)."
+
+      - name: Download helper asset
+        uses: actions/download-artifact@v4
+        with:
+          name: taarof-remote-x86_64-unknown-linux-musl
+          path: dist/release
+
+      - name: Verify downloaded asset set
+        run: |
+          sha256sum -c "$ASSET.sha256"
+          test -s "$ASSET.intoto.jsonl"
+        working-directory: dist/release
+
+      # A pre-release that is never "Latest": the desktop app's v* releases
+      # keep that slot.
+      - name: Publish helper release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: taarof-remote ${{ github.ref_name }}
+          prerelease: true
+          make_latest: "false"
+          files: |
+            dist/release/${{ env.ASSET }}
+            dist/release/${{ env.ASSET }}.sha256
+            dist/release/${{ env.ASSET }}.intoto.jsonl
+          fail_on_unmatched_files: true
+          body: |
+            Observe-only remote host helper for taarof (`taarof-remote stream`).
+            Static Linux x86_64 build. Install it through mise; see docs/remote-helper.md.
