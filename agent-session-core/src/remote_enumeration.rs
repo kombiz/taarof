@@ -349,9 +349,6 @@ fn parse_remote_kimi_index(modified_at_unix_ms: u64, lines: &[Value]) -> Vec<Age
         .collect()
 }
 
-/// Bytes read from the end of the kimi index. The shell sampler keeps its last
-/// [`REMOTE_MAX_FILES_PER_PROVIDER`] lines; this bounds the read that finds them.
-const LOCAL_KIMI_TAIL_BYTES: u64 = 1024 * 1024;
 /// The local discovery reader's limits: lines read per file, bytes per line,
 /// bytes per file.
 const LOCAL_MAX_LINES: usize = 64;
@@ -604,7 +601,9 @@ impl LocalEnumerator {
                 return cached.clone();
             }
         }
-        let Ok((lines, unparsable_lines)) = read_kimi_tail(path, identity.len) else {
+        let Ok((lines, unparsable_lines)) =
+            read_kimi_tail(path, identity.len, LOCAL_MAX_FILE_BYTES)
+        else {
             self.cache.remove(path);
             return CachedFile::default();
         };
@@ -638,27 +637,29 @@ fn account(
 }
 
 /// The last [`REMOTE_MAX_FILES_PER_PROVIDER`] lines of the kimi index, parsed,
-/// plus how many of them were not valid JSON.
-fn read_kimi_tail(path: &std::path::Path, len: u64) -> std::io::Result<(Vec<Value>, usize)> {
+/// plus how many of them were not valid JSON. Like `tail -n`, over at most the
+/// last `window` bytes; a real index is far smaller and is read whole.
+fn read_kimi_tail(
+    path: &std::path::Path,
+    len: u64,
+    window: u64,
+) -> std::io::Result<(Vec<Value>, usize)> {
     use std::io::{Read, Seek, SeekFrom};
-    // Start one byte early: if that byte is a newline, the window begins on a
-    // line boundary and its first line is whole.
-    let start = len.saturating_sub(LOCAL_KIMI_TAIL_BYTES + 1);
+    let start = len.saturating_sub(window);
+    // Also read the byte before the window: a newline there means the
+    // window's first line is whole.
+    let lead = u64::from(start > 0);
     let mut bytes = Vec::new();
     let mut file = std::fs::File::open(path)?;
-    file.seek(SeekFrom::Start(start))?;
-    file.take(LOCAL_KIMI_TAIL_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    let window = if start > 0 {
-        // Drop the partial line (or the lone newline) before the window.
-        match bytes.iter().position(|byte| *byte == b'\n') {
-            Some(newline) => &bytes[newline + 1..],
-            None => &bytes[..0],
-        }
-    } else {
-        &bytes[..]
+    file.seek(SeekFrom::Start(start - lead))?;
+    file.take(len - start + lead).read_to_end(&mut bytes)?;
+    let whole = match (start, bytes.iter().position(|byte| *byte == b'\n')) {
+        (0, _) => &bytes[..],
+        // Skip the lead byte, or the line that crosses into the window.
+        (_, Some(newline)) => &bytes[newline + 1..],
+        (_, None) => &bytes[..0],
     };
-    let text = String::from_utf8_lossy(window);
+    let text = String::from_utf8_lossy(whole);
     let lines: Vec<&str> = text
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -985,46 +986,27 @@ mod local_enumerator_tests {
     }
 
     #[test]
-    fn kimi_tail_keeps_a_whole_first_line_on_a_newline_boundary() {
-        let home = home("kimi-boundary");
-        // 20 records filling the tail window exactly, behind a filler line.
-        let window = LOCAL_KIMI_TAIL_BYTES as usize;
-        let base = |n: usize, pad: usize| {
-            format!(
-                "{{\"sessionId\":\"b{n:02}\",\"workDir\":\"/w\",\"pad\":\"{}\"}}\n",
-                "z".repeat(pad)
-            )
+    fn kimi_tail_keeps_whole_lines_at_the_window_edge() {
+        let home = home("kimi-window");
+        let path = home.join("index.jsonl");
+        let line = |id: &str| format!("{{\"sessionId\":\"{id}\",\"workDir\":\"/w\"}}\n");
+        let (a, b) = (line("aa"), line("bb"));
+        fs::write(&path, format!("{a}{b}")).unwrap();
+        let len = (a.len() + b.len()) as u64;
+        let ids = |window| {
+            read_kimi_tail(&path, len, window)
+                .unwrap()
+                .0
+                .iter()
+                .map(|v| v["sessionId"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
         };
-        let overhead = base(0, 0).len();
-        let each = window / 20;
-        let mut records = String::new();
-        for n in 0..19 {
-            records.push_str(&base(n, each - overhead));
-        }
-        records.push_str(&base(19, window - 19 * each - overhead));
-        assert_eq!(records.len(), window);
-        let index = format!("{{\"filler\":true}}\n{records}");
-        write(&home, ".kimi-code/session_index.jsonl", &index);
-        let (sessions, stats) = run(&mut LocalEnumerator::default(), &home);
-        assert_eq!(sessions.len(), 20, "the boundary record is whole and kept");
-        assert_eq!(stats.unparsable_lines, 0);
-        fs::remove_dir_all(home).unwrap();
-    }
-
-    #[test]
-    fn kimi_tail_skips_the_fragment_of_a_mid_file_read() {
-        let home = home("kimi-big");
-        let filler = format!("{{\"pad\":\"{}\"}}\n", "z".repeat(200_000));
-        let mut index = filler.repeat(6);
-        index.push_str("{\"sessionId\":\"last\",\"workDir\":\"/w\"}\n");
-        write(&home, ".kimi-code/session_index.jsonl", &index);
-        let (sessions, stats) = run(&mut LocalEnumerator::default(), &home);
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, "last");
-        assert_eq!(
-            stats.unparsable_lines, 0,
-            "the leading fragment is not a record"
-        );
+        // Window starts exactly on `bb`: the newline before it proves it whole.
+        assert_eq!(ids(b.len() as u64), ["bb"]);
+        // Window starts one byte into `aa`: that fragment is not a record.
+        assert_eq!(ids(len - 1), ["bb"]);
+        // Window covers the file: both lines.
+        assert_eq!(ids(len), ["aa", "bb"]);
         fs::remove_dir_all(home).unwrap();
     }
 }
