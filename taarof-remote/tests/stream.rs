@@ -132,7 +132,7 @@ impl Drop for Stream {
 }
 
 #[test]
-fn helper_records_match_shell_probe_and_report_loss() {
+fn helper_records_match_shell_probe_and_keep_titles_past_wire_budgets() {
     let mut stream = Stream::start();
     let (_host, Event::Snapshot { sessions, stats }) = stream.initial() else {
         unreachable!()
@@ -165,7 +165,19 @@ fn helper_records_match_shell_probe_and_report_loss() {
     assert!(!stats.enumeration_failed);
     assert_eq!(metrics.nproc, Some(4));
     assert_eq!(metrics.tmux_session_count, Some(2));
-    // A bounded sample drops a whole oversize line and reports its loss.
+    // The helper reads on the host, past the shell sampler's wire budgets: a
+    // codex title behind 64 KiB of instruction lines still comes through,
+    // and a file that yields no session is counted.
+    let pad = "p".repeat(40_000);
+    fs::write(
+        stream.home.join(".codex/sessions/long.jsonl"),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"codex-long\",\"cwd\":\"/synthetic/project\",\"pad\":\"{pad}\"}}}}\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"developer\",\"content\":\"{pad}\"}}}}\n\
+             {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":\"ship the helper\"}}}}\n"
+        ),
+    )
+    .unwrap();
     fs::write(
         stream.home.join(".codex/sessions/oversize.jsonl"),
         format!("{}\n", "x".repeat(65537)),
@@ -173,11 +185,17 @@ fn helper_records_match_shell_probe_and_report_loss() {
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        assert!(Instant::now() < deadline, "loss update deadline");
-        if let Event::Snapshot { stats, .. } = stream.next()
-            && stats.records.dropped_lines == 1
+        assert!(Instant::now() < deadline, "update deadline");
+        if let Event::Snapshot { sessions, stats } = stream.next()
+            && stats.records.blocks_without_session == 1
         {
-            assert_eq!(stats.records.blocks_without_session, 1);
+            let long = sessions
+                .iter()
+                .find(|s| s.session_id == "codex-long")
+                .expect("long codex session");
+            assert_eq!(long.title, "ship the helper");
+            assert_eq!(stats.records.dropped_lines, 0);
+            assert_eq!(stats.records.truncated_files, 0);
             break;
         }
     }

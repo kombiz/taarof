@@ -46,30 +46,43 @@ load percentage. Unavailable metrics are `null`; a failed tmux query is
 not reported as zero sessions. Load and memory come from `/proc`. `nproc`
 and `tmux list-sessions` each have a one-second deadline.
 
-Session records use the exact shell sampler and parsers shared with the app's
-existing remote probe. This keeps provider paths, sorting and limits unchanged:
+Session records use the same file set and parsers as the app's SSH shell
+probe. The helper runs on the host and sends only parsed records, so it reads
+each file in-process with the **local** reader, not the shell probe's wire
+budgets. Remote titles therefore match what the host's own discovery shows.
 
 - Newest 20 files per Claude, Codex and Pi provider; last 20 Kimi index lines.
-- Scan the first 32 lines; keep up to 8 per record file.
-- Drop whole lines above 65,536 characters. Never cut JSON lines.
-- A 32,768-byte budget trims later lines. The first accepted line survives.
-- Read at most 8 MiB per enumeration; keep at most 60 parsed sessions.
+- Read up to 64 lines per record file, 1 MiB per line, 16 MiB per file.
+  A later oversized line ends the sample; it does not lose the record.
+- A file whose header is unreadable, malformed or over 1 MiB yields no session.
+- Keep at most 60 parsed sessions.
+- Cache each file's result by path, mtime and length. A poll re-reads only
+  files that changed. Files that disappear leave the cache.
+
+The SSH shell probe (the fallback) keeps its bounded sampler: 32 lines scanned,
+8 kept, 65,536 characters per line, a 32,768-byte budget after the first line,
+and 8 MiB per enumeration. Its loss counts still appear while a host runs on
+the fallback.
 
 `stats` reports `dropped_lines`, `unparsable_lines`, `truncated_files`, and
-`blocks_without_session`. `output_truncated` reports the aggregate reader
-cap. `enumeration_failed` reports a failed or timed-out sampler; that event
-has no session records. The sampler has the same 10-second deadline as the
-app's SSH probe (`REMOTE_SCAN_TIMEOUT`). Stats describe
-this sample, not lifetime totals. Enumeration is read-only, but like the shell
-probe it may include an early prompt as a session title. Treat the stream as
-private user metadata. Do not log it indiscriminately. Resume strings are
-metadata, not permission to execute; consumers must revalidate attachments.
+`blocks_without_session`. From the helper, `dropped_lines`, `truncated_files`
+and `output_truncated` stay zero: those are shell-sampler losses.
+`unparsable_lines` counts bad Kimi index lines. `blocks_without_session` counts
+files that yield no session; stores also hold non-session JSONL, so this count
+alone does not warn. `enumeration_failed` reports a failed, cancelled or
+timed-out sample; that event has no session records. The sample has the same
+10-second deadline as the app's SSH probe (`REMOTE_SCAN_TIMEOUT`), checked
+before each file read. Stats describe this sample, not lifetime totals.
+Enumeration is read-only, but like the shell probe it may include an early
+prompt as a session title. Treat the stream as private user metadata. Do not
+log it indiscriminately. Resume strings are metadata, not permission to
+execute; consumers must revalidate attachments.
 
 The helper polls every two seconds by default. It compares parsed sessions and
 stats rather than serializing raw record files into the output. Probe time
-adds to the poll interval. Heartbeats continue during child probes after the
-initial snapshot. The helper still invokes the shared shell sampler on each poll; it makes no
-traffic or CPU speedup claim.
+adds to the poll interval. Heartbeats continue during probes after the
+initial snapshot. Each poll still walks the store directories to find the
+newest files; only unchanged files skip the read.
 
 ## Build and host ownership
 

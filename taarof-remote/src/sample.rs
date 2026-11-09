@@ -1,8 +1,5 @@
 use agent_session_core::AgentSessionRecord;
-use agent_session_core::remote_enumeration::{
-    REMOTE_MAX_OUTPUT_BYTES, REMOTE_SCAN_TIMEOUT, parse_remote_enumeration_records,
-    remote_enumeration_script,
-};
+use agent_session_core::remote_enumeration::{LocalEnumerator, REMOTE_SCAN_TIMEOUT};
 use agent_session_core::remote_stream::{Memory, Metrics, Stats};
 use std::{fs, io, time::Duration};
 
@@ -13,19 +10,22 @@ pub struct Sample {
     pub metrics: Metrics,
 }
 
-pub fn sample(mut alive: impl FnMut() -> io::Result<()>) -> Sample {
+/// `enumerator` lives across polls, so unchanged record files are not re-read.
+pub fn sample(
+    enumerator: &mut LocalEnumerator,
+    mut alive: impl FnMut() -> io::Result<()>,
+) -> Sample {
     let mut stats = Stats::default();
-    let sessions = match crate::process::output(
-        crate::process::command("sh").args(["-c", &remote_enumeration_script()]),
-        REMOTE_SCAN_TIMEOUT,
-        REMOTE_MAX_OUTPUT_BYTES,
-        &mut alive,
-    ) {
-        Ok(output) => {
-            stats.output_truncated = output.truncated;
-            // Unstamped: the consumer stamps host and resume from its target.
-            let (sessions, records) =
-                parse_remote_enumeration_records(&String::from_utf8_lossy(&output.bytes));
+    // The helper runs on the host, so it reads record files in-process with
+    // the local limits; the SSH shell sampler's wire budgets do not apply.
+    // Records stay unstamped: the consumer stamps host and resume itself.
+    let enumerated = std::env::var_os("HOME")
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+        .and_then(|home| {
+            enumerator.enumerate(std::path::Path::new(&home), REMOTE_SCAN_TIMEOUT, &mut alive)
+        });
+    let sessions = match enumerated {
+        Ok((sessions, records)) => {
             stats.records = records;
             sessions
         }

@@ -685,9 +685,9 @@ fn read_pi_session_map(path: &Path) -> Result<Vec<PathBuf>, String> {
         .collect())
 }
 
-struct CandidateScan {
-    files: Vec<FileCandidate>,
-    error: Option<String>,
+pub(crate) struct CandidateScan {
+    pub(crate) files: Vec<FileCandidate>,
+    pub(crate) error: Option<String>,
 }
 
 enum CandidateEntry {
@@ -703,7 +703,7 @@ fn combine_discovery_errors(traversal: Option<String>, history: Option<String>) 
     }
 }
 
-fn collect_jsonl_candidates(root: &Path) -> Result<CandidateScan, String> {
+pub(crate) fn collect_jsonl_candidates(root: &Path) -> Result<CandidateScan, String> {
     collect_jsonl_candidates_with(root, |dir| {
         fs::read_dir(dir)
             .map_err(|_| "Session store directory is unreadable.".to_string())
@@ -807,12 +807,12 @@ const INCOMPLETE_APPEND_WARNING: &str =
     "Session history sample is partial: an incomplete trailing JSONL append was ignored.";
 
 #[derive(Debug, Default)]
-struct JsonlSample {
-    values: Vec<Value>,
-    incomplete_append: bool,
+pub(crate) struct JsonlSample {
+    pub(crate) values: Vec<Value>,
+    pub(crate) incomplete_append: bool,
 }
 
-fn read_jsonl_sample_lines(path: &Path) -> Result<JsonlSample, String> {
+pub(crate) fn read_jsonl_sample_lines(path: &Path) -> Result<JsonlSample, String> {
     read_bounded_jsonl(path, MAX_SAMPLE_LINES, false)
 }
 
@@ -1059,9 +1059,9 @@ pub fn unix_time_ms() -> u64 {
 }
 
 #[derive(Clone, Debug)]
-struct FileCandidate {
-    path: PathBuf,
-    modified_at_unix_ms: u64,
+pub(crate) struct FileCandidate {
+    pub(crate) path: PathBuf,
+    pub(crate) modified_at_unix_ms: u64,
 }
 
 #[cfg(test)]

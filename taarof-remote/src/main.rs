@@ -4,6 +4,7 @@ mod sample;
 
 use agent_session_core::{
     discovery::unix_time_ms,
+    remote_enumeration::LocalEnumerator,
     remote_stream::{Event, PROTOCOL_VERSION, event_line, snapshot_line},
 };
 use std::io;
@@ -151,11 +152,15 @@ struct Probe {
     stopped: Arc<AtomicBool>,
 }
 impl Probe {
-    fn start(stopped: Arc<AtomicBool>) -> Self {
+    fn start(stopped: Arc<AtomicBool>, enumerator: Arc<std::sync::Mutex<LocalEnumerator>>) -> Self {
         let (sender, result) = std::sync::mpsc::sync_channel(1);
         let flag = stopped.clone();
         let worker = std::thread::spawn(move || {
-            let snapshot = sample::sample(|| {
+            // One probe runs at a time, so this lock is never contended.
+            let mut enumerator = enumerator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let snapshot = sample::sample(&mut enumerator, || {
                 if flag.load(Ordering::Relaxed) {
                     Err(io::ErrorKind::BrokenPipe.into())
                 } else {
@@ -207,12 +212,13 @@ fn stream(options: Options) -> io::Result<()> {
     let mut previous = None;
     let mut metrics = None;
     let mut probe: Option<Probe> = None;
+    let enumerator = Arc::new(std::sync::Mutex::new(LocalEnumerator::default()));
     let mut next_poll = Instant::now();
     let mut next_heartbeat = Instant::now() + options.heartbeat;
     loop {
         lifecycle.check()?;
         if probe.is_none() && Instant::now() >= next_poll {
-            probe = Some(Probe::start(lifecycle.0.clone()));
+            probe = Some(Probe::start(lifecycle.0.clone(), enumerator.clone()));
         }
         if let Some(active) = &probe {
             match active.result.try_recv() {
