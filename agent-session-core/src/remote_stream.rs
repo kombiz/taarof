@@ -157,8 +157,8 @@ mod tests {
             json!({
                 "type":"snapshot", "sessions":[],
                 "stats":{"dropped_lines":0,"unparsable_lines":0,"truncated_files":0,
-                    "blocks_without_session":0,"output_truncated":false,"enumeration_failed":false,
-                    "sessions_omitted":0}
+                    "blocks_without_session":0,"stores_incomplete":0,"output_truncated":false,
+                    "enumeration_failed":false,"sessions_omitted":0}
             })
         );
         let heartbeat = Event::Heartbeat {
@@ -202,6 +202,17 @@ mod tests {
             Event::Heartbeat {
                 observed_at_unix_ms: 1,
                 metrics: Metrics::default()
+            }
+        );
+        // A 0.1/0.2 helper's stats omit `stores_incomplete`; it reads as zero.
+        let older = json!({"type":"snapshot","sessions":[],"stats":{"dropped_lines":0,
+            "unparsable_lines":0,"truncated_files":0,"blocks_without_session":0,
+            "output_truncated":false,"enumeration_failed":false,"sessions_omitted":0}});
+        assert_eq!(
+            serde_json::from_value::<Event>(older).unwrap(),
+            Event::Snapshot {
+                sessions: vec![],
+                stats: Stats::default()
             }
         );
     }
