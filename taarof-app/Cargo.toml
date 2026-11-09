@@ -37,7 +37,7 @@ getrandom = "0.2"
 base64 = "0.22"
 mime_guess = "2"
 notify-rust = "4"
-rusqlite = { version = "0.31", optional = true }
+rusqlite = { version = "0.41", optional = true, features = ["fallible_uint"] }
 signal-hook = "0.3"
 subtle = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }

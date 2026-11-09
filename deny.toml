@@ -19,6 +19,12 @@ allow = [
   "Unicode-3.0",
 ]
 
+# rusqlite 0.41's statement cache uses hashlink 0.12, which enables hashbrown's
+# default hasher, foldhash. Allow its Zlib license for that one crate only.
+[[licenses.exceptions]]
+crate = "foldhash"
+allow = ["Zlib"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
