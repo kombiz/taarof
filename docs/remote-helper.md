@@ -60,8 +60,10 @@ budgets. Remote titles therefore match what the host's own discovery shows.
 - Keep at most 60 parsed sessions.
 - Cache each file's sample by device, inode, length, mtime and ctime. An
   unchanged file is not re-read. Session stores are append-only, so an append
-  past a full 64-line (or byte-limited) sample reuses it with the new mtime.
-  A shorter file is re-read, so a new session picks up its title.
+  past a full 64-line (or byte-limited) sample reuses it with the new mtime,
+  but only while a hash of the file's first 64 KiB is unchanged: an in-place
+  rewrite on the same inode changes the header, so it is re-read. A shorter
+  file is re-read, so a new session picks up its title.
 - A failed read is not cached; the next poll retries it. Files that
   disappear leave the cache.
 
@@ -70,8 +72,12 @@ The SSH shell probe (the fallback) keeps its bounded sampler: 32 lines scanned,
 and 8 MiB per enumeration. Its loss counts still appear while a host runs on
 the fallback.
 
-`stats` reports `dropped_lines`, `unparsable_lines`, `truncated_files`, and
-`blocks_without_session`. From the helper, `dropped_lines` counts oversized
+`stats` reports `dropped_lines`, `unparsable_lines`, `truncated_files`,
+`blocks_without_session`, and (from helper 0.3.0) `stores_incomplete`.
+`stores_incomplete` counts session stores whose directory walk failed in whole
+or in part (an unreadable store or subtree); readable parts still yield their
+sessions, and a nonzero count warns. Older helpers omit the field and a reader
+treats it as zero. From the helper, `dropped_lines` counts oversized
 lines before a record, `unparsable_lines` counts invalid JSON lines, and
 `truncated_files` and `output_truncated` stay zero (shell-sampler losses).
 `blocks_without_session` counts files that yield no session, including files

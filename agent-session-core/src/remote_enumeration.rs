@@ -133,6 +133,11 @@ pub struct RemoteParseStats {
     pub truncated_files: usize,
     /// Blocks that yielded no session record at all.
     pub blocks_without_session: usize,
+    /// Session stores whose directory walk failed in whole or in part, so
+    /// sessions may be missing. Only the in-process helper reports it; older
+    /// helpers omit it and it reads as zero.
+    #[serde(default)]
+    pub stores_incomplete: usize,
 }
 
 impl RemoteParseStats {
@@ -142,7 +147,7 @@ impl RemoteParseStats {
 
     /// A short, honest summary, or None when nothing was lost.
     pub fn warning(&self) -> Option<String> {
-        if self.lost_lines() == 0 && self.truncated_files == 0 {
+        if self.lost_lines() == 0 && self.truncated_files == 0 && self.stores_incomplete == 0 {
             return None;
         }
         let mut parts = Vec::new();
@@ -162,6 +167,12 @@ impl RemoteParseStats {
             parts.push(format!(
                 "{} file(s) hit the {REMOTE_MAX_BLOCK_BYTES}-byte per-file budget",
                 self.truncated_files
+            ));
+        }
+        if self.stores_incomplete > 0 {
+            parts.push(format!(
+                "{} session store(s) could not be fully read",
+                self.stores_incomplete
             ));
         }
         if self.blocks_without_session > 0 {
@@ -354,6 +365,22 @@ fn parse_remote_kimi_index(modified_at_unix_ms: u64, lines: &[Value]) -> Vec<Age
 const LOCAL_MAX_LINES: usize = 64;
 const LOCAL_MAX_LINE_BYTES: u64 = 1024 * 1024;
 const LOCAL_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// Bytes hashed to tell an append from a rewrite before reusing a sample.
+const LOCAL_HEAD_BYTES: u64 = 64 * 1024;
+
+fn head_hash(path: &std::path::Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(LOCAL_HEAD_BYTES)
+        .read_to_end(&mut head)
+        .ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    head.hash(&mut hasher);
+    Some(hasher.finish())
+}
 
 /// JSONL session stores the helper reads, as `(provider, path under HOME,
 /// parser)`. Same set and same parsers as [`remote_enumeration_script`].
@@ -404,6 +431,9 @@ struct CachedFile {
     /// The sample stopped at a line or byte limit before the end of the file,
     /// so an append cannot change it.
     saturated: bool,
+    /// Hash of the file's first [`LOCAL_HEAD_BYTES`]: an append keeps it, an
+    /// in-place rewrite (which changes the header) does not.
+    head: u64,
 }
 
 /// One record file's head, read with the local limits. Unlike the local
@@ -481,6 +511,9 @@ fn read_helper_sample(path: &std::path::Path) -> std::io::Result<HelperSample> {
 #[derive(Default)]
 pub struct LocalEnumerator {
     cache: std::collections::HashMap<PathBuf, CachedFile>,
+    /// Record-file samples read, so tests can tell reuse from a re-read.
+    #[cfg(test)]
+    sample_reads: usize,
 }
 
 impl LocalEnumerator {
@@ -511,14 +544,21 @@ impl LocalEnumerator {
                 continue;
             }
             check()?;
-            // Like the shell's `find 2>/dev/null`: an unreadable store is
-            // skipped. The collector stops at 100,000 entries; fleet stores
-            // measured 2026-11-09 hold at most ~13,000.
+            // An unreadable store or subtree still yields what it can, but is
+            // counted so the consumer warns. The collector stops at 100,000
+            // entries; fleet stores measured 2026-11-09 hold at most ~13,000.
             let scan = crate::discovery::collect_jsonl_candidates(&root);
             check()?;
-            let Ok(scan) = scan else {
-                continue;
+            let scan = match scan {
+                Ok(scan) => scan,
+                Err(_) => {
+                    stats.stores_incomplete += 1;
+                    continue;
+                }
             };
+            if scan.error.is_some() {
+                stats.stores_incomplete += 1;
+            }
             for candidate in scan.files.into_iter().take(REMOTE_MAX_FILES_PER_PROVIDER) {
                 let file = self.jsonl_file(&candidate.path, candidate.modified_at_unix_ms, parser);
                 check()?;
@@ -560,7 +600,10 @@ impl LocalEnumerator {
             if cached.identity == identity {
                 return cached.clone();
             }
-            if cached.saturated && identity.appended_to(&cached.identity) {
+            if cached.saturated
+                && identity.appended_to(&cached.identity)
+                && head_hash(path) == Some(cached.head)
+            {
                 // The parsers stamp both times from the file mtime.
                 cached.identity = identity;
                 for record in &mut cached.records {
@@ -570,7 +613,11 @@ impl LocalEnumerator {
                 return cached.clone();
             }
         }
-        let Ok(sample) = read_helper_sample(path) else {
+        #[cfg(test)]
+        {
+            self.sample_reads += 1;
+        }
+        let (Some(head), Ok(sample)) = (head_hash(path), read_helper_sample(path)) else {
             // Not cached: a transient failure is retried on the next poll.
             self.cache.remove(path);
             return CachedFile::default();
@@ -582,6 +629,7 @@ impl LocalEnumerator {
                 .collect(),
             stats: sample.stats,
             saturated: sample.saturated,
+            head,
         };
         if sample.incomplete_append {
             self.cache.remove(path);
@@ -617,6 +665,7 @@ impl LocalEnumerator {
                 ..RemoteParseStats::default()
             },
             saturated: false,
+            head: 0,
         };
         self.cache.insert(path.to_path_buf(), file.clone());
         file
@@ -894,14 +943,11 @@ mod local_enumerator_tests {
         use std::io::Write;
         let home = home("append");
         let rel = ".claude/projects/p/a.jsonl";
-        let mut content = String::from("{\"sessionId\":\"long\",\"cwd\":\"/s\"}\n");
-        for n in 0..LOCAL_MAX_LINES + 6 {
-            content.push_str(&format!("{{\"n\":{n}}}\n"));
-        }
-        write(&home, rel, &content);
+        write(&home, rel, &big_body("long"));
         let mut enumerator = LocalEnumerator::default();
         let first = run(&mut enumerator, &home).0[0].updated_at_unix_ms;
         assert!(enumerator.cache.values().all(|file| file.saturated));
+        assert_eq!(enumerator.sample_reads, 1);
         std::thread::sleep(Duration::from_millis(20));
         let mut file = fs::OpenOptions::new()
             .append(true)
@@ -910,6 +956,10 @@ mod local_enumerator_tests {
         file.write_all(b"{\"n\":\"appended\"}\n").unwrap();
         drop(file);
         let after = run(&mut enumerator, &home).0;
+        assert_eq!(
+            enumerator.sample_reads, 1,
+            "the append past 64 KiB is not re-read"
+        );
         assert_eq!(after[0].session_id, "long");
         assert!(
             after[0].updated_at_unix_ms > first,
@@ -919,6 +969,73 @@ mod local_enumerator_tests {
             after[0].started_at_unix_ms,
             Some(after[0].updated_at_unix_ms)
         );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    /// A saturated record file larger than the 64 KiB head hash window.
+    fn big_body(id: &str) -> String {
+        let mut text = format!("{{\"sessionId\":\"{id}\",\"cwd\":\"/s\"}}\n");
+        for n in 0..LOCAL_MAX_LINES + 6 {
+            text.push_str(&format!("{{\"n\":{n},\"pad\":\"{}\"}}\n", "p".repeat(1200)));
+        }
+        assert!(text.len() as u64 > LOCAL_HEAD_BYTES);
+        text
+    }
+
+    #[test]
+    fn a_growing_rewrite_on_the_same_inode_is_re_read() {
+        let home = home("rewrite");
+        let rel = ".claude/projects/p/a.jsonl";
+        write(&home, rel, &big_body("old"));
+        let mut enumerator = LocalEnumerator::default();
+        assert_eq!(run(&mut enumerator, &home).0[0].session_id, "old");
+        let inode = |path: &Path| std::os::unix::fs::MetadataExt::ino(&fs::metadata(path).unwrap());
+        let before = inode(&home.join(rel));
+        // Truncate and rewrite in place: same inode, longer body, new header.
+        write(&home, rel, &format!("{}{{}}\n", big_body("new-id")));
+        assert_eq!(inode(&home.join(rel)), before);
+        assert_eq!(run(&mut enumerator, &home).0[0].session_id, "new-id");
+        assert_eq!(enumerator.sample_reads, 2, "the rewrite forced a re-read");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_store_or_subtree_is_counted_and_warns() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores directory modes
+        }
+        let home = home("traversal");
+        write(
+            &home,
+            ".claude/projects/ok/a.jsonl",
+            "{\"sessionId\":\"seen\",\"cwd\":\"/s\"}\n",
+        );
+        write(
+            &home,
+            ".claude/projects/locked/b.jsonl",
+            "{\"sessionId\":\"hidden\",\"cwd\":\"/s\"}\n",
+        );
+        write(&home, ".codex/sessions/c.jsonl", "{}\n");
+        let mode = |path: PathBuf, bits| {
+            fs::set_permissions(path, fs::Permissions::from_mode(bits)).unwrap()
+        };
+        mode(home.join(".claude/projects/locked"), 0o000);
+        mode(home.join(".codex/sessions"), 0o000);
+        let (sessions, stats) = run(&mut LocalEnumerator::default(), &home);
+        mode(home.join(".claude/projects/locked"), 0o755);
+        mode(home.join(".codex/sessions"), 0o755);
+        // The readable subtree still yields its session.
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "seen");
+        assert_eq!(
+            stats.stores_incomplete, 2,
+            "a locked subtree and a locked store"
+        );
+        assert!(stats
+            .warning()
+            .unwrap()
+            .contains("2 session store(s) could not be fully read"));
         fs::remove_dir_all(home).unwrap();
     }
 
