@@ -511,6 +511,9 @@ fn read_helper_sample(path: &std::path::Path) -> std::io::Result<HelperSample> {
 #[derive(Default)]
 pub struct LocalEnumerator {
     cache: std::collections::HashMap<PathBuf, CachedFile>,
+    /// Record-file samples read, so tests can tell reuse from a re-read.
+    #[cfg(test)]
+    sample_reads: usize,
 }
 
 impl LocalEnumerator {
@@ -609,6 +612,10 @@ impl LocalEnumerator {
                 }
                 return cached.clone();
             }
+        }
+        #[cfg(test)]
+        {
+            self.sample_reads += 1;
         }
         let (Some(head), Ok(sample)) = (head_hash(path), read_helper_sample(path)) else {
             // Not cached: a transient failure is retried on the next poll.
@@ -936,14 +943,11 @@ mod local_enumerator_tests {
         use std::io::Write;
         let home = home("append");
         let rel = ".claude/projects/p/a.jsonl";
-        let mut content = String::from("{\"sessionId\":\"long\",\"cwd\":\"/s\"}\n");
-        for n in 0..LOCAL_MAX_LINES + 6 {
-            content.push_str(&format!("{{\"n\":{n}}}\n"));
-        }
-        write(&home, rel, &content);
+        write(&home, rel, &big_body("long"));
         let mut enumerator = LocalEnumerator::default();
         let first = run(&mut enumerator, &home).0[0].updated_at_unix_ms;
         assert!(enumerator.cache.values().all(|file| file.saturated));
+        assert_eq!(enumerator.sample_reads, 1);
         std::thread::sleep(Duration::from_millis(20));
         let mut file = fs::OpenOptions::new()
             .append(true)
@@ -952,6 +956,10 @@ mod local_enumerator_tests {
         file.write_all(b"{\"n\":\"appended\"}\n").unwrap();
         drop(file);
         let after = run(&mut enumerator, &home).0;
+        assert_eq!(
+            enumerator.sample_reads, 1,
+            "the append past 64 KiB is not re-read"
+        );
         assert_eq!(after[0].session_id, "long");
         assert!(
             after[0].updated_at_unix_ms > first,
@@ -964,26 +972,30 @@ mod local_enumerator_tests {
         fs::remove_dir_all(home).unwrap();
     }
 
+    /// A saturated record file larger than the 64 KiB head hash window.
+    fn big_body(id: &str) -> String {
+        let mut text = format!("{{\"sessionId\":\"{id}\",\"cwd\":\"/s\"}}\n");
+        for n in 0..LOCAL_MAX_LINES + 6 {
+            text.push_str(&format!("{{\"n\":{n},\"pad\":\"{}\"}}\n", "p".repeat(1200)));
+        }
+        assert!(text.len() as u64 > LOCAL_HEAD_BYTES);
+        text
+    }
+
     #[test]
     fn a_growing_rewrite_on_the_same_inode_is_re_read() {
         let home = home("rewrite");
         let rel = ".claude/projects/p/a.jsonl";
-        let body = |id: &str, extra: usize| {
-            let mut text = format!("{{\"sessionId\":\"{id}\",\"cwd\":\"/s\"}}\n");
-            for n in 0..LOCAL_MAX_LINES + extra {
-                text.push_str(&format!("{{\"n\":{n}}}\n"));
-            }
-            text
-        };
-        write(&home, rel, &body("old", 0));
+        write(&home, rel, &big_body("old"));
         let mut enumerator = LocalEnumerator::default();
         assert_eq!(run(&mut enumerator, &home).0[0].session_id, "old");
         let inode = |path: &Path| std::os::unix::fs::MetadataExt::ino(&fs::metadata(path).unwrap());
         let before = inode(&home.join(rel));
         // Truncate and rewrite in place: same inode, longer body, new header.
-        write(&home, rel, &body("new", 5));
+        write(&home, rel, &format!("{}{{}}\n", big_body("new-id")));
         assert_eq!(inode(&home.join(rel)), before);
-        assert_eq!(run(&mut enumerator, &home).0[0].session_id, "new");
+        assert_eq!(run(&mut enumerator, &home).0[0].session_id, "new-id");
+        assert_eq!(enumerator.sample_reads, 2, "the rewrite forced a re-read");
         fs::remove_dir_all(home).unwrap();
     }
 
