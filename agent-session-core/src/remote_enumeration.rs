@@ -148,7 +148,7 @@ impl RemoteParseStats {
         let mut parts = Vec::new();
         if self.dropped_lines > 0 {
             parts.push(format!(
-                "{} record line(s) exceeded the {REMOTE_MAX_LINE_CHARS}-char cap",
+                "{} record line(s) exceeded the per-line cap",
                 self.dropped_lines
             ));
         }
@@ -352,6 +352,11 @@ fn parse_remote_kimi_index(modified_at_unix_ms: u64, lines: &[Value]) -> Vec<Age
 /// Bytes read from the end of the kimi index. The shell sampler keeps its last
 /// [`REMOTE_MAX_FILES_PER_PROVIDER`] lines; this bounds the read that finds them.
 const LOCAL_KIMI_TAIL_BYTES: u64 = 1024 * 1024;
+/// The local discovery reader's limits: lines read per file, bytes per line,
+/// bytes per file.
+const LOCAL_MAX_LINES: usize = 64;
+const LOCAL_MAX_LINE_BYTES: u64 = 1024 * 1024;
+const LOCAL_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// JSONL session stores the helper reads, as `(provider, path under HOME,
 /// parser)`. Same set and same parsers as [`remote_enumeration_script`].
@@ -362,32 +367,130 @@ const LOCAL_JSONL_STORES: [(&str, &str, SessionParser); 3] = [
     ("pi", ".pi/agent/sessions", parse_pi_session),
 ];
 
-/// One file's outcome, reused while its mtime and length are unchanged.
-#[derive(Clone)]
-struct CachedFile {
-    modified_at_unix_ms: u64,
+/// What identifies one version of a file: device, inode, length, and the
+/// full-resolution mtime and ctime. Any rewrite changes ctime.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
     len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileIdentity {
+    fn of(path: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+
+    /// Same file, only grown: an append to a JSONL store.
+    fn appended_to(&self, earlier: &Self) -> bool {
+        self.dev == earlier.dev && self.ino == earlier.ino && self.len > earlier.len
+    }
+}
+
+/// One file's sample, kept between polls. The default is a file that could
+/// not be read this poll: no records, never cached.
+#[derive(Clone, Default)]
+struct CachedFile {
+    identity: FileIdentity,
     records: Vec<AgentSessionRecord>,
-    unparsable_lines: usize,
+    stats: RemoteParseStats,
+    /// The sample stopped at a line or byte limit before the end of the file,
+    /// so an append cannot change it.
+    saturated: bool,
+}
+
+/// One record file's head, read with the local limits. Unlike the local
+/// discovery reader it never fails a whole file over one bad line: like the
+/// shell sampler it skips and counts it, so a valid header still yields its
+/// session and the loss reaches the consumer's warning.
+struct HelperSample {
+    values: Vec<Value>,
+    stats: RemoteParseStats,
+    saturated: bool,
+    incomplete_append: bool,
+}
+
+fn read_helper_sample(path: &std::path::Path) -> std::io::Result<HelperSample> {
+    use std::io::{BufRead, Read};
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut sample = HelperSample {
+        values: Vec::new(),
+        stats: RemoteParseStats::default(),
+        saturated: true,
+        incomplete_append: false,
+    };
+    let mut total: u64 = 0;
+    for _ in 0..LOCAL_MAX_LINES {
+        let mut line = Vec::new();
+        let count = reader
+            .by_ref()
+            .take(LOCAL_MAX_LINE_BYTES + 1)
+            .read_until(b'\n', &mut line)? as u64;
+        if count == 0 {
+            sample.saturated = false;
+            return Ok(sample);
+        }
+        total += count;
+        if count > LOCAL_MAX_LINE_BYTES {
+            if !sample.values.is_empty() {
+                // A large later record (tool output) ends the head read; the
+                // header is already in hand, so nothing is lost.
+                return Ok(sample);
+            }
+            // An oversized line before any record is a real loss: count it
+            // and skip to the next line, like the shell sampler.
+            sample.stats.dropped_lines += 1;
+            total += reader.skip_until(b'\n')? as u64;
+        } else if !line.iter().all(u8::is_ascii_whitespace) {
+            match serde_json::from_slice::<Value>(&line) {
+                Ok(value) => sample.values.push(value),
+                Err(error) if line.last() != Some(&b'\n') && error.is_eof() => {
+                    // An in-progress append at the end of the file.
+                    sample.saturated = false;
+                    sample.incomplete_append = true;
+                    return Ok(sample);
+                }
+                Err(_) => sample.stats.unparsable_lines += 1,
+            }
+        }
+        if total > LOCAL_MAX_FILE_BYTES {
+            return Ok(sample);
+        }
+    }
+    Ok(sample)
 }
 
 /// Enumeration for a helper that runs **on** the host.
 ///
 /// The shell sampler's limits exist for raw lines crossing SSH. A helper sends
-/// only parsed records, so it reads each file with the local reader instead
+/// only parsed records, so it reads each file with the local limits instead
 /// (64 lines, 1 MiB per line, 16 MiB per file): remote titles match what the
 /// host's own discovery would show. The file set, parsers, ordering and caps
-/// match [`remote_enumeration_script`]. Results are cached by path, mtime and
-/// length, so a poll re-reads only files that changed.
+/// match [`remote_enumeration_script`].
+///
+/// Samples are cached by file identity. An append past a saturated sample
+/// reuses it with the new mtime, because session stores are append-only and
+/// the head cannot change. Failed reads are never cached.
 #[derive(Default)]
 pub struct LocalEnumerator {
     cache: std::collections::HashMap<PathBuf, CachedFile>,
 }
 
 impl LocalEnumerator {
-    /// Enumerate `home`. `check` runs before every file read; an error from it
-    /// (cancellation) or a passed `deadline` fails the whole sample, so no
-    /// partial record set is ever published.
+    /// Enumerate `home`. `check` runs before and after every traversal and file
+    /// read; an error from it (cancellation) or a passed `deadline` fails the
+    /// whole sample, so no partial record set is ever published. A single
+    /// blocked read is not interruptible: the deadline applies between reads.
     pub fn enumerate(
         &mut self,
         home: &std::path::Path,
@@ -410,53 +513,27 @@ impl LocalEnumerator {
             if !root.is_dir() {
                 continue;
             }
-            // Like the shell's `find 2>/dev/null`: an unreadable store is skipped.
-            let Ok(scan) = crate::discovery::collect_jsonl_candidates(&root) else {
+            check()?;
+            // Like the shell's `find 2>/dev/null`: an unreadable store is
+            // skipped. The collector stops at 100,000 entries; fleet stores
+            // measured 2026-11-09 hold at most ~13,000.
+            let scan = crate::discovery::collect_jsonl_candidates(&root);
+            check()?;
+            let Ok(scan) = scan else {
                 continue;
             };
             for candidate in scan.files.into_iter().take(REMOTE_MAX_FILES_PER_PROVIDER) {
+                let file = self.jsonl_file(&candidate.path, candidate.modified_at_unix_ms, parser);
                 check()?;
-                let path = candidate.path.clone();
-                let modified = candidate.modified_at_unix_ms;
-                let file = self.cached(&path, modified, |len| {
-                    let (records, cacheable) =
-                        match crate::discovery::read_jsonl_sample_lines(&path) {
-                            Ok(sample) => (
-                                parser(&path, modified, &sample.values)
-                                    .into_iter()
-                                    .collect(),
-                                !sample.incomplete_append,
-                            ),
-                            // A header that is unreadable, malformed or over
-                            // 1 MiB yields no session; it is counted below.
-                            Err(_) => (Vec::new(), true),
-                        };
-                    let file = CachedFile {
-                        modified_at_unix_ms: modified,
-                        len,
-                        records,
-                        unparsable_lines: 0,
-                    };
-                    (file, cacheable)
-                });
-                seen.insert(path);
+                seen.insert(candidate.path);
                 account(&file, &mut sessions, &mut stats);
             }
         }
         let index = home.join(".kimi-code/session_index.jsonl");
         if index.is_file() {
             check()?;
-            let modified = fs_modified_unix_ms(&index);
-            let file = self.cached(&index, modified, |len| {
-                let (lines, unparsable_lines) = read_kimi_tail(&index, len);
-                let file = CachedFile {
-                    modified_at_unix_ms: modified,
-                    len,
-                    records: parse_remote_kimi_index(modified, &lines),
-                    unparsable_lines,
-                };
-                (file, true)
-            });
+            let file = self.kimi_index(&index);
+            check()?;
             seen.insert(index);
             account(&file, &mut sessions, &mut stats);
         }
@@ -472,26 +549,77 @@ impl LocalEnumerator {
         Ok((sessions, stats))
     }
 
-    /// The cached outcome for `path`, or a fresh read when its mtime or length
-    /// changed. `read` gets the current length and says whether to cache.
-    fn cached(
+    fn jsonl_file(
         &mut self,
         path: &std::path::Path,
         modified_at_unix_ms: u64,
-        read: impl FnOnce(u64) -> (CachedFile, bool),
+        parser: SessionParser,
     ) -> CachedFile {
-        let len = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-        if let Some(file) = self.cache.get(path) {
-            if file.modified_at_unix_ms == modified_at_unix_ms && file.len == len {
-                return file.clone();
+        let Some(identity) = FileIdentity::of(path) else {
+            self.cache.remove(path);
+            return CachedFile::default();
+        };
+        if let Some(cached) = self.cache.get_mut(path) {
+            if cached.identity == identity {
+                return cached.clone();
+            }
+            if cached.saturated && identity.appended_to(&cached.identity) {
+                // The parsers stamp both times from the file mtime.
+                cached.identity = identity;
+                for record in &mut cached.records {
+                    record.started_at_unix_ms = Some(modified_at_unix_ms);
+                    record.updated_at_unix_ms = modified_at_unix_ms;
+                }
+                return cached.clone();
             }
         }
-        let (file, cacheable) = read(len);
-        if cacheable {
-            self.cache.insert(path.to_path_buf(), file.clone());
-        } else {
+        let Ok(sample) = read_helper_sample(path) else {
+            // Not cached: a transient failure is retried on the next poll.
             self.cache.remove(path);
+            return CachedFile::default();
+        };
+        let file = CachedFile {
+            identity,
+            records: parser(path, modified_at_unix_ms, &sample.values)
+                .into_iter()
+                .collect(),
+            stats: sample.stats,
+            saturated: sample.saturated,
+        };
+        if sample.incomplete_append {
+            self.cache.remove(path);
+        } else {
+            self.cache.insert(path.to_path_buf(), file.clone());
         }
+        file
+    }
+
+    fn kimi_index(&mut self, path: &std::path::Path) -> CachedFile {
+        let Some(identity) = FileIdentity::of(path) else {
+            self.cache.remove(path);
+            return CachedFile::default();
+        };
+        if let Some(cached) = self.cache.get(path) {
+            if cached.identity == identity {
+                return cached.clone();
+            }
+        }
+        let Ok((lines, unparsable_lines)) = read_kimi_tail(path, identity.len) else {
+            self.cache.remove(path);
+            return CachedFile::default();
+        };
+        let (secs, nanos) = identity.mtime;
+        let modified = (secs.max(0) as u64) * 1000 + (nanos.max(0) as u64) / 1_000_000;
+        let file = CachedFile {
+            identity,
+            records: parse_remote_kimi_index(modified, &lines),
+            stats: RemoteParseStats {
+                unparsable_lines,
+                ..RemoteParseStats::default()
+            },
+            saturated: false,
+        };
+        self.cache.insert(path.to_path_buf(), file.clone());
         file
     }
 }
@@ -501,43 +629,38 @@ fn account(
     sessions: &mut Vec<AgentSessionRecord>,
     stats: &mut RemoteParseStats,
 ) {
-    stats.unparsable_lines += file.unparsable_lines;
+    stats.dropped_lines += file.stats.dropped_lines;
+    stats.unparsable_lines += file.stats.unparsable_lines;
     if file.records.is_empty() {
         stats.blocks_without_session += 1;
     }
     sessions.extend(file.records.iter().cloned());
 }
 
-fn fs_modified_unix_ms(path: &std::path::Path) -> u64 {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or_default()
-}
-
 /// The last [`REMOTE_MAX_FILES_PER_PROVIDER`] lines of the kimi index, parsed,
 /// plus how many of them were not valid JSON.
-fn read_kimi_tail(path: &std::path::Path, len: u64) -> (Vec<Value>, usize) {
+fn read_kimi_tail(path: &std::path::Path, len: u64) -> std::io::Result<(Vec<Value>, usize)> {
     use std::io::{Read, Seek, SeekFrom};
-    let start = len.saturating_sub(LOCAL_KIMI_TAIL_BYTES);
+    // Start one byte early: if that byte is a newline, the window begins on a
+    // line boundary and its first line is whole.
+    let start = len.saturating_sub(LOCAL_KIMI_TAIL_BYTES + 1);
     let mut bytes = Vec::new();
-    let read = std::fs::File::open(path).and_then(|mut file| {
-        file.seek(SeekFrom::Start(start))?;
-        file.take(LOCAL_KIMI_TAIL_BYTES).read_to_end(&mut bytes)
-    });
-    if read.is_err() {
-        return (Vec::new(), 0);
-    }
-    let text = String::from_utf8_lossy(&bytes);
-    let mut lines: Vec<&str> = text.lines().collect();
-    if start > 0 && !lines.is_empty() {
-        // The first line of a mid-file read is a fragment.
-        lines.remove(0);
-    }
-    let lines: Vec<&str> = lines
-        .into_iter()
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    file.take(LOCAL_KIMI_TAIL_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let window = if start > 0 {
+        // Drop the partial line (or the lone newline) before the window.
+        match bytes.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => &bytes[newline + 1..],
+            None => &bytes[..0],
+        }
+    } else {
+        &bytes[..]
+    };
+    let text = String::from_utf8_lossy(window);
+    let lines: Vec<&str> = text
+        .lines()
         .filter(|line| !line.trim().is_empty())
         .collect();
     let tail = &lines[lines.len().saturating_sub(REMOTE_MAX_FILES_PER_PROVIDER)..];
@@ -549,7 +672,7 @@ fn read_kimi_tail(path: &std::path::Path, len: u64) -> (Vec<Value>, usize) {
             Err(_) => unparsable += 1,
         }
     }
-    (values, unparsable)
+    Ok((values, unparsable))
 }
 
 #[cfg(test)]
@@ -670,13 +793,15 @@ mod local_enumerator_tests {
         );
         let mut enumerator = LocalEnumerator::default();
         assert_eq!(run(&mut enumerator, &home).0[0].session_id, "first");
-        // Different length: the cache entry is stale even with an equal mtime.
+        // A same-length rewrite: only the identity's times and ctime change.
+        // File timestamps advance on a coarse kernel tick.
+        std::thread::sleep(Duration::from_millis(20));
         write(
             &home,
             rel,
-            "{\"sessionId\":\"second-id\",\"cwd\":\"/synthetic\"}\n",
+            "{\"sessionId\":\"secnd\",\"cwd\":\"/synthetic\"}\n",
         );
-        assert_eq!(run(&mut enumerator, &home).0[0].session_id, "second-id");
+        assert_eq!(run(&mut enumerator, &home).0[0].session_id, "secnd");
         fs::remove_file(home.join(rel)).unwrap();
         assert!(run(&mut enumerator, &home).0.is_empty());
         assert!(enumerator.cache.is_empty(), "removed files leave the cache");
@@ -684,7 +809,7 @@ mod local_enumerator_tests {
     }
 
     #[test]
-    fn a_file_without_a_session_is_counted() {
+    fn files_without_a_session_and_bad_lines_are_counted() {
         let home = home("no-session");
         write(
             &home,
@@ -695,9 +820,125 @@ mod local_enumerator_tests {
         let (sessions, stats) = run(&mut LocalEnumerator::default(), &home);
         assert!(sessions.is_empty());
         assert_eq!(stats.blocks_without_session, 2);
-        // Like the shell path: stores hold non-session JSONL, so a file with no
-        // session alone is counted but does not warn.
-        assert_eq!(stats.warning(), None);
+        assert_eq!(stats.unparsable_lines, 1);
+        assert!(stats
+            .warning()
+            .unwrap()
+            .contains("1 line(s) were not valid JSON"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_bad_line_after_a_valid_header_keeps_the_session_and_warns() {
+        let home = home("bad-later");
+        write(
+            &home,
+            ".claude/projects/p/a.jsonl",
+            "{\"sessionId\":\"kept\",\"cwd\":\"/s\"}\n{oops\n{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello there\"}}\n",
+        );
+        let (sessions, stats) = run(&mut LocalEnumerator::default(), &home);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "hello there");
+        assert_eq!(stats.unparsable_lines, 1);
+        assert!(stats.warning().is_some());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_line_before_the_header_is_dropped_and_counted() {
+        let home = home("oversize-first");
+        let huge = format!(
+            "{{\"pad\":\"{}\"}}\n",
+            "z".repeat(LOCAL_MAX_LINE_BYTES as usize + 10)
+        );
+        write(
+            &home,
+            ".claude/projects/p/a.jsonl",
+            &format!("{huge}{{\"sessionId\":\"after\",\"cwd\":\"/s\"}}\n"),
+        );
+        let (sessions, stats) = run(&mut LocalEnumerator::default(), &home);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "after");
+        assert_eq!(stats.dropped_lines, 1);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_failed_read_is_not_cached() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores file modes
+        }
+        let home = home("unreadable");
+        let rel = ".claude/projects/p/a.jsonl";
+        write(&home, rel, "{\"sessionId\":\"later\",\"cwd\":\"/s\"}\n");
+        let path = home.join(rel);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut enumerator = LocalEnumerator::default();
+        let (sessions, stats) = run(&mut enumerator, &home);
+        assert!(sessions.is_empty());
+        assert_eq!(stats.blocks_without_session, 1);
+        assert!(
+            enumerator.cache.is_empty(),
+            "a failed read is retried, not cached"
+        );
+        // Restoring access without touching content, mtime or length recovers.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(run(&mut enumerator, &home).0[0].session_id, "later");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn an_append_past_a_saturated_head_reuses_it_with_the_new_mtime() {
+        use std::io::Write;
+        let home = home("append");
+        let rel = ".claude/projects/p/a.jsonl";
+        let mut content = String::from("{\"sessionId\":\"long\",\"cwd\":\"/s\"}\n");
+        for n in 0..LOCAL_MAX_LINES + 6 {
+            content.push_str(&format!("{{\"n\":{n}}}\n"));
+        }
+        write(&home, rel, &content);
+        let mut enumerator = LocalEnumerator::default();
+        let first = run(&mut enumerator, &home).0[0].updated_at_unix_ms;
+        assert!(enumerator.cache.values().all(|file| file.saturated));
+        std::thread::sleep(Duration::from_millis(20));
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(home.join(rel))
+            .unwrap();
+        file.write_all(b"{\"n\":\"appended\"}\n").unwrap();
+        drop(file);
+        let after = run(&mut enumerator, &home).0;
+        assert_eq!(after[0].session_id, "long");
+        assert!(
+            after[0].updated_at_unix_ms > first,
+            "the new mtime is carried over"
+        );
+        assert_eq!(
+            after[0].started_at_unix_ms,
+            Some(after[0].updated_at_unix_ms)
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn an_append_to_a_short_file_is_re_read_for_its_title() {
+        use std::io::Write;
+        let home = home("append-short");
+        let rel = ".claude/projects/p/a.jsonl";
+        write(&home, rel, "{\"sessionId\":\"new\",\"cwd\":\"/s\"}\n");
+        let mut enumerator = LocalEnumerator::default();
+        assert_eq!(run(&mut enumerator, &home).0[0].title, "claude new");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(home.join(rel))
+            .unwrap();
+        file.write_all(
+            b"{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"first prompt\"}}\n",
+        )
+        .unwrap();
+        drop(file);
+        assert_eq!(run(&mut enumerator, &home).0[0].title, "first prompt");
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -740,6 +981,33 @@ mod local_enumerator_tests {
         assert!(sessions.iter().any(|s| s.session_id == "k29"));
         assert!(!sessions.iter().any(|s| s.session_id == "k10"));
         assert_eq!(stats.unparsable_lines, 1);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn kimi_tail_keeps_a_whole_first_line_on_a_newline_boundary() {
+        let home = home("kimi-boundary");
+        // 20 records filling the tail window exactly, behind a filler line.
+        let window = LOCAL_KIMI_TAIL_BYTES as usize;
+        let base = |n: usize, pad: usize| {
+            format!(
+                "{{\"sessionId\":\"b{n:02}\",\"workDir\":\"/w\",\"pad\":\"{}\"}}\n",
+                "z".repeat(pad)
+            )
+        };
+        let overhead = base(0, 0).len();
+        let each = window / 20;
+        let mut records = String::new();
+        for n in 0..19 {
+            records.push_str(&base(n, each - overhead));
+        }
+        records.push_str(&base(19, window - 19 * each - overhead));
+        assert_eq!(records.len(), window);
+        let index = format!("{{\"filler\":true}}\n{records}");
+        write(&home, ".kimi-code/session_index.jsonl", &index);
+        let (sessions, stats) = run(&mut LocalEnumerator::default(), &home);
+        assert_eq!(sessions.len(), 20, "the boundary record is whole and kept");
+        assert_eq!(stats.unparsable_lines, 0);
         fs::remove_dir_all(home).unwrap();
     }
 

@@ -807,12 +807,12 @@ const INCOMPLETE_APPEND_WARNING: &str =
     "Session history sample is partial: an incomplete trailing JSONL append was ignored.";
 
 #[derive(Debug, Default)]
-pub(crate) struct JsonlSample {
-    pub(crate) values: Vec<Value>,
-    pub(crate) incomplete_append: bool,
+struct JsonlSample {
+    values: Vec<Value>,
+    incomplete_append: bool,
 }
 
-pub(crate) fn read_jsonl_sample_lines(path: &Path) -> Result<JsonlSample, String> {
+fn read_jsonl_sample_lines(path: &Path) -> Result<JsonlSample, String> {
     read_bounded_jsonl(path, MAX_SAMPLE_LINES, false)
 }
 
