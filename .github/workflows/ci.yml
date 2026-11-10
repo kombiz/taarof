@@ -161,8 +161,12 @@ jobs:
             python3 \
             tmux
 
+      # No stored credential: checkout's post step would otherwise rewrite
+      # .git/config as root after the ownership hand-back (#101).
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # The container runs as root over a workspace owned by the runner user.
       # actions/checkout marks it safe under a temporary HOME only; later Git
@@ -234,9 +238,89 @@ jobs:
       - name: Build taarof-app release binary
         run: cargo build --release --manifest-path taarof-app/Cargo.toml
 
-      - name: Restore host workspace ownership
+      # Stops leftover build processes, then chowns, so a cancel leaves no
+      # root-owned files (#101). Keep it the last step. It is inline, so it
+      # still runs when a cancel stops checkout early. package-linux reuses
+      # it through the YAML anchor.
+      - &hand-back-workspace
+        name: Restore host workspace ownership
         if: always()
-        run: chown -R 1000:1000 "$GITHUB_WORKSPACE"
+        shell: bash
+        run: |
+          # Killing a step's `docker exec` client does not stop what it started
+          # in the container, so after a cancel cargo and rustc keep writing.
+          set -euo pipefail
+
+          # Signalling every process as root on a host would hit the machine.
+          if [[ ! -f /.dockerenv && ! -f /run/.containerenv ]]; then
+            echo "::error::The hand-back only runs inside a job container."
+            exit 1
+          fi
+          workspace="$GITHUB_WORKSPACE"
+          # The runner creates the workspace's parent, so it has the runner's uid.
+          owner="$(stat -c '%u:%g' "$workspace/..")"
+
+          # Never signal PID 1 (the runner's keep-alive) or this shell and its
+          # ancestors: the runner reads this step's exit status through them.
+          declare -A keep=([1]=1)
+          pid=$$
+          while ((pid > 1)) && [[ -z "${keep[$pid]:-}" ]]; do
+            keep[$pid]=1
+            ppid=0
+            while read -r key value; do
+              if [[ "$key" == PPid: ]]; then ppid="$value"; break; fi
+            done 2>/dev/null <"/proc/$pid/status" || true
+            pid="$ppid"
+          done
+
+          # Sets `targets` to every live process not in `keep`. Builtins only,
+          # so the scan never sees a child of its own. Zombies are skipped:
+          # PID 1 does not reap them, and they cannot write.
+          scan() {
+            local dir p line state
+            targets=()
+            for dir in /proc/[0-9]*; do
+              p="${dir#/proc/}"
+              [[ -n "${keep[$p]:-}" ]] && continue
+              read -r line 2>/dev/null <"$dir/stat" || continue
+              state="${line##*) }"
+              state="${state%% *}"
+              [[ "$state" == Z ]] && continue
+              targets+=("$p")
+            done
+          }
+
+          # Signals every target each 0.5 s round, so processes started in the
+          # meantime stop too. Fails if any target is still live at the end.
+          stop_all() {
+            local signal="$1" rounds="$2" i
+            for ((i = 0; i < rounds; i++)); do
+              scan
+              ((${#targets[@]} == 0)) && return 0
+              kill "-$signal" "${targets[@]}" 2>/dev/null || true
+              sleep 0.5
+            done
+            scan
+            ((${#targets[@]} == 0))
+          }
+
+          scan
+          echo "Stopping ${#targets[@]} leftover process(es) before the hand-back."
+          if ! stop_all TERM 20; then
+            echo "::warning::${#targets[@]} process(es) outlived SIGTERM; sending SIGKILL."
+            if ! stop_all KILL 20; then
+              echo "::warning::Still live after SIGKILL: ${targets[*]}."
+            fi
+          fi
+
+          # -h changes symlinks themselves and never follows them out.
+          chown -R -h "$owner" "$workspace"
+          left="$(find "$workspace" ! -user "${owner%%:*}" -print -quit)"
+          if [[ -n "$left" ]]; then
+            echo "::error::Not owned by ${owner} after the hand-back: ${left}"
+            exit 1
+          fi
+          echo "Workspace handed back to ${owner}."
 
   package-linux:
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
@@ -266,8 +350,12 @@ jobs:
             libvte-2.91-gtk4-dev \
             pkg-config
 
+      # No stored credential: checkout's post step would otherwise rewrite
+      # .git/config as root after the ownership hand-back (#101).
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # This container step runs as root over a workspace owned by the runner
       # user, so Git rejects the checkout as dubiously owned. actions/checkout
@@ -303,9 +391,7 @@ jobs:
           path: dist/launcher-receipts/*.json
           if-no-files-found: error
 
-      - name: Restore host workspace ownership
-        if: always()
-        run: chown -R 1000:1000 "$GITHUB_WORKSPACE"
+      - *hand-back-workspace
 
   # Offline repo-contract suites. These live in mise.toml's `test` task too,
   # but no CI job runs `mise run test`, so they are invoked explicitly here or
