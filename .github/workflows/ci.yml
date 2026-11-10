@@ -161,8 +161,12 @@ jobs:
             python3 \
             tmux
 
+      # No stored credential: checkout's post step would otherwise rewrite
+      # .git/config as root after the ownership hand-back (#101).
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # The container runs as root over a workspace owned by the runner user.
       # actions/checkout marks it safe under a temporary HOME only; later Git
@@ -234,9 +238,11 @@ jobs:
       - name: Build taarof-app release binary
         run: cargo build --release --manifest-path taarof-app/Cargo.toml
 
+      # Stops leftover build processes, then chowns, so a cancel leaves no
+      # root-owned files (#101). Keep it the last step.
       - name: Restore host workspace ownership
         if: always()
-        run: chown -R 1000:1000 "$GITHUB_WORKSPACE"
+        run: bash .github/scripts/hand-back-workspace.sh
 
   package-linux:
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
@@ -266,8 +272,12 @@ jobs:
             libvte-2.91-gtk4-dev \
             pkg-config
 
+      # No stored credential: checkout's post step would otherwise rewrite
+      # .git/config as root after the ownership hand-back (#101).
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # This container step runs as root over a workspace owned by the runner
       # user, so Git rejects the checkout as dubiously owned. actions/checkout
@@ -303,9 +313,11 @@ jobs:
           path: dist/launcher-receipts/*.json
           if-no-files-found: error
 
+      # Stops leftover build processes, then chowns, so a cancel leaves no
+      # root-owned files (#101). Keep it the last step.
       - name: Restore host workspace ownership
         if: always()
-        run: chown -R 1000:1000 "$GITHUB_WORKSPACE"
+        run: bash .github/scripts/hand-back-workspace.sh
 
   # Offline repo-contract suites. These live in mise.toml's `test` task too,
   # but no CI job runs `mise run test`, so they are invoked explicitly here or
