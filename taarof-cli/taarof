@@ -2671,8 +2671,25 @@ def _local_tmux_ensure(session: str, cwd: str | None,
     return step
 
 
+def _validate_ssh_destination(value: Any, *, source: str) -> str:
+    """Return a destination that cannot be interpreted as an SSH option."""
+    allowed_punctuation = ".-_@:%[]"
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.startswith("-")
+        or not all(
+            char.isascii() and (char.isalnum() or char in allowed_punctuation)
+            for char in value
+        )
+    ):
+        raise SystemExit(f"{source} contains an unsupported SSH destination: {value!r}")
+    return value
+
+
 def _resolve_host_alias(alias: str) -> str:
-    """Map a host alias from the taarof config to its SSH address."""
+    """Map a validated host alias to a validated SSH address."""
+    alias = _validate_ssh_destination(alias, source="workspace SSH target")
     cfg_path = Path.home() / ".config" / "taarof" / "config.toml"
     if not cfg_path.exists() or tomllib is None:
         return alias
@@ -2683,7 +2700,9 @@ def _resolve_host_alias(alias: str) -> str:
     hosts = cfg.get("hosts") or {}
     entry = hosts.get(alias)
     if isinstance(entry, dict) and isinstance(entry.get("address"), str):
-        return entry["address"]
+        return _validate_ssh_destination(
+            entry["address"], source=f"configured address for host {alias!r}"
+        )
     return alias
 
 
