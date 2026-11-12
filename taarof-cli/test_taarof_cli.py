@@ -1663,6 +1663,79 @@ cwd = "{cwd}"
             ],
         )
 
+    def test_apply_rejects_option_shaped_ssh_targets_before_launch(self) -> None:
+        cli = load_cli_module()
+        for field in ("remote", "tmux_host"):
+            for target in (
+                "-F./workspace-ssh.conf",
+                "-oProxyCommand=attacker-command",
+                "-Jattacker.example",
+            ):
+                with (
+                    self.subTest(field=field, target=target),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    manifest_path = Path(tmp) / "unsafe.toml"
+                    manifest_path.write_text(
+                        f'''[[workspace]]
+name = "main"
+
+[[workspace.tab]]
+name = "tmux"
+{field} = "{target}"
+tmux_session = "work"
+''',
+                        encoding="utf-8",
+                    )
+                    with (
+                        patch.object(cli.subprocess, "run") as run,
+                        patch.object(cli, "socket_send") as socket_send,
+                        self.assertRaisesRegex(SystemExit, "unsupported SSH destination"),
+                    ):
+                        cli.main(["workspace", "apply", str(manifest_path)])
+                    run.assert_not_called()
+                    socket_send.assert_not_called()
+
+    def test_ssh_destination_validation_rejects_unsafe_grammar(self) -> None:
+        cli = load_cli_module()
+        for target in ("host name", "host\tname", "host/name", "höst.example"):
+            with self.subTest(target=target), self.assertRaisesRegex(
+                SystemExit, "unsupported SSH destination"
+            ):
+                cli._validate_ssh_destination(target, source="test target")
+
+    def test_resolved_host_address_is_validated(self) -> None:
+        cli = load_cli_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            config_path = home / ".config" / "taarof" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                '[hosts.control]\naddress = "-F./workspace-ssh.conf"\n',
+                encoding="utf-8",
+            )
+            with (
+                patch.object(cli.Path, "home", return_value=home),
+                self.assertRaisesRegex(SystemExit, "configured address.*unsupported"),
+            ):
+                cli._resolve_host_alias("control")
+
+    def test_resolve_host_alias_preserves_supported_destination(self) -> None:
+        cli = load_cli_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            config_path = home / ".config" / "taarof" / "config.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                '[hosts.control]\naddress = "deploy@[2001:db8::1]"\n',
+                encoding="utf-8",
+            )
+            with patch.object(cli.Path, "home", return_value=home):
+                self.assertEqual(
+                    cli._resolve_host_alias("control"),
+                    "deploy@[2001:db8::1]",
+                )
+
 
 class AgentLsRenderTests(unittest.TestCase):
     MULTI_AGENT_STATE = {
