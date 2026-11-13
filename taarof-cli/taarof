@@ -2635,7 +2635,7 @@ def _ssh_tmux_ensure(host_address: str, session: str, cwd: str | None,
         step["action"] = "would-ensure"
         return step
     proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", host_address,
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", "--", host_address,
          ensure_cmd],
         capture_output=True, text=True, timeout=20,
     )
@@ -2687,6 +2687,21 @@ def _resolve_host_alias(alias: str) -> str:
     return alias
 
 
+def _workspace_ssh_destination(tab: dict[str, Any]) -> str | None:
+    # tmux_host records the connection target. remote may be the OSC 7 hostname.
+    alias = tab.get("tmux_host") or tab.get("remote")
+    if alias is None or alias == "":
+        return None
+    if not isinstance(alias, str):
+        raise SystemExit(f"invalid SSH destination for tab {tab.get('name')!r}: expected a string")
+    address = _resolve_host_alias(alias)
+    if not address or address.startswith("-") or any(
+        char.isspace() or not char.isprintable() for char in address
+    ):
+        raise SystemExit(f"invalid SSH destination for tab {tab.get('name')!r}: {address!r}")
+    return address
+
+
 def _is_local_hostname(host: Any) -> bool:
     """Return whether an old manifest's remote label names this machine."""
     if not isinstance(host, str):
@@ -2725,10 +2740,15 @@ def cmd_workspace_apply(args: argparse.Namespace) -> Any:
         raise SystemExit(
             f"no workspace matched (--workspace={wanted_name!r} in {args.file})")
 
+    # Resolve every selected destination before applying any part of the manifest.
+    workspace_tabs = [
+        (ws, [(tab, _workspace_ssh_destination(tab)) for tab in ws.get("tab") or []])
+        for ws in workspaces
+    ]
     report: dict[str, Any] = {"dry_run": args.dry_run, "workspaces": []}
-    for ws in workspaces:
+    for ws, tabs in workspace_tabs:
         ws_report: dict[str, Any] = {"name": ws.get("name"), "tabs": [], "tmux": []}
-        for tab in ws.get("tab") or []:
+        for tab, address in tabs:
             tab_report: dict[str, Any] = {"name": tab.get("name")}
             session = tab.get("tmux_session")
             manifest_remote = tab.get("remote")
@@ -2746,28 +2766,23 @@ def cmd_workspace_apply(args: argparse.Namespace) -> Any:
                         "remote field matches the local hostname; preserving SSH because "
                         "legacy local exports and intentional SSH-to-self are ambiguous",
                     )
-            # tmux_host is the recorded connection target. cwd_host/remote may
-            # be the server's OSC 7 hostname and need not be an SSH alias.
-            remote_alias = tmux_host or manifest_remote
             cwd = tab.get("cwd")
             command: str | None = None
 
-            if session and remote_alias:
-                address = _resolve_host_alias(remote_alias)
+            if session and address:
                 if args.ensure_tmux:
                     ws_report["tmux"].append(
                         _ssh_tmux_ensure(address, session, cwd, dry_run=args.dry_run))
                 remote_command = f"tmux attach -t {shlex.quote(session)}"
-                command = f"ssh -t {shlex.quote(address)} {shlex.quote(remote_command)}"
+                command = f"ssh -t -- {shlex.quote(address)} {shlex.quote(remote_command)}"
             elif session:
                 if args.ensure_tmux:
                     ws_report["tmux"].append(
                         _local_tmux_ensure(session, cwd, dry_run=args.dry_run))
                 command = f"tmux attach -t {shlex.quote(session)}"
-            elif remote_alias:
+            elif address:
                 # Remote host, no tmux — plain SSH (warn: not shareable).
-                address = _resolve_host_alias(remote_alias)
-                base = f"ssh -t {shlex.quote(address)}"
+                base = f"ssh -t -- {shlex.quote(address)}"
                 if cwd:
                     remote_command = f"cd {shlex.quote(cwd)} && exec $SHELL -l"
                     base += f" {shlex.quote(remote_command)}"
@@ -2779,7 +2794,7 @@ def cmd_workspace_apply(args: argparse.Namespace) -> Any:
             payload: dict[str, Any] = {"action": "create-tab"}
             if tab.get("name"):
                 payload["name"] = tab["name"]
-            if cwd and not remote_alias and not session:
+            if cwd and not address and not session:
                 payload["working_dir"] = cwd
             if command:
                 payload["command"] = command
