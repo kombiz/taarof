@@ -11,14 +11,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-# Fork pull requests only need to read this repository. Keep the default token
+# Pull requests only need to read this repository. Keep the default token
 # deliberately narrow for every CI job.
 permissions:
   contents: read
 
 jobs:
   fmt:
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
     steps:
       # Root container jobs (taarof-app, package-linux) share this runner's
       # workspace. A cancelled build or a post-job step can leave root-owned
@@ -59,7 +59,7 @@ jobs:
     # a check run (taarof#94), so no checks: write token is needed here.
     permissions:
       contents: read
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
     steps:
       # Root container jobs (taarof-app, package-linux) share this runner's
       # workspace. A cancelled build or a post-job step can leave root-owned
@@ -98,7 +98,7 @@ jobs:
         working-directory: taarof-web
 
   taarof-web:
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
     steps:
       # Root container jobs (taarof-app, package-linux) share this runner's
       # workspace. A cancelled build or a post-job step can leave root-owned
@@ -130,7 +130,7 @@ jobs:
         working-directory: taarof-web
 
   taarof-app:
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
     # Debian trixie ships vte 0.80+, satisfying the vte4-sys >= 0.78 requirement
     # that Ubuntu 24.04 runners (vte 0.76) cannot meet.
     container:
@@ -323,7 +323,7 @@ jobs:
           echo "Workspace handed back to ${owner}."
 
   package-linux:
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
     container:
       image: mirror.gcr.io/library/debian:trixie-slim
     env:
@@ -397,7 +397,7 @@ jobs:
   # but no CI job runs `mise run test`, so they are invoked explicitly here or
   # they would never run on a pull request.
   contracts:
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
     steps:
       # Root container jobs (taarof-app, package-linux) share this runner's
       # workspace. A cancelled build or a post-job step can leave root-owned
@@ -418,7 +418,7 @@ jobs:
         run: python3 testing/test_shell_integration.py
 
   wasm-sidebar:
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
+    runs-on: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["self-hosted","onlyarag-taarof-x64"]') }}
     steps:
       # Root container jobs (taarof-app, package-linux) share this runner's
       # workspace. A cancelled build or a post-job step can leave root-owned
