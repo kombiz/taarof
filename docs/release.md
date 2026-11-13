@@ -15,7 +15,7 @@ GitHub-hosted runner is a fresh, single-use VM per job with no workspace state
 carried over between runs, so a pull request cannot execute code on shared build
 infrastructure or exfiltrate anything durable.
 
-`ci.yml` declares workflow-level `permissions: { contents: read }`. Its fork PR
+`ci.yml` declares workflow-level `permissions: { contents: read }`. Its PR
 jobs use only the default read-only `GITHUB_TOKEN`; an untrusted pull-request
 job must not reference a custom secret. The Claude review workflows retain their
 OAuth token only behind their explicit collaborator authorization gates, and do
